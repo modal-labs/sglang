@@ -305,7 +305,7 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-        if self.enable_overlap:
+        if self.enable_overlap and not self.spec_algorithm.is_eagle():
             TpWorkerClass = TpModelWorkerClient
         else:
             TpWorkerClass = TpModelWorker
@@ -322,9 +322,16 @@ class Scheduler(
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            if self.enable_overlap:
+                from sglang.srt.speculative.eagle_worker_overlap_thread import (
+                    EAGLEWorkerClient as EAGLEWorkerClass,
+                )
+            else:
+                from sglang.srt.speculative.eagle_worker import (
+                    EAGLEWorker as EAGLEWorkerClass
+                )
 
-            self.draft_worker = EAGLEWorker(
+            self.draft_worker = EAGLEWorkerClass(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 moe_ep_rank=moe_ep_rank,
@@ -791,7 +798,11 @@ class Scheduler(
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        next_batch_sampling_info=(
+                            self.draft_worker.cur_sampling_info
+                            if self.spec_algorithm.is_eagle()
+                            else self.tp_worker.cur_sampling_info
+                        ),
                     )
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -799,7 +810,10 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    (self.draft_worker.cur_sampling_info
+                    if self.spec_algorithm.is_eagle()
+                    else self.tp_worker.cur_sampling_info)
+                    if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
