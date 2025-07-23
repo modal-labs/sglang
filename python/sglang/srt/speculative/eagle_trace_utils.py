@@ -37,7 +37,7 @@ def get_object_info(obj: Any) -> str:
         if len(obj) == 0:
             return f"{type(obj).__name__}(len=0)"
         elif len(obj) > 0 and isinstance(obj[0], torch.Tensor):
-            return f"{type(obj).__name__}(len={len(obj)}, tensor_shapes=[{', '.join([f'shape={list(t.shape)}' for t in obj[:3]])}{'...' if len(obj) > 3 else ''}])"
+            return f"{type(obj).__name__}(len={len(obj)}, tensor_shapes=[{', '.join([f'shape={list(t.shape)}' for t in obj])}])"
         else:
             return f"{type(obj).__name__}(len={len(obj)})"
     elif isinstance(obj, dict):
