@@ -13,6 +13,7 @@ import json
 import os
 import time
 from types import SimpleNamespace
+from typing import List
 
 import numpy as np
 import requests
@@ -31,16 +32,15 @@ def node0_print(msg):
         print(msg)
 
 
-prompts = [
-    "Human: Give me a fully functional FastAPI server. Show the full, long python code without stop.\n\nAssistant:",
-    "Human: Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.\n\nAssistant:",
-    "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
-    "Human: I want you to act as an English translator, spelling corrector and improver. I will speak to you in any language and you will detect the language, translate it and answer in the corrected and improved version of my text, in English. I want you to replace my simplified A0-level words and sentences with more beautiful and elegant, upper level English words and sentences. Keep the meaning same, but make them more literary. My first sentence is 'istanbulu cok seviyom burada olmak cok guzel'. Answer in more than 5000 words.\n\nAssistant:",
-    "Human: I want you to act as a storyteller. You will come up with entertaining stories that are engaging, imaginative and captivating for the audience. It can be fairy tales, educational stories or any other type of stories which has the potential to capture people's attention and imagination. Depending on the target audience, you may choose specific themes or topics for your storytelling session e.g., if it’s children then you can talk about animals; If it’s adults then history-based tales might engage them better etc. Answer in more than 5000 words. My first request is 'I need an interesting story on perseverance.'\n\nAssistant:",
-    "Human: Solve x^2 = -1. Think step-by-step. Give me a long detailed explanation. \n\nAssistant:",
-    "Human: Tell me about the president of the USA in wikipedia style.\n\nAssistant:",
-    "Human: Hello? Who are you? Write code, math, and poem to explanin yourself.\n\nAssistant:",
-]
+def load_prompts_from_jsonl(file_path):
+    """Load prompts from a JSONL file."""
+    prompts = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            data = json.loads(line.strip())
+            if 'query' in data:
+                prompts.append(data['query'])
+    return prompts
 
 
 class FakeTokenizer:
@@ -48,7 +48,7 @@ class FakeTokenizer:
         return []
 
 
-def send_one_batch(base_url, num_prompts, batch_size):
+def send_one_batch(base_url, num_prompts, batch_size, prompts):
     padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
         :num_prompts
     ]
@@ -115,6 +115,10 @@ def send_one_batch(base_url, num_prompts, batch_size):
 def main(args, server_args):
     base_url = "http://127.0.0.1:20000"
 
+    # Load prompts from JSONL file
+    prompts = load_prompts_from_jsonl(args.prompts_file)
+    node0_print(f"Loaded {len(prompts)} prompts from {args.prompts_file}")
+
     configs = []
     for batch_size in args.batch_size:
         for steps in args.steps:
@@ -144,7 +148,7 @@ def main(args, server_args):
         else:
             other_args = [
                 "--speculative-algorithm",
-                "EAGLE",
+                "EAGLE3",
                 "--speculative-num-steps",
                 steps,
                 "--speculative-eagle-topk",
@@ -209,11 +213,11 @@ def main(args, server_args):
 
         try:
             # Warmup
-            send_one_batch(base_url, batch_size, batch_size)
+            send_one_batch(base_url, batch_size, batch_size, prompts)
 
             # Benchmark
             acc_length, step_time, speed, completion_tokens = send_one_batch(
-                base_url, max(args.num_prompts, batch_size), batch_size
+                base_url, max(args.num_prompts, batch_size), batch_size, prompts
             )
         finally:
             kill_process_tree(process.pid)
@@ -273,7 +277,12 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int)
     parser.add_argument("--output", type=str, default="output.jsonl")
+    parser.add_argument(
+        "--prompts-file",
+        type=str,
+        default="scripts/playground/eagle_data.jsonl",
+        help="Path to JSONL file containing prompts (default: scripts/playground/eagle_data.jsonl)"
+    )
     args = parser.parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
-
     main(args, server_args)

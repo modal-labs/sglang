@@ -6,6 +6,12 @@ from typing import List, Optional
 
 import torch
 
+# Import EAGLE3 tracing utilities
+from sglang.srt.speculative.eagle_trace_utils import (
+    eagle_trace, trace_call, trace_return, trace_intermediate, 
+    trace_gpu_kernel, trace_memory_op, trace_enabled
+)
+
 from sglang.srt.utils import is_cuda, is_hip
 
 if is_cuda() or is_hip():
@@ -14,6 +20,7 @@ if is_cuda() or is_hip():
     )
 
 
+@eagle_trace
 def build_tree_kernel_efficient_preprocess(
     verified_id: torch.Tensor,
     score_list: List[torch.Tensor],
@@ -21,23 +28,65 @@ def build_tree_kernel_efficient_preprocess(
     parents_list: List[torch.Tensor],
     num_verify_tokens: int,
 ):
+    trace_intermediate("PREPROCESS_INPUTS",
+                      verified_id=verified_id,
+                      score_list_lengths=[s.shape for s in score_list],
+                      token_list_lengths=[t.shape for t in token_list],
+                      parents_list_lengths=[p.shape for p in parents_list],
+                      num_verify_tokens=num_verify_tokens)
+    
     score_list = torch.cat(score_list, dim=1).flatten(
         1
     )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
+    
+    trace_intermediate("SCORE_LIST_CONCATENATED",
+                      concatenated_score_list=score_list)
+    
     ss_token_list = torch.cat(
         token_list, dim=1
     )  # b, (self.topk + (num_steps-1) * self.topk)
+    
+    trace_intermediate("TOKEN_LIST_CONCATENATED",
+                      concatenated_token_list=ss_token_list)
+    
     top_scores = torch.topk(score_list, num_verify_tokens - 1, dim=-1)
     top_scores_index = top_scores.indices
+    
+    trace_intermediate("TOP_SCORES_COMPUTED",
+                      top_scores_values=top_scores.values,
+                      top_scores_indices=top_scores_index)
+    
     top_scores_index = torch.sort(top_scores_index).values
+    
+    trace_intermediate("TOP_SCORES_SORTED",
+                      sorted_top_scores_index=top_scores_index)
+    
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+    
+    trace_intermediate("DRAFT_TOKENS_GATHERED",
+                      draft_tokens_without_verified=draft_tokens)
+    
     draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
+    
+    trace_intermediate("DRAFT_TOKENS_WITH_VERIFIED",
+                      final_draft_tokens=draft_tokens)
 
     if len(parents_list) > 1:
         parent_list = torch.cat(parents_list[:-1], dim=1)
+        trace_intermediate("PARENT_LIST_CONCATENATED",
+                          parent_list=parent_list,
+                          num_parents_lists=len(parents_list))
     else:
         batch_size = parents_list[0].shape[0]
         parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+        trace_intermediate("EMPTY_PARENT_LIST_CREATED",
+                          parent_list=parent_list,
+                          batch_size=batch_size)
+
+    trace_intermediate("PREPROCESS_OUTPUTS",
+                      parent_list=parent_list,
+                      top_scores_index=top_scores_index,
+                      draft_tokens=draft_tokens)
 
     return parent_list, top_scores_index, draft_tokens
 
@@ -48,6 +97,7 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
+@eagle_trace
 def build_tree_kernel_efficient(
     verified_id: torch.Tensor,
     score_list: List[torch.Tensor],
@@ -62,6 +112,17 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
+    trace_intermediate("TREE_BUILD_INIT",
+                      verified_id=verified_id,
+                      seq_lens=seq_lens,
+                      seq_lens_sum=seq_lens_sum,
+                      topk=topk,
+                      spec_steps=spec_steps,
+                      num_verify_tokens=num_verify_tokens,
+                      tree_mask_mode=tree_mask_mode,
+                      has_tree_mask_buf=tree_mask_buf is not None,
+                      has_position_buf=position_buf is not None)
+    
     parent_list, top_scores_index, draft_tokens = (
         build_tree_kernel_efficient_preprocess(
             verified_id,
@@ -71,40 +132,69 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
         )
     )
+    
+    trace_intermediate("PREPROCESSING_COMPLETED",
+                      parent_list=parent_list,
+                      top_scores_index=top_scores_index,
+                      draft_tokens=draft_tokens)
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
     device = seq_lens.device
+    
+    trace_intermediate("BATCH_INFO",
+                      batch_size=bs,
+                      device=device)
+    
     # e.g. for bs=1, tree_mask: num_draft_token, seq_lens_sum + num_draft_token (flattened)
     # where each row indicates the attending pattern of each draft token
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)
     if tree_mask_buf is not None:
         tree_mask = tree_mask_buf
+        trace_intermediate("USING_PROVIDED_TREE_MASK_BUF",
+                          tree_mask_shape=tree_mask.shape)
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+        tree_mask_size = num_verify_tokens * bs * num_verify_tokens
         tree_mask = torch.full(
-            (num_verify_tokens * bs * num_verify_tokens,),
+            (tree_mask_size,),
             True,
             dtype=torch.bool,
             device=device,
         )
+        trace_intermediate("CREATED_QLEN_ONLY_TREE_MASK",
+                          tree_mask_size=tree_mask_size,
+                          tree_mask=tree_mask)
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
         packed_dtypes = [torch.uint8, torch.uint16, torch.uint32]
         packed_dtype_idx = int(math.ceil(math.log2((num_verify_tokens + 7) // 8)))
+        tree_mask_size = num_verify_tokens * bs
         tree_mask = torch.zeros(
-            (num_verify_tokens * bs,),
+            (tree_mask_size,),
             dtype=packed_dtypes[packed_dtype_idx],
             device=device,
         )
+        trace_intermediate("CREATED_BITPACKED_TREE_MASK",
+                          tree_mask_size=tree_mask_size,
+                          packed_dtype_idx=packed_dtype_idx,
+                          packed_dtype=packed_dtypes[packed_dtype_idx],
+                          tree_mask=tree_mask)
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
+        tree_mask_size = (
+            seq_lens_sum * num_verify_tokens
+            + num_verify_tokens * num_verify_tokens * bs
+        )
         tree_mask = torch.full(
-            (
-                seq_lens_sum * num_verify_tokens
-                + num_verify_tokens * num_verify_tokens * bs,
-            ),
+            (tree_mask_size,),
             True,
             device=device,
         )
+        trace_intermediate("CREATED_FULL_TREE_MASK",
+                          tree_mask_size=tree_mask_size,
+                          seq_lens_component=seq_lens_sum * num_verify_tokens,
+                          draft_component=num_verify_tokens * num_verify_tokens * bs,
+                          tree_mask=tree_mask)
     else:
+        trace_intermediate("INVALID_TREE_MASK_MODE", tree_mask_mode=tree_mask_mode)
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
@@ -117,15 +207,55 @@ def build_tree_kernel_efficient(
     retrive_next_sibling = torch.full(
         (bs, num_verify_tokens), -1, device=device, dtype=torch.long
     )
+    
+    trace_intermediate("RETRIEVAL_TENSORS_ALLOCATED",
+                      retrive_index=retrive_index,
+                      retrive_next_token=retrive_next_token,
+                      retrive_next_sibling=retrive_next_sibling)
+    
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
     if position_buf is not None:
         positions = position_buf
+        trace_intermediate("USING_PROVIDED_POSITION_BUF",
+                          positions_shape=positions.shape)
     else:
         positions = torch.empty(
             (bs * num_verify_tokens,), device=device, dtype=torch.long
         )
+        trace_intermediate("ALLOCATED_POSITION_TENSOR",
+                          positions_shape=positions.shape)
+
+    trace_intermediate("CALLING_SGL_BUILD_TREE_KERNEL",
+                      parent_list=parent_list,
+                      top_scores_index=top_scores_index,
+                      seq_lens=seq_lens,
+                      tree_mask_shape=tree_mask.shape,
+                      positions_shape=positions.shape,
+                      retrieval_tensors_shapes={
+                          "retrive_index": retrive_index.shape,
+                          "retrive_next_token": retrive_next_token.shape,
+                          "retrive_next_sibling": retrive_next_sibling.shape
+                      })
+
+    trace_gpu_kernel("sgl_build_tree_kernel_efficient",
+                   inputs={
+                       "parent_list": parent_list,
+                       "top_scores_index": top_scores_index,
+                       "seq_lens": seq_lens,
+                       "topk": topk,
+                       "spec_steps": spec_steps,
+                       "num_verify_tokens": num_verify_tokens,
+                       "tree_mask_mode": tree_mask_mode
+                   },
+                   outputs={
+                       "tree_mask": "mutable - attention mask patterns",
+                       "positions": "mutable - token depth positions",
+                       "retrive_index": "mutable - token retrieval indices",
+                       "retrive_next_token": "mutable - next token pointers",
+                       "retrive_next_sibling": "mutable - sibling pointers"
+                   })
 
     sgl_build_tree_kernel_efficient(
         parent_list,
@@ -141,7 +271,16 @@ def build_tree_kernel_efficient(
         num_verify_tokens,
         tree_mask_mode,
     )
-    return (
+    
+    trace_intermediate("TREE_KERNEL_COMPLETED",
+                      tree_mask=tree_mask,
+                      positions=positions,
+                      retrive_index=retrive_index,
+                      retrive_next_token=retrive_next_token,
+                      retrive_next_sibling=retrive_next_sibling,
+                      draft_tokens=draft_tokens)
+    
+    output = (
         tree_mask,
         positions,
         retrive_index,
@@ -149,6 +288,16 @@ def build_tree_kernel_efficient(
         retrive_next_sibling,
         draft_tokens,
     )
+    
+    trace_intermediate("TREE_BUILD_OUTPUT",
+                      output_tree_mask=output[0],
+                      output_positions=output[1],
+                      output_retrive_index=output[2],
+                      output_retrive_next_token=output[3],
+                      output_retrive_next_sibling=output[4],
+                      output_draft_tokens=output[5])
+    
+    return output
 
 
 def test_build_tree_kernel_efficient():

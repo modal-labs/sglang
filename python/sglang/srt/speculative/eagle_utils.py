@@ -11,6 +11,12 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# Import EAGLE3 tracing utilities
+from sglang.srt.speculative.eagle_trace_utils import (
+    eagle_trace, trace_call, trace_return, trace_intermediate, 
+    trace_gpu_kernel, trace_memory_op, trace_enabled
+)
+
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -312,6 +318,7 @@ class EagleVerifyInput:
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
+    @eagle_trace
     def verify(
         self,
         batch: ScheduleBatch,
@@ -330,7 +337,18 @@ class EagleVerifyInput:
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
         """
+        trace_intermediate("VERIFY_INIT",
+                          forward_mode=batch.forward_mode,
+                          is_idle=batch.forward_mode.is_idle(),
+                          logits_shape=logits_output.next_token_logits.shape,
+                          page_size=page_size,
+                          vocab_mask_provided=vocab_mask is not None,
+                          draft_token_shape=self.draft_token.shape,
+                          draft_token_num=self.draft_token_num,
+                          retrieve_index_shape=self.retrive_index.shape)
+        
         if batch.forward_mode.is_idle():
+            trace_intermediate("RETURNING_IDLE_OUTPUT")
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
@@ -354,6 +372,13 @@ class EagleVerifyInput:
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
 
+        trace_intermediate("VERIFY_TENSORS_PREPARED",
+                          bs=bs,
+                          candidates=candidates,
+                          has_custom_logit_processor=sampling_info.has_custom_logit_processor,
+                          penalizer_required=sampling_info.penalizer_orchestrator.is_required,
+                          is_all_greedy=sampling_info.is_all_greedy)
+
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         predict = torch.empty(predict_shape, dtype=torch.int32, device="cuda")
@@ -361,17 +386,29 @@ class EagleVerifyInput:
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+        
+        trace_intermediate("OUTPUT_TENSORS_ALLOCATED",
+                          predict_shape=predict_shape,
+                          predict=predict,
+                          accept_index=accept_index,
+                          accept_length=accept_length)
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
+            trace_intermediate("APPLYING_CUSTOM_LOGIT_PROCESSOR",
+                              logits_shape_before=logits_output.next_token_logits.shape,
+                              num_tokens_in_batch=self.draft_token_num)
             apply_custom_logit_processor(
                 logits_output.next_token_logits,
                 sampling_info,
                 num_tokens_in_batch=self.draft_token_num,
             )
+            trace_intermediate("CUSTOM_LOGIT_PROCESSOR_APPLIED",
+                              logits_shape_after=logits_output.next_token_logits.shape)
 
         # Apply penalty
         if sampling_info.penalizer_orchestrator.is_required:
+            trace_intermediate("APPLYING_PENALTIES", penalty_required=True)
             # This is a relaxed version of penalties for speculative decoding.
             linear_penalty = torch.zeros(
                 (bs, logits_output.next_token_logits.shape[1]),
@@ -382,18 +419,47 @@ class EagleVerifyInput:
             logits_output.next_token_logits.add_(
                 torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
             )
+            trace_intermediate("PENALTIES_APPLIED",
+                              linear_penalty=linear_penalty,
+                              logits_shape_after=logits_output.next_token_logits.shape)
 
         # Apply grammar mask
         if vocab_mask is not None:
             assert self.grammar is not None
+            trace_intermediate("APPLYING_GRAMMAR_MASK",
+                              vocab_mask=vocab_mask,
+                              grammar_type=type(self.grammar).__name__)
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
+            trace_intermediate("GRAMMAR_MASK_APPLIED")
 
         # Sample tokens
         if batch.sampling_info.is_all_greedy:
+            trace_intermediate("GREEDY_SAMPLING_PATH", sampling_mode="greedy")
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
+            
+            trace_intermediate("CALLING_VERIFY_TREE_GREEDY",
+                              target_predict=target_predict,
+                              candidates=candidates,
+                              retrieve_index=self.retrive_index,
+                              retrieve_next_token=self.retrive_next_token,
+                              retrieve_next_sibling=self.retrive_next_sibling)
+
+            trace_gpu_kernel("verify_tree_greedy", 
+                           inputs={
+                               "candidates": candidates,
+                               "retrive_index": self.retrive_index, 
+                               "retrive_next_token": self.retrive_next_token,
+                               "retrive_next_sibling": self.retrive_next_sibling,
+                               "target_predict": target_predict
+                           },
+                           outputs={
+                               "predicts": "mutable - will be modified",
+                               "accept_index": "mutable - will be modified",
+                               "accept_token_num": "mutable - will be modified"
+                           })
 
             verify_tree_greedy(
                 predicts=predict,  # mutable
@@ -405,6 +471,11 @@ class EagleVerifyInput:
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
             )
+            
+            trace_intermediate("VERIFY_TREE_GREEDY_COMPLETED",
+                              predict=predict,
+                              accept_index=accept_index,
+                              accept_length=accept_length)
         else:
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
@@ -460,6 +531,9 @@ class EagleVerifyInput:
             )
 
         if SIMULATE_ACC_LEN:
+            trace_intermediate("SIMULATION_MODE_ENABLED",
+                              simulate_acc_len=SIMULATE_ACC_LEN,
+                              simulate_acc_method=SIMULATE_ACC_METHOD)
             # Do simulation
             accept_index = _generate_simulated_accept_index(
                 accept_index=accept_index,
@@ -469,16 +543,28 @@ class EagleVerifyInput:
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
+            trace_intermediate("SIMULATION_COMPLETED",
+                              simulated_accept_index=accept_index,
+                              simulated_accept_length=accept_length)
 
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
+        
+        trace_intermediate("STARTING_REQUEST_PROCESSING",
+                          accept_index_cpu=accept_index_cpu,
+                          predict_cpu=predict_cpu,
+                          num_requests=len(batch.reqs))
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            trace_intermediate(f"PROCESSING_REQUEST_{i}",
+                              request_id=getattr(req, 'rid', 'unknown'),
+                              accept_index_row=accept_index_row,
+                              current_output_length=len(req.output_ids))
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
@@ -487,6 +573,9 @@ class EagleVerifyInput:
                 req.check_finished()
                 if req.finished():
                     has_finished = True
+                    trace_intermediate(f"REQUEST_{i}_FINISHED",
+                                      final_token_id=id,
+                                      final_output_length=len(req.output_ids))
                     # set all tokens after finished token to -1 and break
                     accept_index[i, j + 1 :] = -1
                     break
@@ -494,7 +583,15 @@ class EagleVerifyInput:
                     if req.grammar is not None:
                         try:
                             req.grammar.accept_token(id)
+                            trace_intermediate(f"GRAMMAR_TOKEN_ACCEPTED_{i}",
+                                              token_id=id,
+                                              grammar_state="valid")
                         except ValueError as e:
+                            trace_intermediate(f"GRAMMAR_ERROR_{i}",
+                                              token_id=id,
+                                              error=str(e),
+                                              accept_index=accept_index,
+                                              predict=predict)
                             logger.info(
                                 f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
                             )
@@ -507,22 +604,50 @@ class EagleVerifyInput:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
 
+        trace_intermediate("REQUEST_PROCESSING_COMPLETED",
+                          has_finished=has_finished,
+                          num_unfinished=len(unfinished_index),
+                          unfinished_indices=unfinished_index)
+
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
+            trace_intermediate("RECALCULATED_ACCEPT_LENGTH", accept_length=accept_length)
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
+        trace_intermediate("STARTING_KV_CACHE_CLEANUP",
+                          accept_index_before_filter=accept_index,
+                          page_size=page_size)
         accept_index = accept_index[accept_index != -1]
         verified_id = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
+        
+        trace_intermediate("KV_CACHE_MASKS_PREPARED",
+                          accept_index_filtered=accept_index,
+                          verified_id=verified_id,
+                          evict_mask=evict_mask,
+                          num_tokens_to_evict=evict_mask.sum().item())
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
+            trace_intermediate("PAGE_SIZE_1_MEMORY_FREE",
+                              evict_locations=batch.out_cache_loc[evict_mask])
+            trace_memory_op("free_tokens_page_size_1", 
+                           {"locations_to_free": batch.out_cache_loc[evict_mask]})
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
         else:
             if self.topk == 1:
+                trace_intermediate("TOPK_1_PAGE_ALIGNED_FREE")
                 # Only evict full empty page. Do not evict partial empty page
+                trace_gpu_kernel("align_evict_mask_to_page_size",
+                               inputs={
+                                   "seq_lens": batch.seq_lens,
+                                   "evict_mask": evict_mask,
+                                   "page_size": page_size,
+                                   "num_draft_tokens": self.draft_token_num
+                               },
+                               outputs={"evict_mask": "modified in-place"})
                 align_evict_mask_to_page_size[len(batch.seq_lens),](
                     batch.seq_lens,
                     evict_mask,
@@ -530,8 +655,11 @@ class EagleVerifyInput:
                     self.draft_token_num,
                     next_power_of_2(self.draft_token_num),
                 )
+                trace_memory_op("free_page_aligned_tokens", 
+                               {"locations_to_free": batch.out_cache_loc[evict_mask]})
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             else:
+                trace_intermediate("COMPLEX_MEMORY_MANAGEMENT_PATH")
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
                 src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
@@ -542,6 +670,12 @@ class EagleVerifyInput:
                     self.draft_token_num,
                     page_size,
                 )
+                
+                trace_intermediate("CACHE_LOCATIONS_COMPUTED",
+                                  src_cache_loc=src_cache_loc,
+                                  tgt_cache_loc=tgt_cache_loc,
+                                  to_free_num_slots=to_free_num_slots)
+                
                 to_free_slots = torch.empty(
                     (to_free_num_slots.sum().item(),),
                     dtype=torch.int64,
@@ -557,6 +691,17 @@ class EagleVerifyInput:
                 # split each row of out_cache_loc into two parts.
                 # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
                 # 2. the second part goes to to_free_slots.
+                trace_gpu_kernel("get_target_cache_loc",
+                               inputs={
+                                   "accept_length": accept_length,
+                                   "to_free_num_slots": to_free_num_slots,
+                                   "out_cache_loc": batch.out_cache_loc,
+                                   "draft_token_num": self.draft_token_num
+                               },
+                               outputs={
+                                   "tgt_cache_loc": tgt_cache_loc,
+                                   "to_free_slots": to_free_slots
+                               })
                 get_target_cache_loc[(bs,)](
                     tgt_cache_loc,
                     to_free_slots,
@@ -569,9 +714,14 @@ class EagleVerifyInput:
                 )
 
                 # Free the kv cache
+                trace_memory_op("free_cache_tokens_complex", 
+                               {"to_free_slots": to_free_slots})
                 token_to_kv_pool_allocator.free(to_free_slots)
 
                 # Copy the kv cache
+                trace_memory_op("move_kv_cache",
+                               {"tgt_cache_loc": tgt_cache_loc,
+                                "src_cache_loc": src_cache_loc})
                 batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
                 )

@@ -7,6 +7,12 @@ from typing import List, Optional, Tuple
 import torch
 from huggingface_hub import snapshot_download
 
+# Import EAGLE3 tracing utilities
+from sglang.srt.speculative.eagle_trace_utils import (
+    eagle_trace, trace_call, trace_return, trace_intermediate, 
+    trace_gpu_kernel, trace_memory_op, trace_enabled
+)
+
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_tensor_model_parallel_world_size,
@@ -295,6 +301,7 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
+    @eagle_trace
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
@@ -309,34 +316,70 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        trace_intermediate("BATCH_INITIAL_STATE", 
+                          forward_mode=batch.forward_mode, 
+                          is_extend_in_batch=batch.is_extend_in_batch,
+                          batch_size=batch.batch_size(),
+                          seq_lens=batch.seq_lens if hasattr(batch, 'seq_lens') else None)
+        
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            trace_intermediate("ENTERING_EXTEND_PATH")
+            
             logits_output, next_token_ids, bid, seq_lens_cpu = (
                 self.forward_target_extend(batch)
             )
+            
+            trace_intermediate("TARGET_EXTEND_COMPLETE", 
+                              logits_output_logits_shape=logits_output.next_token_logits.shape if logits_output.next_token_logits is not None else None,
+                              logits_output_hidden_states_shape=logits_output.hidden_states.shape if logits_output.hidden_states is not None else None,
+                              next_token_ids=next_token_ids,
+                              bid=bid,
+                              seq_lens_cpu=seq_lens_cpu)
+            
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
+            
+            trace_intermediate("DRAFT_EXTEND_COMPLETE")
             return logits_output, next_token_ids, bid, 0, False
         else:
+            trace_intermediate("ENTERING_SPECULATION_PATH")
+            
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
+            
+            trace_intermediate("DRAFT_COMPLETE", spec_info=spec_info)
+            
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
 
+            trace_intermediate("VERIFY_COMPLETE",
+                              verified_id=verify_output.verified_id,
+                              accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+                              can_run_cuda_graph=can_run_cuda_graph)
+
             if self.check_forward_draft_extend_after_decode(batch):
+                trace_intermediate("ENTERING_DRAFT_EXTEND_AFTER_DECODE")
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
                     self.forward_draft_extend_after_decode(
                         batch,
                     )
-            return (
+                trace_intermediate("DRAFT_EXTEND_AFTER_DECODE_COMPLETE")
+            
+            final_result = (
                 logits_output,
                 verify_output.verified_id,
                 model_worker_batch.bid,
                 sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph,
             )
+            
+            trace_intermediate("SPECULATION_PATH_FINAL_RESULT",
+                              total_accepted_tokens=sum(verify_output.accept_length_per_req_cpu))
+            
+            return final_result
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         local_need_forward = (
@@ -359,6 +402,7 @@ class EAGLEWorker(TpModelWorker):
         need_forward = global_need_forward_cnt > 0
         return need_forward
 
+    @eagle_trace
     def forward_target_extend(
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, List[int], int]:
@@ -372,14 +416,33 @@ class EAGLEWorker(TpModelWorker):
             next_token_ids: Next token ids generated.
             bid: The model batch ID. Used for overlap schedule.
         """
+        trace_intermediate("PRE_TARGET_EXTEND",
+                          input_ids=batch.input_ids if hasattr(batch, 'input_ids') else None,
+                          seq_lens=batch.seq_lens if hasattr(batch, 'seq_lens') else None,
+                          positions=batch.positions if hasattr(batch, 'positions') else None)
+        
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_num_draft_tokens = 1
+        
+        trace_intermediate("TARGET_MODEL_BATCH_PREPARED",
+                          capture_hidden_mode=model_worker_batch.capture_hidden_mode,
+                          spec_num_draft_tokens=model_worker_batch.spec_num_draft_tokens,
+                          batch_size=model_worker_batch.batch_size if hasattr(model_worker_batch, 'batch_size') else None)
+        
         logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
         )
+        
+        trace_intermediate("TARGET_MODEL_FORWARD_COMPLETE",
+                          logits_shape=logits_output.next_token_logits.shape if logits_output.next_token_logits is not None else None,
+                          hidden_states_shape=logits_output.hidden_states.shape if logits_output.hidden_states is not None else None,
+                          next_token_ids=next_token_ids,
+                          bid=model_worker_batch.bid,
+                          seq_lens_cpu=model_worker_batch.seq_lens_cpu)
+        
         return (
             logits_output,
             next_token_ids,
@@ -500,7 +563,12 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
+    @eagle_trace
     def draft(self, batch: ScheduleBatch):
+        trace_intermediate("DRAFT_INIT",
+                          forward_mode=batch.forward_mode,
+                          is_idle=batch.forward_mode.is_idle())
+        
         # Parse args
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -508,6 +576,7 @@ class EAGLEWorker(TpModelWorker):
             self._draft_preprocess_decode(batch)
 
         spec_info = batch.spec_info
+        trace_intermediate("DRAFT_PREPROCESS_COMPLETE", spec_info=spec_info)
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.return_hidden_states = False
@@ -519,31 +588,56 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+        
+        trace_intermediate("FORWARD_BATCH_CREATED",
+                          topk=self.topk,
+                          spec_num_draft_tokens=model_worker_batch.spec_num_draft_tokens,
+                          capture_hidden_mode=model_worker_batch.capture_hidden_mode)
+        
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
+        trace_intermediate("CUDA_GRAPH_CHECK", can_cuda_graph=can_cuda_graph)
+        
         if can_cuda_graph:
+            trace_intermediate("USING_CUDA_GRAPH_REPLAY")
             score_list, token_list, parents_list = self.cuda_graph_runner.replay(
                 forward_batch
             )
         else:
+            trace_intermediate("USING_REGULAR_FORWARD")
             if not forward_batch.forward_mode.is_idle():
                 # Initialize attention backend
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+                trace_intermediate("ATTENTION_BACKEND_INITIALIZED")
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
+        trace_intermediate("DRAFT_FORWARD_COMPLETE",
+                          score_list_len=len(score_list) if score_list else 0,
+                          token_list_len=len(token_list) if token_list else 0,
+                          parents_list_len=len(parents_list) if parents_list else 0)
+
         if batch.forward_mode.is_idle():
+            trace_intermediate("RETURNING_IDLE_INPUT")
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
             )
 
+        trace_intermediate("CALLING_BUILD_TREE_KERNEL",
+                          verified_id=spec_info.verified_id,
+                          seq_lens=batch.seq_lens,
+                          seq_lens_sum=batch.seq_lens_sum,
+                          topk=self.topk,
+                          speculative_num_steps=self.speculative_num_steps,
+                          speculative_num_draft_tokens=self.speculative_num_draft_tokens)
+
         (
             tree_mask,
             position,
-            retrive_index,
+            retrive_index,  
             retrive_next_token,
             retrive_next_sibling,
             draft_tokens,
@@ -559,7 +653,15 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
-        return EagleVerifyInput(
+        trace_intermediate("BUILD_TREE_KERNEL_COMPLETE",
+                          tree_mask=tree_mask,
+                          position=position,
+                          retrive_index=retrive_index,
+                          retrive_next_token=retrive_next_token,
+                          retrive_next_sibling=retrive_next_sibling,
+                          draft_tokens=draft_tokens)
+
+        verify_input = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -574,7 +676,11 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
+        
+        trace_intermediate("VERIFY_INPUT_CREATED", verify_input=verify_input)
+        return verify_input
 
+    @eagle_trace
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info = forward_batch.spec_info
@@ -584,8 +690,18 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+        
+        trace_intermediate("DRAFT_FORWARD_INIT",
+                          topk_p=topk_p,
+                          topk_index=topk_index,
+                          hidden_states=hidden_states,
+                          out_cache_loc=out_cache_loc,
+                          batch_size=forward_batch.batch_size,
+                          hot_token_id_enabled=self.hot_token_id is not None)
+        
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
+            trace_intermediate("HOT_TOKEN_REMAPPING", remapped_topk_index=topk_index)
 
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
@@ -593,6 +709,8 @@ class EAGLEWorker(TpModelWorker):
         out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
             self.speculative_num_steps, -1
         )
+        
+        trace_intermediate("CACHE_LOC_RESHAPED", reshaped_out_cache_loc=out_cache_loc)
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -602,15 +720,37 @@ class EAGLEWorker(TpModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            trace_intermediate(f"DRAFT_STEP_{i}_START",
+                              step=i,
+                              topk_p=topk_p,
+                              topk_index=topk_index,
+                              hidden_states=hidden_states,
+                              scores=scores)
+            
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+            
+            trace_gpu_kernel("select_top_k_tokens",
+                           inputs={"step": i, "topk_p": topk_p, "topk_index": topk_index, 
+                                  "hidden_states": hidden_states, "scores": scores, "topk": self.topk},
+                           outputs={"input_ids": input_ids, "hidden_states": hidden_states, 
+                                   "scores": scores, "tree_info": tree_info})
+                                   
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
 
+            trace_intermediate(f"DRAFT_STEP_{i}_TOKEN_SELECTION",
+                              input_ids=input_ids,
+                              scores=scores,
+                              tree_info_0=tree_info[0],
+                              tree_info_1=tree_info[1],
+                              tree_info_2=tree_info[2])
+
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
+                trace_intermediate(f"DRAFT_STEP_{i}_FINAL_STEP_SKIP_FORWARD")
                 break
 
             # Set inputs
@@ -620,20 +760,54 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
+            trace_intermediate(f"DRAFT_STEP_{i}_FORWARD_BATCH_SETUP",
+                              input_ids=forward_batch.input_ids,
+                              out_cache_loc=forward_batch.out_cache_loc,
+                              positions=forward_batch.positions,
+                              attn_backend=type(forward_batch.attn_backend).__name__)
+
             # Run forward
             logits_output = self.draft_model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
             self._detect_nan_if_needed(logits_output)
+            
+            trace_intermediate(f"DRAFT_STEP_{i}_MODEL_FORWARD_COMPLETE",
+                              logits_shape=logits_output.next_token_logits.shape,
+                              hidden_states_shape=logits_output.hidden_states.shape)
+            
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            
+            trace_gpu_kernel("fast_topk",
+                           inputs={"probs": probs, "topk": self.topk},
+                           outputs={"topk_p": topk_p, "topk_index": topk_index})
+            
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
+                trace_intermediate(f"DRAFT_STEP_{i}_HOT_TOKEN_REMAP", remapped_topk_index=topk_index)
+                
             hidden_states = logits_output.hidden_states
+            
+            trace_intermediate(f"DRAFT_STEP_{i}_COMPLETE",
+                              topk_p=topk_p,
+                              topk_index=topk_index,
+                              hidden_states=hidden_states)
+
+        trace_intermediate("DRAFT_FORWARD_COMPLETE",
+                          score_list_shapes=[s.shape for s in score_list],
+                          token_list_shapes=[t.shape for t in token_list],
+                          parents_list_shapes=[p.shape for p in parents_list])
 
         return score_list, token_list, parents_list
 
+    @eagle_trace
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        trace_intermediate("VERIFY_INIT", 
+                          spec_info=spec_info,
+                          page_size=self.page_size,
+                          has_grammar=batch.has_grammar if hasattr(batch, 'has_grammar') else False)
+        
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
         batch.forward_mode = (
@@ -642,11 +816,20 @@ class EAGLEWorker(TpModelWorker):
             else ForwardMode.IDLE
         )
         batch.spec_info = spec_info
+        
+        trace_intermediate("VERIFY_BATCH_PREPARED",
+                          forward_mode=batch.forward_mode,
+                          return_hidden_states=batch.return_hidden_states)
+        
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
         )
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
+
+        trace_intermediate("MODEL_WORKER_BATCH_PREPARED",
+                          spec_num_draft_tokens=model_worker_batch.spec_num_draft_tokens,
+                          capture_hidden_mode=model_worker_batch.capture_hidden_mode)
 
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
@@ -654,16 +837,28 @@ class EAGLEWorker(TpModelWorker):
             draft_tokens_cpu = spec_info.draft_token.view(
                 spec_info.retrive_next_token.shape
             ).cpu()
+            
+            trace_intermediate("GRAMMAR_TENSORS_PREPARED",
+                              retrieve_next_token_cpu=retrieve_next_token_cpu,
+                              retrieve_next_sibling_cpu=retrieve_next_sibling_cpu,
+                              draft_tokens_cpu=draft_tokens_cpu)
 
         # Forward
+        trace_intermediate("CALLING_TARGET_FORWARD_GENERATION")
         logits_output, _, can_run_cuda_graph = (
             self.target_worker.forward_batch_generation(
                 model_worker_batch, skip_sample=True
             )
         )
 
+        trace_intermediate("TARGET_FORWARD_COMPLETE",
+                          logits_shape=logits_output.next_token_logits.shape,
+                          hidden_states_shape=logits_output.hidden_states.shape,
+                          can_run_cuda_graph=can_run_cuda_graph)
+
         vocab_mask = None
         if batch.has_grammar:
+            trace_intermediate("GENERATING_TOKEN_BITMASK")
             # Generate the logit mask for structured output.
             # Overlap the CPU operations for bitmask generation with the forward pass.
             vocab_mask = generate_token_bitmask(
@@ -681,9 +876,15 @@ class EAGLEWorker(TpModelWorker):
                 # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
+                trace_intermediate("VOCAB_MASK_APPLIED", vocab_mask=vocab_mask)
 
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
+        
+        trace_intermediate("CALLING_SPEC_INFO_VERIFY",
+                          hidden_states=spec_info.hidden_states,
+                          vocab_mask=vocab_mask)
+        
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
@@ -692,14 +893,29 @@ class EAGLEWorker(TpModelWorker):
             vocab_mask,
         )
 
+        trace_intermediate("SPEC_INFO_VERIFY_COMPLETE",
+                          verified_id=res.verified_id,
+                          accept_length_per_req_cpu=res.accept_length_per_req_cpu,
+                          accepted_indices=res.accepted_indices)
+
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
+        original_logits_shape = logits_output.next_token_logits.shape
+        original_hidden_shape = logits_output.hidden_states.shape
+        
         logits_output.next_token_logits = logits_output.next_token_logits[
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
+        trace_intermediate("POST_PROCESS_COMPLETE",
+                          original_logits_shape=original_logits_shape,
+                          original_hidden_shape=original_hidden_shape,
+                          filtered_logits_shape=logits_output.next_token_logits.shape,
+                          filtered_hidden_shape=logits_output.hidden_states.shape)
+
         if batch.return_logprob:
+            trace_intermediate("ADDING_LOGPROB_VALUES")
             self.add_logprob_values(batch, res, logits_output)
 
         # Prepare the batch for the next draft forwards.
@@ -707,6 +923,10 @@ class EAGLEWorker(TpModelWorker):
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = res.draft_input
+
+        trace_intermediate("BATCH_STATE_UPDATED",
+                          new_forward_mode=batch.forward_mode,
+                          draft_input=res.draft_input)
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
