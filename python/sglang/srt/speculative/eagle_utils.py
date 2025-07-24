@@ -317,12 +317,15 @@ class EagleVerifyInput:
 
     def verify(
         self,
-        batch: ScheduleBatch,
-        logits_output: torch.Tensor,
+        model_worker_batch: ModelWorkerBatch,
+        logits_output: LogitsProcessorOutput,
+        req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
+        reqs: List[Req],
+        device: torch.device,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
-    ) -> torch.Tensor:
+    ) -> EagleVerifyOutput:
         """
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
@@ -333,29 +336,30 @@ class EagleVerifyInput:
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
         """
-        if batch.forward_mode.is_idle():
+        if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
-                    device=batch.device,
-                    hidden_size=batch.model_config.hidden_size,
-                    dtype=batch.model_config.dtype,
+                    device=device,
+                    # TODO(nathan): what the duck
+                    hidden_size=model_worker_batch.model_config.hidden_size,
+                    dtype=model_worker_batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 ),
                 logits_output=logits_output,
-                verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                verified_id=torch.empty(0, dtype=torch.long, device=device),
                 accept_length_per_req_cpu=[],
                 accepted_indices=torch.full(
                     (0, self.spec_steps + 1),
                     -1,
                     dtype=torch.int32,
-                    device=batch.device,
+                    device=device,
                 ),
             )
 
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
-        sampling_info = batch.sampling_info
+        sampling_info = model_worker_batch.sampling_info
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
@@ -394,7 +398,7 @@ class EagleVerifyInput:
             )
 
         # Sample tokens
-        if batch.sampling_info.is_all_greedy:
+        if model_worker_batch.sampling_info.is_all_greedy:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
@@ -486,87 +490,33 @@ class EagleVerifyInput:
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
-            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            token_to_kv_pool_allocator.free(model_worker_batch.out_cache_loc[evict_mask])
         else:
-            # TODO (timmy): read and verify that it works
-            if self.topk == 1:
-                # Only evict full empty page. Do not evict partial empty page
-                align_evict_mask_to_page_size[len(batch.seq_lens),](
-                    batch.seq_lens,
-                    evict_mask,
-                    page_size,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                )
-                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-            else:
-                # Shift the accepted tokens to the beginning.
-                # Only evict the last part
-                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    accept_index,
-                    accept_length,
-                    self.draft_token_num,
-                    page_size,
-                )
-                to_free_slots = torch.empty(
-                    (to_free_num_slots.sum().item(),),
-                    dtype=torch.int64,
-                    device=to_free_num_slots.device,
-                )
-
-                # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
-                # accept_index:  [0 -1  2,  3  4 -1,  6 -1 -1]
-                # tgt_cache_loc: [0  1   ,  3  4   ,  6      ]
-                # to_free_slots: [      2,        5,     7  8]
-                # to_free_slots also needs to be page-aligned without the first partial page
-                #
-                # split each row of out_cache_loc into two parts.
-                # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
-                # 2. the second part goes to to_free_slots.
-                get_target_cache_loc[(bs,)](
-                    tgt_cache_loc,
-                    to_free_slots,
-                    accept_length,
-                    to_free_num_slots,
-                    batch.out_cache_loc,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                    next_power_of_2(bs),
-                )
-
-                # Free the kv cache
-                token_to_kv_pool_allocator.free(to_free_slots)
-
-                # Copy the kv cache
-                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                    tgt_cache_loc, src_cache_loc
-                )
+            raise NotImplementedError("page size > 1 is not supported for now")
 
         # Construct EagleVerifyOutput
         if page_size == 1 or self.topk == 1:
-            batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
+            model_worker_batch.out_cache_loc = torch.where(accept_index != -1, model_worker_batch.out_cache_loc[accept_index], 0)
             assign_req_to_token_pool[(bs,)](
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.seq_lens + accept_length + 1,
-                batch.out_cache_loc,
-                batch.req_to_token_pool.req_to_token.shape[1],
+                model_worker_batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                model_worker_batch.seq_lens,
+                model_worker_batch.seq_lens + accept_length + 1,
+                model_worker_batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
                 next_power_of_2(bs),
             )
         else:
-            batch.out_cache_loc = tgt_cache_loc
-        batch.seq_lens.add_(accept_length + 1)
+            raise RuntimeError("page_size != 1 not supported yet")
+        model_worker_batch.seq_lens.add_(accept_length + 1)
 
         draft_input = EagleDraftInput()
-        draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
+        draft_input.hidden_states = model_worker_batch.spec_info.hidden_states[accept_index]
         draft_input.verified_id = verified_id
         draft_input.accept_length = accept_length
         draft_input.accept_length_cpu = accept_length.tolist()
-        draft_input.seq_lens_for_draft_extend = batch.seq_lens
-        draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
+        draft_input.seq_lens_for_draft_extend = model_worker_batch.seq_lens
+        draft_input.req_pool_indices_for_draft_extend = model_worker_batch.req_pool_indices
 
         return EagleVerifyOutput(
             draft_input=draft_input,
