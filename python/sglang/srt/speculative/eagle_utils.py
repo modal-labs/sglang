@@ -108,30 +108,29 @@ class EagleDraftInput:
 
     def prepare_extend_after_decode(
         self,
-        batch: ScheduleBatch,
+        model_worker_batch: ModelWorkerBatch,
         speculative_num_steps: int,
     ):
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND
-        batch.input_ids = self.verified_id
-        batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
-        batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
-        batch.return_logprob = False
-        batch.return_hidden_states = False
+        model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
+        model_worker_batch.input_ids = self.verified_id
+        model_worker_batch.extend_seq_lens = [x + 1 for x in model_worker_batch.spec_info.accept_length_cpu]
+        model_worker_batch.extend_num_tokens = sum(model_worker_batch.extend_seq_lens)
+        model_worker_batch.seq_lens = model_worker_batch.spec_info.seq_lens_for_draft_extend
+        model_worker_batch.req_pool_indices = model_worker_batch.spec_info.req_pool_indices_for_draft_extend
+        model_worker_batch.return_logprob = False
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length.add_(1)
-        self.positions = torch.zeros_like(batch.input_ids, dtype=torch.long)
+        self.positions = torch.zeros_like(model_worker_batch.input_ids, dtype=torch.long)
         self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
 
-        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
-            batch.input_ids,
-            batch.seq_lens,
+        create_extend_after_decode_spec_info[(len(model_worker_batch.seq_lens),)](
+            model_worker_batch.input_ids,
+            model_worker_batch.seq_lens,
             self.accept_length,
             self.positions,
             self.verified_id,
-            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
+            next_power_of_2(max(speculative_num_steps + 1, len(model_worker_batch.seq_lens))),
         )
 
     def generate_attn_arg_prefill(
