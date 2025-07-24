@@ -339,6 +339,12 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(model_worker_batch, spec_info, batch.reqs)
             )
 
+            if self.check_forward_draft_extend_after_decode(model_worker_batch):
+                with self.draft_tp_context(self.draft_model_runner.tp_group):
+                    self.forward_draft_extend_after_decode(
+                        model_worker_batch,
+                    )
+
             # TODO(nathan): Remove this once we remove dependency on batch in the rest of this function
             batch.out_cache_loc = model_worker_batch.out_cache_loc
             batch.seq_lens_sum = model_worker_batch.seq_lens_sum
@@ -348,27 +354,21 @@ class EAGLEWorker(TpModelWorker):
             batch.out_cache_loc = model_worker_batch.out_cache_loc
             batch.forward_mode = model_worker_batch.forward_mode
             batch.spec_info = model_worker_batch.spec_info
-
-            if self.check_forward_draft_extend_after_decode(batch):
-                with self.draft_tp_context(self.draft_model_runner.tp_group):
-                    self.forward_draft_extend_after_decode(
-                        batch,
-                    )
             
-            assert isinstance(batch.spec_info, EagleDraftInput)
+            assert isinstance(model_worker_batch.spec_info, EagleDraftInput)
             return (
                 logits_output,
                 verify_output.verified_id,
                 model_worker_batch.bid,
                 sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph,
-                batch.spec_info,
+                model_worker_batch.spec_info,
             )
 
-    def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+    def check_forward_draft_extend_after_decode(self, model_worker_batch: ModelWorkerBatch):
         local_need_forward = (
-            batch.spec_info.verified_id is not None
-            and batch.spec_info.verified_id.shape[0] > 0
+            model_worker_batch.spec_info.verified_id is not None
+            and model_worker_batch.spec_info.verified_id.shape[0] > 0
         )
         if not self.server_args.enable_dp_attention:
             return local_need_forward
@@ -485,10 +485,10 @@ class EAGLEWorker(TpModelWorker):
             self._draft_preprocess_decode(model_worker_batch)
 
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # Get forward batch
         model_worker_batch.spec_num_draft_tokens = self.topk
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -681,21 +681,23 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is model_worker_batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+    def forward_draft_extend_after_decode(self, model_worker_batch: ModelWorkerBatch):
         # Backup fields that will be modified in-place
-        seq_lens_backup = batch.seq_lens.clone()
-        req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = batch.spec_info.accept_length
-        return_logprob_backup = batch.return_logprob
-        input_is_idle = batch.forward_mode.is_idle()
+        seq_lens_backup = model_worker_batch.seq_lens.clone()
+        req_pool_indices_backup = model_worker_batch.req_pool_indices
+        accept_length_backup = model_worker_batch.spec_info.accept_length
+        return_logprob_backup = model_worker_batch.return_logprob
+        input_is_idle = model_worker_batch.forward_mode.is_idle()
         if not input_is_idle:
             # Prepare metadata
-            if batch.spec_info.verified_id is not None:
-                batch.spec_info.prepare_extend_after_decode(
-                    batch,
+            if model_worker_batch.spec_info.verified_id is not None:
+                model_worker_batch.spec_info.prepare_extend_after_decode(
+                    model_worker_batch,
                     self.speculative_num_steps,
                 )
             else:
+                # TODO(nathan): wtf am I supposed to do here
+                raise NotImplementedError("idle is not supported for now")
                 batch = batch.copy()
                 batch.prepare_for_idle()
                 hidden_size = (
@@ -710,8 +712,8 @@ class EAGLEWorker(TpModelWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-        batch.return_hidden_states = False
-        model_worker_batch = batch.get_model_worker_batch()
+
+        model_worker_batch.capture_hidden_mode = model_worker_batch.spec_info.capture_hidden_mode
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_steps + 1
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
@@ -720,7 +722,7 @@ class EAGLEWorker(TpModelWorker):
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:
-            forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
+            forward_batch.seq_lens_sum = model_worker_batch.seq_lens.sum().item()
 
         # Run
         can_cuda_graph = (
@@ -750,13 +752,13 @@ class EAGLEWorker(TpModelWorker):
 
         # Restore backup.
         # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
-        batch.forward_mode = (
+        model_worker_batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
-        batch.seq_lens = seq_lens_backup
-        batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.accept_length = accept_length_backup
-        batch.return_logprob = return_logprob_backup
+        model_worker_batch.seq_lens = seq_lens_backup
+        model_worker_batch.req_pool_indices = req_pool_indices_backup
+        model_worker_batch.spec_info.accept_length = accept_length_backup
+        model_worker_batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
