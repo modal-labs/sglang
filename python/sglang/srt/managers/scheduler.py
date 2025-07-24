@@ -1901,13 +1901,18 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             else:
+                model_worker_batch = batch.get_model_worker_batch()
+
                 (
                     logits_output,
                     next_token_ids,
                     bid,
                     num_accepted_tokens,
                     can_run_cuda_graph,
-                ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                    next_spec_info,
+                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch, batch)
+
+                batch.spec_info = next_spec_info
                 bs = batch.batch_size()
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
                 self.spec_num_total_forward_ct += bs
