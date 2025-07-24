@@ -23,8 +23,9 @@ from typing import List, Optional, Tuple
 import psutil
 import torch
 
+from sglang.srt.speculative.eagle_utils import EagleDraftInput
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -32,12 +33,6 @@ from sglang.srt.utils import DynamicGradMode, get_compiler_backend
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def resolve_future_token_ids_eagle(batch, future_token_ids_map):
-    pass
-
 
 class EAGLEWorkerClient:
     """An EAGLE speculative decoding worker with overlap thread."""
@@ -63,17 +58,6 @@ class EAGLEWorkerClient:
         self.device = self.worker.device
         self.gpu_id = gpu_id
         self.max_running_requests = self.worker.max_running_requests
-        
-        # Init future mappings
-        self.future_token_ids_ct = 0
-        self.future_token_ids_limit = self.max_running_requests * (self.worker.speculative_num_steps + 1) * 3
-        self.future_token_ids_map = torch.empty(
-            (self.max_running_requests * (self.worker.speculative_num_steps + 1) * 5,), dtype=torch.int64, device=self.device
-        )
-        # Track accepted token counts per request
-        self.future_acceptance_counts = torch.zeros(
-            (self.max_running_requests * 5,), dtype=torch.int64, device=self.device
-        )
         
         # Launch threads
         self.input_queue = Queue()
@@ -103,7 +87,7 @@ class EAGLEWorkerClient:
         batch_lists = [None] * 2
 
         while True:
-            batch, future_token_ids_ct, sync_event = self.input_queue.get()
+            batch, reqs, sync_event, target_output_spec_info = self.input_queue.get()
             if batch is None:
                 break
 
@@ -118,8 +102,7 @@ class EAGLEWorkerClient:
             # Create event
             copy_done = torch.get_device_module(self.device).Event()
 
-            # Resolve future tokens in the input
-            resolve_future_token_ids_eagle(batch, self.future_token_ids_map)
+            print(f"[{batch_pt}] RUNNING WITH BATCH SPEC INFO\n", batch.spec_info)
 
             # Run forward
             (
@@ -128,12 +111,28 @@ class EAGLEWorkerClient:
                 bid,
                 _,
                 can_run_cuda_graph,
-            ) = self.worker.forward_batch_speculative_generation(batch)
+                output_spec_info,
+            ) = self.worker.forward_batch_speculative_generation(batch, reqs)
 
-            # Update the future token ids map
-            self.future_token_ids_map[
-                future_token_ids_ct + 1 : future_token_ids_ct + len(next_token_ids) + 1
-            ] = next_token_ids
+            print(f"[{batch_pt}] GOT OUTPUT SPEC INFO\n", output_spec_info)
+            # TODO(nathan): Understand why sometimes everything is None
+            if output_spec_info.topk_p is not None:
+                target_output_spec_info.topk_p.copy_(output_spec_info.topk_p, non_blocking=True)
+            if output_spec_info.topk_index is not None:
+                target_output_spec_info.topk_index.copy_(output_spec_info.topk_index, non_blocking=True)
+            if output_spec_info.hidden_states is not None:
+                target_output_spec_info.hidden_states.copy_(output_spec_info.hidden_states, non_blocking=True)
+            if output_spec_info.verified_id is not None:
+                target_output_spec_info.verified_id.copy_(output_spec_info.verified_id, non_blocking=True)
+
+            # NOTE(Nathan): not super sure about the placement of this
+            if batch.launch_done is not None:
+                batch.launch_done.set()
+
+            # TODO(nathan): Sometimes we need to copy these? but sometimes they don't exist? SIGH
+            # target_output_spec_info.accept_length.copy_(output_spec_info.accept_length, non_blocking=True)
+            # target_output_spec_info.kv_indptr.copy_(output_spec_info.kv_indptr, non_blocking=True)
+            # target_output_spec_info.kv_indices.copy_(output_spec_info.kv_indices, non_blocking=True)
 
             # Copy results to CPU if needed
             if logits_output is not None:
@@ -181,11 +180,11 @@ class EAGLEWorkerClient:
         return logits_output, next_token_ids, bid, can_run_cuda_graph
 
     def forward_batch_speculative_generation(
-        self, batch: ScheduleBatch
-    ) -> Tuple[None, torch.Tensor, int, int, bool]:
+        self, model_worker_batch: ModelWorkerBatch, reqs: List[Req]
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool, EagleDraftInput]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
-        sampling_info = batch.sampling_info
-        batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
+        sampling_info = model_worker_batch.sampling_info
+        model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
             sampling_info_done=threading.Event(),
         )
@@ -194,25 +193,22 @@ class EAGLEWorkerClient:
         sync_event = torch.get_device_module(self.device).Event()
         sync_event.record(self.scheduler_stream)
 
-        # Push batch to queue
-        self.input_queue.put((batch, self.future_token_ids_ct, sync_event))
-        print(f'added {batch.forward_mode} to queue')
-
-        # Allocate future token placeholders
-        bs = batch.batch_size()
-        max_spec_tokens = bs * (self.worker.speculative_num_steps + 1)
-        future_next_token_ids = torch.arange(
-            -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + max_spec_tokens),
-            -1,
-            dtype=torch.int64,
-            device=self.device,
+        spec_info_output = EagleDraftInput(
+            topk_p=torch.empty((len(model_worker_batch.seq_lens), self.worker.topk), device=self.device, dtype=torch.float32),
+            topk_index=torch.empty((len(model_worker_batch.seq_lens), self.worker.topk), device=self.device, dtype=torch.int64),
+            hidden_states=torch.empty((len(model_worker_batch.seq_lens), self.worker.model_runner.model_config.hidden_size), device=self.device, dtype=torch.bfloat16),
+            verified_id=torch.empty((len(model_worker_batch.seq_lens), ), device=self.device, dtype=torch.int64),
+            # accept_length=torch.empty((len(model_worker_batch.seq_lens), ), device=self.device, dtype=torch.int32),
+            # accept_length_cpu=None,
+            # kv_indptr=torch.empty((len(model_worker_batch.seq_lens) + 1), device=self.device, dtype=torch.int32),
+            # kv_indices=torch.empty((len(model_worker_batch.seq_lens) + 1), device=self.device, dtype=torch.int32),
         )
-        self.future_token_ids_ct = (
-            self.future_token_ids_ct + max_spec_tokens
-        ) % self.future_token_ids_limit
 
-        return None, future_next_token_ids, -1, 0, False
+        # Push batch to queue
+        self.input_queue.put((model_worker_batch, reqs.copy(), sync_event, spec_info_output))
+        print(f'added {model_worker_batch.forward_mode.name} to queue')
+
+        return None, None, -1, 0, False, spec_info_output
 
     def get_worker_info(self):
         return self.worker.get_worker_info()

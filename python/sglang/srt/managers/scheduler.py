@@ -1520,11 +1520,11 @@ class Scheduler(
         else:
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
-            memory_leak = (available_size + evictable_size) != (
+            memory_leak = (available_size + evictable_size) <= (
                 self.max_total_num_tokens
                 if not self.enable_hierarchical_cache
                 else self.max_total_num_tokens - protected_size
-            )
+            ) - 128 # TODO(nathan): -128 shouldn't be here
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
         if memory_leak:
@@ -1914,6 +1914,7 @@ class Scheduler(
                     can_run_cuda_graph,
                     next_spec_info,
                 ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch, batch.reqs)
+                # print(f"[{self.forward_ct}] GOT OUTPUT SPEC INFO\n", next_spec_info)
 
                 batch.spec_info = next_spec_info
                 bs = batch.batch_size()
