@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
     Req,
     ScheduleBatch,
     get_last_loc,
@@ -70,16 +71,17 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
-    def prepare_for_extend(self, batch: ScheduleBatch):
-        if batch.forward_mode.is_idle():
+    def prepare_for_extend(self, model_worker_batch: ModelWorkerBatch):
+        if model_worker_batch.forward_mode.is_idle():
             return
         # Prefill only generate 1 token.
-        assert len(self.verified_id) == len(batch.seq_lens)
+        assert len(self.verified_id) == len(model_worker_batch.seq_lens)
 
         pt = 0
-        for i, extend_len in enumerate(batch.extend_lens):
-            input_ids = batch.input_ids[pt : pt + extend_len]
-            batch.input_ids[pt : pt + extend_len] = torch.cat(
+        assert model_worker_batch.extend_seq_lens is not None
+        for i, extend_len in enumerate(model_worker_batch.extend_seq_lens):
+            input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
+            model_worker_batch.input_ids[pt : pt + extend_len] = torch.cat(
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
             pt += extend_len
