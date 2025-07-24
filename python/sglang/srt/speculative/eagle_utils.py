@@ -163,10 +163,10 @@ class EagleDraftInput:
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor):
-        self.topk_p = self.topk_p[: len(new_indices)]
-        self.topk_index = self.topk_index[: len(new_indices)]
-        self.hidden_states = self.hidden_states[: len(new_indices)]
-        self.verified_id = self.verified_id[: len(new_indices)]
+        self.topk_p = self.topk_p[new_indices]
+        self.topk_index = self.topk_index[new_indices]
+        self.hidden_states = self.hidden_states[new_indices]
+        self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
         if self.hidden_states is None:
@@ -582,103 +582,36 @@ class EagleVerifyInput:
                 )
 
         # Construct EagleVerifyOutput
-        if not has_finished:
-            if page_size == 1 or self.topk == 1:
-                batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
-                assign_req_to_token_pool[(bs,)](
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.seq_lens + accept_length + 1,
-                    batch.out_cache_loc,
-                    batch.req_to_token_pool.req_to_token.shape[1],
-                    next_power_of_2(bs),
-                )
-            else:
-                batch.out_cache_loc = tgt_cache_loc
-            batch.seq_lens.add_(accept_length + 1)
-
-            draft_input = EagleDraftInput()
-            draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
-            draft_input.verified_id = verified_id
-            draft_input.accept_length = accept_length
-            draft_input.accept_length_cpu = accept_length.tolist()
-            draft_input.seq_lens_for_draft_extend = batch.seq_lens
-            draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
-
-            return EagleVerifyOutput(
-                draft_input=draft_input,
-                logits_output=logits_output,
-                verified_id=verified_id,
-                accept_length_per_req_cpu=draft_input.accept_length_cpu,
-                accepted_indices=accept_index,
+        if page_size == 1 or self.topk == 1:
+            batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
+            assign_req_to_token_pool[(bs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.seq_lens + accept_length + 1,
+                batch.out_cache_loc,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                next_power_of_2(bs),
             )
         else:
-            if page_size == 1 or self.topk == 1:
-                assign_req_to_token_pool[(bs,)](
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.seq_lens + accept_length + 1,
-                    torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0),
-                    batch.req_to_token_pool.req_to_token.shape[1],
-                    next_power_of_2(bs),
-                )
-                batch.seq_lens.add_(accept_length + 1)
+            batch.out_cache_loc = tgt_cache_loc
+        batch.seq_lens.add_(accept_length + 1)
 
-            accept_length_cpu = accept_length.tolist()
-            draft_input = EagleDraftInput()
-            if len(unfinished_accept_index) > 0:
-                unfinished_accept_index = torch.cat(unfinished_accept_index)
-                unfinished_index_device = torch.tensor(
-                    unfinished_index, dtype=torch.int64, device=predict.device
-                )
-                draft_input_accept_length_cpu = [
-                    accept_length_cpu[i] for i in unfinished_index
-                ]
-                if page_size == 1 or self.topk == 1:
-                    batch.out_cache_loc = batch.out_cache_loc[unfinished_accept_index]
-                else:
-                    # TODO (timmy): read and verify that it works
-                    batch.out_cache_loc = torch.empty(
-                        len(unfinished_index) + sum(draft_input_accept_length_cpu),
-                        dtype=torch.int64,
-                        device=predict.device,
-                    )
-                    accept_length_filter = create_accept_length_filter(
-                        accept_length,
-                        unfinished_index_device,
-                        batch.seq_lens,
-                    )
-                    filter_finished_cache_loc_kernel[(bs,)](
-                        batch.out_cache_loc,
-                        tgt_cache_loc,
-                        accept_length,
-                        accept_length_filter,
-                        next_power_of_2(bs),
-                        next_power_of_2(self.draft_token_num),
-                    )
+        draft_input = EagleDraftInput()
+        draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
+        draft_input.verified_id = verified_id
+        draft_input.accept_length = accept_length
+        draft_input.accept_length_cpu = accept_length.tolist()
+        draft_input.seq_lens_for_draft_extend = batch.seq_lens
+        draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
 
-                draft_input.hidden_states = batch.spec_info.hidden_states[
-                    unfinished_accept_index
-                ]
-                draft_input.verified_id = predict[unfinished_accept_index]
-                draft_input.accept_length_cpu = draft_input_accept_length_cpu
-                draft_input.accept_length = accept_length[unfinished_index_device]
-                draft_input.seq_lens_for_draft_extend = batch.seq_lens[
-                    unfinished_index_device
-                ]
-                draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices[
-                    unfinished_index_device
-                ]
-
-            return EagleVerifyOutput(
-                draft_input=draft_input,
-                logits_output=logits_output,
-                verified_id=verified_id,
-                accept_length_per_req_cpu=accept_length_cpu,
-                accepted_indices=accept_index,
-            )
+        return EagleVerifyOutput(
+            draft_input=draft_input,
+            logits_output=logits_output,
+            verified_id=verified_id,
+            accept_length_per_req_cpu=draft_input.accept_length_cpu,
+            accepted_indices=accept_index,
+        )
 
 
 @triton.jit
