@@ -185,6 +185,12 @@ class EagleDraftInput:
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+    
+
+    def __setattr__(self, name, value):
+        # if name == 'verified_id' and value is not None:
+        #     print("setting verified id", value.dtype)
+        super().__setattr__(name, value)
 
 
 @dataclass

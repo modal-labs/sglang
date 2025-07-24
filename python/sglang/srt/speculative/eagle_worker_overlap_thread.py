@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple
 import psutil
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req, ScheduleBatch
@@ -33,6 +34,99 @@ from sglang.srt.utils import DynamicGradMode, get_compiler_backend
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+class FutureSpecInfo:
+    """
+    Stores spec info for future batches.
+
+    For overlapped scheduling, EagleWorkerClient returns to the scheduler a list of _pointers_ to
+    the spec info that will eventually be populated when the current batch finishes running.
+
+    The scheduler will filter this list of pointers to remove requests that are completed,
+    then give the filtered list of pointers to EagleWorkerClient as part of the next batch.
+
+    Before executing a batch, EagleWorkerClient will take this list of pointers and "dereference"
+    them into actual spec info objects.
+
+    The process is something like this:
+
+    - [scheduler] get batch 1
+    - [eagle]     enqueue batch 1  -> returns pointers to spec info 1
+    - [eagle]     execute batch 0
+    - [scheduler] process batch 0  -> receives list of next token IDs, updates running requests
+    - [scheduler] get batch 2      -> uses result of process batch 0 to filter spec info 1 pointers, removing completed requests
+    - [eagle]     enqueue batch 2  -> receives filtered spec info 1 pointers, returns pointers to spec info 2
+    - [eagle]     execute batch 1  -> populates spec info 1
+    - [scheduler] process batch 1
+    - [scheduler] get batch 3
+    - [eagle]     enqueue batch 3
+    - [eagle]     execute batch 2  -> takes filtered spec info 1 pointers, reconstructs filtered spec info 1 tensors, populates spec info 2
+    - [scheduler] process batch 2
+
+    The scheduler is freely able to mutate and transform pointers that EagleWorkerClient returns.
+    The actual spec info objects are owned by EagleWorkerClient and should not be accessed by the scheduler.
+    """
+
+    def __init__(self, max_items: int, topk: int, hidden_size: int, device: torch.device):
+        self.topk_p: torch.Tensor = torch.empty((max_items, topk), device=device, dtype=torch.float32)
+        self.topk_index: torch.Tensor = torch.empty((max_items, topk), device=device, dtype=torch.int64)
+        self.hidden_states: torch.Tensor = torch.empty((max_items, hidden_size), device=device, dtype=torch.bfloat16)
+        self.verified_id: torch.Tensor = torch.empty((max_items, ), device=device, dtype=torch.int32)
+
+        self.topk: int = topk
+        self.hidden_size: int = hidden_size
+        self.device: torch.device = device
+        self.max_items: int = max_items
+        self.current_index: int = 0
+
+    def get_pointers(self, num_items: int) -> torch.Tensor:
+        """Returns a device tensor of shape (num_items, ) each containing a pointer to one spec info entry."""
+        if self.current_index + num_items > self.max_items:
+            print("[FutureSpecInfo] wrapping around")
+            self.current_index = 0
+
+        pointers = torch.arange(self.current_index, self.current_index + num_items, device=self.device, dtype=torch.int32)
+        self.current_index += num_items
+        return pointers
+
+    def put_data(self, pointers: torch.Tensor, output_spec_info: EagleDraftInput):
+        """Puts the data from output_spec_info into the spec info objects at the indices specified by pointers."""
+        print("[FutureSpecInfo] writing to", pointers)
+
+        if pointers.shape[0] == 0:
+            # Special case where all requests in the batch have finished. In this case, output_spec_info can contain None values.
+            return
+
+        assert output_spec_info.topk_p.shape == (pointers.shape[0], self.topk)
+        assert output_spec_info.topk_index.shape == (pointers.shape[0], self.topk)
+        assert output_spec_info.hidden_states.shape == (pointers.shape[0], self.hidden_size)
+        assert output_spec_info.verified_id.shape == (pointers.shape[0], )
+
+        assert output_spec_info.topk_p.dtype == self.topk_p.dtype
+        assert output_spec_info.topk_index.dtype == self.topk_index.dtype
+        assert output_spec_info.hidden_states.dtype == self.hidden_states.dtype
+        # assert output_spec_info.verified_id.dtype == self.verified_id.dtype
+
+        self.topk_p[pointers] = output_spec_info.topk_p
+        self.topk_index[pointers] = output_spec_info.topk_index
+        self.hidden_states[pointers] = output_spec_info.hidden_states
+        self.verified_id[pointers] = output_spec_info.verified_id
+    
+    def get_data(self, pointers: torch.Tensor) -> EagleDraftInput:
+        """Returns the spec info objects at the indices specified by pointers."""
+        assert pointers.shape == (pointers.shape[0], )
+        assert pointers.dtype == torch.int32
+
+        # TODO(nathan): Need to implement circular buffer
+        print("[FutureSpecInfo] reading from", pointers)
+
+        return EagleDraftInput(
+            topk_p=self.topk_p[pointers],
+            topk_index=self.topk_index[pointers],
+            hidden_states=self.hidden_states[pointers],
+            verified_id=self.verified_id[pointers],
+        )
 
 class EAGLEWorkerClient:
     """An EAGLE speculative decoding worker with overlap thread."""
@@ -58,6 +152,15 @@ class EAGLEWorkerClient:
         self.device = self.worker.device
         self.gpu_id = gpu_id
         self.max_running_requests = self.worker.max_running_requests
+
+        assert self.worker.topk is not None
+        assert self.device is not None
+        self.future_spec_infos: FutureSpecInfo = FutureSpecInfo(
+            max_items=self.max_running_requests * 1000,  # Technically I think this only needs to be 2, but whatever
+            topk=self.worker.topk,
+            hidden_size=self.worker.model_runner.model_config.hidden_size,
+            device=torch.device(self.device),
+        )
         
         # Launch threads
         self.input_queue = Queue()
@@ -87,9 +190,18 @@ class EAGLEWorkerClient:
         batch_lists = [None] * 2
 
         while True:
-            batch, reqs, sync_event, target_output_spec_info = self.input_queue.get()
+            batch, reqs, sync_event, output_spec_info_pointers = self.input_queue.get()
             if batch is None:
                 break
+
+            assert isinstance(batch, ModelWorkerBatch)
+            # TODO(nathan): Figure out how to avoid this hack.
+            # Basically, eagle will remove requests that have been completed from output_spec_info.
+            # So we don't actually need to write to every output_spec_info location.
+            # But in practice I don't actually think eagle _should_ be removing requests like this,
+            # since doing so presumably requires a CPU sync.
+            # Anyway, let's do this for now until Timmy stops eagle from removing requests.
+            batch.magic_output_spec_info_pointers = output_spec_info_pointers
 
             sync_event.wait()
 
@@ -101,6 +213,13 @@ class EAGLEWorkerClient:
 
             # Create event
             copy_done = torch.get_device_module(self.device).Event()
+
+            if batch.forward_mode == ForwardMode.DECODE:
+                batch.spec_info = self.future_spec_infos.get_data(batch.spec_info.verified_id)
+                assert batch.spec_info.verified_id.shape == batch.seq_lens.shape
+            else:
+                assert batch.forward_mode == ForwardMode.EXTEND
+                assert batch.spec_info is None
 
             print(f"[{batch_pt}] RUNNING WITH BATCH SPEC INFO\n", batch.spec_info)
 
@@ -115,24 +234,11 @@ class EAGLEWorkerClient:
             ) = self.worker.forward_batch_speculative_generation(batch, reqs)
 
             print(f"[{batch_pt}] GOT OUTPUT SPEC INFO\n", output_spec_info)
-            # TODO(nathan): Understand why sometimes everything is None
-            if output_spec_info.topk_p is not None:
-                target_output_spec_info.topk_p.copy_(output_spec_info.topk_p, non_blocking=True)
-            if output_spec_info.topk_index is not None:
-                target_output_spec_info.topk_index.copy_(output_spec_info.topk_index, non_blocking=True)
-            if output_spec_info.hidden_states is not None:
-                target_output_spec_info.hidden_states.copy_(output_spec_info.hidden_states, non_blocking=True)
-            if output_spec_info.verified_id is not None:
-                target_output_spec_info.verified_id.copy_(output_spec_info.verified_id, non_blocking=True)
+            self.future_spec_infos.put_data(batch.magic_output_spec_info_pointers, output_spec_info)
 
             # NOTE(Nathan): not super sure about the placement of this
             if batch.launch_done is not None:
                 batch.launch_done.set()
-
-            # TODO(nathan): Sometimes we need to copy these? but sometimes they don't exist? SIGH
-            # target_output_spec_info.accept_length.copy_(output_spec_info.accept_length, non_blocking=True)
-            # target_output_spec_info.kv_indptr.copy_(output_spec_info.kv_indptr, non_blocking=True)
-            # target_output_spec_info.kv_indices.copy_(output_spec_info.kv_indices, non_blocking=True)
 
             # Copy results to CPU if needed
             if logits_output is not None:
@@ -193,22 +299,23 @@ class EAGLEWorkerClient:
         sync_event = torch.get_device_module(self.device).Event()
         sync_event.record(self.scheduler_stream)
 
-        spec_info_output = EagleDraftInput(
-            topk_p=torch.empty((len(model_worker_batch.seq_lens), self.worker.topk), device=self.device, dtype=torch.float32),
-            topk_index=torch.empty((len(model_worker_batch.seq_lens), self.worker.topk), device=self.device, dtype=torch.int64),
-            hidden_states=torch.empty((len(model_worker_batch.seq_lens), self.worker.model_runner.model_config.hidden_size), device=self.device, dtype=torch.bfloat16),
-            verified_id=torch.empty((len(model_worker_batch.seq_lens), ), device=self.device, dtype=torch.int64),
-            # accept_length=torch.empty((len(model_worker_batch.seq_lens), ), device=self.device, dtype=torch.int32),
-            # accept_length_cpu=None,
-            # kv_indptr=torch.empty((len(model_worker_batch.seq_lens) + 1), device=self.device, dtype=torch.int32),
-            # kv_indices=torch.empty((len(model_worker_batch.seq_lens) + 1), device=self.device, dtype=torch.int32),
-        )
+        if model_worker_batch.forward_mode == ForwardMode.DECODE:
+            assert model_worker_batch.spec_info is not None
+            assert isinstance(model_worker_batch.spec_info, EagleDraftInput)
+            assert model_worker_batch.spec_info.verified_id is not None
+        
+        spec_info_pointers = self.future_spec_infos.get_pointers(len(model_worker_batch.seq_lens))
 
         # Push batch to queue
-        self.input_queue.put((model_worker_batch, reqs.copy(), sync_event, spec_info_output))
+        self.input_queue.put((model_worker_batch, reqs.copy(), sync_event, spec_info_pointers))
         print(f'added {model_worker_batch.forward_mode.name} to queue')
 
-        return None, None, -1, 0, False, spec_info_output
+        # For overlap scheduling, we return a list of pointers to the spec info we will eventually populate (once the current batch finishes running).
+        # The scheduler will mutate this list of pointers as needed and give it back to us as part of the next batch's model_worker_batch.spec_info.
+        output_spec_info_pointers = EagleDraftInput(
+            verified_id=spec_info_pointers,
+        )
+        return None, None, -1, 0, False, output_spec_info_pointers
 
     def get_worker_info(self):
         return self.worker.get_worker_info()

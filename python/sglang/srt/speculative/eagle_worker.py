@@ -326,7 +326,7 @@ class EAGLEWorker(TpModelWorker):
             assert next_token_ids is not None
             model_worker_batch.spec_info = EagleDraftInput(
                 hidden_states=logits_output.hidden_states,
-                verified_id=next_token_ids,
+                verified_id=next_token_ids.to(torch.int32), # TODO(nathan): avoid this?
             )
 
             with self.draft_tp_context(self.draft_model_runner.tp_group):
