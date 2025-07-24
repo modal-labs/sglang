@@ -419,20 +419,22 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
-            out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
-                num_seqs * self.speculative_num_steps * self.topk, backup_state=True
-            )
+            # TODO(nathan): Not quite equivalent to ScheduleBatch.alloc_token_slots, but good enough for now
+            token_to_kv_pool_state_backup = self.token_to_kv_pool_allocator.backup_state()
+            out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_seqs * self.speculative_num_steps * self.topk)
+            if out_cache_loc is None:
+                raise RuntimeError("Failed to allocate out_cache_loc")
         else:
             raise NotImplementedError("page size > 1 is not supported")
 
         assign_draft_cache_locs[(num_seqs,)](
             model_worker_batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
+            self.req_to_token_pool.req_to_token,
             model_worker_batch.seq_lens,
             self.extend_lens,
             self.num_new_pages_per_topk,
             out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            self.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
             self.page_size,
