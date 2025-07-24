@@ -1913,7 +1913,7 @@ class Scheduler(
                     num_accepted_tokens,
                     can_run_cuda_graph,
                     next_spec_info,
-                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch, batch)
+                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch, batch.reqs)
 
                 batch.spec_info = next_spec_info
                 bs = batch.batch_size()
