@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
@@ -309,13 +310,15 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            logits_output, next_token_ids, bid, seq_lens_cpu = (
-                self.forward_target_extend(batch)
+        model_worker_batch = batch.get_model_worker_batch()
+
+        if model_worker_batch.forward_mode.is_extend() or model_worker_batch.is_extend_in_batch:
+            logits_output, next_token_ids, bid = (
+                self.forward_target_extend(model_worker_batch)
             )
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
+                    batch, logits_output.hidden_states, next_token_ids, model_worker_batch.seq_lens_cpu
                 )
             return logits_output, next_token_ids, bid, 0, False
         else:
@@ -360,8 +363,8 @@ class EAGLEWorker(TpModelWorker):
         return need_forward
 
     def forward_target_extend(
-        self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, List[int], int]:
+        self, model_worker_batch: ModelWorkerBatch
+    ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor], int]:
         """Run the target extend.
 
         Args:
@@ -374,7 +377,6 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
-        model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_num_draft_tokens = 1
         logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
@@ -384,7 +386,6 @@ class EAGLEWorker(TpModelWorker):
             logits_output,
             next_token_ids,
             model_worker_batch.bid,
-            model_worker_batch.seq_lens_cpu,
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
