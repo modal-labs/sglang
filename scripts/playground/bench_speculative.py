@@ -144,7 +144,7 @@ def main(args, server_args):
         else:
             other_args = [
                 "--speculative-algorithm",
-                "EAGLE",
+                server_args.speculative_algorithm or "EAGLE",
                 "--speculative-num-steps",
                 steps,
                 "--speculative-eagle-topk",
