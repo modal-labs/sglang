@@ -602,28 +602,23 @@ class EAGLEWorker(TpModelWorker):
         assert self.token_to_kv_pool_allocator is not None
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
+        model_worker_batch.forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if not model_worker_batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
+        model_worker_batch.capture_hidden_mode = spec_info.capture_hidden_mode
+        model_worker_batch.spec_info = spec_info
+        model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
+
         # TODO(nathan): Remove this eventually
         batch.input_ids = model_worker_batch.input_ids
         batch.out_cache_loc = model_worker_batch.out_cache_loc
-
-        batch.forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if not batch.forward_mode.is_idle()
-            else ForwardMode.IDLE
-        )
-        batch.spec_info = spec_info
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
-        )
-        model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
-        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
+        batch.forward_mode = model_worker_batch.forward_mode
+        batch.spec_info = model_worker_batch.spec_info
 
         if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
-            draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrive_next_token.shape
-            ).cpu()
+            raise NotImplementedError("Grammar is not supported for now")
 
         # Forward
         logits_output, _, can_run_cuda_graph = (
