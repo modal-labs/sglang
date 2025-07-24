@@ -298,7 +298,7 @@ class EAGLEWorker(TpModelWorker):
         return self.model_runner
 
     def forward_batch_speculative_generation(
-        self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch
+        self, model_worker_batch: ModelWorkerBatch, reqs: List[Req]
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool, EagleDraftInput]:
         """Run speculative decoding forward.
 
@@ -336,7 +336,7 @@ class EAGLEWorker(TpModelWorker):
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(model_worker_batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(model_worker_batch, spec_info, batch.reqs)
+                self.verify(model_worker_batch, spec_info, reqs)
             )
 
             if self.check_forward_draft_extend_after_decode(model_worker_batch):
@@ -344,16 +344,6 @@ class EAGLEWorker(TpModelWorker):
                     self.forward_draft_extend_after_decode(
                         model_worker_batch,
                     )
-
-            # TODO(nathan): Remove this once we remove dependency on batch in the rest of this function
-            batch.out_cache_loc = model_worker_batch.out_cache_loc
-            batch.seq_lens_sum = model_worker_batch.seq_lens_sum
-
-            # TODO(nathan): Remove this eventually
-            batch.input_ids = model_worker_batch.input_ids
-            batch.out_cache_loc = model_worker_batch.out_cache_loc
-            batch.forward_mode = model_worker_batch.forward_mode
-            batch.spec_info = model_worker_batch.spec_info
             
             assert isinstance(model_worker_batch.spec_info, EagleDraftInput)
             return (
