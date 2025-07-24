@@ -170,8 +170,17 @@ def main(args, server_args):
                 server_args.tp_size,
                 "--max-running-requests",
                 batch_size,
+                "--dtype",
+                "bfloat16",
             ]
         )
+
+        if server_args.disable_overlap_schedule:
+            other_args.extend(
+                [
+                    "--disable-overlap-schedule",
+                ]
+            )
 
         if server_args.trust_remote_code:
             other_args.extend(

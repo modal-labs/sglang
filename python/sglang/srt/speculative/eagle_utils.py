@@ -119,7 +119,7 @@ class EagleDraftInput:
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length.add_(1)
-        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
+        self.positions = torch.zeros_like(batch.input_ids, dtype=torch.long)
         self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
 
         create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
@@ -512,15 +512,20 @@ class EagleVerifyInput:
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
-        verified_id = predict[accept_index]
-        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
+        accept_index_full = accept_index.flatten()
+        compact_indices = torch.argsort(accept_index_full == -1, stable=True)
+        accept_index = torch.where(accept_index_full != -1, accept_index_full, -1)[compact_indices]
+
+        verified_id = torch.where(accept_index != -1, predict[accept_index], 0)
+        evict_mask = torch.full((self.draft_token.shape[0] + 1,), True, dtype=torch.bool, device=self.draft_token.device)
         evict_mask[accept_index] = False
+        evict_mask = evict_mask[:-1]
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
         else:
+            # TODO (timmy): read and verify that it works
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
                 align_evict_mask_to_page_size[len(batch.seq_lens),](
@@ -579,7 +584,7 @@ class EagleVerifyInput:
         # Construct EagleVerifyOutput
         if not has_finished:
             if page_size == 1 or self.topk == 1:
-                batch.out_cache_loc = batch.out_cache_loc[accept_index]
+                batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
                 assign_req_to_token_pool[(bs,)](
                     batch.req_pool_indices,
                     batch.req_to_token_pool.req_to_token,
@@ -615,7 +620,7 @@ class EagleVerifyInput:
                     batch.req_to_token_pool.req_to_token,
                     batch.seq_lens,
                     batch.seq_lens + accept_length + 1,
-                    batch.out_cache_loc[accept_index],
+                    torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0),
                     batch.req_to_token_pool.req_to_token.shape[1],
                     next_power_of_2(bs),
                 )
@@ -634,6 +639,7 @@ class EagleVerifyInput:
                 if page_size == 1 or self.topk == 1:
                     batch.out_cache_loc = batch.out_cache_loc[unfinished_accept_index]
                 else:
+                    # TODO (timmy): read and verify that it works
                     batch.out_cache_loc = torch.empty(
                         len(unfinished_index) + sum(draft_input_accept_length_cpu),
                         dtype=torch.int64,

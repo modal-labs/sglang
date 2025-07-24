@@ -297,7 +297,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool]:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that

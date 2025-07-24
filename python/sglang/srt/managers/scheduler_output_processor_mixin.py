@@ -51,9 +51,14 @@ class SchedulerOutputProcessorMixin:
             )
 
             if self.enable_overlap:
-                logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
-                )
+                if self.spec_algorithm.is_eagle():
+                    logits_output, next_token_ids, _, _ = (
+                        self.draft_worker.resolve_last_batch_result(launch_done)
+                    )
+                else:
+                    logits_output, next_token_ids, _ = (
+                        self.tp_worker.resolve_last_batch_result(launch_done)
+                    )
             else:
                 # Move next_token_ids and logprobs to cpu
                 next_token_ids = next_token_ids.tolist()
