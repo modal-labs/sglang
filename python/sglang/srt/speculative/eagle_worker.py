@@ -333,7 +333,10 @@ class EAGLEWorker(TpModelWorker):
             return logits_output, next_token_ids, bid, 0, False, model_worker_batch.spec_info
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
-                spec_info = self.draft(model_worker_batch, batch)
+                spec_info = self.draft(model_worker_batch)
+                # TODO(nathan): Remove this once we remove dependency on batch in the rest of this function
+                batch.out_cache_loc = model_worker_batch.out_cache_loc
+                batch.seq_lens_sum = model_worker_batch.seq_lens_sum
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
@@ -401,7 +404,7 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.bid,
         )
 
-    def _draft_preprocess_decode(self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch):
+    def _draft_preprocess_decode(self, model_worker_batch: ModelWorkerBatch):
         # Parse args
         num_seqs = len(model_worker_batch.seq_lens)
         spec_info = model_worker_batch.spec_info
@@ -449,13 +452,9 @@ class EAGLEWorker(TpModelWorker):
             ]
 
         model_worker_batch.out_cache_loc = out_cache_loc
-        # TODO(nathan): Remove this later
-        batch.out_cache_loc = out_cache_loc
 
         # TODO(nathan): Understand why this isn't always true -- in particular on the second DECODE step??
         model_worker_batch.seq_lens_sum = torch.sum(model_worker_batch.seq_lens).item()
-        # TODO(nathan): ???
-        batch.seq_lens_sum = model_worker_batch.seq_lens_sum
 
         assert self.topk is not None
         spec_info.positions = model_worker_batch.seq_lens.repeat_interleave(self.topk, dim=0)
@@ -470,12 +469,12 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
-    def draft(self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch):
+    def draft(self, model_worker_batch: ModelWorkerBatch):
         # Parse args
         if model_worker_batch.forward_mode.is_idle():
             self._draft_preprocess_idle(model_worker_batch)
         else:
-            self._draft_preprocess_decode(model_worker_batch, batch)
+            self._draft_preprocess_decode(model_worker_batch)
 
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
