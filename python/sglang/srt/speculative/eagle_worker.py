@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import (
     ModelWorkerBatch,
+    Req,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
@@ -334,12 +335,19 @@ class EAGLEWorker(TpModelWorker):
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(model_worker_batch)
-                # TODO(nathan): Remove this once we remove dependency on batch in the rest of this function
-                batch.out_cache_loc = model_worker_batch.out_cache_loc
-                batch.seq_lens_sum = model_worker_batch.seq_lens_sum
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(model_worker_batch, batch, spec_info)
+                self.verify(model_worker_batch, spec_info, batch.reqs)
             )
+
+            # TODO(nathan): Remove this once we remove dependency on batch in the rest of this function
+            batch.out_cache_loc = model_worker_batch.out_cache_loc
+            batch.seq_lens_sum = model_worker_batch.seq_lens_sum
+
+            # TODO(nathan): Remove this eventually
+            batch.input_ids = model_worker_batch.input_ids
+            batch.out_cache_loc = model_worker_batch.out_cache_loc
+            batch.forward_mode = model_worker_batch.forward_mode
+            batch.spec_info = model_worker_batch.spec_info
 
             if self.check_forward_draft_extend_after_decode(batch):
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -598,7 +606,7 @@ class EAGLEWorker(TpModelWorker):
 
         return score_list, token_list, parents_list
 
-    def verify(self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+    def verify(self, model_worker_batch: ModelWorkerBatch, spec_info: EagleVerifyInput, reqs: List[Req]):
         assert self.token_to_kv_pool_allocator is not None
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
@@ -626,16 +634,10 @@ class EAGLEWorker(TpModelWorker):
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             self.page_size,
-            batch.reqs,
+            reqs,
             device=self.device,
             vocab_mask=None,
         )
-
-        # TODO(nathan): Remove this eventually
-        batch.input_ids = model_worker_batch.input_ids
-        batch.out_cache_loc = model_worker_batch.out_cache_loc
-        batch.forward_mode = model_worker_batch.forward_mode
-        batch.spec_info = model_worker_batch.spec_info
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
@@ -644,14 +646,14 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        if batch.return_logprob:
-            self.add_logprob_values(batch, res, logits_output)
+        if model_worker_batch.return_logprob:
+            raise NotImplementedError("return_logprob is not supported for now")
 
         # Prepare the batch for the next draft forwards.
-        batch.forward_mode = (
-            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        model_worker_batch.forward_mode = (
+            ForwardMode.DECODE if not model_worker_batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
+        model_worker_batch.spec_info = res.draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
