@@ -316,10 +316,18 @@ class EAGLEWorker(TpModelWorker):
             logits_output, next_token_ids, bid = (
                 self.forward_target_extend(model_worker_batch)
             )
+            assert logits_output.hidden_states is not None
+            assert next_token_ids is not None
             with self.draft_tp_context(self.draft_model_runner.tp_group):
-                self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, model_worker_batch.seq_lens_cpu
+                model_worker_batch.spec_info = EagleDraftInput(
+                    hidden_states=logits_output.hidden_states,
+                    verified_id=next_token_ids,
                 )
+                # TODO(nathan): Understand why I need this?
+                batch.spec_info = model_worker_batch.spec_info
+                batch.return_hidden_states = False
+
+                self.forward_draft_extend(model_worker_batch)
             return logits_output, next_token_ids, bid, 0, False
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -781,10 +789,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_draft_extend(
         self,
-        batch: ScheduleBatch,
-        hidden_states: torch.Tensor,
-        next_token_ids: List[int],
-        seq_lens_cpu: torch.Tensor,
+        model_worker_batch: ModelWorkerBatch,
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -793,16 +798,10 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
-        batch.spec_info = EagleDraftInput(
-            hidden_states=hidden_states,
-            verified_id=next_token_ids,
-        )
-        batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=seq_lens_cpu
-        )
+        assert isinstance(model_worker_batch.spec_info, EagleDraftInput)
+        model_worker_batch.spec_info.prepare_for_extend(model_worker_batch)
+        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.spec_num_draft_tokens = 1
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
@@ -811,7 +810,7 @@ class EAGLEWorker(TpModelWorker):
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        assert forward_batch.spec_info is batch.spec_info
+        assert forward_batch.spec_info is model_worker_batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
