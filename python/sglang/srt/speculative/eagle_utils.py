@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from python.sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -242,37 +243,37 @@ class EagleVerifyInput:
             seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
         )
 
-    def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
-        if batch.forward_mode.is_idle():
+    def prepare_for_verify(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        page_size: int,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    ):
+        if model_worker_batch.forward_mode.is_idle():
             return
 
-        batch.input_ids = self.draft_token
+        model_worker_batch.input_ids = self.draft_token
 
         if page_size == 1:
-            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
-            end_offset = batch.seq_lens + self.draft_token_num
-        else:
-            prefix_lens = batch.seq_lens
-            end_offset = prefix_lens + self.draft_token_num
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                prefix_lens,
-            )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                prefix_lens, end_offset, last_loc, len(batch.input_ids)
-            )
-            self.last_loc = last_loc
+            # TODO(nathan): Not quite equivalent to ScheduleBatch.alloc_token_slots, but good enough for now
+            out_cache_loc = token_to_kv_pool_allocator.alloc(len(model_worker_batch.input_ids))
+            if out_cache_loc is None:
+                raise RuntimeError("Failed to allocate out_cache_loc")
 
-        bs = batch.batch_size()
+            model_worker_batch.out_cache_loc = out_cache_loc
+            end_offset = model_worker_batch.seq_lens + self.draft_token_num
+        else:
+            raise NotImplementedError("page size > 1 is not supported")
+
+        bs = len(model_worker_batch.seq_lens)
         assign_req_to_token_pool[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
+            model_worker_batch.req_pool_indices,
+            req_to_token_pool.req_to_token,
+            model_worker_batch.seq_lens,
             end_offset,
-            batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            model_worker_batch.out_cache_loc,
+            req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
 

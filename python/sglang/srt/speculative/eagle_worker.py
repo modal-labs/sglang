@@ -338,7 +338,7 @@ class EAGLEWorker(TpModelWorker):
                 batch.out_cache_loc = model_worker_batch.out_cache_loc
                 batch.seq_lens_sum = model_worker_batch.seq_lens_sum
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
+                self.verify(model_worker_batch, batch, spec_info)
             )
 
             if self.check_forward_draft_extend_after_decode(batch):
@@ -598,9 +598,14 @@ class EAGLEWorker(TpModelWorker):
 
         return score_list, token_list, parents_list
 
-    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
-        spec_info.prepare_for_verify(batch, self.page_size)
-        batch.return_hidden_states = False
+    def verify(self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        assert self.token_to_kv_pool_allocator is not None
+        spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.req_to_token_pool, self.token_to_kv_pool_allocator)
+
+        # TODO(nathan): Remove this eventually
+        batch.input_ids = model_worker_batch.input_ids
+        batch.out_cache_loc = model_worker_batch.out_cache_loc
+
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
             if not batch.forward_mode.is_idle()
