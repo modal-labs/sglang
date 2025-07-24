@@ -475,17 +475,9 @@ class EAGLEWorker(TpModelWorker):
         else:
             self._draft_preprocess_decode(model_worker_batch, batch)
 
-        spec_info = batch.spec_info
-
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        # TODO(nathan): can we remove this? I think so?
-        batch.return_hidden_states = False
+        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # Get forward batch
-
-        # TODO(nathan): remove once we remove dependency on batch in the rest of this function
-        batch.spec_info = model_worker_batch.spec_info
-
         model_worker_batch.spec_num_draft_tokens = self.topk
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
@@ -505,7 +497,7 @@ class EAGLEWorker(TpModelWorker):
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
-        if batch.forward_mode.is_idle():
+        if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
@@ -520,12 +512,12 @@ class EAGLEWorker(TpModelWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            model_worker_batch.spec_info.verified_id,
             score_list,
             token_list,
             parents_list,
-            batch.seq_lens,
-            batch.seq_lens_sum,
+            model_worker_batch.seq_lens,
+            model_worker_batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
