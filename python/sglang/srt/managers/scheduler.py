@@ -1901,6 +1901,9 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             else:
+                if batch.has_grammar:
+                    raise NotImplementedError("Grammar is not supported for now")
+
                 model_worker_batch = batch.get_model_worker_batch()
 
                 (

@@ -611,15 +611,6 @@ class EAGLEWorker(TpModelWorker):
         model_worker_batch.spec_info = spec_info
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
 
-        # TODO(nathan): Remove this eventually
-        batch.input_ids = model_worker_batch.input_ids
-        batch.out_cache_loc = model_worker_batch.out_cache_loc
-        batch.forward_mode = model_worker_batch.forward_mode
-        batch.spec_info = model_worker_batch.spec_info
-
-        if batch.has_grammar:
-            raise NotImplementedError("Grammar is not supported for now")
-
         # Forward
         logits_output, _, can_run_cuda_graph = (
             self.target_worker.forward_batch_generation(
@@ -627,35 +618,24 @@ class EAGLEWorker(TpModelWorker):
             )
         )
 
-        vocab_mask = None
-        if batch.has_grammar:
-            # Generate the logit mask for structured output.
-            # Overlap the CPU operations for bitmask generation with the forward pass.
-            vocab_mask = generate_token_bitmask(
-                batch.reqs,
-                spec_info,
-                retrieve_next_token_cpu,
-                retrieve_next_sibling_cpu,
-                draft_tokens_cpu,
-                batch.sampling_info.vocab_size,
-            )
-
-            if vocab_mask is not None:
-                assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
-                # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
-                # and will be applied to produce wrong results
-                batch.sampling_info.vocab_mask = None
-
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
-            batch,
+            model_worker_batch,
             logits_output,
+            self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             self.page_size,
-            vocab_mask,
+            batch.reqs,
+            device=self.device,
+            vocab_mask=None,
         )
+
+        # TODO(nathan): Remove this eventually
+        batch.input_ids = model_worker_batch.input_ids
+        batch.out_cache_loc = model_worker_batch.out_cache_loc
+        batch.forward_mode = model_worker_batch.forward_mode
+        batch.spec_info = model_worker_batch.spec_info
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
