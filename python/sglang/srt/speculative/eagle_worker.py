@@ -297,8 +297,8 @@ class EAGLEWorker(TpModelWorker):
         return self.model_runner
 
     def forward_batch_speculative_generation(
-        self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool]:
+        self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool, EagleDraftInput]:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -307,28 +307,28 @@ class EAGLEWorker(TpModelWorker):
         Args:
             batch: The batch to run forward. The state of the batch is modified as it runs.
         Returns:
-            A tuple of the final logit output of the target model, next tokens accepted,
-            the batch id (used for overlap schedule), and number of accepted tokens.
+            A tuple of:
+            - the final logit output of the target model
+            - next tokens accepted
+            - the batch id (used for overlap schedule)
+            - number of accepted tokens
+            - whether the cuda graph can be run
+            - the speculative decoding info for the next batch
         """
-        model_worker_batch = batch.get_model_worker_batch()
-
         if model_worker_batch.forward_mode.is_extend() or model_worker_batch.is_extend_in_batch:
             logits_output, next_token_ids, bid = (
                 self.forward_target_extend(model_worker_batch)
             )
             assert logits_output.hidden_states is not None
             assert next_token_ids is not None
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
-                model_worker_batch.spec_info = EagleDraftInput(
-                    hidden_states=logits_output.hidden_states,
-                    verified_id=next_token_ids,
-                )
-                # TODO(nathan): Understand why I need this?
-                batch.spec_info = model_worker_batch.spec_info
-                batch.return_hidden_states = False
+            model_worker_batch.spec_info = EagleDraftInput(
+                hidden_states=logits_output.hidden_states,
+                verified_id=next_token_ids,
+            )
 
+            with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(model_worker_batch)
-            return logits_output, next_token_ids, bid, 0, False
+            return logits_output, next_token_ids, bid, 0, False, model_worker_batch.spec_info
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
@@ -341,12 +341,14 @@ class EAGLEWorker(TpModelWorker):
                     self.forward_draft_extend_after_decode(
                         batch,
                     )
+            assert isinstance(batch.spec_info, EagleDraftInput)
             return (
                 logits_output,
                 verify_output.verified_id,
                 model_worker_batch.bid,
                 sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph,
+                batch.spec_info,
             )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
