@@ -191,14 +191,6 @@ class EAGLEWorkerClient:
                 break
 
             assert isinstance(batch, ModelWorkerBatch)
-            # TODO(nathan): Figure out how to avoid this hack.
-            # Basically, eagle will remove requests that have been completed from output_spec_info.
-            # So we don't actually need to write to every output_spec_info location.
-            # But in practice I don't actually think eagle _should_ be removing requests like this,
-            # since doing so presumably requires a CPU sync.
-            # Anyway, let's do this for now until Timmy stops eagle from removing requests.
-            batch.magic_output_spec_info_pointers = output_spec_info_pointers
-
             sync_event.wait()
 
             # Keep a reference of batch by storing it into a list.
@@ -227,7 +219,7 @@ class EAGLEWorkerClient:
                 output_spec_info,
             ) = self.worker.forward_batch_speculative_generation(batch, reqs)
 
-            self.future_spec_infos.put_data(batch.magic_output_spec_info_pointers, output_spec_info)
+            self.future_spec_infos.put_data(output_spec_info_pointers, output_spec_info)
 
             # NOTE(Nathan): not super sure about the placement of this
             if batch.launch_done is not None:
