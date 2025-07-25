@@ -474,12 +474,12 @@ class EagleVerifyInput:
         # TODO: fuse them
         accept_index_full = accept_index.flatten()
         compact_indices = torch.argsort(accept_index_full == -1, stable=True)
-        accept_index = torch.where(accept_index_full != -1, accept_index_full, -1)[compact_indices]
+        accept_index = accept_index_full[compact_indices]
 
         verified_id = torch.where(accept_index != -1, predict[accept_index], 0)
         evict_mask = torch.full((self.draft_token.shape[0] + 1,), True, dtype=torch.bool, device=self.draft_token.device)
-        evict_mask[accept_index] = False
-        evict_mask = evict_mask[:-1]
+        evict_mask.scatter_(0, accept_index.to(torch.int64) + 1, False)
+        evict_mask = evict_mask[1:]
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
