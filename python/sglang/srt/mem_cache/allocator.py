@@ -65,7 +65,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def restore_state(self, free_pages):
         self.free_pages = free_pages
-        print(f"[BaseTokenToKVPoolAllocator] restore_state. Remaining: {len(self.free_pages)}")
 
     def backup_state(self):
         return self.free_pages
@@ -148,6 +147,19 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(free_index)
+        
+        if len(torch.unique(self.free_pages)) != len(self.free_pages):
+            print(f"[TokenToKVPoolAllocator] free {free_index.shape}. Remaining: {len(self.free_pages)} ({self.is_not_in_free_group=})")
+            print(len(torch.unique(self.free_pages)), len(self.free_pages))
+            print(set(range(1, self.size + 1)) - set(self.free_pages.tolist()))
+            # print only duplicates
+            uniques, counts = torch.unique(self.free_pages, return_counts=True)
+            duplicates = uniques[counts > 1]
+            if len(duplicates) > 0:
+                print("Duplicates in free_pages:", duplicates)
+            import traceback
+            traceback.print_stack()
+            raise Exception("Duplicates in free_pages")
 
         # print(f"[TokenToKVPoolAllocator] free {free_index.shape}. Remaining: {len(self.free_pages)} ({self.is_not_in_free_group=})")
         # import traceback

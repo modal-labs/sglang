@@ -220,6 +220,7 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        # print(f"[RadixCache] cache_finished_req {kv_indices=} {len(token_ids)=} {len(req.origin_input_ids)=} {len(req.output_ids)=}")
 
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size

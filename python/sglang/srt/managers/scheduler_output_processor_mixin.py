@@ -234,7 +234,10 @@ class SchedulerOutputProcessorMixin:
             idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
         else:
             idx_to_batch = list(range(len(batch.reqs)))
+        
+        print(f"[SchedulerOutputProcessorMixin] Got {len(idx_to_batch)} tokens generated. {batch.out_cache_loc.shape=}, {len(next_token_ids)=}")
 
+        completed_freed_batches = set()
         for i, (b, next_token_id) in enumerate(zip(idx_to_batch, next_token_ids)):
             req = batch.reqs[b]
             if req.is_retracted:
@@ -242,8 +245,13 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap and req.finished():
                 # Free the one extra delayed token
+                print(f"[SchedulerOutputProcessorMixin] ENCOUNTERED FINISHED REQ {req.rid} {i=} {b=} {batch.out_cache_loc=}")
                 if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                    if b not in completed_freed_batches:
+                        completed_freed_batches.add(b)
+                        # TODO(nathan): feels super sus
+                        self.token_to_kv_pool_allocator.free(batch.out_cache_loc[b : b + 1])
+                        print(f"[SchedulerOutputProcessorMixin] FREE {batch.out_cache_loc[b : b + 1]}")
                 elif self.spec_algorithm.is_none():
                     # Only free when the extra token is in a new page
                     # NOTE (timmy): do we do anything for eagle?
@@ -256,7 +264,29 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             req.output_ids.append(next_token_id)
+
             req.check_finished()
+            if req.finished() and b not in completed_freed_batches:
+                # print(f"[SchedulerOutputProcessorMixin] Finished request. {req.rid=} {logits_output.accept_length=}")
+                self.tree_cache.cache_finished_req(req)
+                req.time_stats.completion_time = time.time()
+                # I think (but am not sure) that batch.out_cache_loc[b : b + 1] is the single KV cache location
+                # for the target model. We need to free it, exactly once, when the extra token is received
+                # in the next call to process_batch_result_decode.
+                completed_freed_batches.add(b)
+            elif req.finished():
+                # Speculative models could return extra tokens even after the request is finished.
+                # In particular they'll return all tokens where draft model matches target model,
+                # even if the tokens appear after the request is finished.
+                # If this happens, we need to free the extra token.
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, len(req.origin_input_ids) + len(req.output_ids) - 2: len(req.origin_input_ids) + len(req.output_ids) - 1
+                ]
+                # print(f"[SchedulerOutputProcessorMixin] Finished request with extra token. {req.rid=}. Clearing {kv_indices=}")
+                self.token_to_kv_pool_allocator.free(kv_indices)
+                self.req_to_token_pool.free(req.req_pool_idx)
+                continue
+
 
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
@@ -293,11 +323,6 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
-
-        for req in batch.reqs:
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
-                req.time_stats.completion_time = time.time()
 
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)

@@ -317,7 +317,6 @@ class EAGLEWorker(TpModelWorker):
             - the speculative decoding info for the next batch
         """
 
-        logger.info(f"Executing {model_worker_batch.forward_mode.name}")
         if model_worker_batch.forward_mode.is_extend() or model_worker_batch.is_extend_in_batch:
             logits_output, next_token_ids, bid = (
                 self.forward_target_extend(model_worker_batch)
