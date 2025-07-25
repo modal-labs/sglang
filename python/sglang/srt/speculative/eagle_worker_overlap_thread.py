@@ -82,8 +82,8 @@ class FutureSpecInfo:
 
     def get_pointers(self, num_items: int) -> torch.Tensor:
         """Returns a device tensor of shape (num_items, ) each containing a pointer to one spec info entry."""
+        # TODO(nathan): This is a really sketchy to implement a circular buffer.
         if self.current_index + num_items > self.max_items:
-            print("[FutureSpecInfo] wrapping around")
             self.current_index = 0
 
         pointers = torch.arange(self.current_index, self.current_index + num_items, device=self.device, dtype=torch.int32)
@@ -92,7 +92,6 @@ class FutureSpecInfo:
 
     def put_data(self, pointers: torch.Tensor, output_spec_info: EagleDraftInput):
         """Puts the data from output_spec_info into the spec info objects at the indices specified by pointers."""
-        print("[FutureSpecInfo] writing to", pointers)
 
         if pointers.shape[0] == 0:
             # Special case where all requests in the batch have finished. In this case, output_spec_info can contain None values.
@@ -117,9 +116,6 @@ class FutureSpecInfo:
         """Returns the spec info objects at the indices specified by pointers."""
         assert pointers.shape == (pointers.shape[0], )
         assert pointers.dtype == torch.int32
-
-        # TODO(nathan): Need to implement circular buffer
-        print("[FutureSpecInfo] reading from", pointers)
 
         return EagleDraftInput(
             topk_p=self.topk_p[pointers],
@@ -221,8 +217,6 @@ class EAGLEWorkerClient:
                 assert batch.forward_mode == ForwardMode.EXTEND
                 assert batch.spec_info is None
 
-            print(f"[{batch_pt}] RUNNING WITH BATCH SPEC INFO\n", batch.spec_info)
-
             # Run forward
             (
                 logits_output,
@@ -233,7 +227,6 @@ class EAGLEWorkerClient:
                 output_spec_info,
             ) = self.worker.forward_batch_speculative_generation(batch, reqs)
 
-            print(f"[{batch_pt}] GOT OUTPUT SPEC INFO\n", output_spec_info)
             self.future_spec_infos.put_data(batch.magic_output_spec_info_pointers, output_spec_info)
 
             # NOTE(Nathan): not super sure about the placement of this
@@ -308,7 +301,6 @@ class EAGLEWorkerClient:
 
         # Push batch to queue
         self.input_queue.put((model_worker_batch, reqs.copy(), sync_event, spec_info_pointers))
-        print(f'added {model_worker_batch.forward_mode.name} to queue')
 
         # For overlap scheduling, we return a list of pointers to the spec info we will eventually populate (once the current batch finishes running).
         # The scheduler will mutate this list of pointers as needed and give it back to us as part of the next batch's model_worker_batch.spec_info.
