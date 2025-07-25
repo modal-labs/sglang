@@ -210,12 +210,16 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids, can_run_cuda_graph = (
-                self.tp_worker.resolve_last_batch_result(launch_done)
-            )
+            if self.spec_algorithm.is_eagle():
+                logits_output, next_token_ids, _, can_run_cuda_graph = (
+                    self.draft_worker.resolve_last_batch_result(launch_done)
+                )
+            else:
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    self.tp_worker.resolve_last_batch_result(launch_done)
+                )
             next_token_logprobs = logits_output.next_token_logprobs
-        elif batch.spec_algorithm.is_none():
-            # spec decoding handles output logprobs inside verify process.
+        else:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
@@ -225,7 +229,14 @@ class SchedulerOutputProcessorMixin:
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+        if self.spec_algorithm.is_eagle():
+            accept_length = logits_output.accept_length.tolist()
+            idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
+        else:
+            idx_to_batch = list(range(len(batch.reqs)))
+
+        for i, (b, next_token_id) in enumerate(zip(idx_to_batch, next_token_ids)):
+            req = batch.reqs[b]
             if req.is_retracted:
                 continue
 
@@ -233,8 +244,9 @@ class SchedulerOutputProcessorMixin:
                 # Free the one extra delayed token
                 if self.page_size == 1:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                else:
+                elif self.spec_algorithm.is_none():
                     # Only free when the extra token is in a new page
+                    # NOTE (timmy): do we do anything for eagle?
                     if (
                         len(req.origin_input_ids) + len(req.output_ids) - 1
                     ) % self.page_size == 0:
@@ -243,17 +255,10 @@ class SchedulerOutputProcessorMixin:
                         )
                 continue
 
-            if batch.spec_algorithm.is_none():
-                # speculative worker will solve the output_ids in speculative decoding
-                req.output_ids.append(next_token_id)
-
+            req.output_ids.append(next_token_id)
             req.check_finished()
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
-                req.time_stats.completion_time = time.time()
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
-                # speculative worker handles logprob in speculative decoding
+            if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
                 if req.top_logprobs_num > 0:
@@ -276,7 +281,7 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None and batch.spec_algorithm.is_none():
+            if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     req.grammar.accept_token(next_token_id)
@@ -288,6 +293,11 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
+
+        for req in batch.reqs:
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+                req.time_stats.completion_time = time.time()
 
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)

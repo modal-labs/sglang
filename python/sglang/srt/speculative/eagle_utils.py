@@ -490,46 +490,6 @@ class EagleVerifyInput:
                 spec_steps=self.spec_steps,
             )
 
-        unfinished_index = []
-        unfinished_accept_index = []
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
-        has_finished = False
-
-        # Iterate every accepted token and check if req has finished after append the token
-        # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
-                    break
-                id = predict_cpu[idx]
-                req.output_ids.append(id)
-                req.check_finished()
-                if req.finished():
-                    has_finished = True
-                    # set all tokens after finished token to -1 and break
-                    accept_index[i, j + 1 :] = -1
-                    break
-                else:
-                    if req.grammar is not None:
-                        try:
-                            req.grammar.accept_token(id)
-                        except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
-                            raise e
-            if not req.finished():
-                unfinished_index.append(i)
-                if idx == -1:
-                    unfinished_accept_index.append(accept_index[i, :j])
-                else:
-                    unfinished_accept_index.append(accept_index[i])
-            req.spec_verify_ct += 1
-
-        if has_finished:
-            accept_length = (accept_index != -1).sum(dim=1) - 1
-
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
         accept_index_full = accept_index.flatten()
