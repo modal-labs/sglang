@@ -129,7 +129,6 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
     ):
-        print(f"[RadixCache] init {page_size=}")
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
@@ -220,7 +219,6 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
-        # print(f"[RadixCache] cache_finished_req {kv_indices=} {len(token_ids)=} {len(req.origin_input_ids)=} {len(req.output_ids)=}")
 
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size

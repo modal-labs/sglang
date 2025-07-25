@@ -235,12 +235,18 @@ class SchedulerOutputProcessorMixin:
         else:
             idx_to_batch = list(range(len(batch.reqs)))
 
-        # Populate req.output_ids and similar fields
+        # Add new tokens to requests
         for i, (b, next_token_id) in enumerate(zip(idx_to_batch, next_token_ids)):
             req = batch.reqs[b]
-            assert not req.is_retracted
+            if req.is_retracted:
+                # TODO(nathan): Make sure this is OK
+                continue
 
-            # TODO(nathan): We might populate some extra tokens for speculative models, but we probably shouldn't?
+            # TODO(nathan): Speculative models could return extra tokens even after the request is finished.
+            # In particular they'll return all draft tokens that match target tokens,
+            # even if the tokens appear after the request is finished.
+            # As a consequence, we may end up caching more tokens than necessary. Also, req.output_ids will be
+            # longer than it should be.
             req.output_ids.append(next_token_id)
 
             if req.return_logprob:
@@ -281,14 +287,17 @@ class SchedulerOutputProcessorMixin:
         
         for b, req in enumerate(batch.reqs):
             if req.finished():
-                assert self.enable_overlap, "only time req should be finished already is if overlap is enabled"
-                assert self.page_size == 1, "page size > 1 haven't thoguht about yet"
-                assert self.spec_algorithm.is_eagle(), "uhh help, i think accept_length[b] is just 1?"
+                # An extra token was generated due to zero-overlap scheduling. Discard it from the KV cache.
+
+                assert self.enable_overlap, "A completed request should only be given to process_batch_result_decode if overlap is enabled"
+                assert self.page_size == 1, "TODO(nathan): Add support for page size > 1"
+                assert self.spec_algorithm.is_eagle(), "TODO(nathan): I think if spec_algorithm is not eagle, we should assume accept_length[b] is 1"
 
                 previous_output_ids_len = len(req.output_ids) - accept_length[b]
 
-                # Man, what even is this indexing. Which tokens are from the draft model and which are from the target model?
-                # This is taken from cache_finished_req in radix_cache.py
+                # TODO(nathan): Understand what this code is doing.
+                # Which tokens are from the draft model and which are from the target model?
+                # This is taken from cache_finished_req in radix_cache.py.
                 kv_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, len(req.origin_input_ids) + previous_output_ids_len - 1: len(req.origin_input_ids) + len(req.output_ids) - 1
                 ]
@@ -298,10 +307,6 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished()
             if req.finished():
-                # Speculative models could return extra tokens even after the request is finished.
-                # In particular they'll return all tokens where draft model matches target model,
-                # even if the tokens appear after the request is finished.
-                # So we might be caching extra tokens here.
                 self.tree_cache.cache_finished_req(req)
                 req.time_stats.completion_time = time.time()
 

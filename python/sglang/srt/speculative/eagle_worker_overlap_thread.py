@@ -105,7 +105,7 @@ class FutureSpecInfo:
         assert output_spec_info.topk_p.dtype == self.topk_p.dtype
         assert output_spec_info.topk_index.dtype == self.topk_index.dtype
         assert output_spec_info.hidden_states.dtype == self.hidden_states.dtype
-        # assert output_spec_info.verified_id.dtype == self.verified_id.dtype
+        assert output_spec_info.verified_id.dtype == self.verified_id.dtype
 
         self.topk_p[pointers] = output_spec_info.topk_p
         self.topk_index[pointers] = output_spec_info.topk_index
@@ -152,7 +152,7 @@ class EAGLEWorkerClient:
         assert self.worker.topk is not None
         assert self.device is not None
         self.future_spec_infos: FutureSpecInfo = FutureSpecInfo(
-            max_items=self.max_running_requests * 1000,  # Technically I think this only needs to be 2, but whatever
+            max_items=self.max_running_requests * 1000,  # TODO(nathan): Make this something more reasonable. Have to fix the circular buffer implementation of FutureSpecInfo first though.
             topk=self.worker.topk,
             hidden_size=self.worker.model_runner.model_config.hidden_size,
             device=torch.device(self.device),
@@ -186,7 +186,7 @@ class EAGLEWorkerClient:
         batch_lists = [None] * 2
 
         while True:
-            batch, reqs, sync_event, output_spec_info_pointers = self.input_queue.get()
+            batch, sync_event, output_spec_info_pointers = self.input_queue.get()
             if batch is None:
                 break
 
@@ -217,7 +217,7 @@ class EAGLEWorkerClient:
                 _,
                 can_run_cuda_graph,
                 output_spec_info,
-            ) = self.worker.forward_batch_speculative_generation(batch, reqs)
+            ) = self.worker.forward_batch_speculative_generation(batch)
 
             self.future_spec_infos.put_data(output_spec_info_pointers, output_spec_info)
 
@@ -271,7 +271,7 @@ class EAGLEWorkerClient:
         return logits_output, next_token_ids, bid, can_run_cuda_graph
 
     def forward_batch_speculative_generation(
-        self, model_worker_batch: ModelWorkerBatch, reqs: List[Req]
+        self, model_worker_batch: ModelWorkerBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool, EagleDraftInput]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
@@ -280,6 +280,7 @@ class EAGLEWorkerClient:
             sampling_info_done=threading.Event(),
         )
 
+        # TODO(nathan): Remove this restriction
         assert len(model_worker_batch.seq_lens) == 1, "only batch size 1 is supported for overlap scheduling"
 
         # Create sync event to coordinate streams
@@ -294,7 +295,7 @@ class EAGLEWorkerClient:
         spec_info_pointers = self.future_spec_infos.get_pointers(len(model_worker_batch.seq_lens))
 
         # Push batch to queue
-        self.input_queue.put((model_worker_batch, reqs.copy(), sync_event, spec_info_pointers))
+        self.input_queue.put((model_worker_batch, sync_event, spec_info_pointers))
 
         # For overlap scheduling, we return a list of pointers to the spec info we will eventually populate (once the current batch finishes running).
         # The scheduler will mutate this list of pointers as needed and give it back to us as part of the next batch's model_worker_batch.spec_info.

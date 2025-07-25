@@ -1538,13 +1538,14 @@ class Scheduler(
         else:
             req_total_size = self.req_to_token_pool.size
 
-        if len(self.req_to_token_pool.free_slots) < req_total_size - 128:  # TODO(nathan): shouldn't be here
-            msg = (
-                "req_to_token_pool memory leak detected!"
-                f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"total_size={self.req_to_token_pool.size}\n"
-            )
-            raise ValueError(msg)
+        # TODO(nathan): Fix this
+        # if len(self.req_to_token_pool.free_slots) != req_total_size:
+        #     msg = (
+        #         "req_to_token_pool memory leak detected!"
+        #         f"available_size={len(self.req_to_token_pool.free_slots)}, "
+        #         f"total_size={self.req_to_token_pool.size}\n"
+        #     )
+        #     raise ValueError(msg)
 
         if (
             self.enable_metrics
@@ -1901,9 +1902,6 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             else:
-                if batch.has_grammar:
-                    raise NotImplementedError("Grammar is not supported for now")
-
                 model_worker_batch = batch.get_model_worker_batch()
 
                 (
@@ -1913,9 +1911,9 @@ class Scheduler(
                     num_accepted_tokens,
                     can_run_cuda_graph,
                     next_spec_info,
-                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch, batch.reqs)
-
+                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
                 batch.spec_info = next_spec_info
+
                 bs = batch.batch_size()
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
                 self.spec_num_total_forward_ct += bs

@@ -298,7 +298,7 @@ class EAGLEWorker(TpModelWorker):
         return self.model_runner
 
     def forward_batch_speculative_generation(
-        self, model_worker_batch: ModelWorkerBatch, reqs: List[Req]
+        self, model_worker_batch: ModelWorkerBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool, EagleDraftInput]:
         """Run speculative decoding forward.
 
@@ -308,13 +308,9 @@ class EAGLEWorker(TpModelWorker):
         Args:
             batch: The batch to run forward. The state of the batch is modified as it runs.
         Returns:
-            A tuple of:
-            - the final logit output of the target model
-            - next tokens accepted
-            - the batch id (used for overlap schedule)
-            - number of accepted tokens
-            - whether the cuda graph can be run
-            - the speculative decoding info for the next batch
+            A tuple of the final logit output of the target model, next tokens accepted,
+            the batch id (used for overlap schedule), number of accepted tokens, and the
+            speculative decoding info for the next batch.
         """
 
         if model_worker_batch.forward_mode.is_extend() or model_worker_batch.is_extend_in_batch:
@@ -335,7 +331,7 @@ class EAGLEWorker(TpModelWorker):
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(model_worker_batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(model_worker_batch, spec_info, reqs)
+                self.verify(model_worker_batch, spec_info)
             )
 
             if self.check_forward_draft_extend_after_decode(model_worker_batch):
@@ -419,7 +415,7 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
-            # TODO(nathan): Not quite equivalent to ScheduleBatch.alloc_token_slots, but good enough for now
+            # TODO(nathan): This is copied from ScheduleBatch.alloc_token_slots but is missing some important logic.
             token_to_kv_pool_state_backup = self.token_to_kv_pool_allocator.backup_state()
             out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_seqs * self.speculative_num_steps * self.topk)
             if out_cache_loc is None:
@@ -450,7 +446,7 @@ class EAGLEWorker(TpModelWorker):
 
         model_worker_batch.out_cache_loc = out_cache_loc
 
-        # TODO(nathan): Understand why this isn't always true -- in particular on the second DECODE step??
+        # TODO(nathan): I don't understand why this isn't always true?
         model_worker_batch.seq_lens_sum = torch.sum(model_worker_batch.seq_lens).item()
 
         assert self.topk is not None
@@ -595,7 +591,7 @@ class EAGLEWorker(TpModelWorker):
 
         return score_list, token_list, parents_list
 
-    def verify(self, model_worker_batch: ModelWorkerBatch, spec_info: EagleVerifyInput, reqs: List[Req]):
+    def verify(self, model_worker_batch: ModelWorkerBatch, spec_info: EagleVerifyInput):
         assert self.token_to_kv_pool_allocator is not None
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
@@ -623,7 +619,6 @@ class EAGLEWorker(TpModelWorker):
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             self.page_size,
-            reqs,
             device=self.device,
             vocab_mask=None,
         )
@@ -685,7 +680,7 @@ class EAGLEWorker(TpModelWorker):
                     self.speculative_num_steps,
                 )
             else:
-                # TODO(nathan): wtf am I supposed to do here
+                # TODO(nathan): Figure out what to do here
                 raise NotImplementedError("idle is not supported for now")
                 batch = batch.copy()
                 batch.prepare_for_idle()

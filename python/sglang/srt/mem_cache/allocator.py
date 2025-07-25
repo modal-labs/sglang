@@ -110,7 +110,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
         super().__init__(size, 1, dtype, device, kvcache)
-        # print(f"[TokenToKVPoolAllocator] init {size} {dtype} {device} {kvcache}")
         self.clear()
 
     def clear(self):
@@ -120,7 +119,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.is_not_in_free_group = True
         self.free_group = []
-        # print(f"[TokenToKVPoolAllocator] clear. Remaining: {len(self.free_pages)}")
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -132,11 +130,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
-
-        # print(f"[TokenToKVPoolAllocator] alloc {need_size}. Remaining: {len(self.free_pages)}")
-        # import traceback
-        # traceback.print_stack()
-
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -147,23 +140,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(free_index)
-        
-        # if len(torch.unique(self.free_pages)) != len(self.free_pages):
-        #     print(f"[TokenToKVPoolAllocator] free {free_index.shape}. Remaining: {len(self.free_pages)} ({self.is_not_in_free_group=})")
-        #     print(len(torch.unique(self.free_pages)), len(self.free_pages))
-        #     print(set(range(1, self.size + 1)) - set(self.free_pages.tolist()))
-        #     # print only duplicates
-        #     uniques, counts = torch.unique(self.free_pages, return_counts=True)
-        #     duplicates = uniques[counts > 1]
-        #     if len(duplicates) > 0:
-        #         print("Duplicates in free_pages:", duplicates)
-        #     import traceback
-        #     traceback.print_stack()
-        #     raise Exception("Duplicates in free_pages")
-
-        # print(f"[TokenToKVPoolAllocator] free {free_index.shape}. Remaining: {len(self.free_pages)} ({self.is_not_in_free_group=})")
-        # import traceback
-        # traceback.print_stack()
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

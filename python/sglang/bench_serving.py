@@ -554,8 +554,6 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
-                                # print(f"Generated text: {generated_text}")
-
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
