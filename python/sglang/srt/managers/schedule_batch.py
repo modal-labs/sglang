@@ -890,6 +890,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
+    free_cache_loc_cpu: Optional[torch.Tensor] = None
 
     # Enable custom logit processor
     enable_custom_logit_processor: bool = False
