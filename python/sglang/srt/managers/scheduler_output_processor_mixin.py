@@ -295,6 +295,9 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         for req in batch.reqs:
+            if req.free_cache_loc_cpu is not None:
+                free_cache_loc_cpu = req.free_cache_loc_cpu[req.free_cache_loc_cpu != 0]
+                self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
                 req.time_stats.completion_time = time.time()
