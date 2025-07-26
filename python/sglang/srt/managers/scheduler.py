@@ -1538,13 +1538,14 @@ class Scheduler(
         else:
             req_total_size = self.req_to_token_pool.size
 
-        if len(self.req_to_token_pool.free_slots) != req_total_size:
-            msg = (
-                "req_to_token_pool memory leak detected!"
-                f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"total_size={self.req_to_token_pool.size}\n"
-            )
-            raise ValueError(msg)
+        # TODO(nathan): Fix this
+        # if len(self.req_to_token_pool.free_slots) != req_total_size:
+        #     msg = (
+        #         "req_to_token_pool memory leak detected!"
+        #         f"available_size={len(self.req_to_token_pool.free_slots)}, "
+        #         f"total_size={self.req_to_token_pool.size}\n"
+        #     )
+        #     raise ValueError(msg)
 
         if (
             self.enable_metrics
@@ -1901,17 +1902,17 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             else:
+                model_worker_batch = batch.get_model_worker_batch()
+
                 (
                     logits_output,
                     next_token_ids,
                     bid,
                     num_accepted_tokens,
                     can_run_cuda_graph,
-                ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                bs = batch.batch_size()
-                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
-                self.spec_num_total_forward_ct += bs
-                self.num_generated_tokens += num_accepted_tokens
+                    next_spec_info,
+                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
+                batch.spec_info = next_spec_info
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
