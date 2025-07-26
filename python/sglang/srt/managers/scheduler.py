@@ -1905,13 +1905,9 @@ class Scheduler(
                     logits_output,
                     next_token_ids,
                     bid,
-                    num_accepted_tokens,
+                    _,
                     can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                bs = batch.batch_size()
-                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
-                self.spec_num_total_forward_ct += bs
-                self.num_generated_tokens += num_accepted_tokens
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
@@ -2021,6 +2017,7 @@ class Scheduler(
                 [
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
+                    # TODO (timmy): we should maybe deprecate `extend_lens`
                     for logprob_start_len, extend_len in zip(
                         local_batch.extend_logprob_start_lens, local_batch.extend_lens
                     )

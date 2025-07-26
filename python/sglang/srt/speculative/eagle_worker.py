@@ -334,7 +334,7 @@ class EAGLEWorker(TpModelWorker):
                 logits_output,
                 verify_output.verified_id,
                 model_worker_batch.bid,
-                sum(verify_output.accept_length_per_req_cpu),
+                0,
                 can_run_cuda_graph,
             )
 

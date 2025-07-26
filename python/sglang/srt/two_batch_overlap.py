@@ -292,6 +292,7 @@ class TboDPAttentionPreparer:
                 num_tokens = local_batch.batch_size() * token_num_per_seq
             else:
                 num_tokens = local_batch.extend_num_tokens
+            # TODO (timmy): we should maybe deprecate `extend_lens`
             self.local_tbo_split_seq_index = compute_split_seq_index(
                 forward_mode=local_batch.forward_mode,
                 num_tokens=num_tokens,
