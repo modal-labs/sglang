@@ -207,7 +207,6 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
-        self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
             if self.spec_algorithm.is_eagle():
@@ -234,6 +233,12 @@ class SchedulerOutputProcessorMixin:
             idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
         else:
             idx_to_batch = list(range(len(batch.reqs)))
+
+        num_generated_tokens_this_batch = len(idx_to_batch)
+        self.num_generated_tokens += num_generated_tokens_this_batch
+        if self.spec_algorithm.is_eagle():
+            self.spec_num_total_accepted_tokens += num_generated_tokens_this_batch
+            self.spec_num_total_forward_ct += len(batch.reqs)
 
         # Add new tokens to requests
         for i, (b, next_token_id) in enumerate(zip(idx_to_batch, next_token_ids)):
