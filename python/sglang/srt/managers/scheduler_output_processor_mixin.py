@@ -230,7 +230,7 @@ class SchedulerOutputProcessorMixin:
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
         if self.spec_algorithm.is_eagle():
-            accept_length = logits_output.accept_length.tolist()
+            accept_length = logits_output.accept_length_cpu.tolist()
             idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
         else:
             idx_to_batch = list(range(len(batch.reqs)))
