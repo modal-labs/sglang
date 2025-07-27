@@ -209,11 +209,16 @@ class SchedulerOutputProcessorMixin:
         )
         self.num_generated_tokens += len(batch.reqs)
 
+        self.token_to_kv_pool_allocator.free_group_begin()
+
         if self.enable_overlap:
             if self.spec_algorithm.is_eagle():
-                logits_output, next_token_ids, _, can_run_cuda_graph = (
+                logits_output, next_token_ids, _, can_run_cuda_graph, free_cache_loc_cpu = (
                     self.draft_worker.resolve_last_batch_result(launch_done)
                 )
+                free_cache_loc_cpu = free_cache_loc_cpu[free_cache_loc_cpu != 0]
+
+                self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
             else:
                 logits_output, next_token_ids, can_run_cuda_graph = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
@@ -223,8 +228,6 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-
-        self.token_to_kv_pool_allocator.free_group_begin()
 
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
@@ -295,9 +298,6 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         for req in batch.reqs:
-            if req.free_cache_loc_cpu is not None:
-                free_cache_loc_cpu = req.free_cache_loc_cpu[req.free_cache_loc_cpu != 0]
-                self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
                 req.time_stats.completion_time = time.time()
