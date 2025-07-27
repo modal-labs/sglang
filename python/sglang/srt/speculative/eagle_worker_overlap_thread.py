@@ -153,7 +153,7 @@ class EAGLEWorkerClient:
             copy_done.record()
 
             self.output_queue.put(
-                (copy_done, logits_output, next_token_ids, bid, can_run_cuda_graph)
+                (copy_done, logits_output, next_token_ids, bid, can_run_cuda_graph, batch.free_cache_loc_cpu)
             )
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
@@ -161,7 +161,7 @@ class EAGLEWorkerClient:
         Resolve the last batch result and wait for the current batch to be launched.
         Used in overlap mode.
         """
-        copy_done, logits_output, next_token_ids, bid, can_run_cuda_graph = (
+        copy_done, logits_output, next_token_ids, bid, can_run_cuda_graph, free_cache_loc_cpu = (
             self.output_queue.get()
         )
         
@@ -178,7 +178,7 @@ class EAGLEWorkerClient:
                     logits_output.input_token_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
-        return logits_output, next_token_ids, bid, can_run_cuda_graph
+        return logits_output, next_token_ids, bid, can_run_cuda_graph, free_cache_loc_cpu
 
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
