@@ -130,6 +130,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        print(f"allocating {select_index}")
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -137,6 +138,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
+            print(f"freeing {free_index}")
             self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(free_index)
