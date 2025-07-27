@@ -202,23 +202,19 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        logits_output, next_token_ids, can_run_cuda_graph = (
+        logits_output, next_token_ids, free_cache_loc_cpu, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
+            result.free_cache_loc_cpu,
             result.can_run_cuda_graph,
         )
         self.num_generated_tokens += len(batch.reqs)
-
-        self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.enable_overlap:
             if self.spec_algorithm.is_eagle():
                 logits_output, next_token_ids, _, can_run_cuda_graph, free_cache_loc_cpu = (
                     self.draft_worker.resolve_last_batch_result(launch_done)
                 )
-                free_cache_loc_cpu = free_cache_loc_cpu[free_cache_loc_cpu != 0]
-
-                self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
             else:
                 logits_output, next_token_ids, can_run_cuda_graph = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
@@ -228,6 +224,12 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+
+        if free_cache_loc_cpu is not None:
+            free_cache_loc_cpu = free_cache_loc_cpu[free_cache_loc_cpu != 0]
+            self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
 
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
@@ -243,7 +245,7 @@ class SchedulerOutputProcessorMixin:
             if req.is_retracted:
                 continue
 
-            if self.enable_overlap and req.finished():
+            if (self.enable_overlap or self.spec_algorithm.is_eagle()) and req.finished():
                 # Free the one extra delayed token
                 if self.page_size == 1:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
