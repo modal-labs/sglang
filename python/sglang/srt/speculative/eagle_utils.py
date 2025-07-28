@@ -191,8 +191,6 @@ class EagleVerifyOutput:
     verified_id: torch.Tensor
     # KV indices to free
     free_cache_loc_cpu: Optional[torch.Tensor]
-    # Accepted token length per sequence in a batch in CPU.
-    accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
 
@@ -340,7 +338,6 @@ class EagleVerifyInput:
                 logits_output=logits_output,
                 verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
                 free_cache_loc_cpu=None,
-                accept_length_per_req_cpu=[],
                 accepted_indices=torch.full(
                     (0, self.spec_steps + 1),
                     -1,
@@ -508,7 +505,6 @@ class EagleVerifyInput:
             draft_input=draft_input,
             logits_output=logits_output,
             verified_id=verified_id,
-            accept_length_per_req_cpu=[],
             accepted_indices=accept_index,
             free_cache_loc_cpu=free_cache_loc_cpu,
         )
