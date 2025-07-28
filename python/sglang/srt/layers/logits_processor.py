@@ -56,7 +56,7 @@ class LogitsProcessorOutput:
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
     # Speculative accept lengths
-    accept_length_cpu: Optional[torch.Tensor] = None
+    accept_length: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # The logprobs of the next tokens.                              shape: [#seq]
