@@ -63,7 +63,7 @@ class EAGLEWorkerClient:
         self.device = self.worker.device
         self.gpu_id = gpu_id
         self.max_running_requests = self.worker.max_running_requests
-        
+
         # Init future mappings
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * (self.worker.speculative_num_steps + 1) * 3
@@ -74,7 +74,7 @@ class EAGLEWorkerClient:
         self.future_acceptance_counts = torch.zeros(
             (self.max_running_requests * 5,), dtype=torch.int64, device=self.device
         )
-        
+
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
@@ -125,6 +125,7 @@ class EAGLEWorkerClient:
             (
                 logits_output,
                 next_token_ids,
+                free_cache_loc_cpu,
                 bid,
                 _,
                 can_run_cuda_graph,
@@ -153,7 +154,7 @@ class EAGLEWorkerClient:
             copy_done.record()
 
             self.output_queue.put(
-                (copy_done, logits_output, next_token_ids, bid, can_run_cuda_graph)
+                (copy_done, logits_output, next_token_ids, free_cache_loc_cpu, bid, can_run_cuda_graph)
             )
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
@@ -161,10 +162,10 @@ class EAGLEWorkerClient:
         Resolve the last batch result and wait for the current batch to be launched.
         Used in overlap mode.
         """
-        copy_done, logits_output, next_token_ids, bid, can_run_cuda_graph = (
+        copy_done, logits_output, next_token_ids, free_cache_loc_cpu, bid, can_run_cuda_graph = (
             self.output_queue.get()
         )
-        
+
         if launch_done is not None:
             launch_done.wait()
         copy_done.synchronize()
@@ -178,7 +179,7 @@ class EAGLEWorkerClient:
                     logits_output.input_token_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
-        return logits_output, next_token_ids, bid, can_run_cuda_graph
+        return logits_output, next_token_ids, free_cache_loc_cpu, bid, can_run_cuda_graph
 
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch

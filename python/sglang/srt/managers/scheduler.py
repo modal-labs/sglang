@@ -176,6 +176,7 @@ _is_cpu = is_cpu()
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput]
     pp_hidden_states_proxy_tensors: Optional[torch.Tensor]
+    free_cache_loc_cpu: Optional[torch.Tensor]
     next_token_ids: Optional[List[int]]
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
@@ -1904,6 +1905,7 @@ class Scheduler(
                 (
                     logits_output,
                     next_token_ids,
+                    free_cache_loc_cpu,
                     bid,
                     num_accepted_tokens,
                     can_run_cuda_graph,
@@ -1937,6 +1939,7 @@ class Scheduler(
                     if not self.pp_group.is_last_rank
                     else None
                 ),
+                free_cache_loc_cpu=free_cache_loc_cpu if self.spec_algorithm.is_eagle() else None,
                 next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
