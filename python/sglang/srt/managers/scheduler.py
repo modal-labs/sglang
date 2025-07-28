@@ -1732,6 +1732,7 @@ class Scheduler(
                 (
                     logits_output,
                     next_token_ids,
+                    free_cache_loc_cpu,
                     bid,
                     num_accepted_tokens,
                     can_run_cuda_graph,
@@ -1740,7 +1741,6 @@ class Scheduler(
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
                 self.spec_num_total_forward_ct += bs
                 self.num_generated_tokens += num_accepted_tokens
-                free_cache_loc_cpu = batch.free_cache_loc_cpu
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids

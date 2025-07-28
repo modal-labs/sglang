@@ -212,7 +212,7 @@ class SchedulerOutputProcessorMixin:
 
         if self.enable_overlap:
             if self.spec_algorithm.is_eagle():
-                logits_output, next_token_ids, _, can_run_cuda_graph, free_cache_loc_cpu = (
+                logits_output, next_token_ids, free_cache_loc_cpu, _, can_run_cuda_graph = (
                     self.draft_worker.resolve_last_batch_result(launch_done)
                 )
             else:
