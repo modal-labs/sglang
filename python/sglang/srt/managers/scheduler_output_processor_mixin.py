@@ -52,7 +52,7 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap:
                 if self.spec_algorithm.is_eagle():
-                    logits_output, next_token_ids, _, _ = (
+                    logits_output, next_token_ids, free_cache_loc_cpu, _, _ = (
                         self.draft_worker.resolve_last_batch_result(launch_done)
                     )
                 else:
@@ -238,34 +238,25 @@ class SchedulerOutputProcessorMixin:
             self.spec_num_total_forward_ct += len(batch.reqs)
         else:
             idx_to_batch = list(range(len(batch.reqs)))
-            self.num_generated_tokens += len(batch.reqs)
 
-        # Check finish condition
+        num_generated_tokens_this_batch = len(idx_to_batch)
+        self.num_generated_tokens += num_generated_tokens_this_batch
+        if self.spec_algorithm.is_eagle():
+            self.spec_num_total_accepted_tokens += num_generated_tokens_this_batch
+            self.spec_num_total_forward_ct += len(batch.reqs)
+
+        # Add new tokens to requests
         for i, (b, next_token_id) in enumerate(zip(idx_to_batch, next_token_ids)):
             req = batch.reqs[b]
             if req.is_retracted:
                 continue
 
-            if (self.enable_overlap or self.spec_algorithm.is_eagle()) and req.finished():
-                # Free the one extra delayed token
-                if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                elif self.spec_algorithm.is_none():
-                    # Only free when the extra token is in a new page
-                    # NOTE (timmy): do we do anything for eagle?
-                    if (
-                        len(req.origin_input_ids) + len(req.output_ids) - 1
-                    ) % self.page_size == 0:
-                        self.token_to_kv_pool_allocator.free(
-                            batch.out_cache_loc[i : i + 1]
-                        )
-                continue
-
+            # TODO(nathan): Speculative models could return extra tokens even after the request is finished.
+            # In particular they'll return all draft tokens that match target tokens,
+            # even if the tokens appear after the request is finished.
+            # As a consequence, we may end up caching more tokens than necessary. Also, req.output_ids will be
+            # longer than it should be.
             req.output_ids.append(next_token_id)
-            req.check_finished()
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
-                req.time_stats.completion_time = time.time()
 
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
@@ -302,6 +293,33 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
+        
+        for b, req in enumerate(batch.reqs):
+            if req.finished():
+                # An extra token was generated due to zero-overlap scheduling. Discard it from the KV cache.
+
+<<<<<<< HEAD
+=======
+                assert self.enable_overlap, "A completed request should only be given to process_batch_result_decode if overlap is enabled"
+                assert self.page_size == 1, "TODO(nathan): Add support for page size > 1"
+                assert self.spec_algorithm.is_eagle(), "TODO(nathan): I think if spec_algorithm is not eagle, we should assume accept_length[b] is 1"
+
+                previous_output_ids_len = len(req.output_ids) - accept_length[b]
+
+                # TODO(nathan): Understand what this code is doing.
+                # Which tokens are from the draft model and which are from the target model?
+                # This is taken from cache_finished_req in radix_cache.py.
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, len(req.origin_input_ids) + previous_output_ids_len - 1: len(req.origin_input_ids) + len(req.output_ids) - 1
+                ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+                self.req_to_token_pool.free(req.req_pool_idx)
+                continue
+
+            req.check_finished()
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+                req.time_stats.completion_time = time.time()
 
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)

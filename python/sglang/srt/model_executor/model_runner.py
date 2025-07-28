@@ -1172,7 +1172,7 @@ class ModelRunner:
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
+                    size=max_num_reqs * 8,  # TODO(nathan): is this actually necessary?
                     max_context_len=self.model_config.context_len + 4,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,

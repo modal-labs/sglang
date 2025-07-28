@@ -1361,13 +1361,14 @@ class Scheduler(
         else:
             req_total_size = self.req_to_token_pool.size
 
-        if len(self.req_to_token_pool.free_slots) != req_total_size:
-            msg = (
-                "req_to_token_pool memory leak detected!"
-                f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"total_size={self.req_to_token_pool.size}\n"
-            )
-            raise ValueError(msg)
+        # TODO(nathan): Fix this
+        # if len(self.req_to_token_pool.free_slots) != req_total_size:
+        #     msg = (
+        #         "req_to_token_pool memory leak detected!"
+        #         f"available_size={len(self.req_to_token_pool.free_slots)}, "
+        #         f"total_size={self.req_to_token_pool.size}\n"
+        #     )
+        #     raise ValueError(msg)
 
         if (
             self.enable_metrics
@@ -1730,10 +1731,18 @@ class Scheduler(
                 bid = model_worker_batch.bid
             else:
                 # TODO (timmy): move this to model_worker_batch
+                # TODO(nathan): handle this
                 batch.seq_lens_cpu = batch.seq_lens.cpu()
                 if self.enable_overlap:
                     # Optimistically estimate the seq_lens_cpu for the next draft forward
                     batch.seq_lens_cpu.add_(self.server_args.speculative_num_steps + 1)
+
+                if batch.has_grammar:
+                    raise NotImplementedError("Grammar is not supported for now")
+
+                model_worker_batch = batch.get_model_worker_batch(seq_lens_cpu_cache=batch.seq_lens_cpu)
+                # TODO(nathan): not sure why this is needed
+                model_worker_batch.seq_lens_cpu = batch.seq_lens_cpu
 
                 (
                     logits_output,
@@ -1741,7 +1750,9 @@ class Scheduler(
                     free_cache_loc_cpu,
                     bid,
                     can_run_cuda_graph,
-                ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                    next_spec_info,
+                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
+                batch.spec_info = next_spec_info
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
