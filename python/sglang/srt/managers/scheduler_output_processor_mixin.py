@@ -208,7 +208,6 @@ class SchedulerOutputProcessorMixin:
             result.free_cache_loc_cpu,
             result.can_run_cuda_graph,
         )
-        self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
             if self.spec_algorithm.is_eagle():
@@ -231,15 +230,17 @@ class SchedulerOutputProcessorMixin:
             free_cache_loc_cpu = free_cache_loc_cpu[free_cache_loc_cpu != 0]
             self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
 
-        # Check finish condition
-        # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
-        # We should ignore using next_token_ids for spec decoding cases.
         if self.spec_algorithm.is_eagle():
             accept_length = logits_output.accept_length.tolist()
             idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
+            self.num_generated_tokens += sum(accept_length)
+            self.spec_num_total_accepted_tokens += sum(accept_length)
+            self.spec_num_total_forward_ct += len(batch.reqs)
         else:
             idx_to_batch = list(range(len(batch.reqs)))
+            self.num_generated_tokens += len(batch.reqs)
 
+        # Check finish condition
         for i, (b, next_token_id) in enumerate(zip(idx_to_batch, next_token_ids)):
             req = batch.reqs[b]
             if req.is_retracted:
