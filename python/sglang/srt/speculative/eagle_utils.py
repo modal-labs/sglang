@@ -174,26 +174,32 @@ class EagleDraftInput:
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor):
-        self.topk_p = self.topk_p[new_indices]
-        self.topk_index = self.topk_index[new_indices]
-        self.hidden_states = self.hidden_states[new_indices]
-        self.verified_id = self.verified_id[new_indices]
+        if self.topk_p is not None:
+            self.topk_p = self.topk_p[new_indices]
+        if self.topk_index is not None:
+            self.topk_index = self.topk_index[new_indices]
+        if self.hidden_states is not None:
+            self.hidden_states = self.hidden_states[new_indices]
+        if self.verified_id is not None:
+            self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
-            self.verified_id = spec_info.verified_id
+        else:
+            self.hidden_states = torch.cat([self.hidden_states, spec_info.hidden_states], axis=0)
+        if self.topk_p is None:
             self.topk_p = spec_info.topk_p
+        else:
+            self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], axis=0)
+        if self.topk_index is None:
             self.topk_index = spec_info.topk_index
-            return
-        if spec_info.hidden_states is None:
-            return
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
-        )
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        else:
+            self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], axis=0)
+        if self.verified_id is None:
+            self.verified_id = spec_info.verified_id
+        else:
+            self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
 
 
 @dataclass

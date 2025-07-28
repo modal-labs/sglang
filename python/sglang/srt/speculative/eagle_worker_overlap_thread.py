@@ -280,9 +280,6 @@ class EAGLEWorkerClient:
             sampling_info_done=threading.Event(),
         )
 
-        # TODO(nathan): Remove this restriction
-        assert len(model_worker_batch.seq_lens) == 1, "only batch size 1 is supported for overlap scheduling"
-
         # Create sync event to coordinate streams
         sync_event = torch.get_device_module(self.device).Event()
         sync_event.record(self.scheduler_stream)
