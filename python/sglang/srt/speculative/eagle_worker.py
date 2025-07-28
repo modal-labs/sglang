@@ -299,7 +299,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], int, int, bool]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], int, bool]:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -320,7 +320,7 @@ class EAGLEWorker(TpModelWorker):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
-            return logits_output, next_token_ids, None, bid, 0, False
+            return logits_output, next_token_ids, None, bid, False
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
@@ -343,7 +343,6 @@ class EAGLEWorker(TpModelWorker):
                 verify_output.verified_id,
                 verify_output.free_cache_loc_cpu,
                 model_worker_batch.bid,
-                sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph,
             )
 
@@ -797,6 +796,7 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+        forward_batch.extend_seq_lens = batch.spec_info.accept_length
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:

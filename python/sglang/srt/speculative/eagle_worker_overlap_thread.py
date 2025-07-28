@@ -127,7 +127,6 @@ class EAGLEWorkerClient:
                 next_token_ids,
                 free_cache_loc_cpu,
                 bid,
-                _,
                 can_run_cuda_graph,
             ) = self.worker.forward_batch_speculative_generation(batch)
 
@@ -183,7 +182,7 @@ class EAGLEWorkerClient:
 
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
-    ) -> Tuple[None, torch.Tensor, int, int, bool]:
+    ) -> Tuple[None, torch.Tensor, Optional[torch.Tensor], int, bool]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = batch.sampling_info
         batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
@@ -213,7 +212,7 @@ class EAGLEWorkerClient:
             self.future_token_ids_ct + max_spec_tokens
         ) % self.future_token_ids_limit
 
-        return None, future_next_token_ids, -1, 0, False
+        return None, future_next_token_ids, None, -1, False
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
