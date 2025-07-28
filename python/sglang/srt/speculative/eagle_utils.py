@@ -63,7 +63,6 @@ class EagleDraftInput:
     # shape: (b,)
     verified_id: torch.Tensor = None
     accept_length: torch.Tensor = None
-    accept_length_cpu: List[int] = None
 
     # Inputs for the attention backends
     # shape: (b + 1,)
@@ -100,7 +99,6 @@ class EagleDraftInput:
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
-            accept_length_cpu=[],
         )
 
     def prepare_extend_after_decode(
@@ -110,8 +108,6 @@ class EagleDraftInput:
     ):
         batch.forward_mode = ForwardMode.DRAFT_EXTEND
         batch.input_ids = self.verified_id
-        batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
-        batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
@@ -505,7 +501,6 @@ class EagleVerifyInput:
         draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
         draft_input.verified_id = verified_id
         draft_input.accept_length = accept_length
-        draft_input.accept_length_cpu = accept_length.tolist()
         draft_input.seq_lens_for_draft_extend = batch.seq_lens
         draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
 
@@ -513,7 +508,7 @@ class EagleVerifyInput:
             draft_input=draft_input,
             logits_output=logits_output,
             verified_id=verified_id,
-            accept_length_per_req_cpu=draft_input.accept_length_cpu,
+            accept_length_per_req_cpu=[],
             accepted_indices=accept_index,
             free_cache_loc_cpu=free_cache_loc_cpu,
         )
