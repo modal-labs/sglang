@@ -831,6 +831,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
+    seq_lens_cpu: Optional[torch.Tensor] = None
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
