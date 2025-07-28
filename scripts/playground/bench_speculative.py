@@ -48,7 +48,7 @@ class FakeTokenizer:
         return []
 
 
-def send_one_batch(base_url, num_prompts, batch_size):
+def send_one_batch(base_url, num_prompts, batch_size, profile=False):
     padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
         :num_prompts
     ]
@@ -89,7 +89,7 @@ def send_one_batch(base_url, num_prompts, batch_size):
             disable_tqdm=False,
             lora_names=None,
             extra_request_body={},
-            profile=None,
+            profile=profile,
         )
     )
 
@@ -182,6 +182,13 @@ def main(args, server_args):
                 ]
             )
 
+        if server_args.disable_cuda_graph:
+            other_args.extend(
+                [
+                    "--disable-cuda-graph",
+                ]
+            )
+
         if server_args.trust_remote_code:
             other_args.extend(
                 [
@@ -222,7 +229,7 @@ def main(args, server_args):
 
             # Benchmark
             acc_length, step_time, speed, completion_tokens = send_one_batch(
-                base_url, max(args.num_prompts, batch_size), batch_size
+                base_url, max(args.num_prompts, batch_size), batch_size, args.profile
             )
         finally:
             kill_process_tree(process.pid)
@@ -282,7 +289,11 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int)
     parser.add_argument("--output", type=str, default="output.jsonl")
+    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
+
+    if args.profile:
+        args.num_prompts = 1
 
     main(args, server_args)
