@@ -69,6 +69,8 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
+    spec_steps: Optional[int] = None
+
     def prepare_for_extend(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
             return
@@ -502,6 +504,7 @@ class EagleVerifyInput:
         draft_input.accept_length = accept_length
         draft_input.seq_lens_for_draft_extend = batch.seq_lens
         draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
+        draft_input.spec_steps = self.spec_steps
 
         return EagleVerifyOutput(
             draft_input=draft_input,

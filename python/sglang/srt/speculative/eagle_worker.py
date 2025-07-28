@@ -728,6 +728,7 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
+            spec_steps=self.speculative_num_steps,
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
