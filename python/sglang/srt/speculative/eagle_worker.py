@@ -738,6 +738,7 @@ class EAGLEWorker(TpModelWorker):
             verified_id=next_token_ids,
             num_tokens_per_batch=1,
             num_tokens_for_logprob_per_batch=1,
+            spec_steps=self.speculative_num_steps,
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
