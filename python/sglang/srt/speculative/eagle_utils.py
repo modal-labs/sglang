@@ -193,6 +193,8 @@ class EagleVerifyOutput:
     logits_output: LogitsProcessorOutput
     # Accepted token ids including the bonus token
     verified_id: torch.Tensor
+    # KV indices to free
+    free_cache_loc_cpu: Optional[torch.Tensor]
     # Accepted token length per sequence in a batch in CPU.
     accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
@@ -319,7 +321,7 @@ class EagleVerifyInput:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
-    ) -> torch.Tensor:
+    ) -> EagleVerifyOutput:
         """
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
@@ -341,6 +343,7 @@ class EagleVerifyInput:
                 ),
                 logits_output=logits_output,
                 verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                free_cache_loc_cpu=None,
                 accept_length_per_req_cpu=[],
                 accepted_indices=torch.full(
                     (0, self.spec_steps + 1),
@@ -483,7 +486,7 @@ class EagleVerifyInput:
 
         if page_size > 1:
             raise NotImplementedError("Free cache loc cpu is not supported for page size > 1")
-        batch.free_cache_loc_cpu = torch.where(evict_mask, batch.out_cache_loc, 0).to("cpu", non_blocking=True)
+        free_cache_loc_cpu = torch.where(evict_mask, batch.out_cache_loc, 0).to("cpu", non_blocking=True)
 
         # Construct EagleVerifyOutput
         batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
@@ -512,6 +515,7 @@ class EagleVerifyInput:
             verified_id=verified_id,
             accept_length_per_req_cpu=draft_input.accept_length_cpu,
             accepted_indices=accept_index,
+            free_cache_loc_cpu=free_cache_loc_cpu,
         )
 
 
