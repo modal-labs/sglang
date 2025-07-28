@@ -48,7 +48,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import require_mlp_sync
 
@@ -744,7 +744,11 @@ class SchedulerDisaggregationDecodeMixin:
                         tmp_batch = ScheduleBatch(
                             reqs=None,
                             forward_mode=ForwardMode.DUMMY_FIRST,
-                            next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                            next_batch_sampling_info=(
+                                self.draft_worker.cur_sampling_info
+                                if self.spec_algorithm.is_eagle()
+                                else self.tp_worker.cur_sampling_info
+                            )
                         )
                         self.set_next_batch_sampling_info_done(tmp_batch)
                     last_batch_in_queue = True
@@ -761,7 +765,9 @@ class SchedulerDisaggregationDecodeMixin:
             if self.last_batch and self.last_batch_in_queue:
                 tmp_batch, tmp_result = result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    self.draft_worker.cur_sampling_info
+                    if self.spec_algorithm.is_eagle()
+                    else self.tp_worker.cur_sampling_info
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
 

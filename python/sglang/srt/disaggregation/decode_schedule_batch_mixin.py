@@ -139,6 +139,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 verified_id=self.output_ids,
                 spec_steps=server_args.speculative_num_steps,
             )
-            spec_info.prepare_for_extend(self)
+            model_worker_batch = self.get_model_worker_batch()
+            spec_info.prepare_for_extend(model_worker_batch)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            self.capture_hidden_mode = CaptureHiddenMode.LAST
             self.spec_info = spec_info

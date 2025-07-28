@@ -170,6 +170,10 @@ class EAGLEWorkerClient:
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
+    
+    @property
+    def model_runner(self):
+        return self.worker.model_runner
 
     def forward_thread_func(self):
         try:
@@ -203,7 +207,13 @@ class EAGLEWorkerClient:
             copy_done = torch.get_device_module(self.device).Event()
 
             if batch.forward_mode == ForwardMode.DECODE:
-                batch.spec_info = self.future_spec_infos.get_data(batch.spec_info.verified_id)
+                if batch.spec_info.hidden_states is None:
+                    # If hidden_states is None, we were given pointers to the spec info tensors.
+                    # This is almost always the case; however, if we are doing prefill-decode
+                    # disaggregation, then the very first decode request (where the hidden states,
+                    # etc are coming from the prefill worker) will _not_ be given pointers; it
+                    # will be given the actual spec info tensors.
+                    batch.spec_info = self.future_spec_infos.get_data(batch.spec_info.verified_id)
                 assert batch.spec_info.verified_id.shape == batch.seq_lens.shape
             else:
                 assert batch.forward_mode == ForwardMode.EXTEND

@@ -322,14 +322,21 @@ class SchedulerDisaggregationPrefillMixin:
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        next_batch_sampling_info=(
+                            self.draft_worker.cur_sampling_info
+                            if self.spec_algorithm.is_eagle()
+                            else self.tp_worker.cur_sampling_info
+                        ),
                     )
                     self.set_next_batch_sampling_info_done(tmp_batch)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    (self.draft_worker.cur_sampling_info
+                    if self.spec_algorithm.is_eagle()
+                    else self.tp_worker.cur_sampling_info)
+                    if batch else None
                 )
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
 
@@ -372,9 +379,14 @@ class SchedulerDisaggregationPrefillMixin:
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         if self.enable_overlap:
             # wait
-            logits_output, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(
-                launch_done
-            )
+            if self.spec_algorithm.is_eagle():
+                logits_output, next_token_ids, free_cache_loc_cpu, bid, can_run_cuda_graph = self.draft_worker.resolve_last_batch_result(
+                    launch_done
+                )
+            else:
+                logits_output, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(
+                    launch_done
+                )
         else:
             next_token_ids = result.next_token_ids.tolist()
             if batch.return_logprob:
@@ -387,7 +399,6 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output.input_token_logprobs.tolist()
                     )
 
-        hidden_state_offset = 0
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -398,13 +409,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
                 if logits_output.hidden_states is not None:
-                    last_hidden_index = (
-                        hidden_state_offset + extend_input_len_per_req[i] - 1
-                    )
+                    # TODO(nathan): I hacked this but now it only works with specdec
                     req.hidden_states_tensor = (
-                        logits_output.hidden_states[last_hidden_index].cpu().clone()
+                        batch.spec_info.hidden_states[i].cpu().clone()
                     )
-                    hidden_state_offset += extend_input_len_per_req[i]
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:
