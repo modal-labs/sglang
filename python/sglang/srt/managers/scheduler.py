@@ -1729,6 +1729,12 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             else:
+                # TODO (timmy): move this to model_worker_batch
+                batch.seq_lens_cpu = batch.seq_lens.cpu()
+                if self.enable_overlap:
+                    # Optimistically estimate the seq_lens_cpu for the next draft forward
+                    batch.seq_lens_cpu.add_(self.server_args.speculative_num_steps + 1)
+
                 (
                     logits_output,
                     next_token_ids,

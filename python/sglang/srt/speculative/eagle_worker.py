@@ -490,7 +490,7 @@ class EAGLEWorker(TpModelWorker):
             ]
 
         batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.seq_lens_sum = torch.sum(batch.seq_lens_cpu).item()
         batch.return_hidden_states = False
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
@@ -520,7 +520,10 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
 
         # Get forward batch
-        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch = batch.get_model_worker_batch(
+            seq_lens_cpu_cache=batch.seq_lens_cpu
+        )
+        model_worker_batch.spec_num_draft_tokens = self.topk
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
@@ -791,7 +794,10 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.return_hidden_states = False
-        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch = batch.get_model_worker_batch(
+            seq_lens_cpu_cache=batch.seq_lens_cpu
+        )
+        model_worker_batch.spec_num_draft_tokens = self.speculative_num_steps + 1
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
@@ -800,7 +806,7 @@ class EAGLEWorker(TpModelWorker):
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:
-            forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
+            forward_batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
         # Run
         can_cuda_graph = (

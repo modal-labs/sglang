@@ -513,6 +513,8 @@ class EagleVerifyInput:
             next_power_of_2(bs),
         )
         batch.seq_lens.add_(accept_length + 1)
+        # Optimistically estimate the seq_lens_cpu for the next draft forward
+        batch.seq_lens_cpu.add_(self.spec_steps + 1)
 
         draft_input = EagleDraftInput()
         draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
