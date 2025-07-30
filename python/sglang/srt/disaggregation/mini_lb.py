@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
+from sglang.srt.managers.io_struct import ProfileReqInput
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
@@ -399,6 +400,30 @@ async def register(obj: PDRegistryRequest):
 
     return Response(status_code=200)
 
+
+@app.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile(obj: Optional[ProfileReqInput] = None):
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        for server in chain(prefill_servers, decode_servers):
+            await session.post(f"{server}/start_profile", json=obj)
+
+    return Response(status_code=200)
+
+
+@app.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile():
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        for server in chain(prefill_servers, decode_servers):
+            await session.post(f"{server}/stop_profile")
+    return Response(status_code=200)
 
 def run(prefill_configs, decode_addrs, host, port):
     global load_balancer
