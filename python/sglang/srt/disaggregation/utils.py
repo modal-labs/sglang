@@ -206,6 +206,7 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    CUPY = "cupy"
 
 
 class KVClassType(Enum):
@@ -268,6 +269,23 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             KVClassType.SENDER: NixlKVSender,
             KVClassType.RECEIVER: (NixlKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.CUPY:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.cupy import (
+            CupyKVBootstrapServer,
+            CupyKVManager,
+            CupyKVReceiver,
+            CupyKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: CupyKVManager,
+            KVClassType.SENDER: CupyKVSender,
+            KVClassType.RECEIVER: CupyKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: CupyKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
