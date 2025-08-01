@@ -7,6 +7,7 @@ import threading
 import uuid
 from collections import defaultdict
 from typing import Dict, List, Optional, Set
+import ctypes
 
 import cupy as cp
 import numpy as np
@@ -65,9 +66,8 @@ class KVArgsRegisterInfo:
     endpoint: str
     dst_port: int
     agent_name: str
-    agent_metadata: bytes
-    dst_kv_ptrs: list[int]
-    dst_aux_ptrs: list[int]
+    dst_kv_ptrs: List[int]
+    dst_aux_ptrs: List[int]
     gpu_id: int
 
     @classmethod
@@ -77,10 +77,9 @@ class KVArgsRegisterInfo:
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             agent_name=msg[3].decode("ascii"),
-            agent_metadata=msg[4],
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
-            gpu_id=int(msg[7].decode("ascii")),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+            gpu_id=int(msg[5].decode("ascii")),
+            dst_kv_ptrs=[cp.cuda.runtime.ipcOpenMemHandle(handle) for handle in msg[6:]],
         )
 
 
@@ -120,11 +119,12 @@ class CupyKVManager(CommonKVManager):
         self.device = cp.cuda.Device(self.kv_args.gpu_id)
         self.server_socket = zmq.Context().socket(zmq.PULL)
 
+        self._start_communication_thread()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.request_status: Dict[int, KVPoll] = {}
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
-            self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
@@ -156,24 +156,12 @@ class CupyKVManager(CommonKVManager):
 
     def _ensure_peer_access(self, src_gpu: int, dst_gpu: int):
         assert src_gpu != dst_gpu
-        try:
-            can_access = cp.cuda.runtime.deviceCanAccessPeer(src_gpu, dst_gpu)
-            if can_access:
-                with cp.cuda.Device(src_gpu):
-                    try:
-                        cp.cuda.runtime.deviceEnablePeerAccess(dst_gpu)
-                    except cp.cuda.runtime.CUDARuntimeError as e:
-                        if "already enabled" not in str(e).lower():
-                            logger.error(f"Could not enable peer access from GPU {src_gpu} to {dst_gpu}: {e}")
-            else:
-                logger.error(f"Peer access not supported between GPU {src_gpu} and {dst_gpu}")
-        except Exception as e:
-            logger.warning(f"Failed to check/enable peer access: {e}")
+        can_access = cp.cuda.runtime.deviceCanAccessPeer(src_gpu, dst_gpu)
+        assert can_access, f"Peer access not supported between GPU {src_gpu} and {dst_gpu}"
+        with cp.cuda.Device(src_gpu):
+            cp.cuda.runtime.deviceEnablePeerAccess(dst_gpu)
 
     def _copy_peer_memory(self, src_addr: int, src_gpu: int, dst_addr: int, dst_gpu: int, length: int):
-        logger.debug(f"Copying {length} bytes from GPU {src_gpu} addr {hex(src_addr)}"
-                     f"to GPU {dst_gpu} addr {hex(dst_addr)}")
-
         with cp.cuda.Device(src_gpu):
             src_mem = cp.cuda.UnownedMemory(src_addr, length, None)
             src_ptr = cp.cuda.MemoryPointer(src_mem, 0)
@@ -186,7 +174,7 @@ class CupyKVManager(CommonKVManager):
 
         cp.copyto(dst_array, src_array)
 
-        logger.debug(f"Successfully copied {length} bytes between GPUs")
+        logger.debug(f"Successfully copied {length} bytes from GPU {src_gpu} to GPU {dst_gpu}")
 
     def send_kvcache(
         self,
@@ -227,35 +215,6 @@ class CupyKVManager(CommonKVManager):
 
         return event
 
-    def send_aux(
-        self,
-        peer_name: str,
-        prefill_aux_index: int,
-        dst_aux_ptrs: list[int],
-        dst_aux_index: int,
-        notif: str,
-    ):
-        event = cp.cuda.Event()
-
-        aux_item_len = self.kv_args.aux_item_lens[0]
-        prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
-        )
-        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
-
-        # For host-to-host memory transfers, use ctypes memcpy
-        try:
-            import ctypes
-            ctypes.memmove(decode_aux_addr, prefill_aux_addr, aux_item_len)
-        except Exception as e:
-            logger.error(f"Host memory copy failed for aux data: "
-                       f"src_addr={hex(prefill_aux_addr)}, dst_addr={hex(decode_aux_addr)}, length={aux_item_len}")
-            raise e
-
-        event.record()
-
-        return event
-
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -292,14 +251,7 @@ class CupyKVManager(CommonKVManager):
             # Only the last chunk we need to send the aux data.
             if is_last:
                 assert aux_index is not None
-                aux_event = self.send_aux(
-                    req.agent_name,
-                    aux_index,
-                    self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
-                    req.dst_aux_index,
-                    str(req.room) + "_aux",
-                )
-                events.append(aux_event)
+                self._send_aux_data_to_peer(req, bootstrap_room, aux_index)
         if is_last:
             del self.transfer_infos[bootstrap_room]
         return events
@@ -309,44 +261,78 @@ class CupyKVManager(CommonKVManager):
             return False
         return self.transfer_statuses[room].is_done()
 
-    def _start_bootstrap_thread(self):
+    def _send_aux_data_to_peer(self, req: TransferInfo, bootstrap_room: int, aux_index: int):
+        if req.is_dummy():
+            return
+
+        aux_item_len = self.kv_args.aux_item_lens[0]
+        aux_addr = self.kv_args.aux_data_ptrs[0] + aux_index * aux_item_len
+        aux_data = ctypes.string_at(aux_addr, aux_item_len)
+
+        # Send aux data to decode worker
+        decode_url = f"tcp://{req.endpoint}:{req.dst_port}"
+        sock = zmq.Context().socket(zmq.PUSH)
+        try:
+            sock.connect(decode_url)
+            sock.send_multipart([
+                GUARD,
+                str(bootstrap_room).encode("ascii"),
+                str(req.dst_aux_index).encode("ascii"),
+                aux_data
+            ])
+        finally:
+            sock.close()
+
+    def _start_communication_thread(self):
         self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
-        def bootstrap_thread():
-            """This thread recvs transfer info from the decode engine"""
+        def communication_thread():
             while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
+                msg = self.server_socket.recv_multipart()
                 logger.debug(
-                    f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
+                    f"Received multipart with total byte size {sum(len(x) for x in msg)}"
                 )
-                assert (
-                    waiting_req_bytes[0] == GUARD
-                ), f"First message should be {GUARD}. Foreign traffic?"
-                waiting_req_bytes = waiting_req_bytes[1:]
-                room = waiting_req_bytes[0].decode("ascii")
-                agent_name = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
-                    continue
-                room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+                assert msg[0] == GUARD, f"First message should be {GUARD}. Foreign traffic?"
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self._handle_bootstrap_message(msg[1:])
+                else:
+                    self._handle_aux_data_message(msg[1:])
+
+        threading.Thread(target=communication_thread).start()
+
+    def _handle_bootstrap_message(self, msg_parts):
+        room = msg_parts[0].decode("ascii")
+        agent_name = msg_parts[3].decode("ascii")
+        if room == "None":
+            # Register new peer and save KV base pointers.
+            self._add_remote_peer(
+                KVArgsRegisterInfo.from_zmq(msg_parts)
+            )
+            logger.debug(f"Register KVArgs from {agent_name} successfully")
+            return
+
+        room = int(room)
+        if room not in self.transfer_infos:
+            self.transfer_infos[room] = {}
+        self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(msg_parts)
+        required_dst_info_num = self.transfer_infos[room][agent_name].required_dst_info_num
+        logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
+        if len(self.transfer_infos[room]) == required_dst_info_num:
+            logger.debug(f"{room=} is bootstrapped")
+            self.update_status(room, KVPoll.WaitingForInput)
+
+    def _handle_aux_data_message(self, msg_parts):
+        room = int(msg_parts[0].decode("ascii"))
+        aux_index = int(msg_parts[1].decode("ascii"))
+        aux_data = msg_parts[2]
+
+        aux_item_len = self.kv_args.aux_item_lens[0]
+        aux_addr = self.kv_args.aux_data_ptrs[0] + aux_index * aux_item_len
+        ctypes.memmove(aux_addr, aux_data, len(aux_data))
+
+        self.transfer_statuses[room].received_aux = True
+        logger.debug(f"Received aux data for room {room}, index {aux_index}")
 
 
 class CupyKVSender(BaseKVSender):
@@ -399,15 +385,7 @@ class CupyKVSender(BaseKVSender):
     def poll(self) -> KVPoll:
         if not self.has_sent:
             return self.kv_mgr.check_status(self.bootstrap_room)
-
-        # Check if all events have completed
-        try:
-            for event in self.events:
-                if not event.done:
-                    return KVPoll.WaitingForInput  # type: ignore
-            return KVPoll.Success  # type: ignore
-        except Exception as e:
-            raise Exception(f"KVSender transfer encountered an error: {e}")
+        return KVPoll.Success if all(event.done for event in self.events) else KVPoll.WaitingForInput  # type: ignore
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
@@ -459,10 +437,11 @@ class CupyKVReceiver(CommonKVReceiver):
             return self.conclude_state
         if not self.started_transfer:
             return KVPoll.WaitingForInput  # type: ignore
-
+        logger.debug(f"Receiver polling for room {self.bootstrap_room}")
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
+            logger.debug(f"Receiver concluded for room {self.bootstrap_room}")
             return KVPoll.Success  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
@@ -471,9 +450,10 @@ class CupyKVReceiver(CommonKVReceiver):
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
             )
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
+            kv_handles = [
+                cp.cuda.runtime.ipcGetMemHandle(ptr)
+                for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            ]
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
@@ -487,10 +467,9 @@ class CupyKVReceiver(CommonKVReceiver):
                         get_local_ip_by_remote().encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.kv_mgr.agent_name.encode("ascii"),
-                        b"",  # CuPy doesn't need agent metadata
-                        packed_kv_data_ptrs,
                         packed_aux_data_ptrs,
                         str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+                        *kv_handles,
                     ]
                 )
 
