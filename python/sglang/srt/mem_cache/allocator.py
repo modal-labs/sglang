@@ -118,7 +118,12 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
         super().__init__(size, 1, dtype, device, kvcache)
-        self.allocating_temp_buffer = False
+        # TODO(nathan): There are some race conditions with allocating a temporary buffer
+        # for specdec + freeing memory / allocating additional memory.
+        # I think the laziest way to fix this is to reserve some amount of space for
+        # temporary buffers.
+        self.MAX_TEMP_BUFFER_SIZE = 1024
+        self.has_allocated_temp_buffer = False
         self.clear()
 
     def clear(self):
@@ -134,8 +139,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return len(self.free_pages)
 
     def alloc(self, need_size: int):
-        assert not self.allocating_temp_buffer, "cannot allocate new memory while a temporary buffer has been allocated. Please call return_temp_buffer() first."
-        if need_size > len(self.free_pages):
+        if need_size > len(self.free_pages) - self.MAX_TEMP_BUFFER_SIZE:
             return None
 
         select_index = self.free_pages[:need_size]
@@ -143,21 +147,20 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return select_index
     
     def alloc_temp_buffer(self, need_size: int):
-        """Get a temporary buffer. No additional memory can be allocated until return_temp_buffer is called.
+        """Get a temporary buffer. Only one temporary buffer can be allocated at a time.
         
         This is equivalent to .alloc() followed by .free(), but is more performant since freeing this
         temporary buffer does not require mutating the free pages list."""
-        assert not self.allocating_temp_buffer, "cannot allocate new temporary memory while a temporary buffer has already been allocated. Please call return_temp_buffer() first."
-        if need_size > len(self.free_pages):
-            return None
+        assert not self.has_allocated_temp_buffer, "cannot allocate new temporary memory while a temporary buffer has already been allocated. Please call return_temp_buffer() first."
+        assert need_size <= self.MAX_TEMP_BUFFER_SIZE, "cannot allocate more than MAX_TEMP_BUFFER_SIZE temporary memory"
 
-        select_index = self.free_pages[:need_size]
-        self.allocating_temp_buffer = True
+        select_index = self.free_pages[-need_size:]
+        self.has_allocated_temp_buffer = True
         return select_index
     
     def return_temp_buffer(self):
-        assert self.allocating_temp_buffer
-        self.allocating_temp_buffer = False
+        assert self.has_allocated_temp_buffer
+        self.has_allocated_temp_buffer = False
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:

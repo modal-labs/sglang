@@ -416,6 +416,7 @@ class EAGLEWorker(TpModelWorker):
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
             # TODO(nathan): This is copied from ScheduleBatch.alloc_token_slots but is missing some important logic.
+            # TODO(nathan): could this be simpler if we reused the same temp buffer every time?
             out_cache_loc = self.token_to_kv_pool_allocator.alloc_temp_buffer(num_seqs * self.speculative_num_steps * self.topk)
             if out_cache_loc is None:
                 raise RuntimeError("Failed to allocate out_cache_loc")
