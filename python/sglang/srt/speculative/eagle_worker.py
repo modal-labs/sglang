@@ -416,8 +416,7 @@ class EAGLEWorker(TpModelWorker):
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
             # TODO(nathan): This is copied from ScheduleBatch.alloc_token_slots but is missing some important logic.
-            token_to_kv_pool_state_backup = self.token_to_kv_pool_allocator.backup_state()
-            out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_seqs * self.speculative_num_steps * self.topk)
+            out_cache_loc = self.token_to_kv_pool_allocator.alloc_temp_buffer(num_seqs * self.speculative_num_steps * self.topk)
             if out_cache_loc is None:
                 raise RuntimeError("Failed to allocate out_cache_loc")
         else:
@@ -450,7 +449,7 @@ class EAGLEWorker(TpModelWorker):
         model_worker_batch.seq_lens_sum = torch.sum(model_worker_batch.seq_lens_cpu).item()
 
         spec_info.positions = model_worker_batch.seq_lens.repeat_interleave(self.topk, dim=0)
-        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+        self.token_to_kv_pool_allocator.return_temp_buffer()
 
     def _draft_preprocess_idle(self, model_worker_batch: ModelWorkerBatch):
         model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
