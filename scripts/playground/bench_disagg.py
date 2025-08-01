@@ -1,22 +1,19 @@
 """
 Usage:
-# Basic disaggregation benchmark
-python3 bench_disagg.py --model-path Qwen/Qwen3-8B --specdec --bench-max-concurrency 8 --page-size 16
+# Basic disaggregation benchmark with random data
+python3 bench_disagg.py --model-path Qwen/Qwen3-8B --specdec --bench-max-concurrency 8 --page-size 16 --input-tokens 512 --output-tokens 128
 
 # With different concurrency levels
-python3 bench_disagg.py --model-path Qwen/Qwen3-8B --bench-max-concurrency 1 4 8 16 --page-size 16
+python3 bench_disagg.py --model-path Qwen/Qwen3-8B --bench-max-concurrency 1 4 8 16 --page-size 16 --input-tokens 1024 --output-tokens 256
 """
 
 import argparse
 import asyncio
-import json
-import os
+import random
+import string
 import subprocess
 import time
 from types import SimpleNamespace
-
-import numpy as np
-import requests
 
 from sglang.bench_serving import DatasetRow, benchmark, set_global_args
 from sglang.srt.server_args import ServerArgs
@@ -26,8 +23,18 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+def generate_random_text(num_tokens: int) -> str:
+    num_chars = num_tokens * 2
+    words = []
+    current_length = 0
 
-OUTPUT_TOKEN_LEN = 32
+    while current_length < num_chars:
+        word_length = random.randint(3, 12)
+        word = ''.join(random.choices(string.ascii_lowercase, k=word_length))
+        words.append(word)
+        current_length += word_length + 1
+
+    return ' '.join(words)[:num_chars]
 
 
 def wait_for_port(process: subprocess.Popen, port: int):
@@ -47,23 +54,11 @@ class FakeTokenizer:
         return []
 
 
-def send_one_batch(base_url, num_prompts, batch_size, profile=False):
-    prompts = [
-        "Human: Give me a fully functional FastAPI server. Show the full, long python code without stop.\n\nAssistant:",
-        "Human: Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.\n\nAssistant:",
-        "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
-        "Human: I want you to act as an English translator, spelling corrector and improver. I will speak to you in any language and you will detect the language, translate it and answer in the corrected and improved version of my text, in English. I want you to replace my simplified A0-level words and sentences with more beautiful and elegant, upper level English words and sentences. Keep the meaning same, but make them more literary. My first sentence is 'istanbulu cok seviyom burada olmak cok guzel'. Answer in more than 5000 words.\n\nAssistant:",
-        "Human: I want you to act as a storyteller. You will come up with entertaining stories that are engaging, imaginative and captivating for the audience. It can be fairy tales, educational stories or any other type of stories which has the potential to capture people's attention and imagination. Depending on the target audience, you may choose specific themes or topics for your storytelling session e.g., if it's children then you can talk about animals; If it's adults then history-based tales might engage them better etc. Answer in more than 5000 words. My first request is 'I need an interesting story on perseverance.'\n\nAssistant:",
-        "Human: Solve x^2 = -1. Think step-by-step. Give me a long detailed explanation. \n\nAssistant:",
-        "Human: Tell me about the president of the USA in wikipedia style.\n\nAssistant:",
-        "Human: Hello? Who are you? Write code, math, and poem to explanin yourself.\n\nAssistant:",
-    ]
+def send_one_batch(base_url, num_prompts, batch_size, input_tokens, output_tokens, profile=False):
+    # Generate random prompts with the specified input token length
+    prompts = [generate_random_text(input_tokens) for _ in range(num_prompts)]
 
-    padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
-        :num_prompts
-    ]
-
-    input_requests = [DatasetRow(p, 0, OUTPUT_TOKEN_LEN) for p in padded_prompts]
+    input_requests = [DatasetRow(p, 0, output_tokens) for p in prompts]
 
     args = SimpleNamespace(
         disable_ignore_eos=False,
@@ -169,11 +164,11 @@ def main(args, server_args):
 
     try:
         # Warmup
-        send_one_batch(base_url, bench_max_concurrency, bench_max_concurrency)
+        send_one_batch(base_url, bench_max_concurrency, bench_max_concurrency, args.input_tokens, args.output_tokens)
 
         # Benchmark
         send_one_batch(
-            base_url, max(args.num_prompts, bench_max_concurrency), bench_max_concurrency, profile=args.profile
+            base_url, max(args.num_prompts, bench_max_concurrency), bench_max_concurrency, args.input_tokens, args.output_tokens, profile=args.profile
         )
     finally:
         # Clean up processes
@@ -209,6 +204,18 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Enable profiling",
+    )
+    parser.add_argument(
+        "--input-tokens",
+        type=int,
+        default=500,
+        help="Number of input tokens for each prompt (default: 512)",
+    )
+    parser.add_argument(
+        "--output-tokens",
+        type=int,
+        default=100,
+        help="Number of output tokens to generate (default: 128)",
     )
     args = parser.parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
