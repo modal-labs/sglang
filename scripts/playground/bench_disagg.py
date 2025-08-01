@@ -118,6 +118,7 @@ def main(args, server_args):
         "--cuda-graph-max-bs", str(bench_max_concurrency),
         "--mem-fraction", "0.7",
         "--page-size", str(args.page_size),
+        "--log-level", args.log_level,
     ]
 
     # Add speculative decoding config if enabled

@@ -6,7 +6,7 @@ import struct
 import threading
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 import ctypes
 
 import cupy as cp
@@ -183,30 +183,32 @@ class CupyKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
-        notif: str,
+        notif: List[bytes],
+        notif_callback: Callable[[List[bytes]], None],
     ):
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
 
-        logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
+        logger.debug(f"sending kvcache to {peer_name}")
 
+        current_stream = cp.cuda.get_current_stream()
         event = cp.cuda.Event()
         num_layers = len(self.kv_args.kv_data_ptrs)
 
-        with self.device:
-            for layer_id in range(num_layers):
-                src_ptr = self.kv_args.kv_data_ptrs[layer_id]
-                dst_ptr = dst_kv_ptrs[layer_id]
-                item_len = self.kv_args.kv_item_lens[layer_id]
+        for layer_id in range(num_layers):
+            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
 
-                for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                    src_addr = src_ptr + int(prefill_index[0]) * item_len
-                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                    length = item_len * len(prefill_index)
-                    self._copy_peer_memory(src_addr, self.kv_args.gpu_id, dst_addr, dst_gpu_id, length)
+            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
+                self._copy_peer_memory(src_addr, self.kv_args.gpu_id, dst_addr, dst_gpu_id, length)
 
-            event.record()
+        event.record()
+        current_stream.launch_host_func(notif_callback, notif)
 
         logger.debug(
             f"len(transfers): before group: {len(prefill_kv_indices)},"
@@ -238,7 +240,25 @@ class CupyKVManager(CommonKVManager):
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
-            notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
+            notif = [
+                struct.pack("Q", req.room),
+                struct.pack("I", chunk_id),
+                struct.pack("?", is_last),
+            ]
+
+            def notif_callback(notif: List[bytes]):
+                decode_url = f"tcp://{req.endpoint}:{req.dst_port}"
+                sock = zmq.Context().socket(zmq.PUSH)
+                try:
+                    sock.connect(decode_url)
+                    sock.send_multipart([
+                        GUARD,
+                        b"KV_NOTIF",
+                        *notif,
+                    ])
+                finally:
+                    sock.close()
+
             kv_event = self.send_kvcache(
                 req.agent_name,
                 kv_indices,
@@ -246,6 +266,7 @@ class CupyKVManager(CommonKVManager):
                 chunked_dst_kv_indice,
                 self.decode_kv_args_table[req.agent_name].gpu_id,
                 notif,
+                notif_callback,
             )
             events.append(kv_event)
             # Only the last chunk we need to send the aux data.
@@ -276,6 +297,7 @@ class CupyKVManager(CommonKVManager):
             sock.connect(decode_url)
             sock.send_multipart([
                 GUARD,
+                b"AUX_DATA",
                 str(bootstrap_room).encode("ascii"),
                 str(req.dst_aux_index).encode("ascii"),
                 aux_data
@@ -297,7 +319,12 @@ class CupyKVManager(CommonKVManager):
                 if self.disaggregation_mode == DisaggregationMode.PREFILL:
                     self._handle_bootstrap_message(msg[1:])
                 else:
-                    self._handle_aux_data_message(msg[1:])
+                    if msg[1] == b"AUX_DATA":
+                        self._handle_aux_data_message(msg[2:])
+                    elif msg[1] == b"KV_NOTIF":
+                        self._handle_kv_notif_message(msg[2:])
+                    else:
+                        raise ValueError(f"Unknown message type: {msg[1]}")
 
         threading.Thread(target=communication_thread).start()
 
@@ -333,6 +360,15 @@ class CupyKVManager(CommonKVManager):
 
         self.transfer_statuses[room].received_aux = True
         logger.debug(f"Received aux data for room {room}, index {aux_index}")
+
+    def _handle_kv_notif_message(self, msg_parts):
+        room = struct.unpack("Q", msg_parts[0])[0]
+        chunk_id = struct.unpack("I", msg_parts[1])[0]
+        is_last = struct.unpack("?", msg_parts[2])[0]
+        self.transfer_statuses[room].received_kvs.add(chunk_id)
+        if is_last:
+            self.transfer_statuses[room].num_kvs_expected = chunk_id + 1
+        logger.debug(f"Received kv notif for room {room}, chunk {chunk_id}, is_last {is_last}")
 
 
 class CupyKVSender(BaseKVSender):
@@ -437,11 +473,9 @@ class CupyKVReceiver(CommonKVReceiver):
             return self.conclude_state
         if not self.started_transfer:
             return KVPoll.WaitingForInput  # type: ignore
-        logger.debug(f"Receiver polling for room {self.bootstrap_room}")
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
-            logger.debug(f"Receiver concluded for room {self.bootstrap_room}")
             return KVPoll.Success  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
