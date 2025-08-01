@@ -1792,7 +1792,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     swa_num_tokens = max(0, num_tokens - swa_available_size)
                     self.tree_cache.evict(full_num_tokens, swa_num_tokens)
         else:
-            if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+            # TODO(nathan): this is ugly
+            if self.token_to_kv_pool_allocator.available_size() - self.token_to_kv_pool_allocator.MAX_TEMP_BUFFER_SIZE < num_tokens:
                 if self.tree_cache is not None:
                     self.tree_cache.evict(num_tokens)
 
