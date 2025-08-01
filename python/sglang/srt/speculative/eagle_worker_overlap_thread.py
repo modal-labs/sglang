@@ -214,6 +214,8 @@ class EAGLEWorkerClient:
                     # etc are coming from the prefill worker) will _not_ be given pointers; it
                     # will be given the actual spec info tensors.
                     batch.spec_info = self.future_spec_infos.get_data(batch.spec_info.verified_id)
+                else:
+                    assert False
                 assert batch.spec_info.verified_id.shape == batch.seq_lens.shape
             else:
                 assert batch.forward_mode == ForwardMode.EXTEND

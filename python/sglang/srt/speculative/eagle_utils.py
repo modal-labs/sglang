@@ -64,6 +64,7 @@ class EagleDraftInput:
     # Inputs for extend
     # shape: (b,)
     verified_id: torch.Tensor = None
+    verified_id_from_prefill: torch.Tensor = None
     accept_length: torch.Tensor = None
 
     # Inputs for the attention backends
@@ -173,6 +174,10 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
+        # TODO(nathan): it might be cleaner to just never allow None values.
+        # Currently, in overlap mode, everything other than verified_id is None.
+        # However, for PD + overlap mode, the batches coming from prefill are NOT none.
+        assert self.verified_id is not None
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
         else:
@@ -185,10 +190,7 @@ class EagleDraftInput:
             self.topk_index = spec_info.topk_index
         else:
             self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], axis=0)
-        if self.verified_id is None:
-            self.verified_id = spec_info.verified_id
-        else:
-            self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
+        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
 
 
 @dataclass

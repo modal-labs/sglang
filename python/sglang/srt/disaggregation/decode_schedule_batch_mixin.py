@@ -94,7 +94,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
         )
 
     def process_prebuilt_extend(
-        self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
+        # draft_worker is EagleWorkerClient from eagle_worker_overlap_thread.py
+        # TODO(nathan): wow this code is terrible
+        self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig, draft_worker
     ):
         """Assign the buffered last input id to schedule batch"""
         self.output_ids = []
@@ -104,7 +106,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             if req.grammar is not None:
                 req.grammar.accept_token(req.output_ids[-1])
                 req.grammar.finished = req.finished()
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
+        self.output_ids = torch.tensor(self.output_ids, device=self.device, dtype=torch.int32)
 
         # Simulate the eagle run. We add mock data to hidden states for the
         # ease of implementation now meaning the first token will have acc rate
@@ -132,13 +134,24 @@ class ScheduleBatchDisaggregationDecodeMixin:
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_utils import EagleDraftInput
 
-            spec_info = EagleDraftInput(
+            spec_info_pointers = draft_worker.future_spec_infos.get_pointers(b)
+            actual_spec_info = EagleDraftInput(
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 verified_id=self.output_ids,
                 spec_steps=server_args.speculative_num_steps,
             )
+            spec_info = EagleDraftInput(
+                # topk_p=topk_p,
+                # topk_index=topk_index,
+                # hidden_states=hidden_states,
+                verified_id=spec_info_pointers,
+                spec_steps=server_args.speculative_num_steps,
+            )
+
+            draft_worker.future_spec_infos.put_data(spec_info_pointers, actual_spec_info)
+
             model_worker_batch = self.get_model_worker_batch()
             spec_info.prepare_for_extend(model_worker_batch)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
