@@ -13,6 +13,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 import argparse
 import asyncio
 import json
+import math
 import os
 import pickle
 import random
@@ -714,6 +715,7 @@ class BenchmarkMetrics:
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
+    p95_ttft_ms: float
     p99_ttft_ms: float
     mean_tpot_ms: float
     median_tpot_ms: float
@@ -728,6 +730,7 @@ class BenchmarkMetrics:
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
     std_e2e_latency_ms: float
+    p95_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
 
@@ -960,7 +963,7 @@ def sample_sharegpt_requests(
     ]
 
     # Shuffle the dataset.
-    random.shuffle(dataset)
+    # random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
     filtered_dataset: List[DatasetRow] = []
@@ -993,20 +996,26 @@ def sample_sharegpt_requests(
             len(completion_token_ids) if fixed_output_len is None else fixed_output_len
         )
 
-        if prompt_len < 2 or output_len < 2:
-            # Prune too short sequences.
+        # if prompt_len < 2 or output_len < 2:
+        #     # Prune too short sequences.
+        #     continue
+
+        if prompt_len < 2000:
+            continue
+        if prompt_len > 5000:
             continue
 
-        if context_len and prompt_len + output_len > context_len:
-            # Prune too long sequences.
-            continue
+        # if context_len and prompt_len + output_len > context_len:
+        #     # Prune too long sequences.
+        #     continue
 
         filtered_dataset.append(
-            DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len)
+            DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len - 4 + int(random.random() * 8))
         )
 
     print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
+    print(f"#Total requests: {len(filtered_dataset)}")
     return filtered_dataset
 
 
@@ -1289,6 +1298,7 @@ def calculate_metrics(
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
+        p95_ttft_ms=np.percentile(ttfts or 0, 95) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,
@@ -1303,6 +1313,7 @@ def calculate_metrics(
         mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
+        p95_e2e_latency_ms=np.percentile(e2e_latencies, 95) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
     )
@@ -1514,9 +1525,20 @@ async def benchmark(
             "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
         )
     )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "P95 E2E Latency (ms):", metrics.p95_e2e_latency_ms
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "P99 E2E Latency (ms):", metrics.p99_e2e_latency_ms
+        )
+    )
     print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+    print("{:<40} {:<10.2f}".format("P95 TTFT (ms):", metrics.p95_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))

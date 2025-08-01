@@ -122,7 +122,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # for specdec + freeing memory / allocating additional memory.
         # I think the laziest way to fix this is to reserve some amount of space for
         # temporary buffers.
-        self.MAX_TEMP_BUFFER_SIZE = 1024
+        self.MAX_TEMP_BUFFER_SIZE = 4096
         self.has_allocated_temp_buffer = False
         self.clear()
 
