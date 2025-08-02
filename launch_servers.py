@@ -18,7 +18,7 @@ def create_mprocs_config(decode_servers: List[Dict[str, Any]], prefill_servers: 
         port = server['port']
         cuda_graph_max_bs = server['cuda_graph_max_bs']
         
-        cmd = f"python3 -m sglang.launch_server --model Qwen/Qwen3-8B --speculative-algorithm EAGLE3 --speculative-draft-model-path Tengyunw/qwen3_8b_eagle3 --speculative-num-steps 6 --speculative-eagle-topk 10 --speculative-num-draft-tokens 32 --mem-fraction 0.9 --cuda-graph-max-bs {cuda_graph_max_bs} --dtype bfloat16 --disaggregation-mode decode --disaggregation-transfer-backend nixl --port {port} --attention-backend fa3"
+        cmd = f"python3 -m sglang.launch_server --model Qwen/Qwen3-8B --speculative-algorithm EAGLE3 --speculative-draft-model-path Tengyunw/qwen3_8b_eagle3 --speculative-num-steps 6 --speculative-eagle-topk 10 --speculative-num-draft-tokens 32 --mem-fraction 0.8 --cuda-graph-max-bs {cuda_graph_max_bs} --dtype bfloat16 --disaggregation-mode decode --disaggregation-transfer-backend nixl --port {port} --attention-backend fa3"
         
         procs[f"decode-{i}"] = {
             "shell": cmd,
@@ -76,7 +76,7 @@ def main():
     parser.add_argument("--start-gpu", type=int, default=0, help="Starting GPU ID")
     parser.add_argument("--start-port", type=int, default=30000, help="Starting port number")
     parser.add_argument("--start-bootstrap-port", type=int, default=20000, help="Starting bootstrap port number")
-    parser.add_argument("--cuda-graph-max-bs", type=int, default=16, help="CUDA graph max batch size for both prefill and decode servers")
+    parser.add_argument("--cuda-graph-max-bs", type=int, default=32, help="CUDA graph max batch size for both prefill and decode servers")
     parser.add_argument("--lb-host", type=str, default="0.0.0.0", help="Load balancer host")
     parser.add_argument("--lb-port", type=int, default=8000, help="Load balancer port")
     

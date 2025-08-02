@@ -159,6 +159,7 @@ async def async_request_trt_llm(
 
                         # Decoding phase
                         else:
+                            # TODO(nathan): figure out how this plays with specdec
                             output.itl.append(timestamp - most_recent_timestamp)
 
                         most_recent_timestamp = timestamp

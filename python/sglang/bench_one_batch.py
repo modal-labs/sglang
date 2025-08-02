@@ -56,6 +56,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
@@ -139,19 +141,23 @@ def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    model_config = ModelConfig.from_server_args(server_args)
-    model_runner = ModelRunner(
-        model_config=model_config,
-        mem_fraction_static=server_args.mem_fraction_static,
+    tp_worker = TpModelWorker(
+        server_args=server_args,
         gpu_id=tp_rank,
         tp_rank=tp_rank,
-        tp_size=server_args.tp_size,
         pp_rank=0,
-        pp_size=1,
+        dp_rank=0,
         nccl_port=port_args.nccl_port,
-        server_args=server_args,
     )
-    rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
+    draft_worker = EAGLEWorker(
+        server_args=server_args,
+        gpu_id=tp_rank,
+        tp_rank=tp_rank,
+        dp_rank=0,
+        nccl_port=port_args.nccl_port,
+        target_worker=tp_worker,
+    )
+    rank_print(f"max_total_num_tokens={tp_worker.model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
         tokenizer_mode=server_args.tokenizer_mode,
@@ -159,7 +165,7 @@ def load_model(server_args, port_args, tp_rank):
     )
     if server_args.tp_size > 1:
         dist.barrier()
-    return model_runner, tokenizer
+    return draft_worker, tokenizer
 
 
 def prepare_inputs_for_correctness_test(bench_args, tokenizer):
@@ -233,97 +239,42 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
 
 @torch.no_grad
-def extend(reqs, model_runner):
+def extend(reqs, eagle_worker: EAGLEWorker):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
-        req_to_token_pool=model_runner.req_to_token_pool,
-        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+        req_to_token_pool=eagle_worker.req_to_token_pool,
+        token_to_kv_pool_allocator=eagle_worker.token_to_kv_pool_allocator,
         tree_cache=None,
-        model_config=model_runner.model_config,
+        model_config=eagle_worker.model_runner.model_config,
         enable_overlap=False,
-        spec_algorithm=SpeculativeAlgorithm.NONE,
+        spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         enable_custom_logit_processor=False,
     )
     batch.prepare_for_extend()
-    _maybe_prepare_mlp_sync_batch(batch, model_runner)
+    _maybe_prepare_mlp_sync_batch(batch, eagle_worker.model_runner)
     model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output, _ = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    logits_output, next_token_ids, bid, _, can_run_cuda_graph, next_spec_info = eagle_worker.forward_batch_speculative_generation(model_worker_batch)
+    batch.spec_info = next_spec_info
     return next_token_ids, logits_output.next_token_logits, batch
 
 
 @torch.no_grad
-def decode(input_token_ids, batch, model_runner):
+def decode(input_token_ids, batch, eagle_worker: EAGLEWorker):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
-    _maybe_prepare_mlp_sync_batch(batch, model_runner)
+    _maybe_prepare_mlp_sync_batch(batch, eagle_worker.model_runner)
     model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output, _ = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    logits_output, next_token_ids, free_cache_loc_cpu, bid, can_run_cuda_graph, next_spec_info = eagle_worker.forward_batch_speculative_generation(model_worker_batch)
+    # TODO(nathan): free cache loc cpu?
+    # free_cache_loc_cpu = free_cache_loc_cpu[free_cache_loc_cpu != 0]
+    # self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
+    batch.spec_info = next_spec_info
     return next_token_ids, logits_output.next_token_logits
 
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
     if require_mlp_sync(model_runner.server_args):
-        Scheduler.prepare_mlp_sync_batch_raw(
-            batch,
-            dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=1,
-            tp_group=model_runner.tp_group,
-            get_idle_batch=None,
-            disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            speculative_num_draft_tokens=None,
-            require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
-            disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
-        )
-
-
-def correctness_test(
-    server_args,
-    port_args,
-    bench_args,
-    tp_rank,
-):
-    # Configure the logger
-    configure_logger(server_args, prefix=f" TP{tp_rank}")
-    rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-
-    # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
-
-    # Prepare inputs
-    input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
-    rank_print(f"\n{input_ids=}\n")
-
-    if bench_args.cut_len > 0:
-        # Prefill
-        next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-        rank_print(f"prefill logits (first half): {next_token_logits} \n")
-
-    # Prepare extend inputs
-    reqs = prepare_extend_inputs_for_correctness_test(
-        bench_args, input_ids, reqs, model_runner
-    )
-
-    # Extend (prefill w/ KV cache)
-    next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-    rank_print(f"prefill logits (final): {next_token_logits} \n")
-
-    # Decode
-    output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        next_token_ids_list = next_token_ids.tolist()
-        for i in range(len(reqs)):
-            output_ids[i].append(next_token_ids_list[i])
-
-    # Print output texts
-    for i in range(len(reqs)):
-        rank_print(f"========== Prompt {i} ==========")
-        rank_print(tokenizer.decode(output_ids[i]), "\n")
+        raise NotImplementedError("MLP sync is not supported yet.")
 
 
 def synchronize(device):
@@ -332,7 +283,7 @@ def synchronize(device):
 
 def latency_test_run_once(
     run_name,
-    model_runner,
+    eagle_worker: EAGLEWorker,
     rank_print,
     reqs,
     batch_size,
@@ -343,7 +294,7 @@ def latency_test_run_once(
     profile,
     profile_filename_prefix,
 ):
-    max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
+    max_batch_size = eagle_worker.model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
         rank_print(
             f"skipping ({batch_size}, {input_len}, {output_len}) due to max batch size limit"
@@ -351,8 +302,8 @@ def latency_test_run_once(
         return
 
     # Clear the pools.
-    model_runner.req_to_token_pool.clear()
-    model_runner.token_to_kv_pool_allocator.clear()
+    eagle_worker.req_to_token_pool.clear()
+    eagle_worker.token_to_kv_pool_allocator.clear()
 
     measurement_results = {
         "run_name": run_name,
@@ -377,7 +328,7 @@ def latency_test_run_once(
     # Prefill
     synchronize(device)
     tic = time.perf_counter()
-    next_token_ids, _, batch = extend(reqs, model_runner)
+    next_token_ids, _, batch = extend(reqs, eagle_worker)
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
     tot_latency += prefill_latency
@@ -393,7 +344,7 @@ def latency_test_run_once(
     for i in range(output_len - 1):
         synchronize(device)
         tic = time.perf_counter()
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        next_token_ids, _ = decode(next_token_ids, batch, eagle_worker)
         synchronize(device)
         latency = time.perf_counter() - tic
         tot_latency += latency
@@ -446,7 +397,7 @@ def latency_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    eagle_worker, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -457,7 +408,7 @@ def latency_test(
     rank_print("Warmup ...")
     latency_test_run_once(
         bench_args.run_name,
-        model_runner,
+        eagle_worker,
         rank_print,
         reqs,
         bench_args.batch_size[0],
@@ -479,7 +430,7 @@ def latency_test(
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
         ret = latency_test_run_once(
             bench_args.run_name,
-            model_runner,
+            eagle_worker,
             rank_print,
             reqs,
             bs,
@@ -510,7 +461,7 @@ def main(server_args, bench_args):
 
     if server_args.model_path:
         if bench_args.correctness_test:
-            work_func = correctness_test
+            raise NotImplementedError("Correctness test is not supported yet.")
         else:
             work_func = latency_test
     else:
