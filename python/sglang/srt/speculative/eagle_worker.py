@@ -399,26 +399,13 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.verified_id.to(torch.int64)
             )
 
-        # Allocate cache locations
-        # Layout of the out_cache_loc
-        # [       topk 0         ] [       topk 1         ]
-        # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
-        if self.page_size == 1:
-            # TODO(nathan): This is copied from ScheduleBatch.alloc_token_slots but is missing some important logic.
-            token_to_kv_pool_state_backup = self.token_to_kv_pool_allocator.backup_state()
-            out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_seqs * self.speculative_num_steps * self.topk)
-            if out_cache_loc is None:
-                raise RuntimeError("Failed to allocate out_cache_loc")
-        else:
-            raise NotImplementedError("page size > 1 is not supported")
-
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
             self.extend_lens,
             self.num_new_pages_per_topk,
-            out_cache_loc,
+            batch.draft_out_cache_loc,
             self.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
@@ -427,16 +414,8 @@ class EAGLEWorker(TpModelWorker):
             next_power_of_2(self.speculative_num_steps),
         )
 
-        if self.page_size > 1 and self.topk > 1:
-            # Remove padded slots
-            out_cache_loc = out_cache_loc[
-                : num_seqs * self.topk * self.speculative_num_steps
-            ]
-
-        batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens_cpu).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
-        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ModelWorkerBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
@@ -453,6 +432,9 @@ class EAGLEWorker(TpModelWorker):
             self._draft_preprocess_idle(batch)
         else:
             self._draft_preprocess_decode(batch)
+
+        verify_out_cache_loc = batch.out_cache_loc
+        batch.out_cache_loc = batch.draft_out_cache_loc
 
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -473,6 +455,8 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
+
+        batch.out_cache_loc = verify_out_cache_loc
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(

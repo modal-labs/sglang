@@ -252,26 +252,7 @@ class EagleVerifyInput:
 
         batch.input_ids = self.draft_token
 
-        if page_size == 1:
-            # TODO(nathan): This is copied from ScheduleBatch.alloc_token_slots but is missing some important logic.
-            out_cache_loc = token_to_kv_pool_allocator.alloc(len(batch.input_ids))
-            if out_cache_loc is None:
-                raise RuntimeError("Failed to allocate out_cache_loc")
-
-            batch.out_cache_loc = out_cache_loc
-            end_offset = batch.seq_lens + self.draft_token_num
-        else:
-            prefix_lens = batch.seq_lens
-            end_offset = prefix_lens + self.draft_token_num
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                prefix_lens,
-            )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                prefix_lens, end_offset, last_loc, len(batch.input_ids)
-            )
-            self.last_loc = last_loc
+        end_offset = batch.seq_lens + self.draft_token_num
 
         bs = len(batch.seq_lens)
         assign_req_to_token_pool[(bs,)](
