@@ -1914,6 +1914,11 @@ class Scheduler(
                 model_worker_batch = batch.get_model_worker_batch(seq_lens_cpu_cache=batch.seq_lens_cpu)
                 model_worker_batch.seq_lens_cpu = batch.seq_lens_cpu
 
+                # Populate fields needed to reuse batch for verify
+                model_worker_batch.extend_seq_lens = batch.extend_lens
+                model_worker_batch.extend_prefix_lens = batch.prefix_lens
+                model_worker_batch.extend_logprob_start_lens = batch.extend_logprob_start_lens
+
                 (
                     logits_output,
                     next_token_ids,
