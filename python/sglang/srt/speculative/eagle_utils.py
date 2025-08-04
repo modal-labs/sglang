@@ -269,6 +269,7 @@ class EagleVerifyInput:
 
         model_worker_batch.input_ids = self.draft_token
 
+<<<<<<< HEAD
         if page_size == 1:
             # TODO(nathan): This is copied from ScheduleBatch.alloc_token_slots but is missing some important logic.
             out_cache_loc = token_to_kv_pool_allocator.alloc(len(model_worker_batch.input_ids))
@@ -305,6 +306,7 @@ class EagleVerifyInput:
                     dtype=torch.int64,
                     device=to_free_num_slots.device,
                 )
+        end_offset = batch.seq_lens + self.draft_token_num
 
                 # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
                 # accept_index:  [0 -1  2,  3  4 -1,  6 -1 -1]
@@ -385,14 +387,9 @@ class EagleVerifyInput:
 
     def verify(
         self,
-<<<<<<< HEAD
-        batch: ScheduleBatch,
-        logits_output: LogitsProcessorOutput,
-=======
         model_worker_batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         req_to_token_pool: ReqToTokenPool,
->>>>>>> d5666f6bf (Add overlap scheduling)
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         device: torch.device,
