@@ -263,6 +263,9 @@ class SchedulerOutputProcessorMixin:
 
             req.output_ids.append(next_token_id)
             req.check_finished()
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+                req.time_stats.completion_time = time.time()
 
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
@@ -299,11 +302,6 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
-
-        for req in batch.reqs:
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
-                req.time_stats.completion_time = time.time()
 
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
