@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 GUARD = "NixlMsgGuard".encode("ascii")
 
 
+APPLY_NIXL_FIX = True
+
+
 @dataclasses.dataclass
 class TransferInfo:
     """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
@@ -74,6 +77,8 @@ class KVArgsRegisterInfo:
     dst_kv_ptrs: list[int]
     dst_aux_ptrs: list[int]
     gpu_id: int
+
+    registered_agent: bool = False
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -179,7 +184,9 @@ class NixlKVManager(CommonKVManager):
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
         self.decode_kv_args_table[agent_name] = decode_kv_args
-        self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+        if not APPLY_NIXL_FIX:
+            self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+            self.decode_kv_args_table[agent_name].registered_agent = True
 
     def send_kvcache(
         self,
@@ -287,6 +294,10 @@ class NixlKVManager(CommonKVManager):
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
+
+            if not self.decode_kv_args_table[req.agent_name].registered_agent:
+                self.agent.add_remote_agent(self.decode_kv_args_table[req.agent_name].agent_metadata)
+                self.decode_kv_args_table[req.agent_name].registered_agent = True
 
             notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
             kv_xfer_handle = self.send_kvcache(
