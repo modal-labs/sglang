@@ -52,7 +52,7 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap:
                 if self.spec_algorithm.is_eagle():
-                    logits_output, next_token_ids, _, _ = (
+                    logits_output, next_token_ids, _, _, _ = (
                         self.draft_worker.resolve_last_batch_result(launch_done)
                     )
                 else:
@@ -233,12 +233,14 @@ class SchedulerOutputProcessorMixin:
         if self.spec_algorithm.is_eagle():
             accept_length = logits_output.accept_length.tolist()
             idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
-            self.num_generated_tokens += sum(accept_length)
-            self.spec_num_total_accepted_tokens += sum(accept_length)
-            self.spec_num_total_forward_ct += len(batch.reqs)
         else:
             idx_to_batch = list(range(len(batch.reqs)))
-            self.num_generated_tokens += len(batch.reqs)
+
+        num_generated_tokens_this_batch = len(idx_to_batch)
+        self.num_generated_tokens += num_generated_tokens_this_batch
+        if self.spec_algorithm.is_eagle():
+            self.spec_num_total_accepted_tokens += num_generated_tokens_this_batch
+            self.spec_num_total_forward_ct += len(batch.reqs)
 
         # Check finish condition
         for i, (b, next_token_id) in enumerate(zip(idx_to_batch, next_token_ids)):

@@ -1908,13 +1908,21 @@ class Scheduler(
                     # Optimistically estimate the seq_lens_cpu for the next draft forward
                     batch.seq_lens_cpu.add_(self.server_args.speculative_num_steps + 1)
 
+                if batch.has_grammar:
+                    raise NotImplementedError("Grammar is not supported for now")
+
+                model_worker_batch = batch.get_model_worker_batch(seq_lens_cpu_cache=batch.seq_lens_cpu)
+                model_worker_batch.seq_lens_cpu = batch.seq_lens_cpu
+
                 (
                     logits_output,
                     next_token_ids,
                     free_cache_loc_cpu,
                     bid,
                     can_run_cuda_graph,
-                ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                    next_spec_info,
+                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
+                batch.spec_info = next_spec_info
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids

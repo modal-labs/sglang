@@ -1671,7 +1671,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode_or_idle():
+        # TODO(nathan): I needed to change this so EagleWorker has access to
+        # extend_seq_lens / etc, but I haven't verified that this is safe to do.
+        if self.forward_mode.is_decode_or_idle() and False:
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
