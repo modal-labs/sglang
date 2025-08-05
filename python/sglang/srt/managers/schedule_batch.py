@@ -848,7 +848,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
-    seq_lens_cpu: Optional[torch.Tensor] = None
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
@@ -1717,6 +1716,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or attention_backend_str == "cutlass_mla"
             or attention_backend_str == "ascend"
             or global_server_args_dict["enable_two_batch_overlap"]
+            or self.spec_algorithm.is_eagle()
         ):
             seq_lens_cpu = (
                 seq_lens_cpu_cache
