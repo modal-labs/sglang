@@ -85,6 +85,7 @@ class EAGLEWorkerClient:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
         target_worker: TpModelWorker,
@@ -94,6 +95,7 @@ class EAGLEWorkerClient:
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
             dp_rank=dp_rank,
             nccl_port=nccl_port,
             target_worker=target_worker,
@@ -222,7 +224,7 @@ class EAGLEWorkerClient:
 
     def forward_batch_speculative_generation(
         self, model_worker_batch: ModelWorkerBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool, EagleDraftInput]:
+    ) -> Tuple[any, torch.Tensor, int, int, bool, EagleDraftInput]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(

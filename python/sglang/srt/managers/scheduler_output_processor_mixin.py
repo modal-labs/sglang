@@ -297,9 +297,6 @@ class SchedulerOutputProcessorMixin:
         for b, req in enumerate(batch.reqs):
             if req.finished():
                 # An extra token was generated due to zero-overlap scheduling. Discard it from the KV cache.
-
-<<<<<<< HEAD
-=======
                 assert self.enable_overlap, "A completed request should only be given to process_batch_result_decode if overlap is enabled"
                 assert self.page_size == 1, "TODO(nathan): Add support for page size > 1"
                 assert self.spec_algorithm.is_eagle(), "TODO(nathan): I think if spec_algorithm is not eagle, we should assume accept_length[b] is 1"

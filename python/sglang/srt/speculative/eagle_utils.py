@@ -269,72 +269,7 @@ class EagleVerifyInput:
 
         model_worker_batch.input_ids = self.draft_token
 
-<<<<<<< HEAD
-        if page_size == 1:
-            # TODO(nathan): This is copied from ScheduleBatch.alloc_token_slots but is missing some important logic.
-            out_cache_loc = token_to_kv_pool_allocator.alloc(len(model_worker_batch.input_ids))
-            if out_cache_loc is None:
-                raise RuntimeError("Failed to allocate out_cache_loc")
-
-            model_worker_batch.out_cache_loc = out_cache_loc
-            end_offset = model_worker_batch.seq_lens + self.draft_token_num
-        else:
-            # TODO (timmy): read and verify that it works
-            if self.topk == 1:
-                # Only evict full empty page. Do not evict partial empty page
-                align_evict_mask_to_page_size[len(model_worker_batch.seq_lens),](
-                    model_worker_batch.seq_lens,
-                    evict_mask,
-                    page_size,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                )
-                token_to_kv_pool_allocator.free(model_worker_batch.out_cache_loc[evict_mask])
-            else:
-                # Shift the accepted tokens to the beginning.
-                # Only evict the last part
-                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
-                    model_worker_batch.seq_lens,
-                    model_worker_batch.out_cache_loc,
-                    accept_index,
-                    accept_length,
-                    self.draft_token_num,
-                    page_size,
-                )
-                to_free_slots = torch.empty(
-                    (to_free_num_slots.sum().item(),),
-                    dtype=torch.int64,
-                    device=to_free_num_slots.device,
-                )
-        end_offset = batch.seq_lens + self.draft_token_num
-
-                # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
-                # accept_index:  [0 -1  2,  3  4 -1,  6 -1 -1]
-                # tgt_cache_loc: [0  1   ,  3  4   ,  6      ]
-                # to_free_slots: [      2,        5,     7  8]
-                # to_free_slots also needs to be page-aligned without the first partial page
-                #
-                # split each row of out_cache_loc into two parts.
-                # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
-                # 2. the second part goes to to_free_slots.
-                get_target_cache_loc[(bs,)](
-                    tgt_cache_loc,
-                    to_free_slots,
-                    accept_length,
-                    to_free_num_slots,
-                    model_worker_batch.out_cache_loc,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                    next_power_of_2(bs),
-                )
-
-                # Free the kv cache
-                token_to_kv_pool_allocator.free(to_free_slots)
-
-                # Copy the kv cache
-                token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                    tgt_cache_loc, src_cache_loc
-                )
+        end_offset = model_worker_batch.seq_lens + self.draft_token_num
 
         bs = len(model_worker_batch.seq_lens)
         assign_req_to_token_pool[(bs,)](

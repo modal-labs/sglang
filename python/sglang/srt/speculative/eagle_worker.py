@@ -398,23 +398,23 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.bid,
         )
 
-    def _draft_preprocess_decode(self, model_worker_batch: ModelWorkerBatch):
+    def _draft_preprocess_decode(self, batch: ModelWorkerBatch):
         # Parse args
-        num_seqs = len(model_worker_batch.seq_lens)
-        spec_info = model_worker_batch.spec_info
+        num_seqs = len(batch.seq_lens)
+        spec_info = batch.spec_info
         assert spec_info is not None
 
         # Accumulate penalty
-        if model_worker_batch.sampling_info.penalizer_orchestrator.is_required:
+        if batch.sampling_info.penalizer_orchestrator.is_required:
             # This is a relaxed version of penalties for speculative decoding.
-            model_worker_batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 spec_info.verified_id.to(torch.int64)
             )
 
         assign_draft_cache_locs[(num_seqs,)](
-            model_worker_batch.req_pool_indices,
+            batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
-            model_worker_batch.seq_lens,
+            batch.seq_lens,
             self.extend_lens,
             self.num_new_pages_per_topk,
             batch.draft_out_cache_loc,
@@ -429,8 +429,8 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens_sum = torch.sum(batch.seq_lens_cpu).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
-    def _draft_preprocess_idle(self, model_worker_batch: ModelWorkerBatch):
-        model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
+    def _draft_preprocess_idle(self, batch: ModelWorkerBatch):
+        batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
             hidden_size=self.model_config.hidden_size,
             dtype=self.model_config.dtype,
@@ -438,12 +438,12 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
-    def draft(self, model_worker_batch: ModelWorkerBatch):
+    def draft(self, batch: ModelWorkerBatch):
         # Parse args
-        if model_worker_batch.forward_mode.is_idle():
-            self._draft_preprocess_idle(model_worker_batch)
+        if batch.forward_mode.is_idle():
+            self._draft_preprocess_idle(batch)
         else:
-            self._draft_preprocess_decode(model_worker_batch)
+            self._draft_preprocess_decode(batch)
 
         verify_out_cache_loc = batch.out_cache_loc
         batch.out_cache_loc = batch.draft_out_cache_loc
@@ -452,7 +452,7 @@ class EAGLEWorker(TpModelWorker):
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.spec_num_draft_tokens = self.topk
         forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
+            batch, self.draft_model_runner
         )
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
@@ -486,12 +486,12 @@ class EAGLEWorker(TpModelWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            model_worker_batch.spec_info.verified_id,
+            batch.spec_info.verified_id,
             score_list,
             token_list,
             parents_list,
-            model_worker_batch.seq_lens,
-            model_worker_batch.seq_lens_sum,
+            batch.seq_lens,
+            batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
