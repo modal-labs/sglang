@@ -1902,17 +1902,13 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             else:
-                # TODO (timmy): move this to model_worker_batch
-                batch.seq_lens_cpu = batch.seq_lens.cpu()
-                if self.enable_overlap:
-                    # Optimistically estimate the seq_lens_cpu for the next draft forward
-                    batch.seq_lens_cpu.add_(self.server_args.speculative_num_steps + 1)
-
                 if batch.has_grammar:
                     raise NotImplementedError("Grammar is not supported for now")
 
-                model_worker_batch = batch.get_model_worker_batch(seq_lens_cpu_cache=batch.seq_lens_cpu)
-                model_worker_batch.seq_lens_cpu = batch.seq_lens_cpu
+                model_worker_batch = batch.get_model_worker_batch()
+                if self.enable_overlap:
+                    # Optimistically estimate the seq_lens_cpu for the next draft forward
+                    model_worker_batch.seq_lens_cpu.add_(self.server_args.speculative_num_steps + 1)
 
                 # Populate fields needed to reuse batch for verify
                 model_worker_batch.extend_seq_lens = batch.extend_lens
