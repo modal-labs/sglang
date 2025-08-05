@@ -11,11 +11,13 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from python.sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
     Req,
     ScheduleBatch,
     get_last_loc,
@@ -71,14 +73,15 @@ class EagleDraftInput:
 
     spec_steps: Optional[int] = None
 
-    def prepare_for_extend(self, batch: ScheduleBatch):
+    def prepare_for_extend(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_idle():
             return
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 
         pt = 0
-        for i, extend_len in enumerate(batch.extend_lens):
+        assert batch.extend_seq_lens is not None
+        for i, extend_len in enumerate(batch.extend_seq_lens):
             input_ids = batch.input_ids[pt : pt + extend_len]
             batch.input_ids[pt : pt + extend_len] = torch.cat(
                 (input_ids[1:], self.verified_id[i].reshape(1))
@@ -105,7 +108,7 @@ class EagleDraftInput:
 
     def prepare_extend_after_decode(
         self,
-        batch: ScheduleBatch,
+        batch: ModelWorkerBatch,
         speculative_num_steps: int,
     ):
         batch.forward_mode = ForwardMode.DRAFT_EXTEND
@@ -113,7 +116,6 @@ class EagleDraftInput:
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
-        batch.return_hidden_states = False
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length.add_(1)
@@ -238,37 +240,28 @@ class EagleVerifyInput:
             seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
         )
 
-    def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
+    def prepare_for_verify(
+        self,
+        batch: ModelWorkerBatch,
+        page_size: int,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    ):
         if batch.forward_mode.is_idle():
             return
 
         batch.input_ids = self.draft_token
 
-        if page_size == 1:
-            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
-            end_offset = batch.seq_lens + self.draft_token_num
-        else:
-            prefix_lens = batch.seq_lens
-            end_offset = prefix_lens + self.draft_token_num
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                prefix_lens,
-            )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                prefix_lens, end_offset, last_loc, len(batch.input_ids)
-            )
-            self.last_loc = last_loc
+        end_offset = batch.seq_lens + self.draft_token_num
 
-        bs = batch.batch_size()
+        bs = len(batch.seq_lens)
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
+            req_to_token_pool.req_to_token,
             batch.seq_lens,
             end_offset,
             batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
 
@@ -312,10 +305,12 @@ class EagleVerifyInput:
 
     def verify(
         self,
-        batch: ScheduleBatch,
-        logits_output: torch.Tensor,
+        batch: ModelWorkerBatch,
+        logits_output: LogitsProcessorOutput,
+        req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
+        device: torch.device,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> EagleVerifyOutput:
         """
@@ -331,20 +326,21 @@ class EagleVerifyInput:
         if batch.forward_mode.is_idle():
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
-                    device=batch.device,
+                    device=device,
+                    # TODO(nathan): model_config doesn't exist on batch, figure out what to do instead
                     hidden_size=batch.model_config.hidden_size,
                     dtype=batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 ),
                 logits_output=logits_output,
-                verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                verified_id=torch.empty(0, dtype=torch.long, device=device),
                 free_cache_loc_cpu=None,
                 accepted_indices=torch.full(
                     (0, self.spec_steps + 1),
                     -1,
                     dtype=torch.int32,
-                    device=batch.device,
+                    device=device,
                 ),
             )
 
@@ -487,11 +483,11 @@ class EagleVerifyInput:
         batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
+            req_to_token_pool.req_to_token,
             batch.seq_lens,
             batch.seq_lens + accept_length + 1,
             batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
         batch.seq_lens.add_(accept_length + 1)

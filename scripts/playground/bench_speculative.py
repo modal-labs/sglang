@@ -196,11 +196,26 @@ def main(args, server_args):
                 ]
             )
 
+        if server_args.disable_radix_cache:
+            other_args.extend(
+                [
+                    "--disable-radix-cache",
+                ]
+            )
+
         if server_args.attention_backend:
             other_args.extend(
                 [
                     "--attention-backend",
                     server_args.attention_backend,
+                ]
+            )
+
+        if server_args.log_level:
+            other_args.extend(
+                [
+                    "--log-level",
+                    server_args.log_level,
                 ]
             )
 
