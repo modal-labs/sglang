@@ -332,5 +332,8 @@ class EAGLEWorkerClient:
     def unload_lora_adapter(self, recv_req):
         return self.worker.unload_lora_adapter(recv_req)
 
+    def add_logprob_values(self, *args, **kwargs):
+        self.worker.add_logprob_values(*args, **kwargs)
+
     def __delete__(self):
         self.input_queue.put((None, None, None))

@@ -233,6 +233,7 @@ class SchedulerOutputProcessorMixin:
         if self.spec_algorithm.is_eagle():
             accept_length = logits_output.accept_length.tolist()
             idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
+            self.draft_worker.add_logprob_values(batch, logits_output, next_token_ids, batch.sampling_info.temperatures, accept_length)
         else:
             idx_to_batch = list(range(len(batch.reqs)))
 
@@ -286,6 +287,7 @@ class SchedulerOutputProcessorMixin:
                     req.output_token_ids_logprobs_idx.append(
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
+                print(f"{req.output_token_ids_logprobs_val=}")
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(

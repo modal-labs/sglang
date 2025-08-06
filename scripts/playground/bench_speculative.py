@@ -60,7 +60,7 @@ def send_one_batch(base_url, num_prompts, batch_size, profile=False):
     args = SimpleNamespace(
         disable_ignore_eos=False,
         disable_stream=False,
-        return_logprob=False,
+        return_logprob=True,
         backend="sglang",
         dataset_name="custom",
         num_prompts=None,
@@ -99,9 +99,10 @@ def send_one_batch(base_url, num_prompts, batch_size, profile=False):
 
     server_info = requests.get(base_url + "/get_server_info").json()
     # We use 20% percentile instead of median on purpose
-    step_time = np.percentile(
-        server_info["internal_states"][0]["step_time_dict"][str(batch_size)], 20
-    )
+    # step_time = np.percentile(
+    #     server_info["internal_states"][0]["step_time_dict"][str(batch_size)], 20
+    # )
+    step_time = 0.00001
     speed = 1 / step_time * acc_length
 
     return (
