@@ -328,6 +328,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 req_pool_indices,
                 seq_lens,
                 seq_lens_sum,
+                None,
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
@@ -415,6 +416,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_sum,
+                seq_lens_cpu[:bs],
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -615,6 +617,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
+        seq_lens_cpu: Optional[torch.Tensor],
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -627,6 +630,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
+        seq_lens_cpu: Optional[torch.Tensor],
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -637,6 +641,7 @@ class FlashInferIndicesUpdaterDecode:
             req_pool_indices,
             seq_lens,
             seq_lens_sum,
+            seq_lens_cpu,
             self.kv_indptr[0],
             None,
             spec_info,
@@ -647,6 +652,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
+        seq_lens_cpu: Optional[torch.Tensor],
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -675,6 +681,7 @@ class FlashInferIndicesUpdaterDecode:
                 req_pool_indices,
                 paged_kernel_lens_tmp,
                 paged_kernel_lens_sum_tmp,
+                None,
                 self.kv_indptr[wrapper_id],
                 kv_start_idx_tmp,
                 spec_info,
@@ -686,6 +693,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
+        seq_lens_cpu: Optional[torch.Tensor],
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -706,6 +714,7 @@ class FlashInferIndicesUpdaterDecode:
                 req_pool_indices,
                 paged_kernel_lens,
                 seq_lens_sum,
+                None,
                 self.kv_indptr[wrapper_id],
                 kv_start_idx,
                 spec_info,
@@ -717,6 +726,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
+        paged_kernel_lens_cpu: Optional[torch.Tensor],
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -744,6 +754,10 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+
+            if paged_kernel_lens_cpu is not None:
+                kv_indptr = torch.zeros_like(kv_indptr, device="cpu")
+                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens_cpu, dim=0)
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1

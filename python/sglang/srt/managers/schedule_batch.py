@@ -1690,10 +1690,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Create seq_lens_cpu when needed
         if (
             global_server_args_dict["attention_backend"] == "fa3"
-            or (
-                global_server_args_dict["use_mla_backend"]
-                and global_server_args_dict["attention_backend"] == "flashinfer"
-            )
+            or global_server_args_dict["attention_backend"] == "flashinfer"
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
             or global_server_args_dict["attention_backend"] == "ascend"
