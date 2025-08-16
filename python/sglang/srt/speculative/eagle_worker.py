@@ -338,6 +338,9 @@ class EAGLEWorker(TpModelWorker):
                 )
             return logits_output, next_token_ids, None, bid, False, batch.spec_info
         else:
+            # Clone seq_lens because it will be modified in-place by verify
+            batch.seq_lens = batch.seq_lens.clone()
+
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
             logits_output, verify_output, can_run_cuda_graph = (

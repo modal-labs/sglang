@@ -231,6 +231,8 @@ class SchedulerOutputProcessorMixin:
             self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
 
         if self.spec_algorithm.is_eagle():
+            batch.seq_lens.add_(logits_output.accept_length + 1)
+
             accept_length = logits_output.accept_length.tolist()
             idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
         else:
