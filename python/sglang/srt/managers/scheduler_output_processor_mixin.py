@@ -202,16 +202,16 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        logits_output, next_token_ids, free_cache_loc_cpu, can_run_cuda_graph = (
+        logits_output, next_token_ids, evict_cache_loc, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
-            result.free_cache_loc_cpu,
+            result.evict_cache_loc,
             result.can_run_cuda_graph,
         )
 
         if self.enable_overlap:
             if self.spec_algorithm.is_eagle():
-                logits_output, next_token_ids, free_cache_loc_cpu, _, can_run_cuda_graph = (
+                logits_output, next_token_ids, evict_cache_loc, _, can_run_cuda_graph = (
                     self.draft_worker.resolve_last_batch_result(launch_done)
                 )
             else:
@@ -226,9 +226,9 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        if free_cache_loc_cpu is not None:
-            free_cache_loc_cpu = free_cache_loc_cpu[free_cache_loc_cpu != 0]
-            self.token_to_kv_pool_allocator.free(free_cache_loc_cpu.to("cuda", non_blocking=True))
+        if evict_cache_loc is not None:
+            evict_cache_loc = evict_cache_loc[evict_cache_loc != 0]
+            self.token_to_kv_pool_allocator.free(evict_cache_loc)
 
         if self.spec_algorithm.is_eagle():
             accept_length = logits_output.accept_length.tolist()

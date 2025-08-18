@@ -351,7 +351,7 @@ class EAGLEWorker(TpModelWorker):
             return (
                 logits_output,
                 verify_output.verified_id,
-                verify_output.free_cache_loc_cpu,
+                verify_output.evict_cache_loc,
                 batch.bid,
                 can_run_cuda_graph,
                 batch.spec_info,
