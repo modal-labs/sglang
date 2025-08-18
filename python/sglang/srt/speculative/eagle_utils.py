@@ -260,16 +260,33 @@ class EagleVerifyInput:
         batch: ModelWorkerBatch,
         page_size: int,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    ):
+    ) -> Optional[torch.Tensor]:
         if batch.forward_mode.is_idle():
-            return
+            return None
 
         batch.input_ids = self.draft_token
 
-        end_offset = batch.seq_lens + self.draft_token_num
-
         bs = len(batch.seq_lens)
+
+        if page_size == 1:
+            end_offset = batch.seq_lens + self.draft_token_num
+            evict_cache_loc = None
+        else:
+            assert batch.out_cache_loc.shape[0] == bs * self.draft_token_num
+            last_loc = get_last_loc(
+                req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                batch.seq_lens,
+            )
+            batch.out_cache_loc, evict_cache_loc = merge_cache_loc_large_page_size(
+                batch.out_cache_loc,
+                last_loc,
+                page_size,
+                self.draft_token_num,
+                bs,
+            )
+            end_offset = batch.seq_lens + self.draft_token_num + page_size - 1
+
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             req_to_token_pool.req_to_token,
@@ -279,6 +296,8 @@ class EagleVerifyInput:
             req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
+
+        return evict_cache_loc
 
     def generate_attn_arg_prefill(
         self,
@@ -942,6 +961,48 @@ def select_top_k_tokens(
         )
 
     return input_ids, hidden_states, scores, tree_info
+
+
+torch.compile(dynamic=True)
+def merge_cache_loc_large_page_size(
+    alloc_cache_loc: torch.Tensor,
+    last_loc: torch.Tensor,
+    page_size: int,
+    draft_token_num: int,
+    bs: int,
+):
+    out_cache_loc = torch.zeros(
+        (bs, draft_token_num + page_size - 1),
+        dtype=alloc_cache_loc.dtype,
+        device=alloc_cache_loc.device,
+    )
+
+    # Copy the padding from the last partial page
+    page_indices = torch.arange(page_size - 1, device=alloc_cache_loc.device)
+    pad_src = (last_loc + 1)[:, None] + page_indices[None, :]
+    out_cache_loc[:, :page_size - 1] = pad_src
+
+    # Copy the newly allocated tokens
+    pad_lens = -(last_loc + 1) % page_size
+    draft_indices = torch.arange(draft_token_num, device=alloc_cache_loc.device)
+    alloc_indices = pad_lens[:, None] + draft_indices[None, :]
+    torch.scatter_(
+        dim=1,
+        index=alloc_indices,
+        src=alloc_cache_loc.view(bs, -1),
+    )
+
+    # Do not evict partial pages
+    non_evict_len = -(draft_token_num - pad_lens) % page_size
+    evict_cache_loc = torch.where(
+        page_indices[None, :] >= non_evict_len[:, None],
+        out_cache_loc[:, draft_token_num:],
+        0,
+    ).flatten()
+
+    out_cache_loc = out_cache_loc[:, :draft_token_num].flatten()
+
+    return out_cache_loc, evict_cache_loc
 
 
 def _generate_simulated_accept_index(

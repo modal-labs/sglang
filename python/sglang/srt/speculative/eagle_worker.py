@@ -592,11 +592,10 @@ class EAGLEWorker(TpModelWorker):
         return score_list, token_list, parents_list
 
     def verify(self, batch: ModelWorkerBatch, spec_info: EagleVerifyInput):
-        spec_info.prepare_for_verify(
+        evict_cache_loc = spec_info.prepare_for_verify(
             batch,
             self.page_size,
             self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
         )
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -626,6 +625,9 @@ class EAGLEWorker(TpModelWorker):
             device=self.device,
             vocab_mask=None,
         )
+
+        if evict_cache_loc is not None:
+            res.evict_cache_loc = torch.cat([res.evict_cache_loc, evict_cache_loc])
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
