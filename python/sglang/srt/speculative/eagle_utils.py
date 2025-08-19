@@ -514,9 +514,56 @@ class EagleVerifyInput:
         evict_mask.scatter_(0, accept_index.to(torch.int64) + 1, False)
         evict_mask = evict_mask[1:]
 
-        if page_size > 1:
-            raise NotImplementedError("Evict cache loc is not supported for page size > 1")
-        evict_cache_loc = torch.where(evict_mask, batch.out_cache_loc, 0)
+        if page_size == 1:
+            evict_cache_loc = torch.where(evict_mask, batch.out_cache_loc, 0)
+        else:
+            if self.topk == 1:
+                # Only evict full empty page. Do not evict partial empty page
+                align_evict_mask_to_page_size[len(batch.seq_lens),](
+                    batch.seq_lens,
+                    evict_mask,
+                    page_size,
+                    self.draft_token_num,
+                    next_power_of_2(self.draft_token_num),
+                )
+                evict_cache_loc = torch.where(evict_mask, batch.out_cache_loc, 0)
+            else:
+                # Shift the accepted tokens to the beginning.
+                # Only evict the last part
+                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    accept_index,
+                    accept_length,
+                    self.draft_token_num,
+                    page_size,
+                )
+                evict_cache_loc = torch.zeros_like(batch.out_cache_loc)
+
+                # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
+                # accept_index:  [0 -1  2,  3  4 -1,  6 -1 -1]
+                # tgt_cache_loc: [0  1   ,  3  4   ,  6      ]
+                # to_free_slots: [      2,        5,     7  8]
+                # to_free_slots also needs to be page-aligned without the first partial page
+                #
+                # split each row of out_cache_loc into two parts.
+                # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
+                # 2. the second part goes to to_free_slots.
+                get_target_cache_loc[(bs,)](
+                    tgt_cache_loc,
+                    evict_cache_loc,
+                    accept_length,
+                    to_free_num_slots,
+                    batch.out_cache_loc,
+                    self.draft_token_num,
+                    next_power_of_2(self.draft_token_num),
+                    next_power_of_2(bs),
+                )
+
+                # Copy the kv cache
+                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_cache_loc, src_cache_loc
+                )
 
         # Construct EagleVerifyOutput
         batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
@@ -858,7 +905,7 @@ def get_src_tgt_cache_loc(
     draft_token_num: int,
     page_size: int,
 ):
-    src_cache_loc = out_cache_loc[accept_index]
+    src_cache_loc = torch.where(accept_index == -1, 0, out_cache_loc[accept_index])
     tgt_cache_loc = torch.empty_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
