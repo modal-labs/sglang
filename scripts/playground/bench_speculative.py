@@ -13,6 +13,7 @@ import json
 import os
 import time
 from types import SimpleNamespace
+from typing import List
 
 import numpy as np
 import requests
@@ -224,6 +225,14 @@ def main(args, server_args):
                 [
                     "--quantization",
                     server_args.quantization,
+                ]
+            )
+
+        if server_args.page_size != 1:
+            other_args.extend(
+                [
+                    "--page-size",
+                    server_args.page_size,
                 ]
             )
 
