@@ -165,7 +165,7 @@ class EAGLEWorkerClient:
             (
                 logits_output,
                 next_token_ids,
-                evict_cache_loc_cpu,
+                evict_cache_loc,
                 bid,
                 can_run_cuda_graph,
                 output_spec_info,
@@ -196,7 +196,7 @@ class EAGLEWorkerClient:
             copy_done.record()
 
             self.output_queue.put(
-                (copy_done, logits_output, next_token_ids, evict_cache_loc_cpu, bid, can_run_cuda_graph)
+                (copy_done, logits_output, next_token_ids, evict_cache_loc, bid, can_run_cuda_graph)
             )
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):

@@ -561,21 +561,24 @@ class EagleVerifyInput:
                 )
 
                 # Copy the kv cache
-                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
                 )
 
         # Construct EagleVerifyOutput
-        batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
-        assign_req_to_token_pool[(bs,)](
-            batch.req_pool_indices,
-            req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + accept_length + 1,
-            batch.out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
+        if page_size == 1 or self.topk == 1:
+            batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
+            assign_req_to_token_pool[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.seq_lens + accept_length + 1,
+                batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                next_power_of_2(bs),
+            )
+        else:
+            batch.out_cache_loc = tgt_cache_loc
         batch.seq_lens.add_(accept_length + 1)
         # Optimistically estimate the seq_lens_cpu for the next draft forward
         batch.seq_lens_cpu.add_(self.spec_steps + 1)
@@ -1018,26 +1021,22 @@ def merge_cache_loc_large_page_size(
     draft_token_num: int,
     bs: int,
 ):
+    device = alloc_cache_loc.device
     out_cache_loc = torch.zeros(
         (bs, draft_token_num + page_size - 1),
         dtype=alloc_cache_loc.dtype,
-        device=alloc_cache_loc.device,
+        device=device,
     )
 
     # Copy the padding from the last partial page
-    page_indices = torch.arange(page_size - 1, device=alloc_cache_loc.device)
+    page_indices = torch.arange(page_size - 1, device=device)
     pad_src = (last_loc + 1)[:, None] + page_indices[None, :]
     out_cache_loc[:, :page_size - 1] = pad_src
 
     # Copy the newly allocated tokens
     pad_lens = -(last_loc + 1) % page_size
-    draft_indices = torch.arange(draft_token_num, device=alloc_cache_loc.device)
-    alloc_indices = pad_lens[:, None] + draft_indices[None, :]
-    torch.scatter_(
-        dim=1,
-        index=alloc_indices,
-        src=alloc_cache_loc.view(bs, -1),
-    )
+    alloc_indices = pad_lens[:, None] + torch.arange(draft_token_num, device=device)[None, :]
+    out_cache_loc[torch.arange(bs, device=device)[:, None], alloc_indices] = alloc_cache_loc.view(bs, -1)
 
     # Do not evict partial pages
     non_evict_len = -(draft_token_num - pad_lens) % page_size

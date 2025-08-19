@@ -232,19 +232,20 @@ class SchedulerOutputProcessorMixin:
 
         if self.spec_algorithm.is_eagle():
             accept_length = logits_output.accept_length.tolist()
-            idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length + 1)]
+            bids = [(bid, step) for bid, length in enumerate(accept_length) for step in range(length + 1)]
         else:
-            idx_to_batch = list(range(len(batch.reqs)))
+            bids = [(bid, 0) for bid in range(len(batch.reqs))]
 
-        num_generated_tokens_this_batch = len(idx_to_batch)
+        num_generated_tokens_this_batch = len(bids)
         self.num_generated_tokens += num_generated_tokens_this_batch
         if self.spec_algorithm.is_eagle():
             self.spec_num_total_accepted_tokens += num_generated_tokens_this_batch
             self.spec_num_total_forward_ct += len(batch.reqs)
 
         # Check finish condition
-        for i, (b, next_token_id) in enumerate(zip(idx_to_batch, next_token_ids)):
-            req = batch.reqs[b]
+        prev_seq_lens = [batch.reqs[bid].seqlen for bid in range(len(batch.reqs))]
+        for i, ((bid, step), next_token_id) in enumerate(zip(bids, next_token_ids)):
+            req = batch.reqs[bid]
             if req.is_retracted:
                 continue
 
@@ -252,12 +253,9 @@ class SchedulerOutputProcessorMixin:
                 # Free the one extra delayed token
                 if self.page_size == 1:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                elif self.spec_algorithm.is_none():
+                else:
                     # Only free when the extra token is in a new page
-                    # NOTE (timmy): do we do anything for eagle?
-                    if (
-                        len(req.origin_input_ids) + len(req.output_ids) - 1
-                    ) % self.page_size == 0:
+                    if (prev_seq_lens[bid] + step) % self.page_size == 0:
                         self.token_to_kv_pool_allocator.free(
                             batch.out_cache_loc[i : i + 1]
                         )

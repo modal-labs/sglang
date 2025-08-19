@@ -412,8 +412,7 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.verified_id.to(torch.int64)
             )
 
-        num_new_pages_per_topk = \
-            self.draft_out_cache_loc.shape[0] // (num_seqs * self.topk * self.page_size)
+        num_new_pages_per_topk = batch.draft_out_cache_loc.shape[0] // (num_seqs * self.topk * self.page_size)
 
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,

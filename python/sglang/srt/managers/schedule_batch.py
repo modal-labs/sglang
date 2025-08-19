@@ -1559,9 +1559,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             num_new_pages_per_topk = (max_draft_len - 1) // page_size + 1
             self.draft_out_cache_loc, backup_state = self.alloc_paged_token_slots_extend(
                 prefix_lens=torch.zeros_like(self.seq_lens),
-                seq_lens=torch.full_like(self.seq_lens, num_new_pages_per_topk * page_size),
+                seq_lens=torch.full_like(self.seq_lens, speculative_eagle_topk * num_new_pages_per_topk * page_size),
                 last_loc=torch.full_like(self.seq_lens, -1),
-                extend_num_tokens=bs * num_new_pages_per_topk * page_size,
+                extend_num_tokens=bs * speculative_eagle_topk * num_new_pages_per_topk * page_size,
                 backup_state=True
             )
             self.token_to_kv_pool_allocator.restore_state(backup_state)
