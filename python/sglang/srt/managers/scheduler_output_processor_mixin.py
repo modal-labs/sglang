@@ -255,7 +255,7 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
                 else:
                     # Only free when the extra token is in a new page
-                    if (prev_seq_lens[bid] + step) % self.page_size == 0:
+                    if (prev_seq_lens[bid] + step - 1) % self.page_size == 0:
                         self.token_to_kv_pool_allocator.free(
                             batch.out_cache_loc[i : i + 1]
                         )
