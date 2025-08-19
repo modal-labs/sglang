@@ -86,6 +86,7 @@ class EAGLEWorkerClient:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        moe_ep_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -95,6 +96,7 @@ class EAGLEWorkerClient:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
+            moe_ep_rank=moe_ep_rank,
             nccl_port=nccl_port,
             target_worker=target_worker,
         )

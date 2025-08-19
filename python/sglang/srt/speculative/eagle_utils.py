@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -71,11 +72,22 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
+    # Shape info for padding
+    num_tokens_per_batch: int = -1
+    num_tokens_for_logprob_per_batch: int = -1
+
+    # Inputs for draft extend
+    # shape: (b,)
+    seq_lens_for_draft_extend: torch.Tensor = None
+    req_pool_indices_for_draft_extend: torch.Tensor = None
+
     spec_steps: Optional[int] = None
 
     def prepare_for_extend(self, batch: ModelWorkerBatch):
+
         if batch.forward_mode.is_idle():
             return
+
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 
@@ -98,7 +110,7 @@ class EagleDraftInput:
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
-            verified_id=None,
+            verified_id=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -111,7 +123,10 @@ class EagleDraftInput:
         batch: ModelWorkerBatch,
         speculative_num_steps: int,
     ):
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND
+
+        if batch.forward_mode.is_idle():
+            return
+
         batch.input_ids = self.verified_id
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
@@ -356,6 +371,11 @@ class EagleVerifyInput:
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
 
+        if bs != len(sampling_info):
+            sampling_info = copy.deepcopy(sampling_info)
+            # NOTE: retrive_index are the indices of the requests that are kept.
+            sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
+
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(
@@ -494,13 +514,14 @@ class EagleVerifyInput:
         # Optimistically estimate the seq_lens_cpu for the next draft forward
         batch.seq_lens_cpu.add_(self.spec_steps + 1)
 
-        draft_input = EagleDraftInput()
-        draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
-        draft_input.verified_id = verified_id
-        draft_input.accept_length = accept_length
-        draft_input.seq_lens_for_draft_extend = batch.seq_lens
-        draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
-        draft_input.spec_steps = self.spec_steps
+        draft_input = EagleDraftInput(
+            hidden_states=batch.spec_info.hidden_states[accept_index],
+            verified_id=verified_id,
+            accept_length=accept_length,
+            seq_lens_for_draft_extend=batch.seq_lens,
+            req_pool_indices_for_draft_extend=batch.req_pool_indices,
+            spec_steps=self.spec_steps,
+        )
 
         return EagleVerifyOutput(
             draft_input=draft_input,
