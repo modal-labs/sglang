@@ -1560,7 +1560,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.draft_out_cache_loc, backup_state = self.alloc_paged_token_slots_extend(
                 prefix_lens=torch.zeros_like(self.seq_lens),
                 seq_lens=torch.full_like(self.seq_lens, num_new_pages_per_topk * page_size),
-                last_loc=torch.zeros_like(self.seq_lens),
+                last_loc=torch.full_like(self.seq_lens, -1),
                 extend_num_tokens=bs * num_new_pages_per_topk * page_size,
                 backup_state=True
             )
@@ -1568,7 +1568,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.out_cache_loc = self.alloc_paged_token_slots_extend(
                 prefix_lens=torch.zeros_like(self.seq_lens),
                 seq_lens=torch.full_like(self.seq_lens, speculative_num_draft_tokens),
-                last_loc=torch.zeros_like(self.seq_lens),
+                last_loc=torch.full_like(self.seq_lens, -1),
                 extend_num_tokens=bs * speculative_num_draft_tokens,
             )
 
