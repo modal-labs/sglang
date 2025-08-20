@@ -634,7 +634,7 @@ class EAGLEWorker(TpModelWorker):
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
-        logits_output.accept_length = res.draft_input.accept_length
+        logits_output.accept_length = res.draft_input.accept_length.clone()
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (

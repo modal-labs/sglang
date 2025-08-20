@@ -236,7 +236,7 @@ class SchedulerOutputProcessorMixin:
                 batch.seq_lens.add_(logits_output.accept_length + 1)
 
             accept_length = logits_output.accept_length.tolist()
-            idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length)]
+            idx_to_batch = [i for i, length in enumerate(accept_length) for _ in range(length + 1)]
         else:
             idx_to_batch = list(range(len(batch.reqs)))
 
