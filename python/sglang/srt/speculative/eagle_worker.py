@@ -338,6 +338,9 @@ class EAGLEWorker(TpModelWorker):
                 )
             return logits_output, next_token_ids, None, bid, False, batch.spec_info
         else:
+            # Clone seq_lens because it will be modified in-place by verify
+            batch.seq_lens = batch.seq_lens.clone()
+
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
             logits_output, verify_output, can_run_cuda_graph = (
@@ -631,7 +634,7 @@ class EAGLEWorker(TpModelWorker):
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
-        logits_output.accept_length = res.draft_input.accept_length
+        logits_output.accept_length = res.draft_input.accept_length.clone()
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -679,11 +682,6 @@ class EAGLEWorker(TpModelWorker):
     def forward_draft_extend_after_decode(self, batch: ModelWorkerBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
-        seq_lens_backup = batch.seq_lens.clone()
-        req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = batch.spec_info.accept_length
-        return_logprob_backup = batch.return_logprob
-
         input_is_idle = batch.forward_mode.is_idle()
 
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
@@ -756,15 +754,9 @@ class EAGLEWorker(TpModelWorker):
 
         self._detect_nan_if_needed(logits_output)
 
-        # Restore backup.
-        # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
-        batch.seq_lens = seq_lens_backup
-        batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.accept_length = accept_length_backup
-        batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
