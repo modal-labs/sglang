@@ -272,20 +272,24 @@ class EagleVerifyInput:
             end_offset = batch.seq_lens + self.draft_token_num
             evict_cache_loc = None
         else:
-            assert batch.out_cache_loc.shape[0] == bs * self.draft_token_num
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
                 batch.seq_lens,
             )
-            batch.out_cache_loc, evict_cache_loc = merge_cache_loc_large_page_size(
-                batch.out_cache_loc,
+
+            alloc_cache_loc = batch.out_cache_loc
+            batch.out_cache_loc = torch.zeros_like(alloc_cache_loc)
+            evict_cache_loc = torch.zeros_like(alloc_cache_loc)
+            merge_cache_loc[(bs,)](
                 last_loc,
+                alloc_cache_loc,
+                batch.out_cache_loc,
+                evict_cache_loc,
                 page_size,
                 self.draft_token_num,
-                bs,
             )
-            end_offset = batch.seq_lens + self.draft_token_num + page_size - 1
+            end_offset = batch.seq_lens + self.draft_token_num
 
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
@@ -899,6 +903,40 @@ def get_target_cache_loc(
     )
 
 
+@triton.jit
+def merge_cache_loc(
+    last_loc,
+    alloc_cache_loc,
+    out_cache_loc,
+    evict_cache_loc,
+    page_size: tl.constexpr,
+    draft_token_num: tl.constexpr,
+):
+    page_offsets = tl.arange(0, page_size)
+    bid = tl.program_id(axis=0)
+
+    # Copy the padding from the last partial page
+    last_loc_ = tl.load(last_loc + bid)
+    pad_len = (page_size - (last_loc_ + 1) % page_size) % page_size
+    pad_indices = page_offsets + last_loc_ + 1
+    tl.store(out_cache_loc + bid * draft_token_num + page_offsets, pad_indices, mask=page_offsets < pad_len)
+
+    # Copy the newly allocated tokens
+    for i in range(0, draft_token_num - pad_len, page_size):
+        write_mask = i + page_offsets < draft_token_num - pad_len
+        alloc_offsets = bid * draft_token_num + i + page_offsets
+        alloc_indices = tl.load(alloc_cache_loc + alloc_offsets, mask=write_mask)
+        tl.store(out_cache_loc + pad_len + alloc_offsets, alloc_indices, mask=write_mask)
+
+    # Evict non-partial pages
+    evict_begin = tl.cdiv(draft_token_num - pad_len, page_size) * page_size
+    for i in range(evict_begin, draft_token_num, page_size):
+        evict_mask = i + page_offsets < draft_token_num
+        evict_offsets = bid * draft_token_num + i + page_offsets
+        evict_indices = tl.load(alloc_cache_loc + evict_offsets, mask=evict_mask)
+        tl.store(evict_cache_loc + evict_offsets, evict_indices, mask=evict_mask)
+
+
 @torch.compile(dynamic=True)
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
@@ -1011,44 +1049,6 @@ def select_top_k_tokens(
         )
 
     return input_ids, hidden_states, scores, tree_info
-
-
-torch.compile(dynamic=True)
-def merge_cache_loc_large_page_size(
-    alloc_cache_loc: torch.Tensor,
-    last_loc: torch.Tensor,
-    page_size: int,
-    draft_token_num: int,
-    bs: int,
-):
-    device = alloc_cache_loc.device
-    out_cache_loc = torch.zeros(
-        (bs, draft_token_num + page_size - 1),
-        dtype=alloc_cache_loc.dtype,
-        device=device,
-    )
-
-    # Copy the padding from the last partial page
-    page_indices = torch.arange(page_size - 1, device=device)
-    pad_src = (last_loc + 1)[:, None] + page_indices[None, :]
-    out_cache_loc[:, :page_size - 1] = pad_src
-
-    # Copy the newly allocated tokens
-    pad_lens = -(last_loc + 1) % page_size
-    alloc_indices = pad_lens[:, None] + torch.arange(draft_token_num, device=device)[None, :]
-    out_cache_loc[torch.arange(bs, device=device)[:, None], alloc_indices] = alloc_cache_loc.view(bs, -1)
-
-    # Do not evict partial pages
-    non_evict_len = -(draft_token_num - pad_lens) % page_size
-    evict_cache_loc = torch.where(
-        page_indices[None, :] >= non_evict_len[:, None],
-        out_cache_loc[:, draft_token_num:],
-        0,
-    ).flatten()
-
-    out_cache_loc = out_cache_loc[:, :draft_token_num].flatten()
-
-    return out_cache_loc, evict_cache_loc
 
 
 def _generate_simulated_accept_index(
