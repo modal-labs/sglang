@@ -679,31 +679,15 @@ def assign_draft_cache_locs(
     page_size: tl.constexpr,
     iter_upper: tl.constexpr,
 ):
-    # NOTE (timmy): for page_size > 1
-    # 1. maximum num_new_pages_per_topk is now a constant
-    # 2. extend_lens is always num_new_pages_per_topk * page_size
-    #
-    # The arrangement of token pool looks like:
-    # | ---- ---- ---- | -... | -xxx xx.. | -xxx xx.. | -xxx xx.. |
-    #  prefix         last page  topk1      topk2      topk3
-    #
-    # Legend: - is prefix token, x is speculative token, . is padding
-    #
-    # * Last page can be empty, but we always leave a padded page for it.
-
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
 
-    if page_size == 1 or topk == 1:
-        copy_len = topk * speculative_num_steps
-        out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
-    else:
-        copy_len = num_new_pages_per_topk * page_size
-        cum_copy_len = copy_len * pid
-        out_cache_ptr = out_cache_loc + cum_copy_len
+    copy_len = topk * num_new_pages_per_topk * page_size
+    out_cache_ptr = out_cache_loc + pid * copy_len
 
     # Part 1: Copy from out_cache_loc to req_to_token
-    kv_start = tl.load(seq_lens + pid)
+    prefix_len = tl.load(seq_lens + pid)
+    kv_start = tl.cdiv(prefix_len, page_size) * page_size
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
     num_loop = tl.cdiv(copy_len, BLOCK_SIZE)
     for i in range(num_loop):
@@ -712,30 +696,36 @@ def assign_draft_cache_locs(
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
 
-    if page_size == 1 or topk == 1:
+    if page_size == 1:
         return
 
-    # Part 2: Copy the indices for the last partial page
-    prefix_len = tl.load(seq_lens + pid)
-    last_page_len = prefix_len % page_size
+    # Part 2: Extend token pool for the last partial page
+    last_loc = tl.load(token_pool + prefix_len - 1)
     offsets = tl.arange(0, page_size)
+    mask = offsets < kv_start - prefix_len
+    tl.store(token_pool + prefix_len + offsets, offsets + last_loc + 1, mask=mask)
+
+    if topk == 1:
+        return
+
+    # Part 3: Copy the indices for the last partial page
+    last_page_len = prefix_len % page_size
     mask = offsets < last_page_len
     prefix_base = token_pool + prefix_len - last_page_len
 
     for topk_id in range(topk):
         value = tl.load(prefix_base + offsets, mask=mask)
         tl.store(
-            prefix_base + page_size + topk_id * num_new_pages_per_topk * page_size + offsets,
+            prefix_base + topk_id * num_new_pages_per_topk * page_size + offsets,
             value,
             mask=mask,
         )
 
-    # Part 3: Remove the padding in out_cache_loc
+    # Part 4: Remove the padding in out_cache_loc
     iter_offest = tl.arange(0, iter_upper)
     for topk_id in range(topk):
         indices = tl.load(
             prefix_base
-            + page_size
             + topk_id * num_new_pages_per_topk * page_size
             + last_page_len
             + iter_offest,
