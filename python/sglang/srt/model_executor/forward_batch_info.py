@@ -521,43 +521,46 @@ class ForwardBatch:
         if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
             # extend_seq_lens can either be a list or a tensor
             extend_seq_lens = (
-                batch.extend_seq_lens.tolist()
-                if isinstance(batch.extend_seq_lens, torch.Tensor)
+                torch.tensor(batch.extend_seq_lens, dtype=torch.int64).to(
+                    device=device, non_blocking=True
+                )
+                if isinstance(batch.extend_seq_lens, list)
                 else batch.extend_seq_lens
             )
 
             mrope_deltas = []
-            extend_lens = []
             for batch_idx in range(batch_size):
-                extend_seq_len = extend_seq_lens[batch_idx]
-                extend_lens.append(extend_seq_len)
                 mrope_delta = (
-                    torch.tensor([0], dtype=torch.int64)
+                    torch.tensor([0], dtype=torch.int64, device=device)
                     if mm_inputs[batch_idx] is None
                     else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
                 )
                 assert mrope_delta.shape == (
                     1,
                 ), "mrope_delta should be a single value: got " + str(mrope_delta.shape)
-                mrope_deltas.append(mrope_delta.to(device=device))
-            position_chunks = torch.split(
-                batch.spec_info.positions[: sum(extend_lens)], extend_lens
+                mrope_deltas.append(mrope_delta.to(device=device, non_blocking=True))
+            mrope_deltas = torch.cat(mrope_deltas, dim=0)
+
+            # TODO (timmy): should this be a triton kernel?
+            # torch native hack
+            extend_lens_cumsum = extend_seq_lens.cumsum(dim=0)
+            extend_num_tokens = extend_lens_cumsum[-1]
+
+            mrope_delta_indices = torch.zeros_like(batch.spec_info.positions)
+            mrope_delta_indices.scatter_(0, extend_lens_cumsum[:-1], 1)
+            mrope_delta_indices = mrope_delta_indices.cumsum(dim=0)
+
+            expanded_mrope_deltas = torch.where(
+                torch.arange(batch.spec_info.positions.shape[0], device=device)
+                < extend_num_tokens,
+                mrope_deltas[mrope_delta_indices],
+                0,
             )
-            mrope_positions_list = [
-                pos_chunk + delta
-                for pos_chunk, delta in zip(position_chunks, mrope_deltas)
-            ]
-            pad_len = batch.spec_info.positions.shape[0] - sum(extend_lens)
-            if pad_len > 0:
-                mrope_positions_list.append(
-                    torch.zeros(
-                        (pad_len,),
-                        dtype=torch.int64,
-                        device=device,
-                    )
-                )
+
             next_input_positions = (
-                torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
+                (batch.spec_info.positions + expanded_mrope_deltas)
+                .unsqueeze(0)
+                .repeat(3, 1)
             )
 
         else:  # target_verify or draft_decode
