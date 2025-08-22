@@ -109,6 +109,12 @@ class LlamaModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+
+        self.is_mrope_enabled = hasattr(config, "rope_scaling") and config.rope_scaling is not None and "mrope_section" in config.rope_scaling
+        # fix rope_scaling for qwen2.5-vl
+        if self.is_mrope_enabled:
+            config.rope_scaling["rope_type"] = "default"
+
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -143,6 +149,9 @@ class LlamaModel(nn.Module):
             embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
+        
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
@@ -176,7 +185,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-
+            
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
 
