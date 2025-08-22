@@ -345,9 +345,6 @@ class EAGLEWorker(TpModelWorker):
                 )
             return logits_output, next_token_ids, None, bid, False, batch.spec_info
         else:
-            # Clone seq_lens because it will be modified in-place by verify
-            batch.seq_lens = batch.seq_lens.clone()
-
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
             logits_output, verify_output, can_run_cuda_graph = self.verify(
@@ -444,6 +441,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.seq_lens_sum = torch.sum(batch.seq_lens_cpu).item()
+        print(f"_draft_preprocess_decode: {batch.seq_lens=}")
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
     def _draft_preprocess_idle(self, batch: ModelWorkerBatch):
@@ -755,8 +753,8 @@ class EAGLEWorker(TpModelWorker):
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         assert batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        batch.extend_seq_lens = batch.spec_info.accept_length
         forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
-        forward_batch.extend_seq_lens = batch.spec_info.accept_length
         if forward_batch.seq_lens_cpu is not None:
             # TODO(nathan): not sure why this is happening
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()

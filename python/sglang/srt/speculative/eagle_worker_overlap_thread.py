@@ -289,6 +289,10 @@ class EAGLEWorkerClient:
     def is_hybrid(self) -> bool:
         return self.worker.is_hybrid
 
+    @property
+    def model_runner(self):
+        return self.worker.model_runner
+
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
 
