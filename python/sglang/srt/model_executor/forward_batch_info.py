@@ -519,22 +519,43 @@ class ForwardBatch:
         mm_inputs = batch.multimodal_inputs
 
         if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
+            # extend_seq_lens can either be a list or a tensor
+            extend_seq_lens = (
+                batch.extend_seq_lens.tolist()
+                if isinstance(batch.extend_seq_lens, torch.Tensor)
+                else batch.extend_seq_lens
+            )
+
             mrope_deltas = []
             extend_lens = []
             for batch_idx in range(batch_size):
-                extend_seq_len = batch.extend_seq_lens[batch_idx]
+                extend_seq_len = extend_seq_lens[batch_idx]
                 extend_lens.append(extend_seq_len)
                 mrope_delta = (
                     torch.tensor([0], dtype=torch.int64)
                     if mm_inputs[batch_idx] is None
                     else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
                 )
+                assert mrope_delta.shape == (
+                    1,
+                ), "mrope_delta should be a single value: got " + str(mrope_delta.shape)
                 mrope_deltas.append(mrope_delta.to(device=device))
-            position_chunks = torch.split(batch.spec_info.positions, extend_lens)
+            position_chunks = torch.split(
+                batch.spec_info.positions[: sum(extend_lens)], extend_lens
+            )
             mrope_positions_list = [
                 pos_chunk + delta
                 for pos_chunk, delta in zip(position_chunks, mrope_deltas)
             ]
+            pad_len = batch.spec_info.positions.shape[0] - sum(extend_lens)
+            if pad_len > 0:
+                mrope_positions_list.append(
+                    torch.zeros(
+                        (pad_len,),
+                        dtype=torch.int64,
+                        device=device,
+                    )
+                )
             next_input_positions = (
                 torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
             )
@@ -549,7 +570,9 @@ class ForwardBatch:
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(
+                device=device, non_blocking=True
+            )
             next_input_positions = (
                 (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
             )

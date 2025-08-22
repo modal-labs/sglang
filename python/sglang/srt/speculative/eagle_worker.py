@@ -441,7 +441,6 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.seq_lens_sum = torch.sum(batch.seq_lens_cpu).item()
-        print(f"_draft_preprocess_decode: {batch.seq_lens=}")
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
     def _draft_preprocess_idle(self, batch: ModelWorkerBatch):

@@ -23,10 +23,10 @@ from typing import Optional, Tuple
 import psutil
 import torch
 
-from sglang.srt.speculative.eagle_utils import EagleDraftInput
-from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_utils import EagleDraftInput
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
@@ -44,18 +44,14 @@ class FutureSpecInfo:
         hidden_size: int,
         device: torch.device,
     ):
-        self.topk_p = torch.zeros(
-            (max_items, topk), device=device, dtype=torch.float32
-        )
+        self.topk_p = torch.zeros((max_items, topk), device=device, dtype=torch.float32)
         self.topk_index = torch.zeros(
             (max_items, topk), device=device, dtype=torch.int64
         )
         self.hidden_states = torch.zeros(
             (max_items, hidden_size), device=device, dtype=torch.bfloat16
         )
-        self.verified_id = torch.zeros(
-            (max_items,), device=device, dtype=torch.int32
-        )
+        self.verified_id = torch.zeros((max_items,), device=device, dtype=torch.int32)
 
     def resolve(self, spec_info: EagleDraftInput) -> EagleDraftInput:
         """Resolves spec_info."""
@@ -72,9 +68,15 @@ class FutureSpecInfo:
         """Puts the data from spec_info into the stores starting at future_spec_info_ct."""
         bs = spec_info.verified_id.shape[0]
         self.topk_p[future_spec_info_ct : future_spec_info_ct + bs] = spec_info.topk_p
-        self.topk_index[future_spec_info_ct : future_spec_info_ct + bs] = spec_info.topk_index
-        self.hidden_states[future_spec_info_ct : future_spec_info_ct + bs] = spec_info.hidden_states
-        self.verified_id[future_spec_info_ct : future_spec_info_ct + bs] = spec_info.verified_id.to(torch.int32)
+        self.topk_index[future_spec_info_ct : future_spec_info_ct + bs] = (
+            spec_info.topk_index
+        )
+        self.hidden_states[future_spec_info_ct : future_spec_info_ct + bs] = (
+            spec_info.hidden_states
+        )
+        self.verified_id[future_spec_info_ct : future_spec_info_ct + bs] = (
+            spec_info.verified_id.to(torch.int32)
+        )
 
 
 class EAGLEWorkerClient:
@@ -159,7 +161,9 @@ class EAGLEWorkerClient:
 
             # Resolve spec info for decode
             if model_worker_batch.spec_info is not None:
-                model_worker_batch.spec_info = self.future_spec_info_map.resolve(model_worker_batch.spec_info)
+                model_worker_batch.spec_info = self.future_spec_info_map.resolve(
+                    model_worker_batch.spec_info
+                )
 
             # Run forward
             (
@@ -196,7 +200,14 @@ class EAGLEWorkerClient:
             copy_done.record()
 
             self.output_queue.put(
-                (copy_done, logits_output, next_token_ids, free_cache_loc_cpu, bid, can_run_cuda_graph)
+                (
+                    copy_done,
+                    logits_output,
+                    next_token_ids,
+                    free_cache_loc_cpu,
+                    bid,
+                    can_run_cuda_graph,
+                )
             )
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
@@ -204,9 +215,14 @@ class EAGLEWorkerClient:
         Resolve the last batch result and wait for the current batch to be launched.
         Used in overlap mode.
         """
-        copy_done, logits_output, next_token_ids, free_cache_loc_cpu, bid, can_run_cuda_graph = (
-            self.output_queue.get()
-        )
+        (
+            copy_done,
+            logits_output,
+            next_token_ids,
+            free_cache_loc_cpu,
+            bid,
+            can_run_cuda_graph,
+        ) = self.output_queue.get()
 
         if launch_done is not None:
             launch_done.wait()
@@ -221,7 +237,13 @@ class EAGLEWorkerClient:
                     logits_output.input_token_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
-        return logits_output, next_token_ids, free_cache_loc_cpu, bid, can_run_cuda_graph
+        return (
+            logits_output,
+            next_token_ids,
+            free_cache_loc_cpu,
+            bid,
+            can_run_cuda_graph,
+        )
 
     def forward_batch_speculative_generation(
         self, model_worker_batch: ModelWorkerBatch
