@@ -1432,24 +1432,6 @@ class MRotaryEmbedding(RotaryEmbedding):
 
             return position_ids, mrope_position_deltas
 
-    @staticmethod
-    def get_next_input_positions(
-        mrope_position_delta: int,
-        context_len: int,
-        seq_len: int,
-    ) -> torch.Tensor:
-        return torch.tensor(
-            [
-                list(
-                    range(
-                        context_len + mrope_position_delta,
-                        seq_len + mrope_position_delta,
-                    )
-                )
-                for _ in range(3)
-            ]
-        )
-
 
 class DualChunkRotaryEmbedding(CustomOp):
     """Rotary positional embedding for Dual Chunk Attention."""
