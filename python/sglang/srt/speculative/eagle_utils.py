@@ -937,7 +937,7 @@ def get_src_tgt_cache_loc(
     page_size: int,
 ):
     src_cache_loc = torch.where(accept_index == -1, 0, out_cache_loc[accept_index])
-    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    tgt_cache_loc = torch.zeros_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
         (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,
