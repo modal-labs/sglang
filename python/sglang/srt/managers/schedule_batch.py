@@ -1538,19 +1538,47 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
-    def prepare_for_decode(self):
+    def prepare_for_speculative_decode(self):
         self.forward_mode = ForwardMode.DECODE
+
+        speculative_num_steps = global_server_args_dict["speculative_num_steps"]
+        speculative_eagle_topk = global_server_args_dict["speculative_eagle_topk"]
+        speculative_num_draft_tokens = global_server_args_dict["speculative_num_draft_tokens"]
+        page_size = self.token_to_kv_pool_allocator.page_size
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle():
-            assert self.token_to_kv_pool_allocator.page_size == 1, "Eagle only supports page size 1"
+        if page_size == 1:
             self.draft_out_cache_loc, backup_state = self.alloc_token_slots(
-                bs * global_server_args_dict["speculative_num_steps"] * global_server_args_dict["speculative_eagle_topk"],
+                bs * speculative_num_steps * speculative_eagle_topk,
                 backup_state=True
             )
             self.token_to_kv_pool_allocator.restore_state(backup_state)
-            self.out_cache_loc = self.alloc_token_slots(bs * global_server_args_dict["speculative_num_draft_tokens"])
+            self.out_cache_loc = self.alloc_token_slots(bs * speculative_num_draft_tokens)
+        else:
+            max_draft_len = page_size - 1 + speculative_num_steps
+            num_new_pages_per_topk = (max_draft_len - 1) // page_size + 1
+            self.draft_out_cache_loc, backup_state = self.alloc_paged_token_slots_extend(
+                prefix_lens=torch.zeros_like(self.seq_lens),
+                seq_lens=torch.full_like(self.seq_lens, speculative_eagle_topk * num_new_pages_per_topk * page_size),
+                last_loc=torch.full_like(self.seq_lens, -1),
+                extend_num_tokens=bs * speculative_eagle_topk * num_new_pages_per_topk * page_size,
+                backup_state=True
+            )
+            self.token_to_kv_pool_allocator.restore_state(backup_state)
+            self.out_cache_loc = self.alloc_paged_token_slots_extend(
+                prefix_lens=torch.zeros_like(self.seq_lens),
+                seq_lens=torch.full_like(self.seq_lens, speculative_num_draft_tokens),
+                last_loc=torch.full_like(self.seq_lens, -1),
+                extend_num_tokens=bs * speculative_num_draft_tokens,
+            )
+
+    def prepare_for_decode(self):
+        if self.spec_algorithm.is_eagle():
+            self.prepare_for_speculative_decode()
             return
+
+        self.forward_mode = ForwardMode.DECODE
+        bs = len(self.reqs)
 
         if self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:
