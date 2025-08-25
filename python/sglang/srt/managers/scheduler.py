@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -145,6 +146,7 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     disable_request_logging,
+    freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
@@ -337,7 +339,7 @@ class Scheduler(
                 )
             else:
                 from sglang.srt.speculative.eagle_worker import (
-                    EAGLEWorker as EAGLEWorkerClass
+                    EAGLEWorker as EAGLEWorkerClass,
                 )
 
             self.draft_worker = EAGLEWorkerClass(
@@ -532,6 +534,7 @@ class Scheduler(
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
+                (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
@@ -831,10 +834,13 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    (self.draft_worker.cur_sampling_info
-                    if self.spec_algorithm.is_eagle()
-                    else self.tp_worker.cur_sampling_info)
-                    if batch else None
+                    (
+                        self.draft_worker.cur_sampling_info
+                        if self.spec_algorithm.is_eagle()
+                        else self.tp_worker.cur_sampling_info
+                    )
+                    if batch
+                    else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1766,12 +1772,16 @@ class Scheduler(
                 if self.enable_overlap:
                     # TODO (timmy): Do not alias seq_lens between forward and scheduler threads.
                     # Optimistically estimate the seq_lens_cpu for the next draft forward
-                    model_worker_batch.seq_lens_cpu.add_(self.server_args.speculative_num_steps + 1)
+                    model_worker_batch.seq_lens_cpu.add_(
+                        self.server_args.speculative_num_steps + 1
+                    )
 
                 # Populate fields needed to reuse batch for verify
                 model_worker_batch.extend_seq_lens = batch.extend_lens
                 model_worker_batch.extend_prefix_lens = batch.prefix_lens
-                model_worker_batch.extend_logprob_start_lens = batch.extend_logprob_start_lens
+                model_worker_batch.extend_logprob_start_lens = (
+                    batch.extend_logprob_start_lens
+                )
 
                 (
                     logits_output,
@@ -1780,7 +1790,9 @@ class Scheduler(
                     bid,
                     can_run_cuda_graph,
                     next_spec_info,
-                ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
+                ) = self.draft_worker.forward_batch_speculative_generation(
+                    model_worker_batch
+                )
                 batch.spec_info = next_spec_info
 
             if self.pp_group.is_last_rank:
@@ -1807,7 +1819,9 @@ class Scheduler(
                     if not self.pp_group.is_last_rank
                     else None
                 ),
-                free_cache_loc_cpu=free_cache_loc_cpu if self.spec_algorithm.is_eagle() else None,
+                free_cache_loc_cpu=(
+                    free_cache_loc_cpu if self.spec_algorithm.is_eagle() else None
+                ),
                 next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
@@ -2496,6 +2510,12 @@ class Scheduler(
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
+
+    def handle_freeze_gc(self, recv_req: FreezeGCReq):
+        """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
+        freeze_gc("Scheduler")
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return None
 
 
 class IdleSleeper:

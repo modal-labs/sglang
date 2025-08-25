@@ -87,6 +87,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_radix_cache",
     "enable_dp_lm_head",
+    "flashinfer_mxfp4_moe_precision",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
@@ -106,6 +107,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_symm_mem",
     "quantization",
     "enable_custom_logit_processor",
+    "disaggregation_mode",
     "speculative_num_steps",
     "speculative_eagle_topk",
     "speculative_num_draft_tokens",
@@ -1543,13 +1545,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         bs = len(self.reqs)
 
         if self.spec_algorithm.is_eagle():
-            assert self.token_to_kv_pool_allocator.page_size == 1, "Eagle only supports page size 1"
+            assert (
+                self.token_to_kv_pool_allocator.page_size == 1
+            ), "Eagle only supports page size 1"
             self.draft_out_cache_loc, backup_state = self.alloc_token_slots(
-                bs * global_server_args_dict["speculative_num_steps"] * global_server_args_dict["speculative_eagle_topk"],
-                backup_state=True
+                bs
+                * global_server_args_dict["speculative_num_steps"]
+                * global_server_args_dict["speculative_eagle_topk"],
+                backup_state=True,
             )
             self.token_to_kv_pool_allocator.restore_state(backup_state)
-            self.out_cache_loc = self.alloc_token_slots(bs * global_server_args_dict["speculative_num_draft_tokens"])
+            self.out_cache_loc = self.alloc_token_slots(
+                bs * global_server_args_dict["speculative_num_draft_tokens"]
+            )
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:

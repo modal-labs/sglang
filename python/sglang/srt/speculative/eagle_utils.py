@@ -12,7 +12,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -25,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
@@ -50,6 +50,8 @@ SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
+
+TREE_SPEC_KERNEL_AVAILABLE = "tree_speculative_sampling_target_only" in globals()
 
 
 @dataclass
@@ -404,8 +406,15 @@ class EagleVerifyInput:
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
-        # Sample tokens
-        if batch.sampling_info.is_all_greedy:
+        # Sample tokens. Force greedy sampling on AMD
+        is_all_greedy = sampling_info.is_all_greedy
+        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+            logger.warning(
+                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+                "Falling back to greedy verification."
+            )
+
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
@@ -434,12 +443,13 @@ class EagleVerifyInput:
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
+            if not torch.all(sampling_info.top_ps == 1.0):
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    ),
+                )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             draft_probs = torch.zeros(
@@ -491,16 +501,27 @@ class EagleVerifyInput:
         accept_index = accept_index_full[compact_indices]
 
         verified_id = torch.where(accept_index != -1, predict[accept_index], 0)
-        evict_mask = torch.full((self.draft_token.shape[0] + 1,), True, dtype=torch.bool, device=self.draft_token.device)
+        evict_mask = torch.full(
+            (self.draft_token.shape[0] + 1,),
+            True,
+            dtype=torch.bool,
+            device=self.draft_token.device,
+        )
         evict_mask.scatter_(0, accept_index.to(torch.int64) + 1, False)
         evict_mask = evict_mask[1:]
 
         if page_size > 1:
-            raise NotImplementedError("Free cache loc cpu is not supported for page size > 1")
-        free_cache_loc_cpu = torch.where(evict_mask, batch.out_cache_loc, 0).to("cpu", non_blocking=True)
+            raise NotImplementedError(
+                "Free cache loc cpu is not supported for page size > 1"
+            )
+        free_cache_loc_cpu = torch.where(evict_mask, batch.out_cache_loc, 0).to(
+            "cpu", non_blocking=True
+        )
 
         # Construct EagleVerifyOutput
-        batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
+        batch.out_cache_loc = torch.where(
+            accept_index != -1, batch.out_cache_loc[accept_index], 0
+        )
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             req_to_token_pool.req_to_token,

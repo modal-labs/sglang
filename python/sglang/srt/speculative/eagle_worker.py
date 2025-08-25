@@ -9,7 +9,6 @@ from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     patch_tensor_parallel_group,
 )
@@ -92,7 +91,7 @@ class EAGLEWorker(TpModelWorker):
         )
         self.padded_static_len = -1
 
-        # Override context length with target model's context length
+        # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         # Do not capture cuda graph in `super().__init__()`
@@ -267,6 +266,43 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
+        elif self.server_args.attention_backend == "trtllm_mha":
+            from sglang.srt.layers.attention.trtllm_mha_backend import (
+                TRTLLMHAAttnBackend,
+                TRTLLMHAAttnMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = TRTLLMHAAttnMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = TRTLLMHAAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.has_prefill_wrapper_verify = True
+        elif self.server_args.attention_backend == "trtllm_mla":
+            if not global_server_args_dict["use_mla_backend"]:
+                raise ValueError(
+                    "trtllm_mla backend requires MLA model (use_mla_backend=True)."
+                )
+
+            from sglang.srt.layers.attention.trtllm_mla_backend import (
+                TRTLLMMLABackend,
+                TRTLLMMLAMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = TRTLLMMLAMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = TRTLLMMLABackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.has_prefill_wrapper_verify = True
         else:
             raise ValueError(
                 f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
@@ -313,9 +349,14 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    def forward_batch_speculative_generation(
-        self, batch: ModelWorkerBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], int, bool, EagleDraftInput]:
+    def forward_batch_speculative_generation(self, batch: ModelWorkerBatch) -> Tuple[
+        LogitsProcessorOutput,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        int,
+        bool,
+        EagleDraftInput,
+    ]:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -329,19 +370,20 @@ class EAGLEWorker(TpModelWorker):
             accepted tokens.
         """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            logits_output, next_token_ids, bid = (
-                self.forward_target_extend(batch)
-            )
+            logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, batch.seq_lens_cpu
+                    batch,
+                    logits_output.hidden_states,
+                    next_token_ids,
+                    batch.seq_lens_cpu,
                 )
             return logits_output, next_token_ids, None, bid, False, batch.spec_info
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
-            logits_output, verify_output, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
+            logits_output, verify_output, can_run_cuda_graph = self.verify(
+                batch, spec_info
             )
 
             with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -468,9 +510,7 @@ class EAGLEWorker(TpModelWorker):
 
         # Get forward batch
         assert batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
@@ -606,9 +646,7 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward
         logits_output, _, can_run_cuda_graph = (
-            self.target_worker.forward_batch_generation(
-                batch, skip_sample=True
-            )
+            self.target_worker.forward_batch_generation(batch, skip_sample=True)
         )
 
         # TODO(timmy): add grammar support
@@ -666,9 +704,7 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        forward_batch = ForwardBatch.init_new(
-            batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
         forward_batch.return_logprob = False
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
@@ -714,9 +750,7 @@ class EAGLEWorker(TpModelWorker):
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         assert batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
         forward_batch.extend_seq_lens = batch.spec_info.accept_length
         if forward_batch.seq_lens_cpu is not None:
             # TODO(nathan): not sure why this is happening
@@ -798,7 +832,9 @@ def get_last_loc_large_page_size_top_k_1(
     return prefix_lens, seq_lens, last_loc
 
 
-@torch.compile(dynamic=True)
+# Disable torch.compile for this function because it will be
+# even slower.
+# @torch.compile(dynamic=True)
 def get_last_loc_large_page_size_large_top_k(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
