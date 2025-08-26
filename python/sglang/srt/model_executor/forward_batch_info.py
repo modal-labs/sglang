@@ -298,8 +298,8 @@ class ForwardBatch:
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
 
-    # For Qwen2-VL
-    mrope_positions: torch.Tensor = None
+    # For Qwen2-VL. (3, N) for extend and (N,) for decode.
+    mrope_positions: Optional[torch.Tensor] = None
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
@@ -515,11 +515,10 @@ class ForwardBatch:
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
-            if self.forward_mode.is_decode():
-                # 3 * N
+            if self.forward_mode.is_decode():  # (N,)
                 if mm_input is None:
                     mrope_positions_list[batch_idx] = torch.full(
-                        (3, 1),
+                        (1,),
                         self.seq_lens[batch_idx] - 1,
                         dtype=torch.int64,
                         device=model_runner.device,
@@ -529,11 +528,9 @@ class ForwardBatch:
                         model_runner.device, non_blocking=True
                     )
                     mrope_positions_list[batch_idx] = (
-                        (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
-                        .unsqueeze(0)
-                        .repeat(3, 1)
+                        mrope_position_deltas + self.seq_lens[batch_idx] - 1
                     )
-            elif self.forward_mode.is_extend():
+            elif self.forward_mode.is_extend():  # (3, N)
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
@@ -561,7 +558,7 @@ class ForwardBatch:
 
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
-            dim=1,
+            dim=0 if self.forward_mode.is_decode() else 1,
         ).to(dtype=torch.int64, device=model_runner.device)
 
     def get_max_chunk_capacity(self):

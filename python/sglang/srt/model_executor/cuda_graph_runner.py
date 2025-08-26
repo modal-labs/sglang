@@ -317,7 +317,7 @@ class CudaGraphRunner:
                 (self.max_num_token,), dtype=self._cache_loc_dtype()
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+            self.mrope_positions = torch.zeros((self.max_bs,), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -532,7 +532,7 @@ class CudaGraphRunner:
             encoder_lens = self.encoder_lens[:bs]
         else:
             encoder_lens = None
-        mrope_positions = self.mrope_positions[:, :bs]
+        mrope_positions = self.mrope_positions[:bs]
         next_token_logits_buffer = self.next_token_logits_buffer[:num_tokens]
         self.num_token_non_padded[...] = num_tokens
 
@@ -751,7 +751,12 @@ class CudaGraphRunner:
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
+            # CUDA graph only supports decode / target verify / idle.
+            # In each of these cases, we are only processing text, so mrope_positions should be (N,) (i.e. 1D rope, not multidimensional rope).
+            assert forward_batch.mrope_positions.shape == (
+                raw_bs,
+            ), f"CUDA graph runner expected forward_batch.mrope_positions to be ({raw_bs},), but got {forward_batch.mrope_positions.shape=}"
+            self.mrope_positions[:raw_bs].copy_(forward_batch.mrope_positions)
         if self.require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)

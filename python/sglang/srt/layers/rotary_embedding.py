@@ -1029,14 +1029,13 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    @torch.compile(dynamic=True)
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch-native implementation equivalent to forward().
+        """Multimodal rotary embedding.
 
         Args:
             positions:
@@ -1045,7 +1044,31 @@ class MRotaryEmbedding(RotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
-        assert positions.ndim == 1 or positions.ndim == 2
+
+        if positions.ndim == 1:
+            # In the text-only case, multimodal rotary embedding is equivalent to 1D rotary embedding.
+            # Use the parent class's implementation, which is faster.
+            return super().forward(positions, query, key)
+        elif positions.ndim == 2:
+            # In the multimodal case, use the PyTorch-native implementation.
+            return self._forward_multimodal(positions, query, key)
+        else:
+            raise ValueError(
+                f"Invalid shape for multimodal rotary embedding: {positions.shape=}"
+            )
+
+    @torch.compile(dynamic=True)
+    def _forward_multimodal(
+        self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """PyTorch-native implementation of multimodal rotary embedding.
+
+        Args:
+            positions: [3, num_tokens] (T/H/W positions)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 2
 
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
