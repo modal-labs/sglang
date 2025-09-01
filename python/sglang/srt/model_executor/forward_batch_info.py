@@ -526,7 +526,11 @@ class ForwardBatch:
         device = model_runner.device
         mm_inputs = batch.multimodal_inputs
 
-        if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
+        # Note that in overlap schedule mode, batch.spec_info.positions is a size batch_size * num_speculative_steps+1 tensor
+        if (
+            batch.forward_mode.is_draft_extend()
+            and model_runner.server_args.disable_overlap_schedule
+        ):  # draft_extend_after_decode
             mrope_deltas = []
             extend_lens = []
             for batch_idx in range(batch_size):
