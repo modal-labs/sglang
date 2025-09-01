@@ -421,9 +421,14 @@ class ForwardBatch:
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            if isinstance(batch.extend_seq_lens, torch.Tensor):
+                ret.extend_seq_lens = (
+                    batch.extend_seq_lens.detach().clone().to(device, non_blocking=True)
+                )
+            else:
+                ret.extend_seq_lens = torch.tensor(
+                    batch.extend_seq_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)

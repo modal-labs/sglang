@@ -135,13 +135,16 @@ class EagleDraftInput:
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
 
+        self.accept_length.add_(1)
+
         if isinstance(batch, ScheduleBatch):
             batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
             batch.extend_num_tokens = sum(batch.extend_lens)
             batch.return_hidden_states = False
+        else:
+            batch.extend_seq_lens = self.accept_length
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.accept_length.add_(1)
         self.positions = torch.zeros_like(batch.input_ids, dtype=torch.long)
         self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
 

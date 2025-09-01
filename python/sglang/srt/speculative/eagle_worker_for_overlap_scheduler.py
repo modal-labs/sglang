@@ -755,7 +755,6 @@ class EAGLEWorker(TpModelWorker):
 
         assert batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
-        forward_batch.extend_seq_lens = batch.spec_info.accept_length
         if forward_batch.seq_lens_cpu is not None:
             # TODO(nathan): not sure why this is happening
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
