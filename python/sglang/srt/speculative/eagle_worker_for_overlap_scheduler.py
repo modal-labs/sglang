@@ -401,8 +401,6 @@ class EAGLEWorker(TpModelWorker):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
 
-            print(f"right before return: {batch.out_cache_loc=}")
-
             return (
                 logits_output,
                 verify_output.verified_id,
@@ -669,7 +667,6 @@ class EAGLEWorker(TpModelWorker):
             device=self.device,
             vocab_mask=None,
         )
-        print(f"verify: {batch.out_cache_loc=}")
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)

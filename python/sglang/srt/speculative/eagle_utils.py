@@ -930,9 +930,6 @@ class EagleVerifyInput:
         batch.out_cache_loc = torch.where(
             accept_index != -1, batch.out_cache_loc[accept_index], 0
         )
-        print("===")
-        print(f"free_cache_loc_cpu: {free_cache_loc_cpu}")
-        print(f"batch.out_cache_loc: {batch.out_cache_loc}")
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             req_to_token_pool.req_to_token,
