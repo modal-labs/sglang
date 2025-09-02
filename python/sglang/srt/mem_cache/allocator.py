@@ -78,7 +78,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.cat(self.free_group))
+            to_free = self.free_group
+            self.free_group = []
+            self.free(torch.cat(to_free))
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
@@ -156,9 +158,41 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[need_size:]
         return select_index
 
+    def restore_state(self, state):
+        super().restore_state(state)
+        if self.debug_mode:
+            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+            assert len(
+                torch.unique(torch.cat((self.free_pages, self.release_pages)))
+            ) == len(torch.cat((self.free_pages, self.release_pages)))
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        if self.debug_mode:
+            # Find pages in free_index that are already in free_pages
+            already_in_free = free_index[torch.isin(free_index, self.free_pages)]
+            if already_in_free.numel() > 0:
+                print(f"Pages in free_index already in free_pages: {already_in_free}")
+                raise ValueError("Pages in free_index already in free_pages")
+
+            already_in_release_pages = free_index[
+                torch.isin(free_index, self.release_pages)
+            ]
+            if already_in_release_pages.numel() > 0:
+                print(
+                    f"Pages in free_index already in release_pages: {already_in_release_pages}"
+                )
+                raise ValueError("Pages in free_index already in release_pages")
+
+            for free_group in self.free_group:
+                already_in_free_group = free_index[torch.isin(free_index, free_group)]
+                if already_in_free_group.numel() > 0:
+                    print(
+                        f"Pages in free_index already in free_group: {already_in_free_group}"
+                    )
+                    raise ValueError("Pages in free_index already in free_group")
 
         if self.is_not_in_free_group:
             if self.need_sort:
@@ -166,7 +200,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
                 if self.debug_mode:
-                    assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+                    if len(torch.unique(self.free_pages)) != len(self.free_pages):
+                        uniques, counts = torch.unique(
+                            self.free_pages, return_counts=True
+                        )
+                        duplicates = uniques[counts > 1]
+                        print(f"Duplicate pages in free_pages: {duplicates}")
+                        print(f"Just tried to free {free_index}")
+                        raise ValueError("Duplicate pages in free_pages")
         else:
             self.free_group.append(free_index)
 

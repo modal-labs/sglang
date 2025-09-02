@@ -52,7 +52,7 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap:
                 if self.spec_algorithm.is_eagle():
-                    logits_output, next_token_ids, _, _, _ = (
+                    logits_output, next_token_ids, _, _, _, _ = (
                         self.draft_worker.resolve_last_batch_result(launch_done)
                     )
                 else:
@@ -215,6 +215,12 @@ class SchedulerOutputProcessorMixin:
                     logits_output,
                     next_token_ids,
                     free_cache_loc_cpu,
+                    # Note: It's important we use out_cache_loc here and not batch.out_cache_loc.
+                    # out_cache_loc stores the out cache locations for the accepted tokens in
+                    # the target verify step, which is what we want. However, batch.out_cache_loc
+                    # contains the out cache locations for all tokens. If we use that, we will end
+                    # up freeing the wrong locations when we free extra delayed tokens in specdec.
+                    out_cache_loc,
                     _,
                     can_run_cuda_graph,
                 ) = self.draft_worker.resolve_last_batch_result(launch_done)
@@ -222,6 +228,7 @@ class SchedulerOutputProcessorMixin:
                 logits_output, next_token_ids, can_run_cuda_graph = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
+                out_cache_loc = batch.out_cache_loc
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
             # spec decoding handles output logprobs inside verify process.
@@ -234,6 +241,7 @@ class SchedulerOutputProcessorMixin:
         if self.enable_overlap and self.spec_algorithm.is_eagle():
             if free_cache_loc_cpu is not None:
                 free_cache_loc_cpu = free_cache_loc_cpu[free_cache_loc_cpu != 0]
+                print(f"freeing {free_cache_loc_cpu} (free cache loc cpu)")
                 self.token_to_kv_pool_allocator.free(
                     free_cache_loc_cpu.to("cuda", non_blocking=True)
                 )
@@ -250,6 +258,9 @@ class SchedulerOutputProcessorMixin:
         else:
             idx_to_batch = list(range(len(batch.reqs)))
 
+        print(f"process_batch_result_decode: {batch.out_cache_loc=}")
+        print(f"process_batch_result_decode: {out_cache_loc=}")
+
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
@@ -261,15 +272,14 @@ class SchedulerOutputProcessorMixin:
             if self.enable_overlap and req.finished():
                 # Free the one extra delayed token
                 if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                    print(f"freeing {out_cache_loc[i : i + 1]} (delayed token)")
+                    self.token_to_kv_pool_allocator.free(out_cache_loc[i : i + 1])
                 else:
                     # Only free when the extra token is in a new page
                     if (
                         len(req.origin_input_ids) + len(req.output_ids) - 1
                     ) % self.page_size == 0:
-                        self.token_to_kv_pool_allocator.free(
-                            batch.out_cache_loc[i : i + 1]
-                        )
+                        self.token_to_kv_pool_allocator.free(out_cache_loc[i : i + 1])
                 continue
 
             if batch.spec_algorithm.is_none() or self.enable_overlap:
