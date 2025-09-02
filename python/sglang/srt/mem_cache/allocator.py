@@ -134,6 +134,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -145,6 +146,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc(self, need_size: int):
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
+            if self.debug_mode:
+                assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
         if need_size > len(self.free_pages):
             return None
@@ -162,6 +165,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
+                if self.debug_mode:
+                    assert len(torch.unique(self.free_pages)) == len(self.free_pages)
         else:
             self.free_group.append(free_index)
 

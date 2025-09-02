@@ -566,6 +566,8 @@ class ForwardBatch:
                 (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
             )
 
+        # TODO(nathan): I don't think this is necessary, but we should confirm
+        next_input_positions = next_input_positions.where(next_input_positions >= 0, 0)
         self.mrope_positions = next_input_positions
 
     def _compute_mrope_positions(

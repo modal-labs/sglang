@@ -1656,6 +1656,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # No need to filter
             return
 
+        if self.spec_algorithm.is_eagle() and self.enable_overlap:
+            # In eagle overlap mode, seq_lens is mutated in the EagleWorkerClient's forward_stream,
+            # but we copy seq_lens in the scheduler's stream. This is a problem because seq_lens may
+            # not have been mutated by EagleWorkerClient before the scheduler stream starts making
+            # a copy of it. To avoid this, we synchronize all streams before copying seq_lens.
+            torch.cuda.synchronize()
+
         keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1668,13 +1675,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
-
-        if self.spec_algorithm.is_eagle() and self.enable_overlap:
-            # In eagle overlap mode, seq_lens is mutated in the EagleWorkerClient's forward_stream,
-            # but we copy seq_lens in the scheduler's stream. This is a problem because seq_lens may
-            # not have been mutated by EagleWorkerClient before the scheduler stream starts making
-            # a copy of it. To avoid this, we synchronize all streams before copying seq_lens.
-            torch.cuda.synchronize()
 
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]

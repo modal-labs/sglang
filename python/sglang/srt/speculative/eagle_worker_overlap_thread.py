@@ -192,6 +192,10 @@ class EAGLEWorkerClient:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                     )
+                if logits_output.accept_length is not None:
+                    logits_output.accept_length = logits_output.accept_length.to(
+                        "cpu", non_blocking=True
+                    )
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states.to(
                     "cpu", non_blocking=True
