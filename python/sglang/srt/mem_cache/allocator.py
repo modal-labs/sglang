@@ -78,7 +78,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.cat(self.free_group))
+            to_free = self.free_group
+            self.free_group = []
+            self.free(torch.cat(to_free))
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
@@ -152,6 +154,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
         return select_index
+
+    def restore_state(self, state):
+        super().restore_state(state)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:

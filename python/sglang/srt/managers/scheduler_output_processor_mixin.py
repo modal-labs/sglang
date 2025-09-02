@@ -52,7 +52,7 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap:
                 if self.spec_algorithm.is_eagle():
-                    logits_output, next_token_ids, _, _, _ = (
+                    logits_output, next_token_ids, _, _, _, _ = (
                         self.draft_worker.resolve_last_batch_result(launch_done)
                     )
                 else:
@@ -215,10 +215,12 @@ class SchedulerOutputProcessorMixin:
                     logits_output,
                     next_token_ids,
                     free_cache_loc_cpu,
+                    out_cache_loc,
                     _,
                     can_run_cuda_graph,
                 ) = self.draft_worker.resolve_last_batch_result(launch_done)
             else:
+                out_cache_loc = batch.out_cache_loc
                 logits_output, next_token_ids, can_run_cuda_graph = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
@@ -261,16 +263,14 @@ class SchedulerOutputProcessorMixin:
             ) and req.finished():
                 # Free the one extra delayed token
                 if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                    self.token_to_kv_pool_allocator.free(out_cache_loc[i : i + 1])
                 elif self.spec_algorithm.is_none():
                     # Only free when the extra token is in a new page
                     # NOTE (timmy): do we do anything for eagle?
                     if (
                         len(req.origin_input_ids) + len(req.output_ids) - 1
                     ) % self.page_size == 0:
-                        self.token_to_kv_pool_allocator.free(
-                            batch.out_cache_loc[i : i + 1]
-                        )
+                        self.token_to_kv_pool_allocator.free(out_cache_loc[i : i + 1])
                 continue
 
             req.output_ids.append(next_token_id)

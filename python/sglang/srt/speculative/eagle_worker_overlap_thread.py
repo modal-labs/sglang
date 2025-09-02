@@ -205,6 +205,7 @@ class EAGLEWorkerClient:
                     logits_output,
                     next_token_ids,
                     free_cache_loc_cpu,
+                    model_worker_batch.out_cache_loc,
                     bid,
                     can_run_cuda_graph,
                 )
@@ -220,6 +221,7 @@ class EAGLEWorkerClient:
             logits_output,
             next_token_ids,
             free_cache_loc_cpu,
+            out_cache_loc,
             bid,
             can_run_cuda_graph,
         ) = self.output_queue.get()
@@ -241,6 +243,7 @@ class EAGLEWorkerClient:
             logits_output,
             next_token_ids,
             free_cache_loc_cpu,
+            out_cache_loc,
             bid,
             can_run_cuda_graph,
         )
