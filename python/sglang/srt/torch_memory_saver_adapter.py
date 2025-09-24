@@ -38,7 +38,7 @@ class TorchMemorySaverAdapter(ABC):
     def configure_subprocess(self):
         raise NotImplementedError
 
-    def region(self, tag: str):
+    def region(self, tag: str, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
     def pause(self, tag: str):
@@ -78,7 +78,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     @contextmanager
-    def region(self, tag: str):
+    def region(self, tag: str, enable_cpu_backup: bool = False):
         yield
 
     def pause(self, tag: str):
