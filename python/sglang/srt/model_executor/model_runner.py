@@ -25,7 +25,6 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -117,7 +116,6 @@ from sglang.srt.utils import (
     is_npu,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
-    set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -539,7 +537,7 @@ class ModelRunner:
                 server_args.hicache_io_backend = "direct"
                 logger.warning(
                     "FlashAttention3 decode backend is not compatible with hierarchical cache. "
-                    f"Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
+                    "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
     def init_torch_distributed(self):
@@ -677,7 +675,7 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS, enable_cpu_backup=self.server_args.enable_weights_cpu_backup):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -893,7 +891,7 @@ class ModelRunner:
                 handle.wait()
 
             self.model.load_weights(weights)
-            return True, f"Succeeded to update parameter online."
+            return True, "Succeeded to update parameter online."
 
         except Exception as e:
             error_msg = (
@@ -1445,8 +1443,8 @@ class ModelRunner:
                 f"prefill_backend={self.prefill_attention_backend_str}."
             )
             logger.warning(
-                f"Warning: Attention backend specified by --attention-backend or default backend might be overridden."
-                f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
+                "Warning: Attention backend specified by --attention-backend or default backend might be overridden."
+                "The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
             )
         else:
             attn_backend = self._get_attention_backend_from_str(
