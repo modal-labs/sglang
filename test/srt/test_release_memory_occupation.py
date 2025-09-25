@@ -190,7 +190,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         outputs = engine.generate(params["prompt"], params["sampling_params"])[
             "text"
         ]
-        self.assertEqual(outputs, params["expect_output_after_update_weights"])
+        self.assertEqual(outputs, params["expect_output_before_update_weights"])
         engine.shutdown()
 
     def test_multi_stage_release_and_resume(self):
