@@ -730,6 +730,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             use_deepstack=self.use_deepstack,
         )
 
+        aux_hidden_states = None
         if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
 
