@@ -484,8 +484,7 @@ class LogitsProcessor(nn.Module):
                 )
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
-                    hidden_states_to_store = aux_hidden_states
+                    hidden_states_to_store = torch.cat(aux_hidden_states, dim=-1)
                 else:
                     hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
@@ -506,6 +505,11 @@ class LogitsProcessor(nn.Module):
                     )
             else:
                 assert False, "Should never reach"
+            if hidden_states_to_store is not None:
+                print(
+                    "[EAGLE DEBUG] LogitsProcessor: stored hidden states shape",
+                    hidden_states_to_store.shape,
+                )
 
         if not logits_metadata.extend_return_logprob:
             # Decode mode or extend mode without return_logprob.
