@@ -968,6 +968,17 @@ class EAGLEWorker(TpModelWorker):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
+        if draft_input.hidden_states is not None:
+            hs = draft_input.hidden_states
+            print(
+                "[EAGLE DEBUG] captured hidden_states:",
+                f"shape={hs.shape}",
+                f"dtype={hs.dtype}",
+                f"mean={hs.float().mean().item():.4f}",
+                f"std={hs.float().std().item():.4f}",
+            )
+        else:
+            print("[EAGLE DEBUG] captured hidden_states: None")
 
     def _detect_nan_if_needed(self, logits_output: LogitsProcessorOutput):
         if self.enable_nan_detection:
