@@ -761,6 +761,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             ]
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        print(
+            "[EAGLE DEBUG] Qwen3-VL capture layers:",
+            self.model.layers_to_capture,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

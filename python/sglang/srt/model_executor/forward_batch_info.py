@@ -570,6 +570,9 @@ class ForwardBatch:
                 f"sample={sample.tolist()}",
             )
         self.mrope_positions = base_positions
+        spec_info_mrope = getattr(batch.spec_info, "mrope_positions", None)
+        if spec_info_mrope is not None:
+            batch.spec_info.mrope_positions = base_positions.detach().clone()
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -641,6 +644,9 @@ class ForwardBatch:
                 f"sample={sample.tolist()}",
             )
         self.mrope_positions = concatenated
+        spec_info_mrope = getattr(batch.spec_info, "mrope_positions", None)
+        if spec_info_mrope is not None:
+            batch.spec_info.mrope_positions = concatenated.detach().clone()
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk

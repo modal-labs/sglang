@@ -269,6 +269,10 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ]
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        print(
+            "[EAGLE DEBUG] Qwen3-VL-MoE capture layers:",
+            self.model.layers_to_capture,
+        )
 
     def load_fused_expert_weights(
         self,

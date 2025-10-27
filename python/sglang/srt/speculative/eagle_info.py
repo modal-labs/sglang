@@ -581,6 +581,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, hidden_size)
     hidden_states: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+    # optional mRoPE positions (3, total_tokens)
+    mrope_positions: Optional[torch.Tensor] = None
 
     # Inputs for extend
     # shape: (b,)
@@ -651,6 +653,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             capture_hidden_mode=capture_hidden_mode,
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length_cpu=[],
+            mrope_positions=None,
         )
 
     def prepare_extend_after_decode(
@@ -758,6 +761,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.mrope_positions = spec_info.mrope_positions
             return
         if spec_info.hidden_states is None:
             return
@@ -767,6 +771,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if spec_info.mrope_positions is not None:
+            if self.mrope_positions is None:
+                self.mrope_positions = spec_info.mrope_positions
+            else:
+                self.mrope_positions = torch.cat(
+                    [self.mrope_positions, spec_info.mrope_positions], dim=1
+                )
 
 
 @dataclass
