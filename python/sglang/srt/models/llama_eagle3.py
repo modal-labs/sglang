@@ -170,7 +170,17 @@ class LlamaModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            print(
+                "[EAGLE DEBUG] Draft LlamaModel: projecting target features",
+                f"shape_in={tuple(hidden_states.shape)}",
+                f"shape_embeds={tuple(embeds.shape)}",
+            )
             hidden_states = self.fc(hidden_states)
+        else:
+            print(
+                "[EAGLE DEBUG] Draft LlamaModel: using cached hidden states directly",
+                f"shape={tuple(hidden_states.shape)}",
+            )
 
         residual = None
         hidden_states, residual = self.midlayer(
