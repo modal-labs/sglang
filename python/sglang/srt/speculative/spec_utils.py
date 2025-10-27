@@ -394,6 +394,12 @@ def select_top_k_tokens(
     scores: torch.Tensor,
     topk: int,
 ):
+    if hidden_states is not None:
+        print(
+            "[EAGLE DEBUG] select_top_k_tokens:"
+            f" step={i}"
+            f" hidden_shape={tuple(hidden_states.shape)}"
+        )
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()

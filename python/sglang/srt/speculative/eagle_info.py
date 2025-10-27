@@ -578,7 +578,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, hidden_size)
+    # shape: (b, hidden_size) or (b, aux_hidden_size)
     hidden_states: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
     # optional mRoPE positions (3, total_tokens)
