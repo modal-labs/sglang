@@ -400,6 +400,17 @@ def select_top_k_tokens(
             f" step={i}"
             f" hidden_shape={tuple(hidden_states.shape)}"
         )
+    flat_topk = topk_p.to(dtype=torch.float32)
+    mean_val = torch.mean(flat_topk).item() if flat_topk.numel() > 0 else float("nan")
+    max_val = torch.amax(flat_topk).item() if flat_topk.numel() > 0 else float("nan")
+    min_val = torch.amin(flat_topk).item() if flat_topk.numel() > 0 else float("nan")
+    print(
+        "[EAGLE DEBUG] select_top_k_tokens: topk_p stats",
+        f"step={i}",
+        f"mean={mean_val:.4f}",
+        f"max={max_val:.4f}",
+        f"min={min_val:.4f}",
+    )
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
