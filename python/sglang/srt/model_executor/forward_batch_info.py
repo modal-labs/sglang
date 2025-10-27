@@ -496,6 +496,16 @@ class ForwardBatch:
             or self.contains_image_inputs()
         )
 
+    @staticmethod
+    def _is_mrope_interleaved(model_runner: "ModelRunner") -> bool:
+        config = getattr(model_runner.model_config, "hf_text_config", None)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is None:
+            return False
+        if isinstance(rope_scaling, dict):
+            return rope_scaling.get("mrope_interleaved", False)
+        return getattr(rope_scaling, "mrope_interleaved", False)
+
     def _compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
@@ -503,6 +513,7 @@ class ForwardBatch:
         batch_size = self.seq_lens.shape[0]
         device = model_runner.device
         mm_inputs = batch.multimodal_inputs
+        interleaved = self._is_mrope_interleaved(model_runner)
 
         if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
             mrope_deltas = []
@@ -521,8 +532,8 @@ class ForwardBatch:
                 pos_chunk + delta
                 for pos_chunk, delta in zip(position_chunks, mrope_deltas)
             ]
-            next_input_positions = (
-                torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
+            base_positions = torch.cat(mrope_positions_list, dim=0).to(
+                device=device, dtype=torch.int64
             )
 
         else:  # target_verify or draft_decode
@@ -536,18 +547,24 @@ class ForwardBatch:
                 for i in range(batch_size)
             ]
             mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-            next_input_positions = (
-                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+            base_positions = (seq_positions + mrope_delta_tensor).flatten().to(
+                device=device, dtype=torch.int64
             )
 
-        self.mrope_positions = next_input_positions
+        if base_positions.dim() == 1:
+            base_positions = base_positions.unsqueeze(0)
+        if base_positions.shape[0] == 1:
+            base_positions = base_positions.repeat(3, 1)
+        elif not interleaved and base_positions.shape[0] != 3:
+            base_positions = base_positions.repeat(3, 1)
+        self.mrope_positions = base_positions
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens.shape[0]
-        mrope_positions_list = [[]] * batch_size
+        mrope_positions_list = [None] * batch_size
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():

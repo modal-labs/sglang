@@ -313,6 +313,10 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        if forward_batch.mrope_positions is not None:
+            self.mrope_positions[:, :raw_num_token].copy_(
+                forward_batch.mrope_positions
+            )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
