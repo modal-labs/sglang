@@ -473,6 +473,15 @@ class LogitsProcessor(nn.Module):
 
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
+            if aux_hidden_states is None:
+                print("[EAGLE DEBUG] LogitsProcessor: aux_hidden_states is None")
+            else:
+                print(
+                    "[EAGLE DEBUG] LogitsProcessor: received",
+                    len(aux_hidden_states),
+                    "aux tensors with shapes",
+                    [h.shape for h in aux_hidden_states],
+                )
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
                     aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
