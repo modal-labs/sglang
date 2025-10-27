@@ -554,11 +554,19 @@ class Qwen3LLMModel(Qwen3Model):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        if getattr(self, "layers_to_capture", None) is None:
+            print("[EAGLE DEBUG] Qwen3LLMModel.layers_to_capture not set")
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx = layer_idx + self.start_layer
             if layer_idx in self.layers_to_capture:
+                print(
+                    "[EAGLE DEBUG] capturing layer",
+                    layer_idx,
+                    "hidden shape",
+                    (hidden_states.shape if isinstance(hidden_states, torch.Tensor) else None),
+                )
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
