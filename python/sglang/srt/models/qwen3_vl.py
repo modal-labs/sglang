@@ -718,6 +718,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
+            if positions is not None and positions.numel() > 0:
+                sample = positions[:, : min(5, positions.shape[1])].detach().cpu()
+                print(
+                    "[EAGLE DEBUG] Qwen3LLMModel.forward positions:",
+                    f"mode={forward_batch.forward_mode}",
+                    f"shape={tuple(positions.shape)}",
+                    f"rows_equal_01={torch.equal(sample[0], sample[1]) if sample.shape[0] > 1 else None}",
+                    f"rows_equal_02={torch.equal(sample[0], sample[2]) if sample.shape[0] > 2 else None}",
+                    f"sample={sample.tolist()}",
+                )
 
         if not (
             forward_batch.forward_mode.is_decode()
