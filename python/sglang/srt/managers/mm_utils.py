@@ -665,6 +665,12 @@ def general_mm_embed_routine(
         and not forward_batch.forward_mode.is_target_verify()
         and forward_batch.contains_mm_inputs()
     ):
+        print(
+            "[EAGLE DEBUG] general_mm_embed_routine:",
+            f"use_deepstack={use_deepstack}",
+            f"forward_mode={forward_batch.forward_mode}",
+            f"num_mm_inputs={sum(mm is not None for mm in forward_batch.mm_inputs)}",
+        )
         mm_inputs_list = [
             mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
         ]
@@ -691,6 +697,12 @@ def general_mm_embed_routine(
         )
         # add for qwen3_vl deepstack
         if use_deepstack:
+            ds_embed = other_info.get("input_deepstack_embeds")
+            print(
+                "[EAGLE DEBUG] general_mm_embed_routine: deepstack tensors",
+                f"present={ds_embed is not None}",
+                f"shape={tuple(ds_embed.shape) if ds_embed is not None else None}",
+            )
             kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
         # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
         # just being defensive here
