@@ -581,6 +581,16 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        if forward_batch.mrope_positions is not None:
+            mp = forward_batch.mrope_positions
+            sample = mp[:, : min(5, mp.shape[1])].cpu()
+            print(
+                "[EAGLE DEBUG] initial draft mrope positions:",
+                f"shape={mp.shape}",
+                f"rows_equal_01={torch.equal(mp[0], mp[1])}",
+                f"rows_equal_02={torch.equal(mp[0], mp[2])}",
+                f"sample={sample.tolist()}",
+            )
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -607,6 +617,15 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.positions.add_(1)
             if forward_batch.mrope_positions is not None:
                 forward_batch.mrope_positions.add_(1)
+                mp_iter = forward_batch.mrope_positions
+                sample_iter = mp_iter[:, : min(5, mp_iter.shape[1])].cpu()
+                print(
+                    f"[EAGLE DEBUG] step {i} mrope positions:",
+                    f"shape={mp_iter.shape}",
+                    f"rows_equal_01={torch.equal(mp_iter[0], mp_iter[1])}",
+                    f"rows_equal_02={torch.equal(mp_iter[0], mp_iter[2])}",
+                    f"sample={sample_iter.tolist()}",
+                )
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 

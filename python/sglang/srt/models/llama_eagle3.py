@@ -125,6 +125,10 @@ class LlamaModel(nn.Module):
         else:
             mrope_interleaved = False
         self.mrope_interleaved = mrope_interleaved
+        if self.is_mrope_enabled:
+            print(
+                f"[EAGLE DEBUG] Draft LlamaModel detected mRoPE config: interleaved={self.mrope_interleaved}"
+            )
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(

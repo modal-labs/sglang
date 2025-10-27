@@ -557,6 +557,18 @@ class ForwardBatch:
             base_positions = base_positions.repeat(3, 1)
         elif not interleaved and base_positions.shape[0] != 3:
             base_positions = base_positions.repeat(3, 1)
+        if interleaved and base_positions.shape[0] == 3:
+            row_eq_01 = torch.equal(base_positions[0], base_positions[1])
+            row_eq_02 = torch.equal(base_positions[0], base_positions[2])
+            sample = base_positions[:, : min(5, base_positions.shape[1])].cpu()
+            print(
+                "[EAGLE DEBUG] _compute_spec_mrope_positions:",
+                f"interleaved={interleaved}",
+                f"shape={base_positions.shape}",
+                f"rows_equal_01={row_eq_01}",
+                f"rows_equal_02={row_eq_02}",
+                f"sample={sample.tolist()}",
+            )
         self.mrope_positions = base_positions
 
     def _compute_mrope_positions(
@@ -611,10 +623,24 @@ class ForwardBatch:
                     ]
                 mrope_positions_list[batch_idx] = mrope_positions
 
-        self.mrope_positions = torch.cat(
+        concatenated = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device)
+        interleaved = self._is_mrope_interleaved(model_runner)
+        if interleaved and concatenated.shape[0] == 3:
+            row_eq_01 = torch.equal(concatenated[0], concatenated[1])
+            row_eq_02 = torch.equal(concatenated[0], concatenated[2])
+            sample = concatenated[:, : min(5, concatenated.shape[1])].cpu()
+            print(
+                "[EAGLE DEBUG] _compute_mrope_positions:",
+                f"interleaved={interleaved}",
+                f"shape={concatenated.shape}",
+                f"rows_equal_01={row_eq_01}",
+                f"rows_equal_02={row_eq_02}",
+                f"sample={sample.tolist()}",
+            )
+        self.mrope_positions = concatenated
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
