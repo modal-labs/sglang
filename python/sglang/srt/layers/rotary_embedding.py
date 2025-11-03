@@ -1322,7 +1322,6 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         self.mrope_section = mrope_section
         self.mrope_interleaved = mrope_interleaved
-        self._debug_printed = False
         if self.mrope_section:
             expected_sum = rotary_dim // 2
             actual_sum = sum(self.mrope_section)
@@ -1418,19 +1417,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         key_pass = key[..., self.rotary_dim :]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-        if not self._debug_printed:
-            rank_ok = True
-            if torch.distributed.is_initialized():
-                rank_ok = torch.distributed.get_rank() == 0
-            if rank_ok:
-                print(
-                    "[RoPE] MRotaryEmbedding forward: "
-                    f"mrope_section={self.mrope_section} "
-                    f"mrope_interleaved={self.mrope_interleaved} "
-                    f"positions_shape={tuple(positions.shape)} "
-                    f"query_shape={query_shape} key_shape={key_shape}"
-                )
-            self._debug_printed = True
         return query, key
 
     def forward(

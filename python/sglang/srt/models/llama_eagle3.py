@@ -87,17 +87,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         # Self Attention
-        if positions is not None and torch.distributed.get_rank() == 0:
-            rope = getattr(self.self_attn.rotary_emb, "mrope_section", None)
-            interleaved = getattr(
-                self.self_attn.rotary_emb, "mrope_interleaved", False
-            )
-            print(
-                "[EAGLE3 draft] self_attn call: "
-                f"positions_shape={tuple(positions.shape)} "
-                f"hidden_states_shape={tuple(hidden_states.shape)} "
-                f"mrope_section={rope} mrope_interleaved={interleaved}"
-            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -173,11 +162,6 @@ class LlamaModel(nn.Module):
             embeds = input_embeds
 
         if self.is_mrope_enabled:
-            if torch.distributed.get_rank() == 0:
-                print(
-                    "[EAGLE3 draft] mRoPE enabled: positions_shape="
-                    f"{tuple(forward_batch.mrope_positions.shape)}"
-                )
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
