@@ -311,8 +311,10 @@ class ForwardBatch:
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
 
-    # For Qwen2-VL
+    # For Qwen2-VL / Qwen3-VL
     mrope_positions: torch.Tensor = None
+    mm_prompt_mrope_positions: Optional[List[Optional[torch.Tensor]]] = None
+    mm_prompt_mrope_deltas: Optional[List[Optional[torch.Tensor]]] = None
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
@@ -366,6 +368,32 @@ class ForwardBatch:
             dimensions=batch.dimensions,
         )
         device = model_runner.device
+
+        # Cache prompt mRoPE metadata so we can reconstruct positions even after
+        # mm_inputs are cleared during embedding.
+        mm_prompt_positions: List[Optional[torch.Tensor]] = []
+        mm_prompt_deltas: List[Optional[torch.Tensor]] = []
+        if batch.multimodal_inputs is not None:
+            for mm_input in batch.multimodal_inputs:
+                if mm_input is None:
+                    mm_prompt_positions.append(None)
+                    mm_prompt_deltas.append(None)
+                    continue
+
+                prompt_pos = getattr(mm_input, "mrope_positions", None)
+                prompt_delta = getattr(mm_input, "mrope_position_delta", None)
+                mm_prompt_positions.append(
+                    prompt_pos.clone() if prompt_pos is not None else None
+                )
+                mm_prompt_deltas.append(
+                    prompt_delta.clone() if prompt_delta is not None else None
+                )
+        else:
+            mm_prompt_positions = [None] * ret.batch_size
+            mm_prompt_deltas = [None] * ret.batch_size
+
+        ret.mm_prompt_mrope_positions = mm_prompt_positions
+        ret.mm_prompt_mrope_deltas = mm_prompt_deltas
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -524,48 +552,155 @@ class ForwardBatch:
             or self.contains_image_inputs()
         )
 
+    def _expand_positions_with_mm_info(
+        self,
+        positions_1d: torch.Tensor,
+        batch_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Map scalar positions to 3-axis mRoPE positions using cached prompt data."""
+
+        if positions_1d.numel() == 0:
+            return torch.zeros((3, 0), dtype=torch.int64, device=device)
+
+        positions_1d = positions_1d.to(device=device, dtype=torch.int64, non_blocking=True)
+
+        mm_positions = None
+        mm_delta = None
+        if self.mm_prompt_mrope_positions is not None and batch_idx < len(
+            self.mm_prompt_mrope_positions
+        ):
+            mm_positions = self.mm_prompt_mrope_positions[batch_idx]
+        if self.mm_prompt_mrope_deltas is not None and batch_idx < len(
+            self.mm_prompt_mrope_deltas
+        ):
+            mm_delta = self.mm_prompt_mrope_deltas[batch_idx]
+
+        if mm_positions is None:
+            # Pure text requests: replicate scalar positions across the three axes.
+            return positions_1d.unsqueeze(0).repeat(3, 1)
+
+        mm_positions = mm_positions.to(
+            device=device, dtype=torch.int64, non_blocking=True
+        )
+        prompt_len = mm_positions.shape[1]
+
+        if prompt_len == 0:
+            delta_scalar = 0
+            if mm_delta is not None and mm_delta.numel() > 0:
+                delta_scalar = (
+                    mm_delta.to(device=device, dtype=torch.int64, non_blocking=True)
+                    .view(-1)[0]
+                    .item()
+                )
+            shared = positions_1d + delta_scalar
+            return shared.unsqueeze(0).expand(3, -1)
+
+        clamped = positions_1d.clamp_max(prompt_len - 1)
+        gathered = mm_positions.index_select(1, clamped)
+
+        result = gathered.clone()
+
+        beyond_mask = positions_1d >= prompt_len
+        if beyond_mask.any():
+            if mm_delta is not None and mm_delta.numel() > 0:
+                delta_scalar = (
+                    mm_delta.to(device=device, dtype=torch.int64, non_blocking=True)
+                    .view(-1)[0]
+                    .item()
+                )
+            else:
+                delta_scalar = (
+                    mm_positions.max().to(dtype=torch.int64).item() - (prompt_len - 1)
+                )
+            shared_values = positions_1d[beyond_mask] + delta_scalar
+            result[:, beyond_mask] = shared_values.unsqueeze(0).expand(3, -1)
+
+        return result
+
+    def refresh_decode_mrope_positions(self):
+        """Rebuild decode-time mRoPE positions after scalar positions advance."""
+
+        if self.mrope_positions is None:
+            return
+
+        device = self.mrope_positions.device
+        positions = self.positions.to(
+            device=device, dtype=torch.int64, non_blocking=True
+        )
+        if positions.numel() == 0 or self.batch_size == 0:
+            self.mrope_positions = torch.zeros((3, 0), dtype=torch.int64, device=device)
+            return
+
+        tokens_per_req = None
+        if self.spec_info is not None:
+            tokens_per_req = getattr(self.spec_info, "num_tokens_per_batch", None)
+        if not tokens_per_req:
+            tokens_per_req = max(positions.numel() // self.batch_size, 1)
+
+        expanded_blocks: List[torch.Tensor] = []
+        cursor = 0
+        for batch_idx in range(self.batch_size):
+            end = min(cursor + tokens_per_req, positions.numel())
+            pos_chunk = positions[cursor:end]
+            if pos_chunk.numel() == 0:
+                expanded = torch.zeros((3, 0), dtype=torch.int64, device=device)
+            else:
+                expanded = self._expand_positions_with_mm_info(
+                    pos_chunk, batch_idx, device
+                )
+            expanded_blocks.append(expanded)
+            cursor = end
+
+        self.mrope_positions = (
+            torch.cat(expanded_blocks, dim=1)
+            if expanded_blocks
+            else torch.zeros((3, 0), dtype=torch.int64, device=device)
+        )
+
     def _compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
         # TODO support batched deltas
         batch_size = self.seq_lens.shape[0]
         device = model_runner.device
-        mm_inputs = batch.multimodal_inputs
+
 
         if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
-            mrope_deltas = []
-            extend_lens = []
-            for batch_idx in range(batch_size):
-                extend_seq_len = batch.extend_seq_lens[batch_idx]
-                extend_lens.append(extend_seq_len)
-                mrope_delta = (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[batch_idx] is None
-                    else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
-                )
-                mrope_deltas.append(mrope_delta.to(device=device))
+            extend_lens = [int(batch.extend_seq_lens[idx]) for idx in range(batch_size)]
             position_chunks = torch.split(batch.spec_info.positions, extend_lens)
-            mrope_positions_list = [
-                pos_chunk + delta
-                for pos_chunk, delta in zip(position_chunks, mrope_deltas)
-            ]
+            mrope_position_chunks = []
+            for batch_idx, pos_chunk in enumerate(position_chunks):
+                tensor_chunk = pos_chunk.to(
+                    device=device, dtype=torch.int64, non_blocking=True
+                )
+                expanded = self._expand_positions_with_mm_info(
+                    tensor_chunk, batch_idx, device
+                )
+                mrope_position_chunks.append(expanded)
+
             next_input_positions = (
-                torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
+                torch.cat(mrope_position_chunks, dim=1)
+                if mrope_position_chunks
+                else torch.zeros((3, 0), dtype=torch.int64, device=device)
             )
 
         else:  # target_verify or draft_decode
             seq_positions = batch.spec_info.positions.view(batch_size, -1)
-            mrope_deltas = [
-                (
-                    torch.tensor([0], dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+            mrope_position_chunks = []
+            for batch_idx in range(batch_size):
+                tensor_chunk = seq_positions[batch_idx].to(
+                    device=device, dtype=torch.int64, non_blocking=True
                 )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+                expanded = self._expand_positions_with_mm_info(
+                    tensor_chunk, batch_idx, device
+                )
+                mrope_position_chunks.append(expanded)
+
             next_input_positions = (
-                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+                torch.cat(mrope_position_chunks, dim=1)
+                if mrope_position_chunks
+                else torch.zeros((3, 0), dtype=torch.int64, device=device)
             )
 
         self.mrope_positions = next_input_positions
@@ -575,63 +710,54 @@ class ForwardBatch:
     ):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens.shape[0]
-        mrope_positions_list = [[]] * batch_size
-        for batch_idx in range(batch_size):
-            mm_input = batch.multimodal_inputs[batch_idx]
-            if self.forward_mode.is_decode():
-                # 3 * N
-                if mm_input is None:
-                    mrope_positions_list[batch_idx] = torch.full(
-                        (3, 1),
-                        self.seq_lens[batch_idx] - 1,
-                        dtype=torch.int64,
-                        device=model_runner.device,
-                    )
-                else:
-                    if mm_input.mrope_position_delta.device.type != model_runner.device:
-                        # transfer mrope_position_delta to device when the first running,
-                        # avoiding successvie host-to-device data transfer
-                        mm_input.mrope_position_delta = (
-                            mm_input.mrope_position_delta.to(
-                                model_runner.device, non_blocking=True
-                            )
-                        )
-                    mrope_position_deltas = mm_input.mrope_position_delta.flatten()
-                    mrope_positions_list[batch_idx] = (
-                        (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
-                        .unsqueeze(0)
-                        .repeat(3, 1)
-                    )
-            elif self.forward_mode.is_extend():
-                extend_seq_len, extend_prefix_len = (
-                    batch.extend_seq_lens[batch_idx],
-                    batch.extend_prefix_lens[batch_idx],
-                )
-                if mm_input is None:
-                    # text only
-                    mrope_positions = torch.tensor(
-                        [
-                            [
-                                pos
-                                for pos in range(
-                                    extend_prefix_len,
-                                    extend_prefix_len + extend_seq_len,
-                                )
-                            ]
-                        ]
-                        * 3
-                    )
-                else:
-                    mrope_positions = mm_input.mrope_positions[
-                        :,
-                        extend_prefix_len : extend_prefix_len + extend_seq_len,
-                    ]
-                mrope_positions_list[batch_idx] = mrope_positions
+        device = model_runner.device
+        position_blocks: List[torch.Tensor] = []
 
-        self.mrope_positions = torch.cat(
-            [pos.to(device=model_runner.device) for pos in mrope_positions_list],
-            dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device)
+        for batch_idx in range(batch_size):
+            if self.forward_mode.is_decode():
+                last_pos = torch.tensor(
+                    [self.seq_lens[batch_idx] - 1],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                expanded = self._expand_positions_with_mm_info(
+                    last_pos, batch_idx, device
+                )
+                position_blocks.append(expanded)
+            elif self.forward_mode.is_extend():
+                extend_seq_len = batch.extend_seq_lens[batch_idx]
+                extend_prefix_len = batch.extend_prefix_lens[batch_idx]
+                if extend_seq_len == 0:
+                    expanded = torch.zeros((3, 0), dtype=torch.int64, device=device)
+                else:
+                    seq_positions = torch.arange(
+                        extend_prefix_len,
+                        extend_prefix_len + extend_seq_len,
+                        dtype=torch.int64,
+                        device=device,
+                    )
+                    expanded = self._expand_positions_with_mm_info(
+                        seq_positions, batch_idx, device
+                    )
+                position_blocks.append(expanded)
+            else:
+                seq_len = int(self.seq_lens[batch_idx])
+                if seq_len == 0:
+                    expanded = torch.zeros((3, 0), dtype=torch.int64, device=device)
+                else:
+                    seq_positions = torch.arange(
+                        seq_len, dtype=torch.int64, device=device
+                    )
+                    expanded = self._expand_positions_with_mm_info(
+                        seq_positions, batch_idx, device
+                    )
+                position_blocks.append(expanded)
+
+        self.mrope_positions = (
+            torch.cat(position_blocks, dim=1)
+            if position_blocks
+            else torch.zeros((3, 0), dtype=torch.int64, device=device)
+        )
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
