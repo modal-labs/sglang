@@ -334,10 +334,14 @@ class EAGLEDraftCudaGraphRunner:
         has_mrope = getattr(forward_batch, "mrope_positions", None) is not None
         if has_mrope:
             src_mrope = forward_batch.mrope_positions
-            src_tokens = src_mrope.shape[1]
-            self.mrope_positions[:, :src_tokens].copy_(src_mrope)
-            if raw_num_token > src_tokens:
-                self.mrope_positions[:, src_tokens:raw_num_token].zero_()
+            tgt_tokens = self.mrope_positions.shape[1]
+            copy_tokens = min(src_mrope.shape[1], tgt_tokens)
+            if copy_tokens > 0:
+                self.mrope_positions[:, :copy_tokens].copy_(
+                    src_mrope[:, :copy_tokens]
+                )
+            if copy_tokens < tgt_tokens:
+                self.mrope_positions[:, copy_tokens:tgt_tokens].zero_()
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
@@ -356,7 +360,7 @@ class EAGLEDraftCudaGraphRunner:
             if has_mrope:
                 forward_batch.mrope_positions = self.mrope_positions[:, :num_tokens]
         elif has_mrope:
-            forward_batch.mrope_positions = self.mrope_positions[:, :raw_num_token]
+            forward_batch.mrope_positions = self.mrope_positions[:, :num_tokens]
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
