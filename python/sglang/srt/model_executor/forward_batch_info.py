@@ -416,6 +416,14 @@ class ForwardBatch:
         ):
             ret.positions = ret.spec_info.positions
 
+        spec_mrope_positions = None
+        if ret.spec_info is not None:
+            spec_mrope_positions = getattr(ret.spec_info, "mrope_positions", None)
+        if spec_mrope_positions is not None:
+            ret.mrope_positions = spec_mrope_positions.to(
+                device=device, non_blocking=True
+            )
+
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
@@ -443,13 +451,14 @@ class ForwardBatch:
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
-            if (
-                ret.spec_info is not None
-                and getattr(ret.spec_info, "positions", None) is not None
-            ):
-                ret._compute_spec_mrope_positions(model_runner, batch)
-            else:
-                ret._compute_mrope_positions(model_runner, batch)
+            if ret.mrope_positions is None:
+                if (
+                    ret.spec_info is not None
+                    and getattr(ret.spec_info, "positions", None) is not None
+                ):
+                    ret._compute_spec_mrope_positions(model_runner, batch)
+                else:
+                    ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
         if model_runner.server_args.enable_lora:

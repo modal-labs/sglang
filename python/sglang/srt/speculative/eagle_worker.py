@@ -493,6 +493,10 @@ class EAGLEWorker(TpModelWorker):
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
+            if getattr(forward_batch, "mrope_positions", None) is not None:
+                forward_batch.spec_info.mrope_positions = forward_batch.mrope_positions
+            else:
+                forward_batch.spec_info.mrope_positions = None
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if (
@@ -615,6 +619,11 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+
+        if getattr(forward_batch, "mrope_positions", None) is not None:
+            forward_batch.spec_info.mrope_positions = forward_batch.mrope_positions
+        else:
+            forward_batch.spec_info.mrope_positions = None
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
@@ -836,7 +845,9 @@ class EAGLEWorker(TpModelWorker):
             detect_nan(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self.capture_for_decode(
+            logits_output, forward_batch.spec_info, forward_batch
+        )
         has_finished, unfinished_req_index = False, []
         for i, req in enumerate(batch.reqs):
             if req.finished():
@@ -917,6 +928,12 @@ class EAGLEWorker(TpModelWorker):
                 logits_output.topk_index,
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
+            if getattr(forward_batch, "mrope_positions", None) is not None:
+                forward_batch.spec_info.mrope_positions = (
+                    forward_batch.mrope_positions
+                )
+            else:
+                forward_batch.spec_info.mrope_positions = None
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
@@ -926,7 +943,9 @@ class EAGLEWorker(TpModelWorker):
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
-            self.capture_for_decode(logits_output, forward_batch.spec_info)
+            self.capture_for_decode(
+                logits_output, forward_batch.spec_info, forward_batch
+            )
 
         if self.enable_nan_detection:
             detect_nan(logits_output)
@@ -943,11 +962,18 @@ class EAGLEWorker(TpModelWorker):
         batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self,
+        logits_output: LogitsProcessorOutput,
+        draft_input: EagleDraftInput,
+        forward_batch: ForwardBatch,
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
+        if getattr(forward_batch, "mrope_positions", None) is not None:
+            draft_input.mrope_positions = forward_batch.mrope_positions
+        else:
+            draft_input.mrope_positions = None
 
 
 @torch.compile(dynamic=True, disable=_is_npu)

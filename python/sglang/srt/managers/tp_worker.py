@@ -370,6 +370,13 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            if getattr(forward_batch, "spec_info", None) is not None:
+                if getattr(forward_batch, "mrope_positions", None) is not None:
+                    forward_batch.spec_info.mrope_positions = (
+                        forward_batch.mrope_positions
+                    )
+                else:
+                    forward_batch.spec_info.mrope_positions = None
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
