@@ -364,9 +364,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.positions[:num_tokens].copy_(forward_batch.positions)
         has_mrope = getattr(forward_batch, "mrope_positions", None) is not None
         if has_mrope:
-            self.mrope_positions[:, :num_tokens].copy_(
-                forward_batch.mrope_positions
-            )
+            src_mrope = forward_batch.mrope_positions
+            src_tokens = src_mrope.shape[1]
+            self.mrope_positions[:, :src_tokens].copy_(src_mrope)
+            if num_tokens > src_tokens:
+                self.mrope_positions[:, src_tokens:num_tokens].zero_()
         else:
             self.mrope_positions[:, :num_tokens].zero_()
         if (
