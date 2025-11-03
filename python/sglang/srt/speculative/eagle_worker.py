@@ -604,11 +604,7 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.out_cache_loc = out_cache_loc[i]
             forward_batch.positions.add_(1)
             if getattr(forward_batch, "mrope_positions", None) is not None:
-                forward_batch.mrope_positions = (
-                    forward_batch.positions.unsqueeze(0)
-                    .repeat(3, 1)
-                    .to(dtype=torch.int64, device=forward_batch.positions.device)
-                )
+                forward_batch.mrope_positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
