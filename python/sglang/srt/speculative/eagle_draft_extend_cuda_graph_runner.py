@@ -351,6 +351,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
             self.positions.zero_()
+            self.mrope_positions.zero_()
             self.accept_length.fill_(1)
             self.extend_seq_lens.fill_(1)
 
@@ -361,6 +362,13 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         self.positions[:num_tokens].copy_(forward_batch.positions)
+        has_mrope = getattr(forward_batch, "mrope_positions", None) is not None
+        if has_mrope:
+            self.mrope_positions[:, :num_tokens].copy_(
+                forward_batch.mrope_positions
+            )
+        else:
+            self.mrope_positions[:, :num_tokens].zero_()
         if (
             forward_batch.spec_info.hidden_states.shape[1]
             == self.hidden_states.shape[1]
@@ -386,6 +394,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         if bs != raw_bs:
             forward_batch.spec_info.positions = self.positions[:num_tokens]
             forward_batch.spec_info.accept_length = self.accept_length[:bs]
+            if has_mrope:
+                forward_batch.mrope_positions = self.mrope_positions[:, :num_tokens]
+        elif has_mrope:
+            forward_batch.mrope_positions = self.mrope_positions[:, :num_tokens]
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,

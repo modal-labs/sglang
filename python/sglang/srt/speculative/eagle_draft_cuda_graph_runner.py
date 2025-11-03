@@ -320,6 +320,7 @@ class EAGLEDraftCudaGraphRunner:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
             self.positions.zero_()
+            self.mrope_positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -330,6 +331,11 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.out_cache_loc
         )
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        has_mrope = getattr(forward_batch, "mrope_positions", None) is not None
+        if has_mrope:
+            self.mrope_positions[:, :raw_num_token].copy_(
+                forward_batch.mrope_positions
+            )
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
@@ -345,6 +351,10 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.seq_lens = self.seq_lens[:bs]
             forward_batch.req_pool_indices = self.req_pool_indices[:bs]
             forward_batch.positions = self.positions[:num_tokens]
+            if has_mrope:
+                forward_batch.mrope_positions = self.mrope_positions[:, :num_tokens]
+        elif has_mrope:
+            forward_batch.mrope_positions = self.mrope_positions[:, :raw_num_token]
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
@@ -369,5 +379,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.req_pool_indices = self.req_pool_indices[:raw_bs]
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = self.seq_lens_cpu[:raw_bs]
+            if has_mrope:
+                forward_batch.mrope_positions = self.mrope_positions[:, :raw_num_token]
 
         return out

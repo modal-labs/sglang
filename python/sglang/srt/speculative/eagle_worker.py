@@ -599,6 +599,8 @@ class EAGLEWorker(TpModelWorker):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
             forward_batch.positions.add_(1)
+            if getattr(forward_batch, "mrope_positions", None) is not None:
+                forward_batch.mrope_positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
