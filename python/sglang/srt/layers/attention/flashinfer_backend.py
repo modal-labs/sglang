@@ -51,6 +51,10 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
 
+    # Necessary for overlap plan stream correction.
+    from flashinfer.prefill import _compute_page_mask_indptr
+    from flashinfer.quantization import segment_packbits
+
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -98,6 +102,13 @@ class PrefillMetadata:
     use_ragged: bool
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
+
+
+@dataclass
+class FlashInferPlanStreamCache:
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_sum: int
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -285,6 +296,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+        self.plan_stream_cache: Optional[FlashInferPlanStreamCache] = None
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -685,6 +698,12 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             raise ValueError("Invalid forward mode")
+        # Cache the req_pool_indices for use by the plan stream correction.
+        self.plan_stream_cache = FlashInferPlanStreamCache(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -839,6 +858,39 @@ class FlashInferAttnBackend(AttentionBackend):
             return layer.is_cross_attention
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        # Nothing to fill here because the actual CUDA graph buffers will be filled in during
+        # flashinfer plan() and corrected in update_verify_buffers_to_fill_after_draft().
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self,
+        spec_info: SpecInput,
+        cuda_graph_bs: Optional[int],
+    ):
+        assert cuda_graph_bs is not None and self.plan_stream_cache is not None
+
+        _, kv_indptr, qo_indptr, custom_mask = spec_info.generate_attn_arg_prefill(
+            self.plan_stream_cache.req_pool_indices,
+            self.plan_stream_cache.seq_lens,
+            self.plan_stream_cache.seq_lens_sum,
+            self.indices_updater_prefill.req_to_token,
+        )
+        mask_indptr = _compute_page_mask_indptr(
+            qo_indptr,
+            kv_indptr,
+            self.kv_last_page_len[:cuda_graph_bs],
+            1,
+        )
+        packed_custom_mask, mask_indptr = segment_packbits(
+            custom_mask.contiguous().view(-1),
+            mask_indptr,
+            bitorder="little",
+        )
+        self.cuda_graph_custom_mask[: len(packed_custom_mask)].copy_(packed_custom_mask)
+        for i in range(len(self.prefill_wrappers_verify)):
+            self.cuda_graph_qk_indptr[i][: len(mask_indptr)].copy_(mask_indptr)
 
 
 class FlashInferIndicesUpdaterDecode:
