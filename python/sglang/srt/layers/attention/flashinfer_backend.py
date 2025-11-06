@@ -53,7 +53,7 @@ if is_flashinfer_available():
 
     # Necessary for overlap plan stream correction.
     from flashinfer.prefill import _compute_page_mask_indptr
-    from flashinfer.quantization import segment_packbits
+    from flashinfer.quantization import get_quantization_module
 
 
 class WrapperDispatch(Enum):
@@ -877,18 +877,73 @@ class FlashInferAttnBackend(AttentionBackend):
             self.plan_stream_cache.seq_lens_sum,
             self.indices_updater_prefill.req_to_token,
         )
-        mask_indptr = _compute_page_mask_indptr(
+
+        # Tweaked version of _compute_page_mask_indptr from `flashinfer.prefill`.
+        def compute_page_mask_indptr_nosync(
+            qo_indptr: torch.Tensor,
+            paged_kv_indptr: torch.Tensor,
+            paged_kv_last_page_len: torch.Tensor,
+            page_size: int,
+        ) -> torch.Tensor:
+            if len(qo_indptr) != len(paged_kv_indptr):
+                raise ValueError(
+                    "The length of qo_indptr and paged_kv_indptr should be the same."
+                )
+            mask_indptr = torch.empty_like(qo_indptr)
+            # Using fill_ to avoid device-to-host copy.
+            mask_indptr[:1].fill_(0)
+            mask_indptr[1:] = torch.cumsum(
+                (qo_indptr[1:] - qo_indptr[:-1])
+                * (
+                    (paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size
+                    + paged_kv_last_page_len
+                ),
+                0,
+            )
+            return mask_indptr
+
+        mask_indptr = compute_page_mask_indptr_nosync(
             qo_indptr,
             kv_indptr,
             self.kv_last_page_len[:cuda_graph_bs],
             1,
         )
-        packed_custom_mask, mask_indptr = segment_packbits(
+
+        # Tweaked version of segment_packbits from `flashinfer.quantization`.
+        def segment_packbits_nosync(
+            x: torch.Tensor,
+            indptr: torch.Tensor,
+            output_nnzs: int,
+            bitorder: str,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            seglen = indptr[1:] - indptr[:-1]
+            packed_len = (seglen + 7) // 8
+            indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
+            indptr_new[1:] = torch.cumsum(packed_len, 0)
+
+            device = x.device
+            indptr = indptr.to(torch.int32)
+            indptr_new = indptr_new.to(torch.int32)
+            y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
+            get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder, y)
+            return y, indptr_new
+
+        # Upper bound sum(packed_len), the size of the packed mask.
+        packed_custom_mask_size = min(
+            self.cuda_graph_custom_mask.shape[0],
+            (
+                spec_info.draft_token_num * self.plan_stream_cache.seq_lens_sum +
+                cuda_graph_bs * spec_info.draft_token_num * spec_info.draft_token_num
+            ) // 8 + cuda_graph_bs,
+        )
+        packed_custom_mask, mask_indptr = segment_packbits_nosync(
             custom_mask.contiguous().view(-1),
             mask_indptr,
+            packed_custom_mask_size,
             bitorder="little",
         )
-        self.cuda_graph_custom_mask[: len(packed_custom_mask)].copy_(packed_custom_mask)
+
+        self.cuda_graph_custom_mask[: packed_custom_mask_size].copy_(packed_custom_mask)
         for i in range(len(self.prefill_wrappers_verify)):
             self.cuda_graph_qk_indptr[i][: len(mask_indptr)].copy_(mask_indptr)
 
