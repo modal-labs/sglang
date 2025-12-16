@@ -732,15 +732,64 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
+
+        if not batch.forward_mode.is_idle():
+            # Pack per-request accepted tokens so downstream code can treat
+            # next_token_ids as a fixed-stride [bs, draft_token_num] buffer.
+            #
+            # `accept_index` is padded with -1; do NOT index with it directly.
+            num_spec_tokens = accept_index.shape[1]  # spec_steps + 1
+            stride = self.speculative_num_draft_tokens
+            packed_predict = torch.zeros(
+                (bs * stride,), dtype=torch.int32, device=predict.device
+            )
+            row_offsets = (torch.arange(bs, device=predict.device) * stride).view(
+                bs, 1
+            )
+            col = torch.arange(num_spec_tokens, device=predict.device).view(1, -1)
+            mask = col < accept_length.view(bs, 1)
+            src = accept_index[mask].to(torch.int64)
+            dst = (row_offsets + col)[mask].to(torch.int64)
+            packed_predict[dst] = predict[src]
+            predict = packed_predict
+
+            # For tree spec (topk > 1), accepted indices are typically non-prefix.
+            # Move the accepted KV entries into the committed extension region so
+            # subsequent decode iterations attend to the correct history.
+            if self.topk > 1:
+                self.move_accepted_tokens_to_target_kvcache(
+                    batch, accept_index, accept_length
+                )
+
+        if envs.SGLANG_DEBUG_SPEC_V2_EAGLE_TREE.get():
+            # Debug-only device syncs via .tolist() / .cpu()
+            try:
+                accept_lens_list = accept_length.tolist()
+            except Exception:
+                accept_lens_list = ["<unavailable>"]
+            try:
+                head = min(2, bs)
+                accept_index_head = accept_index[:head].cpu().tolist()
+            except Exception:
+                accept_index_head = "<unavailable>"
+            logger.info(
+                "spec_v2_tree_debug: algo=%s topk=%s page_size=%s bs=%s draft_token_num=%s accept_lens=%s accept_index_head=%s",
+                self.speculative_algorithm,
+                self.topk,
+                self.page_size,
+                bs,
+                verify_input.draft_token_num,
+                accept_lens_list,
+                accept_index_head,
+            )
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
-                all_verified_id,
+                predict,
                 accept_length,
                 verified_id,
                 self.speculative_num_draft_tokens,
@@ -778,7 +827,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length: The length of the accepted tokens.
         """
         bs = len(batch.seq_lens)
-        size = bs * self.speculative_num_draft_tokens
+        stride = self.speculative_num_draft_tokens
+        size = bs * stride
+
+        # accept_index is padded with -1, typically shaped [bs, spec_steps + 1].
+        # Pack it into a fixed-length vector (size=bs*draft_token_num) so the
+        # existing Triton kernel can compact accepted cache locations.
+        num_spec_tokens = accept_index.shape[1]
+        accept_index_packed = torch.full(
+            (size,), -1, dtype=torch.int32, device=self.device
+        )
+        flat = accept_index.flatten()
+        accept_index_packed[: flat.numel()] = flat
 
         tgt_cache_loc = torch.zeros(
             size,
@@ -788,24 +848,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
         accepted_out_cache_loc = torch.zeros(
             size, dtype=torch.int64, device=self.device
         )
+        accept_len_for_move = (accept_index != -1).sum(dim=1).to(batch.seq_lens.dtype)
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + accept_length,
+            batch.seq_lens + accept_len_for_move,
             tgt_cache_loc,
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
         fill_accepted_out_cache_loc[(size,)](
-            accept_index,
+            accept_index_packed,
             batch.out_cache_loc,
             accepted_out_cache_loc,
             next_power_of_2(size),
         )
-        self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accepted_out_cache_loc
-        )
+        # Move exactly the entries that were packed (avoid relying on any
+        # particular accept_length definition w.r.t. the "bonus token").
+        total_to_move = int((accept_index_packed != -1).sum().item())
+        if total_to_move > 0:
+            self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                tgt_cache_loc[:total_to_move],
+                accepted_out_cache_loc[:total_to_move],
+            )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
