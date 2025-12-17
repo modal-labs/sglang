@@ -4,7 +4,7 @@ use std::{
 };
 
 use reqwest::Client;
-use tracing::info;
+use tracing::{info, debug};
 
 use crate::{
     config::RouterConfig,
@@ -356,8 +356,9 @@ impl AppContextBuilder {
             n => {
                 let rate_limit_tokens = config
                     .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
+                    .filter(|&t| t >= 0)
                     .unwrap_or(n);
+                debug!("Rate limiter configured with {} tokens per second", rate_limit_tokens);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
                     rate_limit_tokens as usize,
