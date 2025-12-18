@@ -763,7 +763,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if (
             not batch.forward_mode.is_idle()
             and self.topk > 1
-            and self.page_size > 1
             and (_is_cuda or _is_hip)
         ):
             # Compact accepted KV cache to the front of the per-request speculative
