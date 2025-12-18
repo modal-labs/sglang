@@ -33,6 +33,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
+    build_compact_kv_src_tgt_cache_loc,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
 )
@@ -50,11 +51,15 @@ from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
     get_available_gpu_memory,
+    is_cuda,
+    is_hip,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
@@ -277,6 +282,8 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
+        self._duplicate_last_partial_page_for_topk_branches(draft_input)
+
         # Run draft
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
@@ -343,6 +350,26 @@ class EagleDraftWorker(BaseDraftWorker):
             capture_hidden_mode=None,
             seq_lens_sum=None,
             seq_lens_cpu=None,
+        )
+
+    def _duplicate_last_partial_page_for_topk_branches(
+        self, draft_input: EagleDraftInput
+    ) -> None:
+        if self.topk <= 1 or self.draft_runner.page_size <= 1:
+            return
+
+        duplicate_len = getattr(draft_input, "_duplicate_cache_len", 0)
+        if duplicate_len <= 0:
+            return
+
+        source_cache_loc = getattr(draft_input, "_source_cache_loc", None)
+        target_cache_loc = getattr(draft_input, "_target_cache_loc", None)
+        if source_cache_loc is None or target_cache_loc is None:
+            return
+
+        self.draft_runner.token_to_kv_pool.move_kv_cache(
+            tgt_loc=target_cache_loc,
+            src_loc=source_cache_loc,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -481,7 +508,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
+            num_tokens_per_batch=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_batch=1,
         )
         select_index = (
@@ -655,7 +682,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
+        verify_input.num_tokens_per_batch = self.speculative_num_draft_tokens
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -732,21 +759,98 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
+
+        if (
+            not batch.forward_mode.is_idle()
+            and self.topk > 1
+            and self.page_size > 1
+            and (_is_cuda or _is_hip)
+        ):
+            # Compact accepted KV cache to the front of the per-request speculative
+            # region so subsequent decode reads contiguous KV.
+            accept_index_len = self.speculative_num_steps + 1
+            src_cache_loc = torch.empty(
+                (bs * accept_index_len,),
+                dtype=batch.out_cache_loc.dtype,
+                device=batch.out_cache_loc.device,
+            )
+            tgt_cache_loc = torch.empty_like(src_cache_loc)
+            build_compact_kv_src_tgt_cache_loc[(bs,)](
+                accept_index,
+                accept_length,
+                batch.out_cache_loc,
+                src_cache_loc,
+                tgt_cache_loc,
+                self.speculative_num_draft_tokens,
+                accept_index_len,
+                next_power_of_2(accept_index_len),
+            )
+            self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                tgt_loc=tgt_cache_loc,
+                src_loc=src_cache_loc,
+            )
+
+        if not batch.forward_mode.is_idle() and self.topk > 1:
+            # Pack accepted tokens to the beginning of each per-request stride so
+            # overlap output slicing and draft-extend both consume a contiguous
+            # token sequence.
+            stride = self.speculative_num_draft_tokens
+            accept_index_len = accept_index.shape[1]
+
+            offsets = torch.arange(
+                accept_index_len, device=accept_index.device, dtype=accept_length.dtype
+            )
+            mask = (offsets.unsqueeze(0) < accept_length.unsqueeze(1)) & (
+                accept_index >= 0
+            )
+            src_idx = accept_index.to(torch.int64)
+            src_idx = torch.where(mask, src_idx, torch.zeros_like(src_idx))
+
+            packed_predict = torch.zeros(
+                (bs, stride), dtype=predict.dtype, device=predict.device
+            )
+            gathered_tokens = predict[src_idx]
+            gathered_tokens = torch.where(
+                mask, gathered_tokens, torch.zeros_like(gathered_tokens)
+            )
+            packed_predict[:, :accept_index_len] = gathered_tokens
+            predict = packed_predict.flatten()
+
+            if logits_output.hidden_states is not None:
+                hidden_states = logits_output.hidden_states.reshape(bs * stride, -1)
+                packed_hidden_states = torch.zeros(
+                    (bs, stride, hidden_states.shape[1]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                gathered_hs = hidden_states[src_idx.flatten()].reshape(
+                    bs, accept_index_len, -1
+                )
+                gathered_hs = torch.where(
+                    mask.unsqueeze(-1),
+                    gathered_hs,
+                    torch.zeros_like(gathered_hs),
+                )
+                packed_hidden_states[:, :accept_index_len, :] = gathered_hs
+                logits_output.hidden_states = packed_hidden_states.reshape(
+                    bs * stride, -1
+                )
+
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
-                all_verified_id,
+                predict,
                 accept_length,
                 verified_id,
                 self.speculative_num_draft_tokens,
             )
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+
+        verify_done.record()
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(

@@ -76,6 +76,71 @@ def assign_draft_cache_locs_page_size_1(
         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
 
 
+@triton.jit
+def assign_draft_cache_locs_paged_tree(
+    req_pool_indices,
+    req_to_token,
+    seq_lens,
+    out_cache_loc,
+    source_cache_loc,
+    target_cache_loc,
+    last_page_lens_cumsum,
+    duplicate_cache_len: tl.constexpr,
+    pool_len: tl.constexpr,
+    topk: tl.constexpr,
+    speculative_num_steps: tl.constexpr,
+    page_size: tl.constexpr,
+    num_steps_upper: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    prefix_len = tl.load(seq_lens + pid)
+    last_page_len = prefix_len % page_size
+    num_new_pages_per_topk = (
+        last_page_len + speculative_num_steps + page_size - 1
+    ) // page_size
+    region_size = num_new_pages_per_topk * page_size
+
+    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+    out_ptr = out_cache_loc + pid * topk * speculative_num_steps
+
+    step_offsets = tl.arange(0, num_steps_upper)
+    step_mask = step_offsets < speculative_num_steps
+
+    for topk_id in range(topk):
+        data = tl.load(
+            token_pool + prefix_len + topk_id * region_size + step_offsets,
+            mask=step_mask,
+            other=0,
+        )
+        tl.store(
+            out_ptr + topk_id * speculative_num_steps + step_offsets,
+            data,
+            mask=step_mask,
+        )
+
+    if duplicate_cache_len > 0:
+        page_offsets = tl.arange(0, page_size)
+        page_mask = page_offsets < last_page_len
+
+        prefix_base = prefix_len - last_page_len
+        src_indices = tl.load(
+            token_pool + prefix_base + page_offsets, mask=page_mask, other=0
+        )
+        last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
+        base_offset = (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+
+        for topk_id in range(1, topk):
+            tgt_indices = tl.load(
+                token_pool + prefix_base + topk_id * region_size + page_offsets,
+                mask=page_mask,
+                other=0,
+            )
+            dst_ptr = base_offset + (topk_id - 1) * last_page_len + page_offsets
+            tl.store(source_cache_loc + dst_ptr, src_indices, mask=page_mask)
+            tl.store(target_cache_loc + dst_ptr, tgt_indices, mask=page_mask)
+
+
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
@@ -87,12 +152,27 @@ class EagleDraftInputV2Mixin:
         batch.maybe_wait_verify_done()
 
         page_size = batch.token_to_kv_pool_allocator.page_size
+        global_server_args = get_global_server_args()
+        topk = global_server_args.speculative_eagle_topk or 1
+        num_steps = global_server_args.speculative_num_steps or 1
         cur_kv_lens_cpu = []
         nxt_kv_lens_cpu = []
         num_needed_tokens = 0
         for r in batch.reqs:
             # Over-allocation happens here
-            x = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
+            desired_allocated_len = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE
+            if page_size > 1 and topk > 1:
+                last_page_len = r.kv_committed_len % page_size
+                num_new_pages_per_topk = (
+                    last_page_len + num_steps + page_size - 1
+                ) // page_size
+                desired_allocated_len = max(
+                    desired_allocated_len,
+                    (r.kv_committed_len // page_size) * page_size
+                    + num_new_pages_per_topk * (page_size * topk),
+                )
+
+            x = max(desired_allocated_len - r.kv_allocated_len, 0)
             cur_kv_lens_cpu.append(r.kv_allocated_len)
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
@@ -145,23 +225,86 @@ class EagleDraftInputV2Mixin:
     ):
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
+            page_size = draft_model_runner.page_size
 
             # Assign cache locations
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=batch.input_ids.device,
-            )
-            # FIXME(lsyin): align with the default code path
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
+            if page_size == 1 or topk == 1:
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
+                )
+                assign_draft_cache_locs_page_size_1[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                )
+            else:
+                last_page_lens_cpu = None
+                if batch.seq_lens_cpu is not None:
+                    last_page_lens_cpu = batch.seq_lens_cpu % page_size
+
+                if last_page_lens_cpu is None:
+                    duplicate_cache_len = (
+                        int((batch.seq_lens % page_size).sum().item()) * (topk - 1)
+                    )
+                else:
+                    duplicate_cache_len = int(last_page_lens_cpu.sum().item()) * (
+                        topk - 1
+                    )
+
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
+                )
+                if duplicate_cache_len > 0:
+                    source_cache_loc = torch.empty(
+                        (duplicate_cache_len,),
+                        dtype=torch.int32,
+                        device=batch.input_ids.device,
+                    )
+                    target_cache_loc = torch.empty(
+                        (duplicate_cache_len,),
+                        dtype=torch.int32,
+                        device=batch.input_ids.device,
+                    )
+                    last_page_lens = (batch.seq_lens % page_size).to(torch.int32)
+                    last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
+                else:
+                    source_cache_loc = torch.empty(
+                        (0,), dtype=torch.int32, device=batch.input_ids.device
+                    )
+                    target_cache_loc = torch.empty(
+                        (0,), dtype=torch.int32, device=batch.input_ids.device
+                    )
+                    last_page_lens_cumsum = torch.empty(
+                        (0,), dtype=torch.int32, device=batch.input_ids.device
+                    )
+
+                assign_draft_cache_locs_paged_tree[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    source_cache_loc,
+                    target_cache_loc,
+                    last_page_lens_cumsum,
+                    duplicate_cache_len,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                    page_size,
+                    next_power_of_2(num_steps),
+                )
+
+                self._source_cache_loc = source_cache_loc
+                self._target_cache_loc = target_cache_loc
+                self._duplicate_cache_len = duplicate_cache_len
 
         # Get a forward batch
         self.num_tokens_per_batch = topk
@@ -403,6 +546,53 @@ def fill_accepted_out_cache_loc(
     if src > -1:
         value = tl.load(out_cache_loc + src)
         tl.store(accepted_out_cache_loc + dst, value)
+
+
+@triton.jit
+def build_compact_kv_src_tgt_cache_loc(
+    accept_index,
+    accept_lens,
+    out_cache_loc,
+    src_cache_loc,
+    tgt_cache_loc,
+    draft_token_num: tl.constexpr,
+    accept_index_len: tl.constexpr,
+    accept_index_upper: tl.constexpr,
+):
+    """
+    Build (src_cache_loc, tgt_cache_loc) pairs to compact accepted KV cache to the
+    front of the per-request verify slots without any dynamic allocation.
+
+    Layout:
+    - accept_index: [bs, accept_index_len] (padded with -1)
+    - out_cache_loc: [bs, draft_token_num]
+    - src/tgt_cache_loc: [bs, accept_index_len]
+
+    For each request i and position j in [0, accept_index_len):
+    - tgt = out_cache_loc[i, j]
+    - src = out_cache_loc[accept_index[i, j]] if j < accept_lens[i] and accept_index[i, j] >= 0
+      else tgt (no-op copy)
+    """
+    bid = tl.program_id(axis=0)
+    offsets = tl.arange(0, accept_index_upper)
+    mask = offsets < accept_index_len
+
+    accept_len = tl.load(accept_lens + bid)
+
+    tgt_pos = bid * draft_token_num + offsets
+    tgt_vals = tl.load(out_cache_loc + tgt_pos, mask=mask, other=0)
+    src_vals = tgt_vals
+
+    acc_idx = tl.load(
+        accept_index + bid * accept_index_len + offsets, mask=mask, other=-1
+    )
+    copy_mask = mask & (offsets < accept_len) & (acc_idx >= 0)
+    src_candidate = tl.load(out_cache_loc + acc_idx, mask=copy_mask, other=0)
+    src_vals = tl.where(copy_mask, src_candidate, src_vals)
+
+    out_pos = bid * accept_index_len + offsets
+    tl.store(src_cache_loc + out_pos, src_vals, mask=mask)
+    tl.store(tgt_cache_loc + out_pos, tgt_vals, mask=mask)
 
 
 @triton.jit
