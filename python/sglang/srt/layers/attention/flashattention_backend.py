@@ -739,15 +739,30 @@ class FlashAttentionBackend(AttentionBackend):
         )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         k_descale, v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
-        if (
-            self.kv_cache_dtype_str != "auto"
-            and layer.head_dim <= 256
-            and self.fa_impl_ver != 4
-        ):
+        # Only use FP8 KV-cache support if:
+        # 1) FP8 KV cache is explicitly enabled (`--kv-cache-dtype fp8_*`), and
+        # 2) the selected FA backend supports the layer head dims for FP8 inputs.
+        if self.kv_cache_dtype_str != "auto":
+            if self.fa_impl_ver == 4:
+                # FA4 CuTe currently supports head_dim in {64, 96, 128}, plus a special-case
+                # DeepSeek shape where (head_dim_qk, head_dim_v) == (192, 128).
+                fa4_supported = (
+                    (layer.head_dim == layer.v_head_dim and layer.head_dim in (64, 96, 128))
+                    or (layer.head_dim == 192 and layer.v_head_dim == 128)
+                )
+                if not fa4_supported:
+                    raise NotImplementedError(
+                        "FP8 KV cache with FA4 only supports head_dim in {64, 96, 128} "
+                        "or (head_dim, v_head_dim) == (192, 128); "
+                        f"got (head_dim, v_head_dim) == ({layer.head_dim}, {layer.v_head_dim})."
+                    )
+            else:
+                if layer.head_dim > 256 or layer.v_head_dim > 256:
+                    raise NotImplementedError(
+                        "FP8 KV cache with FA3 only supports head_dim/v_head_dim <= 256; "
+                        f"got (head_dim, v_head_dim) == ({layer.head_dim}, {layer.v_head_dim})."
+                    )
+
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
@@ -790,6 +805,7 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
+            max_seqlen_k = local_metadata.local_max_seq_len
         elif is_swa_layer and metadata.swa_spec_metadata is not None:
             swa_spec_metadata = metadata.swa_spec_metadata
             page_table = swa_spec_metadata.page_table
@@ -797,6 +813,7 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+            max_seqlen_k = swa_spec_metadata.max_seq_len_k
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
@@ -807,6 +824,7 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
+            max_seqlen_k = metadata.max_seq_len_k
 
         # Use Flash Attention for prefill
         if not self.use_mla:
@@ -824,6 +842,7 @@ class FlashAttentionBackend(AttentionBackend):
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
+                max_seqlen_k = metadata.encoder_max_seq_len_k
                 window_size = (-1, -1)
 
             result = flash_attn_with_kvcache(
@@ -835,6 +854,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 window_size=window_size,
@@ -862,6 +882,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                     cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
                     max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    max_seqlen_k=self.forward_metadata_spec_decode_expand.max_seq_len_k,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=window_size,
@@ -1088,10 +1109,30 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         k_descale, v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+        # Only use FP8 KV-cache support if:
+        # 1) FP8 KV cache is explicitly enabled (`--kv-cache-dtype fp8_*`), and
+        # 2) the selected FA backend supports the layer head dims for FP8 inputs.
+        if self.kv_cache_dtype_str != "auto":
+            if self.fa_impl_ver == 4:
+                # FA4 CuTe currently supports head_dim in {64, 96, 128}, plus a special-case
+                # DeepSeek shape where (head_dim_qk, head_dim_v) == (192, 128).
+                fa4_supported = (
+                    (layer.head_dim == layer.v_head_dim and layer.head_dim in (64, 96, 128))
+                    or (layer.head_dim == 192 and layer.v_head_dim == 128)
+                )
+                if not fa4_supported:
+                    raise NotImplementedError(
+                        "FP8 KV cache with FA4 only supports head_dim in {64, 96, 128} "
+                        "or (head_dim, v_head_dim) == (192, 128); "
+                        f"got (head_dim, v_head_dim) == ({layer.head_dim}, {layer.v_head_dim})."
+                    )
+            else:
+                if layer.head_dim > 256 or layer.v_head_dim > 256:
+                    raise NotImplementedError(
+                        "FP8 KV cache with FA3 only supports head_dim/v_head_dim <= 256; "
+                        f"got (head_dim, v_head_dim) == ({layer.head_dim}, {layer.v_head_dim})."
+                    )
+
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)

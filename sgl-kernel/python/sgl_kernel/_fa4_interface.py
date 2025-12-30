@@ -20,6 +20,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 from flash_attn_origin.cute import utils
+from flash_attn_origin.cute.interface import _flash_attn_fwd as _flash_attn_fwd_origin
 from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
@@ -554,10 +555,16 @@ def flash_attn_varlen_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    num_splits: int = 0,
     pack_gqa: Optional[bool] = None,
     return_softmax_lse: Optional[bool] = False,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    out, lse = _flash_attn_fwd(
+    out, lse = _flash_attn_fwd_origin(
         q,
         k,
         v,
@@ -572,8 +579,14 @@ def flash_attn_varlen_func(
         window_size_right=window_size[1],
         learnable_sink=learnable_sink,
         softcap=softcap,
+        num_splits=num_splits,
         pack_gqa=pack_gqa,
         return_lse=return_softmax_lse,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
     )
 
     return (out, lse) if return_softmax_lse else out
