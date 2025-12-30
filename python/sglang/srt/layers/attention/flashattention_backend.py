@@ -1054,7 +1054,9 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert self.fa_impl_ver in [3], "Only FA3 support decoding"
+        assert self.fa_impl_ver in [3, 4], "Only FA3/FA4 support decoding"
+        if self.use_mla:
+            assert self.fa_impl_ver == 3, "FA4 decoding is not supported for MLA models"
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1164,6 +1166,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=metadata.encoder_cu_seqlens_k,
                     max_seqlen_q=1,
+                    max_seqlen_k=metadata.encoder_max_seq_len_k,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=(-1, -1),
@@ -1184,6 +1187,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=local_attn_metadata.local_query_start_loc,
                     cu_seqlens_k_new=None,
                     max_seqlen_q=local_attn_metadata.local_max_query_len,
+                    max_seqlen_k=local_attn_metadata.local_max_seq_len,
                     softmax_scale=layer.scaling,
                     causal=True,
                     window_size=(-1, -1),
@@ -1215,6 +1219,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=metadata.max_seq_len_k,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
@@ -1237,6 +1242,7 @@ class FlashAttentionBackend(AttentionBackend):
                             cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                             cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
                             max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                            max_seqlen_k=self.forward_metadata_spec_decode_expand.max_seq_len_k,
                             softmax_scale=layer.scaling,
                             causal=False,
                             window_size=window_size,
