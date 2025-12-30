@@ -315,6 +315,15 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
     )
+
+    # Compute q_stage based on sequence length
+    max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
+    seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    if compute_capability == 10:
+        q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
+    else:
+        q_stage = 1
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -334,7 +343,8 @@ def _flash_attn_fwd(
                 num_threads=num_threads,
                 Q_in_regs=False,
                 score_mod=score_mod,
-                has_buffers=buffers is not None,
+                mask_mod=None,
+                has_aux_tensors=False,
             )
         elif compute_capability == 10:
             assert page_size in [
@@ -347,13 +357,20 @@ def _flash_attn_fwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=False,
                 pack_gqa=pack_gqa,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                q_stage=q_stage,
                 is_persistent=not causal
                 and not local
                 and cu_seqlens_q is None
                 and seqused_q is None,
                 score_mod=score_mod,
-                has_buffers=buffers is not None,
+                mask_mod=None,
+                has_aux_tensors=False,
+                paged_kv_non_tma=page_size not in [None, 128],
+                is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
             )
         else:
             raise ValueError(
