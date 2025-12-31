@@ -328,6 +328,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        self.cuda_cap_major = torch.cuda.get_device_capability(self.device)[0]
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -1209,6 +1210,22 @@ class FlashAttentionBackend(AttentionBackend):
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
+                num_splits = self.num_splits
+                if self.fa_impl_ver == 4 and num_splits == 0:
+                    # For FA4, using auto num_splits inside CUDA graph capture can permanently lock the
+                    # split-KV heuristic to a tiny captured seq_len (FlashAttentionBackend uses
+                    # `seq_len_fill_value=1` for capture), which leads to `num_splits=1` and severe
+                    # slowdowns at long context during replay. Use a fixed split count during capture.
+                    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+                    if get_is_capture_mode():
+                        num_splits = 16
+                    elif (
+                        self.cuda_cap_major == 10
+                        and max_seqlen_q == 1
+                        and metadata.max_seq_len_k <= 4096
+                    ):
+                        num_splits = 1
 
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
@@ -1227,7 +1244,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=num_splits,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1250,7 +1267,7 @@ class FlashAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
-                            num_splits=self.num_splits,
+                            num_splits=num_splits,
                             **kwargs,
                         )
                     )

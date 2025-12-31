@@ -564,6 +564,181 @@ def flash_attn_varlen_func(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if (
+        num_splits == 0
+        and max_seqlen_q == 1
+        and max_seqlen_k is not None
+        and torch.cuda.get_device_capability()[0] == 10
+    ):
+        if max_seqlen_k <= 4096:
+            num_splits = 1
+
+    is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
+    if (
+        is_varlen_q
+        and q.ndim == 3
+        and cu_seqlens_q is not None
+        and max_seqlen_q == 1
+        and max_seqlen_k is not None
+        and max_seqlen_k >= 1024
+        and window_size[0] is None
+        and window_size[1] is None
+        and learnable_sink is None
+        and pack_gqa is not False
+        and torch.cuda.get_device_capability(q.device)[0] in (10, 11)
+    ):
+        batch_size = cu_seqlens_q.shape[0] - 1
+        total_q, num_heads, head_dim = q.shape
+        if total_q == batch_size:
+            num_kv_heads = k.shape[-2]
+            q_heads_per_kv_head = num_heads // num_kv_heads
+            if (
+                q_heads_per_kv_head > 1
+                and num_heads % num_kv_heads == 0
+                and (128 % q_heads_per_kv_head != 0)
+            ):
+                head_dim_v = v.shape[-1]
+                q_4d = q.view(batch_size, 1, num_heads, head_dim)
+                q_grouped = q_4d.view(
+                    batch_size, 1, num_kv_heads, q_heads_per_kv_head, head_dim
+                )
+                q_packed = q_grouped.permute(0, 1, 3, 2, 4).reshape(
+                    batch_size, q_heads_per_kv_head, num_kv_heads, head_dim
+                )
+
+                out_packed, lse_packed = _flash_attn_fwd_origin(
+                    q_packed,
+                    k,
+                    v,
+                    None,
+                    cu_seqlens_k,
+                    None,
+                    seqused_k,
+                    page_table=page_table,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                    window_size_left=None,
+                    window_size_right=None,
+                    learnable_sink=None,
+                    softcap=softcap,
+                    num_splits=num_splits,
+                    pack_gqa=False,
+                    return_lse=return_softmax_lse,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    max_seqlen_q=None,
+                    max_seqlen_k=max_seqlen_k,
+                )
+
+                out_grouped = out_packed.view(
+                    batch_size, 1, q_heads_per_kv_head, num_kv_heads, head_dim_v
+                ).permute(0, 1, 3, 2, 4)
+                out = out_grouped.reshape(batch_size, 1, num_heads, head_dim_v).view(
+                    total_q, num_heads, head_dim_v
+                )
+
+                if return_softmax_lse:
+                    lse_grouped = lse_packed.view(
+                        batch_size, num_kv_heads, 1, q_heads_per_kv_head
+                    ).permute(0, 2, 1, 3)
+                    lse = lse_grouped.reshape(batch_size * 1, num_heads).T.contiguous()
+                    return out, lse
+                return out
+
+    if (
+        is_varlen_q
+        and q.ndim == 3
+        and max_seqlen_k is not None
+        and max_seqlen_k >= 1024
+        and pack_gqa is not False
+        and torch.cuda.get_device_capability(q.device)[0] in (10, 11)
+    ):
+        num_heads = q.shape[-2]
+        num_kv_heads = k.shape[-2]
+        q_heads_per_kv_head = num_heads // num_kv_heads
+        if (
+            q_heads_per_kv_head > 1
+            and num_heads % num_kv_heads == 0
+            and (128 % q_heads_per_kv_head != 0)
+        ):
+            total_q, _, head_dim = q.shape
+            head_dim_v = v.shape[-1]
+            is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            out_dtype = torch.bfloat16 if is_fp8 else q.dtype
+            out = torch.empty(
+                (total_q, num_heads, head_dim_v), dtype=out_dtype, device=q.device
+            )
+            requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+            lse = (
+                torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device)
+                if requires_grad or return_softmax_lse
+                else None
+            )
+            q_grouped = q.view(total_q, num_kv_heads, q_heads_per_kv_head, head_dim)
+            out_grouped = out.view(
+                total_q, num_kv_heads, q_heads_per_kv_head, head_dim_v
+            )
+            lse_grouped = (
+                lse.view(num_kv_heads, q_heads_per_kv_head, total_q) if lse is not None else None
+            )
+            sink_grouped = (
+                learnable_sink.view(num_kv_heads, q_heads_per_kv_head)
+                if learnable_sink is not None
+                else None
+            )
+
+            remaining = q_heads_per_kv_head
+            start_head = 0
+            while remaining > 0:
+                chunk = 1 << (remaining.bit_length() - 1)
+                if chunk > 128:
+                    chunk = 128
+                remaining -= chunk
+
+                q_chunk = q_grouped[:, :, start_head : start_head + chunk, :].reshape(
+                    total_q, num_kv_heads * chunk, head_dim
+                )
+                sink_chunk = (
+                    sink_grouped[:, start_head : start_head + chunk].reshape(num_kv_heads * chunk)
+                    if sink_grouped is not None
+                    else None
+                )
+
+                out_chunk, lse_chunk = _flash_attn_fwd_origin(
+                    q_chunk,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    page_table=page_table,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size_left=window_size[0],
+                    window_size_right=window_size[1],
+                    learnable_sink=sink_chunk,
+                    softcap=softcap,
+                    num_splits=num_splits,
+                    pack_gqa=True,
+                    return_lse=lse is not None,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                )
+                out_grouped[:, :, start_head : start_head + chunk, :].copy_(
+                    out_chunk.view(total_q, num_kv_heads, chunk, head_dim_v)
+                )
+                if lse is not None:
+                    lse_grouped[:, start_head : start_head + chunk, :].copy_(
+                        lse_chunk.view(num_kv_heads, chunk, total_q)
+                    )
+                start_head += chunk
+
+            return (out, lse) if return_softmax_lse else out
     out, lse = _flash_attn_fwd_origin(
         q,
         k,

@@ -147,6 +147,43 @@ def _load_architecture_specific_ops():
             f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}"
         )
 
+    # Editable installs can point Python at the source tree (sgl-kernel/python/sgl_kernel),
+    # while compiled artifacts live under sgl-kernel/build/<arch>/common_ops.*.
+    build_pattern = str(
+        (sgl_kernel_dir.parent.parent / "build" / ops_subdir / "common_ops.*")
+    )
+    raw_build_files = glob.glob(build_pattern)
+    build_matching_files = _filter_compiled_extensions(raw_build_files)
+    logger.debug(
+        f"[sgl_kernel] Attempting build-dir fallback: looking for pattern {build_pattern}"
+    )
+    logger.debug(f"[sgl_kernel] Found build-dir files: {raw_build_files}")
+    logger.debug(f"[sgl_kernel] Prioritized build-dir files: {build_matching_files}")
+
+    if build_matching_files:
+        build_path = Path(build_matching_files[0])
+        logger.debug(f"[sgl_kernel] Found build-dir library: {build_path}")
+        try:
+            spec = importlib.util.spec_from_file_location("common_ops", str(build_path))
+            if spec is None:
+                raise ImportError(f"Could not create module spec for {build_path}")
+
+            common_ops = importlib.util.module_from_spec(spec)
+            if spec.loader is None:
+                raise ImportError(f"Module spec has no loader for {build_path}")
+
+            logger.debug(f"[sgl_kernel] Loading build-dir module from {build_path}...")
+            spec.loader.exec_module(common_ops)
+            logger.debug(f"[sgl_kernel] ✓ Successfully loaded build-dir library")
+            logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+            return common_ops
+
+        except Exception as e:
+            previous_import_errors.append(e)
+            logger.debug(
+                f"[sgl_kernel] ✗ Failed to load build-dir from {build_path}: {type(e).__name__}: {e}"
+            )
+
     # Final attempt: try standard Python import (for backward compatibility)
     logger.debug(
         f"[sgl_kernel] Final attempt: trying standard Python import 'common_ops'"
@@ -172,7 +209,8 @@ def _load_architecture_specific_ops():
 Attempted locations:
 1. Architecture-specific pattern: {ops_pattern} - found files: {matching_files}
 2. Fallback pattern: {alt_pattern} - found files: {alt_matching_files}
-3. Standard Python import: common_ops - failed
+3. Build-dir pattern: {build_pattern} - found files: {build_matching_files}
+4. Standard Python import: common_ops - failed
 
 GPU Info:
 - Compute capability: {compute_capability}
