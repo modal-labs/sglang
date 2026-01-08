@@ -24,6 +24,20 @@ logger = logging.getLogger(__name__)
 # Debug flag: set DFLASH_DEBUG=1 to enable verbose logging
 DFLASH_DEBUG = os.environ.get("DFLASH_DEBUG", "0") == "1"
 
+# Use FlashInfer ragged wrapper if available, otherwise fall back to SDPA
+DFLASH_USE_FLASHINFER = os.environ.get("DFLASH_USE_FLASHINFER", "1") == "1"
+
+try:
+    from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
+
+    FLASHINFER_AVAILABLE = True
+except ImportError:
+    FLASHINFER_AVAILABLE = False
+    if DFLASH_USE_FLASHINFER:
+        logger.warning(
+            "FlashInfer not available, falling back to SDPA for DFlash attention"
+        )
+
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """Expand KV heads for grouped-query attention (GQA).
@@ -63,9 +77,9 @@ class Qwen3DFlashAttention(nn.Module):
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
+        self.num_qo_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_qo_heads // self.num_kv_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False
@@ -102,6 +116,7 @@ class Qwen3DFlashAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        flashinfer_wrapper=None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
@@ -140,10 +155,6 @@ class Qwen3DFlashAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
-        # Expand K/V for grouped-query attention (GQA)
-        k = repeat_kv(k, self.num_key_value_groups)
-        v = repeat_kv(v, self.num_key_value_groups)
-
         if DFLASH_DEBUG and self.layer_idx == 0:
             logger.info(
                 "DFlash attn L0 shapes: q=%s k=%s v=%s num_kv_groups=%d",
@@ -153,20 +164,48 @@ class Qwen3DFlashAttention(nn.Module):
                 self.num_key_value_groups,
             )
 
-        # Level 1 optimization: Use SDPA instead of eager attention
-        # DFlash uses non-causal attention (is_causal=False)
-        dropout_p = 0.0 if not self.training else self.attention_dropout
-        attn_output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask,
-            dropout_p=dropout_p,
-            is_causal=False,
-            scale=self.scaling,
+        # Use FlashInfer ragged wrapper if available, otherwise SDPA
+        use_flashinfer = (
+            flashinfer_wrapper is not None
+            and FLASHINFER_AVAILABLE
+            and DFLASH_USE_FLASHINFER
         )
-        # SDPA output: [bsz, num_heads, q_len, head_dim] -> [bsz, q_len, num_heads * head_dim]
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
+
+        if use_flashinfer:
+            # FlashInfer expects [total_tokens, num_heads, head_dim]
+            # q: [bsz, num_qo_heads, q_len, head_dim] -> [bsz * q_len, num_qo_heads, head_dim]
+            # k: [bsz, num_kv_heads, kv_len, head_dim] -> [bsz * kv_len, num_kv_heads, head_dim]
+            q_fi = q.transpose(1, 2).reshape(-1, self.num_qo_heads, self.head_dim)
+            k_fi = k.transpose(1, 2).reshape(-1, self.num_kv_heads, self.head_dim)
+            v_fi = v.transpose(1, 2).reshape(-1, self.num_kv_heads, self.head_dim)
+
+            attn_output = flashinfer_wrapper.forward(
+                q_fi,
+                k_fi,
+                v_fi,
+                causal=False,  # DFlash uses non-causal attention
+                sm_scale=self.scaling,
+            )
+            # Output: [bsz * q_len, num_qo_heads, head_dim] -> [bsz, q_len, hidden_size]
+            attn_output = attn_output.view(bsz, q_len, -1)
+        else:
+            # Fallback to SDPA - need to expand K/V for GQA
+            k = repeat_kv(k, self.num_key_value_groups)
+            v = repeat_kv(v, self.num_key_value_groups)
+
+            dropout_p = 0.0 if not self.training else self.attention_dropout
+            attn_output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attention_mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+                scale=self.scaling,
+            )
+            # SDPA output: [bsz, num_heads, q_len, head_dim] -> [bsz, q_len, num_heads * head_dim]
+            attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
+
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
@@ -191,6 +230,7 @@ class Qwen3DFlashDecoderLayer(nn.Module):
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
+        flashinfer_wrapper=None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -203,6 +243,7 @@ class Qwen3DFlashDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            flashinfer_wrapper=flashinfer_wrapper,
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states
@@ -247,6 +288,36 @@ class DFlashDraftModel(nn.Module):
 
         self.block_size = config.block_size
 
+        # FlashInfer ragged wrapper (initialized lazily on first forward)
+        self._flashinfer_workspace = None
+        self._flashinfer_wrapper = None
+        self.num_qo_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+
+    def _init_flashinfer(self, device: torch.device, dtype: torch.dtype):
+        """Initialize FlashInfer workspace and wrapper."""
+        if not FLASHINFER_AVAILABLE or not DFLASH_USE_FLASHINFER:
+            return
+
+        if self._flashinfer_wrapper is not None:
+            return
+
+        # Workspace buffer size (128MB should be enough for most cases)
+        workspace_size = 128 * 1024 * 1024
+        self._flashinfer_workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=device
+        )
+        self._flashinfer_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            self._flashinfer_workspace, "NHD"
+        )
+        logger.info(
+            "DFlash: Initialized FlashInfer ragged wrapper (workspace=%dMB)",
+            workspace_size // (1024 * 1024),
+        )
+
     def forward(
         self,
         *,
@@ -262,6 +333,54 @@ class DFlashDraftModel(nn.Module):
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
 
+        bsz = hidden_states.shape[0]
+        q_len = hidden_states.shape[1]
+        ctx_len = target_hidden.shape[1]
+
+        # Initialize FlashInfer on first forward
+        self._init_flashinfer(hidden_states.device, hidden_states.dtype)
+
+        # Setup FlashInfer wrapper for this forward pass
+        flashinfer_wrapper = None
+        if (
+            self._flashinfer_wrapper is not None
+            and FLASHINFER_AVAILABLE
+            and DFLASH_USE_FLASHINFER
+        ):
+            # Compute KV length after cache update
+            # If past_key_values exists and has content, kv_len = cache_len + ctx_len + q_len
+            # Otherwise, kv_len = ctx_len + q_len
+            # DynamicCache uses get_seq_length() method
+            if past_key_values is not None:
+                cache_len = past_key_values.get_seq_length()
+            else:
+                cache_len = 0
+            total_kv_len = cache_len + ctx_len + q_len
+
+            # Build indptr arrays for ragged batching
+            # For bsz=1: qo_indptr = [0, q_len], kv_indptr = [0, total_kv_len]
+            qo_indptr = torch.tensor(
+                [i * q_len for i in range(bsz + 1)],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            kv_indptr = torch.tensor(
+                [i * total_kv_len for i in range(bsz + 1)],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+
+            # Plan the wrapper (can be reused across layers)
+            self._flashinfer_wrapper.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_data_type=hidden_states.dtype,
+            )
+            flashinfer_wrapper = self._flashinfer_wrapper
+
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(
@@ -272,8 +391,13 @@ class DFlashDraftModel(nn.Module):
                 cache_position=cache_position,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                flashinfer_wrapper=flashinfer_wrapper,
                 **kwargs,
             )
+
+        # End forward for FlashInfer wrapper
+        if flashinfer_wrapper is not None:
+            self._flashinfer_wrapper.end_forward()
 
         return self.norm(hidden_states)
 
