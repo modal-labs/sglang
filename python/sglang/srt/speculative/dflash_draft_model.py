@@ -26,19 +26,40 @@ logger = logging.getLogger(__name__)
 # Debug flag: set DFLASH_DEBUG=1 to enable verbose logging
 DFLASH_DEBUG = os.environ.get("DFLASH_DEBUG", "0") == "1"
 
-# Use FlashInfer ragged wrapper if available, otherwise fall back to SDPA
-DFLASH_USE_FLASHINFER = os.environ.get("DFLASH_USE_FLASHINFER", "1") == "1"
+# Attention backend selection:
+# DFLASH_ATTN_BACKEND: "sdpa" (default), "flashinfer", or "fa3"
+# FA3 = FlashAttention 3, optimized for Hopper (H100/H200)
+DFLASH_ATTN_BACKEND = os.environ.get("DFLASH_ATTN_BACKEND", "sdpa").lower()
 
+# Legacy env var support
+if os.environ.get("DFLASH_USE_FLASHINFER", "0") == "1":
+    DFLASH_ATTN_BACKEND = "flashinfer"
+
+# Check FlashInfer availability
 try:
     from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
 
     FLASHINFER_AVAILABLE = True
 except ImportError:
     FLASHINFER_AVAILABLE = False
-    if DFLASH_USE_FLASHINFER:
+    if DFLASH_ATTN_BACKEND == "flashinfer":
         logger.warning(
             "FlashInfer not available, falling back to SDPA for DFlash attention"
         )
+        DFLASH_ATTN_BACKEND = "sdpa"
+
+# Check FlashAttention 3 availability
+try:
+    from flash_attn import flash_attn_func
+
+    FA3_AVAILABLE = True
+except ImportError:
+    FA3_AVAILABLE = False
+    if DFLASH_ATTN_BACKEND == "fa3":
+        logger.warning(
+            "FlashAttention 3 not available, falling back to SDPA for DFlash attention"
+        )
+        DFLASH_ATTN_BACKEND = "sdpa"
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -166,12 +187,13 @@ class Qwen3DFlashAttention(nn.Module):
                 self.num_key_value_groups,
             )
 
-        # Use FlashInfer ragged wrapper if available, otherwise SDPA
+        # Select attention backend based on DFLASH_ATTN_BACKEND
         use_flashinfer = (
-            flashinfer_wrapper is not None
+            DFLASH_ATTN_BACKEND == "flashinfer"
+            and flashinfer_wrapper is not None
             and FLASHINFER_AVAILABLE
-            and DFLASH_USE_FLASHINFER
         )
+        use_fa3 = DFLASH_ATTN_BACKEND == "fa3" and FA3_AVAILABLE
 
         if use_flashinfer:
             # FlashInfer expects [total_tokens, num_heads, head_dim]
@@ -190,6 +212,26 @@ class Qwen3DFlashAttention(nn.Module):
             )
             # Output: [bsz * q_len, num_qo_heads, head_dim] -> [bsz, q_len, hidden_size]
             attn_output = attn_output.view(bsz, q_len, -1)
+        elif use_fa3:
+            # FlashAttention 3 expects [bsz, seq_len, num_heads, head_dim]
+            # Current shape: [bsz, num_heads, seq_len, head_dim]
+            q_fa = q.transpose(1, 2).contiguous()  # [bsz, q_len, num_heads, head_dim]
+            k_fa = k.transpose(
+                1, 2
+            ).contiguous()  # [bsz, kv_len, num_kv_heads, head_dim]
+            v_fa = v.transpose(
+                1, 2
+            ).contiguous()  # [bsz, kv_len, num_kv_heads, head_dim]
+
+            attn_output = flash_attn_func(
+                q_fa,
+                k_fa,
+                v_fa,
+                causal=False,  # DFlash uses non-causal attention
+                softmax_scale=self.scaling,
+            )
+            # Output: [bsz, q_len, num_heads, head_dim] -> [bsz, q_len, hidden_size]
+            attn_output = attn_output.reshape(bsz, q_len, -1)
         else:
             # Fallback to SDPA - need to expand K/V for GQA
             k = repeat_kv(k, self.num_key_value_groups)
@@ -301,7 +343,7 @@ class DFlashDraftModel(nn.Module):
 
     def _init_flashinfer(self, device: torch.device, dtype: torch.dtype):
         """Initialize FlashInfer workspace and wrapper."""
-        if not FLASHINFER_AVAILABLE or not DFLASH_USE_FLASHINFER:
+        if not FLASHINFER_AVAILABLE or DFLASH_ATTN_BACKEND != "flashinfer":
             return
 
         if self._flashinfer_wrapper is not None:
@@ -345,9 +387,9 @@ class DFlashDraftModel(nn.Module):
         # Setup FlashInfer wrapper for this forward pass
         flashinfer_wrapper = None
         if (
-            self._flashinfer_wrapper is not None
+            DFLASH_ATTN_BACKEND == "flashinfer"
+            and self._flashinfer_wrapper is not None
             and FLASHINFER_AVAILABLE
-            and DFLASH_USE_FLASHINFER
         ):
             # Compute KV length after cache update
             # If past_key_values exists and has content, kv_len = cache_len + ctx_len + q_len
@@ -470,9 +512,9 @@ class DFlashDraftModel(nn.Module):
         total_kv_len = committed_len + q_len
         flashinfer_wrapper = None
         if (
-            self._flashinfer_wrapper is not None
+            DFLASH_ATTN_BACKEND == "flashinfer"
+            and self._flashinfer_wrapper is not None
             and FLASHINFER_AVAILABLE
-            and DFLASH_USE_FLASHINFER
         ):
             qo_indptr = torch.tensor(
                 [0, q_len], dtype=torch.int32, device=hidden_states.device
@@ -563,12 +605,15 @@ class DFlashDraftModel(nn.Module):
         k_total, v_total = req_state.get_attention_kv(layer_idx, q_len)
         # k_total: [committed_len + q_len, n_kv_heads, head_dim]
 
-        # Run attention
-        if (
-            flashinfer_wrapper is not None
+        # Run attention based on selected backend
+        use_flashinfer = (
+            DFLASH_ATTN_BACKEND == "flashinfer"
+            and flashinfer_wrapper is not None
             and FLASHINFER_AVAILABLE
-            and DFLASH_USE_FLASHINFER
-        ):
+        )
+        use_fa3 = DFLASH_ATTN_BACKEND == "fa3" and FA3_AVAILABLE
+
+        if use_flashinfer:
             # FlashInfer expects [total_tokens, num_heads, head_dim]
             q_fi = q.transpose(1, 2).reshape(-1, attn.num_qo_heads, attn.head_dim)
             # k_total/v_total already [kv_len, n_kv_heads, head_dim]
@@ -579,6 +624,20 @@ class DFlashDraftModel(nn.Module):
                 q_fi, k_fi, v_fi, causal=False, sm_scale=attn.scaling
             )
             attn_output = attn_output.view(bsz, q_len, -1)
+        elif use_fa3:
+            # FlashAttention 3 expects [bsz, seq_len, num_heads, head_dim]
+            # q is [bsz, num_heads, q_len, head_dim]
+            q_fa = q.transpose(1, 2).contiguous()  # [bsz, q_len, num_heads, head_dim]
+
+            # k_total/v_total are [kv_len, n_kv_heads, head_dim]
+            # -> [bsz, kv_len, n_kv_heads, head_dim]
+            k_fa = k_total.unsqueeze(0)
+            v_fa = v_total.unsqueeze(0)
+
+            attn_output = flash_attn_func(
+                q_fa, k_fa, v_fa, causal=False, softmax_scale=attn.scaling
+            )
+            attn_output = attn_output.reshape(bsz, q_len, -1)
         else:
             # SDPA path - need [bsz, num_heads, seq_len, head_dim]
             # q is already [bsz, num_heads, q_len, head_dim] after rotary
