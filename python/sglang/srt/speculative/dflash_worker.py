@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 # Set DFLASH_COMMIT_LATER=1 to enable
 DFLASH_COMMIT_LATER = os.environ.get("DFLASH_COMMIT_LATER", "0") == "1"
 
+# Override block size for experiments (default: use model config)
+# Set DFLASH_BLOCK_SIZE=8 to test smaller verify blocks
+DFLASH_BLOCK_SIZE_OVERRIDE = os.environ.get("DFLASH_BLOCK_SIZE", None)
+
 
 class DFlashWorker:
     """DFlash speculative decoding worker (spec-v1, tp=1/pp=1)."""
@@ -63,7 +67,18 @@ class DFlashWorker:
             device=draft_device,
             dtype=draft_dtype,
         )
-        self.block_size = int(getattr(self.draft_config, "block_size", 16))
+        # Block size: use env override if set, otherwise use model config
+        config_block_size = int(getattr(self.draft_config, "block_size", 16))
+        if DFLASH_BLOCK_SIZE_OVERRIDE is not None:
+            self.block_size = int(DFLASH_BLOCK_SIZE_OVERRIDE)
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH_BLOCK_SIZE override: %d (config was %d)",
+                    self.block_size,
+                    config_block_size,
+                )
+        else:
+            self.block_size = config_block_size
         self.use_commit_later = DFLASH_COMMIT_LATER
 
         # Max committed tokens for commit-later mode
