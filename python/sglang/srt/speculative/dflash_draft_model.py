@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 from safetensors.torch import safe_open
@@ -18,6 +18,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 from typing_extensions import Unpack
+
+from sglang.srt.speculative.dflash_cache import DraftReqState
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +405,273 @@ class DFlashDraftModel(nn.Module):
 
     def make_cache(self) -> DynamicCache:
         return DynamicCache()
+
+    def make_req_state(
+        self,
+        req_id: int,
+        max_committed: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> DraftReqState:
+        """Create a commit-later cache state for a request.
+
+        Args:
+            req_id: Unique request identifier
+            max_committed: Maximum committed tokens (context window)
+            device: torch device
+            dtype: tensor dtype
+
+        Returns:
+            DraftReqState with pre-allocated buffers
+        """
+        return DraftReqState(
+            req_id=req_id,
+            num_layers=self.config.num_hidden_layers,
+            n_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            block_size=self.block_size,
+            max_committed=max_committed,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward_commit_later(
+        self,
+        *,
+        noise_embedding: torch.Tensor,
+        position_ids: torch.LongTensor,
+        req_state: DraftReqState,
+    ) -> torch.Tensor:
+        """Forward pass using commit-later cache (no DynamicCache, no crop).
+
+        This is the commit-later version of forward() that:
+        1. Reads committed K/V from req_state's persistent cache
+        2. Writes noise K/V to scratch (overwritten each iteration)
+        3. Never modifies committed_len (that happens after verify)
+
+        Args:
+            noise_embedding: [1, block_size, hidden] - noise token embeddings
+            position_ids: [1, committed_len + block_size] - full position ids
+            req_state: DraftReqState with committed cache + scratch
+
+        Returns:
+            hidden_states: [1, block_size, hidden] - output for lm_head
+        """
+        bsz, q_len, _ = noise_embedding.shape
+        assert bsz == 1, "Commit-later currently only supports bsz=1"
+
+        hidden_states = noise_embedding
+        committed_len = req_state.committed_len
+
+        # Initialize FlashInfer on first forward
+        self._init_flashinfer(hidden_states.device, hidden_states.dtype)
+
+        # Setup FlashInfer wrapper for this forward pass
+        total_kv_len = committed_len + q_len
+        flashinfer_wrapper = None
+        if (
+            self._flashinfer_wrapper is not None
+            and FLASHINFER_AVAILABLE
+            and DFLASH_USE_FLASHINFER
+        ):
+            qo_indptr = torch.tensor(
+                [0, q_len], dtype=torch.int32, device=hidden_states.device
+            )
+            kv_indptr = torch.tensor(
+                [0, total_kv_len], dtype=torch.int32, device=hidden_states.device
+            )
+            self._flashinfer_wrapper.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_data_type=hidden_states.dtype,
+            )
+            flashinfer_wrapper = self._flashinfer_wrapper
+
+        # Position embeddings for noise tokens only
+        # We need positions [committed_len, committed_len + q_len)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_states = self._forward_layer_commit_later(
+                layer=layer,
+                layer_idx=layer_idx,
+                hidden_states=hidden_states,
+                req_state=req_state,
+                position_embeddings=position_embeddings,
+                flashinfer_wrapper=flashinfer_wrapper,
+            )
+
+        if flashinfer_wrapper is not None:
+            self._flashinfer_wrapper.end_forward()
+
+        return self.norm(hidden_states)
+
+    def _forward_layer_commit_later(
+        self,
+        layer: Qwen3DFlashDecoderLayer,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        req_state: DraftReqState,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        flashinfer_wrapper,
+    ) -> torch.Tensor:
+        """Forward one layer using commit-later cache.
+
+        Key difference from original: K/V for context comes from committed cache,
+        not from projecting target_hidden each time.
+        """
+        bsz, q_len, _ = hidden_states.shape
+        attn = layer.self_attn
+
+        # Residual connection
+        residual = hidden_states
+        hidden_states = layer.input_layernorm(hidden_states)
+
+        # Q projection (only from noise/hidden_states)
+        q = attn.q_proj(hidden_states)
+        q = q.view(bsz, q_len, -1, attn.head_dim)
+        q = attn.q_norm(q)
+
+        # K/V projection for NOISE ONLY (not target_hidden)
+        k_noise = attn.k_proj(hidden_states).view(bsz, q_len, -1, attn.head_dim)
+        v_noise = attn.v_proj(hidden_states).view(bsz, q_len, -1, attn.head_dim)
+        k_noise = attn.k_norm(k_noise)
+
+        # Apply rotary to Q (full positions) and K_noise (noise positions only)
+        cos, sin = position_embeddings
+        # Q uses last q_len positions
+        q_cos = cos[..., -q_len:, :]
+        q_sin = sin[..., -q_len:, :]
+        q = (q * q_cos.unsqueeze(1)) + (rotate_half(q) * q_sin.unsqueeze(1))
+
+        # K_noise uses positions [committed_len, committed_len + q_len)
+        k_cos = cos[..., -q_len:, :]
+        k_sin = sin[..., -q_len:, :]
+        k_noise = (k_noise * k_cos.unsqueeze(1)) + (
+            rotate_half(k_noise) * k_sin.unsqueeze(1)
+        )
+
+        # Write noise K/V to scratch [q_len, n_kv_heads, head_dim]
+        k_noise_flat = k_noise.squeeze(0)  # [q_len, n_kv_heads, head_dim]
+        v_noise_flat = v_noise.squeeze(0)  # [q_len, n_kv_heads, head_dim]
+        req_state.write_scratch(layer_idx, k_noise_flat, v_noise_flat, q_len)
+
+        # Get combined K/V for attention: committed + scratch
+        k_total, v_total = req_state.get_attention_kv(layer_idx, q_len)
+        # k_total: [committed_len + q_len, n_kv_heads, head_dim]
+
+        # Run attention
+        if (
+            flashinfer_wrapper is not None
+            and FLASHINFER_AVAILABLE
+            and DFLASH_USE_FLASHINFER
+        ):
+            # FlashInfer expects [total_tokens, num_heads, head_dim]
+            q_fi = q.transpose(1, 2).reshape(-1, attn.num_qo_heads, attn.head_dim)
+            # k_total/v_total already [kv_len, n_kv_heads, head_dim]
+            k_fi = k_total
+            v_fi = v_total
+
+            attn_output = flashinfer_wrapper.forward(
+                q_fi, k_fi, v_fi, causal=False, sm_scale=attn.scaling
+            )
+            attn_output = attn_output.view(bsz, q_len, -1)
+        else:
+            # SDPA path - need [bsz, num_heads, seq_len, head_dim]
+            q_sdpa = q.transpose(1, 2)  # [bsz, num_heads, q_len, head_dim]
+
+            # Expand K/V for SDPA: [kv_len, n_kv_heads, head_dim] -> [bsz, n_kv_heads, kv_len, head_dim]
+            k_sdpa = k_total.unsqueeze(0).transpose(1, 2)
+            v_sdpa = v_total.unsqueeze(0).transpose(1, 2)
+
+            # GQA expansion
+            k_sdpa = repeat_kv(k_sdpa, attn.num_key_value_groups)
+            v_sdpa = repeat_kv(v_sdpa, attn.num_key_value_groups)
+
+            attn_output = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=attn.scaling,
+            )
+            attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
+
+        attn_output = attn.o_proj(attn_output)
+        hidden_states = residual + attn_output
+
+        # MLP
+        residual = hidden_states
+        hidden_states = layer.post_attention_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+    def project_target_hidden_to_kv(
+        self,
+        target_hidden: torch.Tensor,
+        position_start: int,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Project target hidden states to K/V for appending to committed cache.
+
+        This is called AFTER verify to convert the verified target_hidden
+        into K/V that will be appended to the committed cache.
+
+        Args:
+            target_hidden: [commit_len, hidden_size * num_layers] - from target model
+            position_start: Position offset for rotary (= current committed_len)
+
+        Returns:
+            k_per_layer: List of [commit_len, n_kv_heads, head_dim] per layer
+            v_per_layer: List of [commit_len, n_kv_heads, head_dim] per layer
+        """
+        commit_len = target_hidden.shape[0]
+
+        # First, apply the FC projection and norm (same as original DFlash)
+        # target_hidden: [commit_len, hidden * num_layers] -> [commit_len, hidden]
+        ctx_feat = self.hidden_norm(self.fc(target_hidden))
+
+        # Build position embeddings for these tokens
+        position_ids = torch.arange(
+            position_start,
+            position_start + commit_len,
+            device=target_hidden.device,
+            dtype=torch.long,
+        ).unsqueeze(0)  # [1, commit_len]
+
+        # Get rotary embeddings
+        # We need a dummy hidden for rotary_emb shape
+        dummy = ctx_feat.unsqueeze(0)  # [1, commit_len, hidden]
+        cos, sin = self.rotary_emb(dummy, position_ids)
+
+        k_per_layer: List[torch.Tensor] = []
+        v_per_layer: List[torch.Tensor] = []
+
+        for layer in self.layers:
+            attn = layer.self_attn
+            # Project [commit_len, hidden] -> [commit_len, n_kv_heads, head_dim]
+            k = attn.k_proj(ctx_feat).view(commit_len, -1, attn.head_dim)
+            v = attn.v_proj(ctx_feat).view(commit_len, -1, attn.head_dim)
+            k = attn.k_norm(k)
+
+            # Apply rotary to K
+            # cos/sin: [1, 1, commit_len, head_dim]
+            cos_sq = cos.squeeze(0).squeeze(0)  # [commit_len, head_dim]
+            sin_sq = sin.squeeze(0).squeeze(0)
+            k = (k * cos_sq.unsqueeze(1)) + (
+                rotate_half(k.unsqueeze(0)).squeeze(0) * sin_sq.unsqueeze(1)
+            )
+
+            k_per_layer.append(k)
+            v_per_layer.append(v)
+
+        return k_per_layer, v_per_layer
 
 
 def load_dflash_draft_model(

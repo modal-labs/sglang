@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List, Optional, Union
 
 import torch
@@ -10,10 +11,17 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_model import load_dflash_draft_model
-from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.dflash_info import (
+    DFlashDraftInput,
+    DFlashDraftInputCommitLater,
+    DFlashVerifyInput,
+)
 
 logger = logging.getLogger(__name__)
+
+# Enable commit-later cache mode (experimental)
+# Set DFLASH_COMMIT_LATER=1 to enable
+DFLASH_COMMIT_LATER = os.environ.get("DFLASH_COMMIT_LATER", "0") == "1"
 
 
 class DFlashWorker:
@@ -56,15 +64,22 @@ class DFlashWorker:
             dtype=draft_dtype,
         )
         self.block_size = int(getattr(self.draft_config, "block_size", 16))
+        self.use_commit_later = DFLASH_COMMIT_LATER
+
+        # Max committed tokens for commit-later mode
+        # TODO: Make this configurable
+        self.max_committed = 8192
+
         if self.tp_rank == 0:
             logger.info(
-                "Loaded DFLASH draft model. path=%s, dtype=%s, device=%s, block_size=%s, num_hidden_layers=%s, mask_token_id=%s",
+                "Loaded DFLASH draft model. path=%s, dtype=%s, device=%s, block_size=%s, num_hidden_layers=%s, mask_token_id=%s, commit_later=%s",
                 server_args.speculative_draft_model_path,
                 draft_dtype,
                 draft_device,
                 self.block_size,
                 getattr(self.draft_config, "num_hidden_layers", None),
                 self._mask_token_id,
+                self.use_commit_later,
             )
 
     def __getattr__(self, name):
@@ -78,7 +93,9 @@ class DFlashWorker:
     def _resolve_mask_token_id(self) -> int:
         tokenizer = getattr(self.target_worker, "tokenizer", None)
         if tokenizer is None:
-            raise RuntimeError("DFLASH requires tokenizer initialization (skip_tokenizer_init is not supported).")
+            raise RuntimeError(
+                "DFLASH requires tokenizer initialization (skip_tokenizer_init is not supported)."
+            )
 
         vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
         mask_token_id = getattr(tokenizer, "mask_token_id", None)
@@ -106,7 +123,9 @@ class DFlashWorker:
                 )
 
         if mask_token_id is None or int(mask_token_id) < 0:
-            raise ValueError("DFLASH requires a `<|MASK|>` token id, but it could not be resolved.")
+            raise ValueError(
+                "DFLASH requires a `<|MASK|>` token id, but it could not be resolved."
+            )
 
         if mask_token_id >= vocab_size:
             raise ValueError(
@@ -118,12 +137,16 @@ class DFlashWorker:
 
         return int(mask_token_id)
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch, draft_input: DFlashDraftInput):
+    def _prepare_for_speculative_decoding(
+        self, batch: ScheduleBatch, draft_input: DFlashDraftInput
+    ):
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
 
         if batch.has_grammar:
-            raise ValueError("DFLASH does not support grammar-constrained decoding yet.")
+            raise ValueError(
+                "DFLASH does not support grammar-constrained decoding yet."
+            )
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
             if not self._warned_forced_greedy and self.tp_rank == 0:
                 logger.warning(
@@ -136,13 +159,17 @@ class DFlashWorker:
         device = self.model_runner.device
 
         if draft_input.target_hidden is None:
-            raise RuntimeError("DFLASH draft state missing target_hidden context features.")
+            raise RuntimeError(
+                "DFLASH draft state missing target_hidden context features."
+            )
         if len(draft_input.ctx_lens_cpu) != bs:
             raise RuntimeError(
                 f"DFLASH ctx_lens_cpu length mismatch: got {len(draft_input.ctx_lens_cpu)} for bs={bs}."
             )
 
-        embed_weight, head_weight = self.target_worker.model_runner.model.get_embed_and_head()
+        embed_weight, head_weight = (
+            self.target_worker.model_runner.model.get_embed_and_head()
+        )
 
         # Slice ragged target_hidden on CPU for simplicity.
         offsets: List[int] = [0]
@@ -150,7 +177,9 @@ class DFlashWorker:
             offsets.append(offsets[-1] + int(ln))
 
         candidates: List[torch.Tensor] = []
-        for i, (req, ctx_len) in enumerate(zip(batch.reqs, draft_input.ctx_lens_cpu, strict=True)):
+        for i, (req, ctx_len) in enumerate(
+            zip(batch.reqs, draft_input.ctx_lens_cpu, strict=True)
+        ):
             start_pos = int(batch.seq_lens_cpu[i].item())
             cache = draft_input.draft_caches[i]
             cache_len = int(cache.get_seq_length())
@@ -214,7 +243,11 @@ class DFlashWorker:
         )
         verify_input.prepare_for_verify(batch, self.page_size)
 
-        batch.forward_mode = ForwardMode.TARGET_VERIFY if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        batch.forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
 
@@ -224,7 +257,9 @@ class DFlashWorker:
         **kwargs,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
-            raise ValueError("DFLASH speculative decoding does not support return_logprob yet.")
+            raise ValueError(
+                "DFLASH speculative decoding does not support return_logprob yet."
+            )
 
         if isinstance(batch, ModelWorkerBatch):
             # Should not happen for spec-v1 (non-overlap) scheduling, but keep a sane fallback.
@@ -253,25 +288,45 @@ class DFlashWorker:
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
 
-            draft_caches = [self.draft_model.make_cache() for _ in batch.reqs]
-            ctx_lens_cpu = model_worker_batch.seq_lens_cpu.tolist()
+            if self.use_commit_later:
+                # Commit-later mode: create DraftReqState and initialize with prefill hidden
+                return self._handle_prefill_commit_later(
+                    batch,
+                    model_worker_batch,
+                    batch_result,
+                    logits_output,
+                    next_token_ids,
+                )
+            else:
+                # Legacy mode: DynamicCache with crop
+                draft_caches = [self.draft_model.make_cache() for _ in batch.reqs]
+                ctx_lens_cpu = model_worker_batch.seq_lens_cpu.tolist()
 
-            batch.spec_info = DFlashDraftInput(
-                verified_id=next_token_ids.to(torch.int64),
-                target_hidden=logits_output.hidden_states,
-                ctx_lens_cpu=ctx_lens_cpu,
-                draft_caches=draft_caches,
-            )
+                batch.spec_info = DFlashDraftInput(
+                    verified_id=next_token_ids.to(torch.int64),
+                    target_hidden=logits_output.hidden_states,
+                    ctx_lens_cpu=ctx_lens_cpu,
+                    draft_caches=draft_caches,
+                )
 
-            return GenerationBatchResult(
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
-                can_run_cuda_graph=batch_result.can_run_cuda_graph,
-            )
+                return GenerationBatchResult(
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
+                    num_accepted_tokens=0,
+                    can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                )
 
         # Decode / target-verify stage.
         draft_input = batch.spec_info
+
+        if self.use_commit_later:
+            if not isinstance(draft_input, DFlashDraftInputCommitLater):
+                raise RuntimeError(
+                    "DFLASH commit-later decode requires DFlashDraftInputCommitLater state. "
+                    "This usually means the request did not complete the prefill stage."
+                )
+            return self._handle_decode_commit_later(batch, draft_input, **kwargs)
+
         if not isinstance(draft_input, DFlashDraftInput):
             raise RuntimeError(
                 "DFLASH decode requires DFlashDraftInput state on the running batch. "
@@ -316,6 +371,233 @@ class DFlashWorker:
             logger.info(
                 "DFLASH verify completed. accept_length_per_req=%s",
                 accept_length_per_req_cpu,
+            )
+            self._logged_first_verify = True
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=new_verified_id,
+            num_accepted_tokens=num_accepted_tokens,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # COMMIT-LATER MODE
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _handle_prefill_commit_later(
+        self,
+        batch: ScheduleBatch,
+        model_worker_batch: ModelWorkerBatch,
+        batch_result: GenerationBatchResult,
+        logits_output,
+        next_token_ids: torch.Tensor,
+    ) -> GenerationBatchResult:
+        """Handle prefill in commit-later mode.
+
+        Creates DraftReqState for each request and initializes the committed
+        cache with K/V projected from the prefill target_hidden.
+        """
+        device = self.device
+        dtype = self.target_worker.model_runner.dtype
+        seq_lens_cpu = model_worker_batch.seq_lens_cpu.tolist()
+
+        # Create DraftReqState for each request
+        req_states = []
+        hidden_offset = 0
+
+        for i, (req, seq_len) in enumerate(zip(batch.reqs, seq_lens_cpu)):
+            # Create empty req_state
+            req_state = self.draft_model.make_req_state(
+                req_id=id(req),
+                max_committed=self.max_committed,
+                device=device,
+                dtype=dtype,
+            )
+
+            # Get this request's hidden states from prefill
+            target_hidden = logits_output.hidden_states[
+                hidden_offset : hidden_offset + seq_len
+            ]
+            hidden_offset += seq_len
+
+            # Project target_hidden to K/V and append to committed cache
+            k_per_layer, v_per_layer = self.draft_model.project_target_hidden_to_kv(
+                target_hidden=target_hidden,
+                position_start=0,  # Prefill starts at position 0
+            )
+            req_state.append_committed_all_layers(k_per_layer, v_per_layer, seq_len)
+
+            req_states.append(req_state)
+
+        batch.spec_info = DFlashDraftInputCommitLater(
+            verified_id=next_token_ids.to(torch.int64),
+            req_states=req_states,
+        )
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            num_accepted_tokens=0,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+        )
+
+    def _handle_decode_commit_later(
+        self,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputCommitLater,
+        **kwargs,
+    ) -> GenerationBatchResult:
+        """Handle decode in commit-later mode.
+
+        Key differences from legacy mode:
+        1. Uses forward_commit_later() which reads committed cache + writes scratch
+        2. No target_hidden passed to draft forward (already in committed cache)
+        3. After verify: project verified hidden → append to committed cache
+        """
+        if batch.has_grammar:
+            raise ValueError(
+                "DFLASH does not support grammar-constrained decoding yet."
+            )
+        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
+            if not self._warned_forced_greedy and self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH currently supports greedy verification only; "
+                    "ignoring non-greedy sampling params."
+                )
+                self._warned_forced_greedy = True
+
+        device = self.model_runner.device
+
+        embed_weight, head_weight = (
+            self.target_worker.model_runner.model.get_embed_and_head()
+        )
+
+        # Draft forward for each request using commit-later cache
+        candidates: List[torch.Tensor] = []
+        for i, req_state in enumerate(draft_input.req_states):
+            committed_len = req_state.committed_len
+
+            # Create noise block input
+            block_ids = torch.full(
+                (1, self.block_size),
+                self._mask_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+            block_ids[0, 0] = draft_input.verified_id[i].to(torch.long)
+
+            noise_embedding = F.embedding(block_ids, embed_weight)
+
+            # Position ids: [committed_len, committed_len + block_size)
+            position_ids = torch.arange(
+                committed_len,
+                committed_len + self.block_size,
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(0)
+
+            with torch.inference_mode():
+                hidden = self.draft_model.forward_commit_later(
+                    noise_embedding=noise_embedding,
+                    position_ids=position_ids,
+                    req_state=req_state,
+                )
+
+                # Get draft tokens from hidden
+                draft_hidden = hidden[:, -self.block_size + 1 :, :]
+                draft_logits = F.linear(draft_hidden, head_weight)
+                draft_tokens = torch.argmax(draft_logits, dim=-1).to(torch.long)
+
+            candidate = torch.cat(
+                [block_ids[0, 0].view(1), draft_tokens.view(-1)],
+                dim=0,
+            )
+            candidates.append(candidate)
+
+        draft_tokens = torch.stack(candidates, dim=0)  # [bs, block_size]
+        positions = (
+            torch.tensor(
+                [rs.committed_len for rs in draft_input.req_states],
+                device=device,
+                dtype=torch.long,
+            ).unsqueeze(1)
+            + torch.arange(self.block_size, device=device, dtype=torch.long)[None, :]
+        ).flatten()
+
+        verify_input = DFlashVerifyInput(
+            draft_token=draft_tokens.flatten(),
+            positions=positions,
+            draft_token_num=self.block_size,
+        )
+        verify_input.prepare_for_verify(batch, self.page_size)
+
+        batch.forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
+        batch.spec_info = verify_input
+        batch.return_hidden_states = False
+
+        # Run target verify
+        model_worker_batch = batch.get_model_worker_batch()
+        assert model_worker_batch.forward_mode.is_target_verify()
+
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True, **kwargs
+        )
+        logits_output, can_run_cuda_graph = (
+            batch_result.logits_output,
+            batch_result.can_run_cuda_graph,
+        )
+
+        # Verify and get commit info
+        (
+            new_verified_id,
+            commit_lens,
+            next_target_hidden,
+            accept_length_per_req_cpu,
+        ) = verify_input.verify(
+            batch=batch,
+            logits_output=logits_output,
+            page_size=self.page_size,
+        )
+
+        # CRITICAL: Append committed K/V to each request's cache
+        hidden_offset = 0
+        commit_lens_cpu = commit_lens.cpu().tolist()
+        for i, (req_state, commit_len) in enumerate(
+            zip(draft_input.req_states, commit_lens_cpu)
+        ):
+            if commit_len > 0:
+                # Get this request's verified hidden
+                target_hidden = next_target_hidden[
+                    hidden_offset : hidden_offset + commit_len
+                ]
+                hidden_offset += commit_len
+
+                # Project to K/V and append to committed cache
+                k_per_layer, v_per_layer = self.draft_model.project_target_hidden_to_kv(
+                    target_hidden=target_hidden,
+                    position_start=req_state.committed_len,
+                )
+                req_state.append_committed_all_layers(
+                    k_per_layer, v_per_layer, commit_len
+                )
+
+        # Update draft state for next iteration
+        draft_input.verified_id = new_verified_id
+        batch.spec_info = draft_input
+        batch.forward_mode = ForwardMode.DECODE
+
+        num_accepted_tokens = sum(accept_length_per_req_cpu)
+        if not self._logged_first_verify and self.tp_rank == 0:
+            logger.info(
+                "DFLASH commit-later verify completed. accept_length_per_req=%s, committed_lens=%s",
+                accept_length_per_req_cpu,
+                [rs.committed_len for rs in draft_input.req_states],
             )
             self._logged_first_verify = True
 
