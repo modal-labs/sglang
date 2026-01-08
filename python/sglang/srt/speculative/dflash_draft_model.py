@@ -531,32 +531,32 @@ class DFlashDraftModel(nn.Module):
         hidden_states = layer.input_layernorm(hidden_states)
 
         # Q projection (only from noise/hidden_states)
+        # Shape: [bsz, q_len, hidden] -> [bsz, num_heads, q_len, head_dim]
         q = attn.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, attn.head_dim)
-        q = attn.q_norm(q)
+        q = attn.q_norm(q).transpose(1, 2)  # [bsz, num_heads, q_len, head_dim]
 
         # K/V projection for NOISE ONLY (not target_hidden)
+        # Shape: [bsz, q_len, hidden] -> [bsz, n_kv_heads, q_len, head_dim]
         k_noise = attn.k_proj(hidden_states).view(bsz, q_len, -1, attn.head_dim)
         v_noise = attn.v_proj(hidden_states).view(bsz, q_len, -1, attn.head_dim)
-        k_noise = attn.k_norm(k_noise)
+        k_noise = attn.k_norm(k_noise).transpose(
+            1, 2
+        )  # [bsz, n_kv_heads, q_len, head_dim]
+        v_noise = v_noise.transpose(1, 2)
 
-        # Apply rotary to Q (full positions) and K_noise (noise positions only)
+        # Apply rotary to Q and K_noise using same method as original attention
         cos, sin = position_embeddings
-        # Q uses last q_len positions
-        q_cos = cos[..., -q_len:, :]
-        q_sin = sin[..., -q_len:, :]
-        q = (q * q_cos.unsqueeze(1)) + (rotate_half(q) * q_sin.unsqueeze(1))
-
-        # K_noise uses positions [committed_len, committed_len + q_len)
-        k_cos = cos[..., -q_len:, :]
-        k_sin = sin[..., -q_len:, :]
-        k_noise = (k_noise * k_cos.unsqueeze(1)) + (
-            rotate_half(k_noise) * k_sin.unsqueeze(1)
-        )
+        q, k_noise = apply_rotary_pos_emb(q, k_noise, cos, sin)
 
         # Write noise K/V to scratch [q_len, n_kv_heads, head_dim]
-        k_noise_flat = k_noise.squeeze(0)  # [q_len, n_kv_heads, head_dim]
-        v_noise_flat = v_noise.squeeze(0)  # [q_len, n_kv_heads, head_dim]
+        # Transpose back: [bsz, n_kv_heads, q_len, head_dim] -> [q_len, n_kv_heads, head_dim]
+        k_noise_flat = k_noise.squeeze(0).transpose(
+            0, 1
+        )  # [q_len, n_kv_heads, head_dim]
+        v_noise_flat = v_noise.squeeze(0).transpose(
+            0, 1
+        )  # [q_len, n_kv_heads, head_dim]
         req_state.write_scratch(layer_idx, k_noise_flat, v_noise_flat, q_len)
 
         # Get combined K/V for attention: committed + scratch
@@ -581,7 +581,8 @@ class DFlashDraftModel(nn.Module):
             attn_output = attn_output.view(bsz, q_len, -1)
         else:
             # SDPA path - need [bsz, num_heads, seq_len, head_dim]
-            q_sdpa = q.transpose(1, 2)  # [bsz, num_heads, q_len, head_dim]
+            # q is already [bsz, num_heads, q_len, head_dim] after rotary
+            q_sdpa = q
 
             # Expand K/V for SDPA: [kv_len, n_kv_heads, head_dim] -> [bsz, n_kv_heads, kv_len, head_dim]
             k_sdpa = k_total.unsqueeze(0).transpose(1, 2)
@@ -655,18 +656,23 @@ class DFlashDraftModel(nn.Module):
 
         for layer in self.layers:
             attn = layer.self_attn
-            # Project [commit_len, hidden] -> [commit_len, n_kv_heads, head_dim]
-            k = attn.k_proj(ctx_feat).view(commit_len, -1, attn.head_dim)
-            v = attn.v_proj(ctx_feat).view(commit_len, -1, attn.head_dim)
-            k = attn.k_norm(k)
-
-            # Apply rotary to K
-            # cos/sin: [1, 1, commit_len, head_dim]
-            cos_sq = cos.squeeze(0).squeeze(0)  # [commit_len, head_dim]
-            sin_sq = sin.squeeze(0).squeeze(0)
-            k = (k * cos_sq.unsqueeze(1)) + (
-                rotate_half(k.unsqueeze(0)).squeeze(0) * sin_sq.unsqueeze(1)
+            # Project [commit_len, hidden] -> [1, n_kv_heads, commit_len, head_dim]
+            k = attn.k_proj(ctx_feat).view(
+                1, commit_len, attn.num_kv_heads, attn.head_dim
             )
+            v = attn.v_proj(ctx_feat).view(
+                1, commit_len, attn.num_kv_heads, attn.head_dim
+            )
+            k = attn.k_norm(k).transpose(1, 2)  # [1, n_kv_heads, commit_len, head_dim]
+            v = v.transpose(1, 2)
+
+            # Apply rotary to K using same method as attention
+            # cos/sin from rotary_emb, apply_rotary_pos_emb expects 4D tensors
+            _, k = apply_rotary_pos_emb(k, k, cos, sin)  # dummy q, we only need k
+
+            # Reshape to [commit_len, n_kv_heads, head_dim]
+            k = k.squeeze(0).transpose(0, 1)  # [commit_len, n_kv_heads, head_dim]
+            v = v.squeeze(0).transpose(0, 1)
 
             k_per_layer.append(k)
             v_per_layer.append(v)
