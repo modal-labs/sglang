@@ -49,11 +49,13 @@ class DraftLayerCache:
     # Committed (verified) K/V - monotonically growing
     K_committed: Tensor  # [max_committed, n_kv_heads, head_dim]
     V_committed: Tensor  # [max_committed, n_kv_heads, head_dim]
-    committed_len: int = 0
 
     # Scratch for speculative tokens - overwritten each iteration
     K_scratch: Tensor  # [block_size, n_kv_heads, head_dim]
     V_scratch: Tensor  # [block_size, n_kv_heads, head_dim]
+
+    # Current committed length (default must come last)
+    committed_len: int = 0
 
     def get_kv_for_attention(self, scratch_len: int) -> Tuple[Tensor, Tensor]:
         """Get concatenated K/V for attention (committed + scratch).
