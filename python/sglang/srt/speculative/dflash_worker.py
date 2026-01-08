@@ -72,10 +72,10 @@ class DFlashWorker:
         if DFLASH_BLOCK_SIZE_OVERRIDE is not None:
             self.block_size = int(DFLASH_BLOCK_SIZE_OVERRIDE)
             if self.tp_rank == 0:
-                logger.warning(
-                    "DFLASH_BLOCK_SIZE override: %d (config was %d)",
-                    self.block_size,
+                logger.info(
+                    "DFLASH block_size overridden: %d -> %d (env DFLASH_BLOCK_SIZE)",
                     config_block_size,
+                    self.block_size,
                 )
         else:
             self.block_size = config_block_size
