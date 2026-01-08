@@ -9,18 +9,35 @@ from safetensors.torch import safe_open
 from torch import nn
 from transformers import AutoConfig, DynamicCache
 from transformers.cache_utils import Cache
+import torch.nn.functional as F
 from transformers.models.qwen3.modeling_qwen3 import (
-    ALL_ATTENTION_FUNCTIONS,
     Qwen3MLP,
     Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
     FlashAttentionKwargs,
-    eager_attention_forward,
     rotate_half,
 )
 from typing_extensions import Unpack
 
 logger = logging.getLogger(__name__)
+
+# Debug flag: set DFLASH_DEBUG=1 to enable verbose logging
+DFLASH_DEBUG = os.environ.get("DFLASH_DEBUG", "0") == "1"
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Expand KV heads for grouped-query attention (GQA).
+
+    Input shape: [batch, num_kv_heads, seq_len, head_dim]
+    Output shape: [batch, num_kv_heads * n_rep, seq_len, head_dim]
+    """
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_kv_heads, n_rep, seq_len, head_dim
+    )
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
 
 
 def apply_rotary_pos_emb(
@@ -43,8 +60,12 @@ class Qwen3DFlashAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False
@@ -86,16 +107,29 @@ class Qwen3DFlashAttention(nn.Module):
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
 
+        if DFLASH_DEBUG and self.layer_idx == 0:
+            logger.info(
+                "DFlash attn L0: bsz=%d q_len=%d ctx_len=%d hidden=%s target=%s",
+                bsz,
+                q_len,
+                ctx_len,
+                hidden_states.shape,
+                target_hidden.shape,
+            )
+
+        # Q projection (only from noise/hidden_states)
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
 
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
-        k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
-        v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
+        # Level 2 optimization: Combine inputs before K/V projection
+        # Reduces 4 linear ops (k_proj×2, v_proj×2) + 2 cats → 1 cat + 2 linear ops
+        kv_input = torch.cat(
+            [target_hidden, hidden_states], dim=1
+        )  # [bsz, ctx_len + q_len, hidden]
+        kv_len = ctx_len + q_len
+        k = self.k_proj(kv_input).view(bsz, kv_len, -1, self.head_dim)
+        v = self.v_proj(kv_input).view(bsz, kv_len, -1, self.head_dim)
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
@@ -106,24 +140,35 @@ class Qwen3DFlashAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
-        attn_fn = eager_attention_forward
-        if getattr(self.config, "_attn_implementation", "eager") != "eager":
-            attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # Expand K/V for grouped-query attention (GQA)
+        k = repeat_kv(k, self.num_key_value_groups)
+        v = repeat_kv(v, self.num_key_value_groups)
 
-        attn_output, attn_weights = attn_fn(
-            self,
+        if DFLASH_DEBUG and self.layer_idx == 0:
+            logger.info(
+                "DFlash attn L0 shapes: q=%s k=%s v=%s num_kv_groups=%d",
+                q.shape,
+                k.shape,
+                v.shape,
+                self.num_key_value_groups,
+            )
+
+        # Level 1 optimization: Use SDPA instead of eager attention
+        # DFlash uses non-causal attention (is_causal=False)
+        dropout_p = 0.0 if not self.training else self.attention_dropout
+        attn_output = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=None,
-            **kwargs,
+            attn_mask=attention_mask,
+            dropout_p=dropout_p,
+            is_causal=False,
+            scale=self.scaling,
         )
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+        # SDPA output: [bsz, num_heads, q_len, head_dim] -> [bsz, q_len, num_heads * head_dim]
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, None
 
 
 class Qwen3DFlashDecoderLayer(nn.Module):
@@ -132,7 +177,9 @@ class Qwen3DFlashDecoderLayer(nn.Module):
         self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -242,8 +289,9 @@ def load_dflash_draft_model(
 ) -> tuple[DFlashDraftModel, object]:
     """Load DFlash draft model weights from a local folder."""
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
-    # Ensure we don't accidentally select optional FlashAttention implementations.
-    setattr(config, "_attn_implementation", "eager")
+    # Set for compatibility with other code that might check this attribute.
+    # We use F.scaled_dot_product_attention directly in Qwen3DFlashAttention.
+    setattr(config, "_attn_implementation", "sdpa")
 
     model = DFlashDraftModel(config).to(device=device, dtype=dtype)
 
@@ -270,4 +318,3 @@ def load_dflash_draft_model(
     model.eval()
     model.requires_grad_(False)
     return model, config
-
