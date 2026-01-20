@@ -21,7 +21,9 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Environment :: GPU :: NVIDIA CUDA"
 ]
-dependencies = []
+dependencies = [
+  "quack-kernels==0.2.4",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"

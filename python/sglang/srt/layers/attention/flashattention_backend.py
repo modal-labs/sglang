@@ -768,11 +768,9 @@ class FlashAttentionBackend(AttentionBackend):
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
-            and self.fa_impl_ver != 4
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
@@ -972,7 +970,6 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver in [3], "Only FA3 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -2512,7 +2509,7 @@ def prepare_swa_spec_page_table_triton(
 class FlashAttentionMultiStepBackend:
 
     def __init__(
-        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int, fa_impl_ver: int = 3
     ):
         self.model_runner = model_runner
         self.topk = topk
@@ -2525,6 +2522,7 @@ class FlashAttentionMultiStepBackend:
                     speculative_step_id=i,
                     topk=self.topk,
                     speculative_num_steps=self.speculative_num_steps,
+                    fa_impl_ver=fa_impl_ver,
                 )
             )
 

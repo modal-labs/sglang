@@ -1776,12 +1776,6 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
-        if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
-            logger.warning(
-                f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
-            )
-            self.page_size = 128
-
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:

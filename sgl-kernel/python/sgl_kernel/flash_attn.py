@@ -52,6 +52,7 @@ def flash_attn_with_kvcache(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     rotary_seqlens: Optional[torch.Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
@@ -174,9 +175,6 @@ def flash_attn_with_kvcache(
         assert (
             cache_batch_idx is None and cache_leftpad is None
         ), "FA4 does not support non-consecutive batch indices or left padding."
-        assert (
-            q_descale is None and k_descale is None and v_descale is None
-        ), "FA4 does not support descale."
 
         if window_size == (-1, -1):
             window_size = (None, None)
@@ -198,6 +196,11 @@ def flash_attn_with_kvcache(
             page_table=page_table,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
         )
 
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
@@ -242,7 +245,7 @@ def flash_attn_with_kvcache(
         None,  # seqused_q
         cache_seqlens,
         max_seqlen_q,
-        None,  # max_seqlen_k
+        max_seqlen_k,
         page_table,
         cache_batch_idx,
         cache_leftpad,
@@ -318,11 +321,17 @@ def flash_attn_varlen_func(
             causal=causal,
             window_size=window_size,
             softcap=softcap,
+            num_splits=num_splits,
             pack_gqa=pack_gqa,
             learnable_sink=sinks,
             return_softmax_lse=return_softmax_lse,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
         )
 
     if not is_fa3_supported():

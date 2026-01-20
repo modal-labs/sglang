@@ -91,8 +91,8 @@ FetchContent_Populate(repo-flashinfer)
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        f866ec34002250e74c8bbcbcffa0e1ae71300b2d
+    GIT_REPOSITORY https://github.com/modal-labs/flash-attention.git
+    GIT_TAG        5ada46ab51d935cf0baae56f6902590f45e78883
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
