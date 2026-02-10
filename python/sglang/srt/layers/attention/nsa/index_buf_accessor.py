@@ -621,10 +621,10 @@ def _get_k_and_s_triton(
     This is more efficient than calling GetK and GetS separately.
 
     :param buf: (num_pages, page_size * 128 + page_size * 4), uint8
-    :param page_indices: (num_pages,), int32/int64
+    :param page_indices: (batch_size, num_pages), int32/int64
     :param seq_lens: tensor of sequence lens, int64
     :param seq_len_sum: sum of all sequence len, int32
-    :param seq_len_sum: max of sequence len, int32
+    :param max_seq_len: max of sequence len, int32
     :param page_size: int, typically 64
     :param index_head_dim: int, typically 128
     :return: tuple of (k_out, s_out) where
@@ -643,7 +643,7 @@ def _get_k_and_s_triton(
 
     # Launch kernel with one thread per token
     seq_num = seq_lens.shape[0]
-    grid = (seq_num, max_seq_len)
+    grid = (max_seq_len, seq_num)
     seq_num_pow2 = 1
     while seq_num_pow2 < seq_num:
         seq_num_pow2 *= 2
@@ -683,11 +683,11 @@ def _get_k_and_s_triton_kernel(
 ):
     """
     Fused kernel that gathers both K and S data in a single pass.
-    Each program handles one token (seq_len tokens total).
+    Each program handles one (token, batch) pair.
     Loads 128 bytes (K) + 4 bytes (S) from the appropriate page.
     """
-    batch_id = tl.program_id(0)
-    token_id = tl.program_id(1)
+    token_id = tl.program_id(0)
+    batch_id = tl.program_id(1)
 
     # Calculate which page and offset within page
     page_idx = token_id // page_size

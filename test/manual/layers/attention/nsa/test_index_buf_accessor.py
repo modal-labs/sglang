@@ -10,6 +10,8 @@ Test coverage:
 - GetKAndS.triton() vs separate GetK.torch_fast() + GetS.torch_fast()
 """
 
+from itertools import product
+
 import pytest
 import torch
 
@@ -251,8 +253,13 @@ class TestGetS:
 class TestGetKAndS:
     """Test cases for GetKAndS.triton() correctness."""
 
-    @pytest.mark.parametrize("num_pages", [1, 2, 4, 8, 16])
-    @pytest.mark.parametrize("seq_len", [64, 128, 256, 512, 1024])
+    @pytest.mark.parametrize("num_pages,seq_len", [
+        *product(
+            [1, 2, 4, 8, 16],
+            [64, 128, 256, 512, 1024],
+        ),
+        (1024, 65536), # regression test for large seq_len
+    ])
     @pytest.mark.parametrize("page_size", [64])
     @pytest.mark.parametrize("index_head_dim", [128])
     def test_get_k_and_s_correctness(
