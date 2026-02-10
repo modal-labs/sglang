@@ -287,7 +287,7 @@ class NativeSparseAttnBackend(
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
