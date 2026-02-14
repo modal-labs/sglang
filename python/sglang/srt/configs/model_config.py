@@ -279,6 +279,12 @@ class ModelConfig:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] in [
+            "KimiK25ForConditionalGeneration",
+        ]:
+            self.hf_config.architectures[0] = "KimiK25ForConditionalGenerationNextN"
+            self.hf_text_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",
             "Glm4MoeLiteForCausalLM",
         ]:
@@ -428,6 +434,7 @@ class ModelConfig:
             or "PixtralForConditionalGeneration" in self.hf_config.architectures
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK25ForConditionalGenerationNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
