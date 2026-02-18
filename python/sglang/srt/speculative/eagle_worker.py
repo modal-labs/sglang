@@ -1,5 +1,8 @@
+import json as _json
 import logging
+import os
 import time
+from collections import deque
 from typing import List, Optional, Tuple
 
 import torch
@@ -73,6 +76,36 @@ if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+_EAGLE_PROFILE_ENABLED = os.environ.get("EAGLE_PROFILE_STEPS", "0") == "1"
+_EAGLE_PROFILE_DRAIN_LAG = 8
+_EAGLE_PROFILE_FILE = os.environ.get(
+    "EAGLE_PROFILE_FILE", "/tmp/eagle_profile_steps.jsonl"
+)
+
+
+class _EagleStepProfile:
+    """Holds CUDA events for one EAGLE decode step. Events are read lazily."""
+
+    __slots__ = ("ev",)
+
+    def __init__(self):
+        self.ev = tuple(torch.cuda.Event(enable_timing=True) for _ in range(4))
+
+    def record(self, idx: int):
+        self.ev[idx].record()
+
+    def is_ready(self) -> bool:
+        return self.ev[-1].query()
+
+    def read(self) -> dict:
+        return {
+            "draft_ms": self.ev[0].elapsed_time(self.ev[1]),
+            "verify_ms": self.ev[1].elapsed_time(self.ev[2]),
+            "draft_extend_ms": self.ev[2].elapsed_time(self.ev[3]),
+            "total_ms": self.ev[0].elapsed_time(self.ev[3]),
+        }
 
 
 class EAGLEWorker(TpModelWorker):
@@ -206,6 +239,53 @@ class EAGLEWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
+        # Per-step profiling state (only active if EAGLE_PROFILE_STEPS=1)
+        self._profile = _EAGLE_PROFILE_ENABLED
+        self._profile_pending: deque[_EagleStepProfile] = deque()
+        self._profile_step_idx = 0
+        self._profile_req_idx = 0
+        if self._profile:
+            with open(_EAGLE_PROFILE_FILE, "w"):
+                pass
+            print("[EAGLE_PROFILE] Profiling enabled — recording CUDA events per step")
+
+    def _drain_profile_events(self):
+        """Non-blocking drain of completed profiling events."""
+        while len(self._profile_pending) > _EAGLE_PROFILE_DRAIN_LAG:
+            sp = self._profile_pending[0]
+            if not sp.is_ready():
+                break
+            sp = self._profile_pending.popleft()
+            step_idx = self._profile_step_idx - len(self._profile_pending) - 1
+            timing = sp.read()
+            timing["step"] = step_idx
+            timing["req"] = self._profile_req_idx
+            with open(_EAGLE_PROFILE_FILE, "a") as f:
+                f.write(_json.dumps(timing) + "\n")
+
+    def flush_profile_events(self) -> list:
+        """Sync GPU and drain ALL pending profile events."""
+        if not self._profile or not self._profile_pending:
+            self._profile_req_idx += 1
+            self._profile_step_idx = 0
+            return []
+
+        self._profile_pending[-1].ev[-1].synchronize()
+        result = []
+        step_base = self._profile_step_idx - len(self._profile_pending)
+
+        with open(_EAGLE_PROFILE_FILE, "a") as f:
+            for i, sp in enumerate(self._profile_pending):
+                timing = sp.read()
+                timing["step"] = step_base + i
+                timing["req"] = self._profile_req_idx
+                result.append(timing)
+                f.write(_json.dumps(timing) + "\n")
+        self._profile_pending.clear()
+        self._profile_req_idx += 1
+        self._profile_step_idx = 0
+        return result
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
         draft_backend_factory = DraftBackendFactory(
@@ -300,13 +380,25 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
+            sp = None
+            if self._profile:
+                sp = _EagleStepProfile()
+                sp.record(0)
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 spec_info = self.draft(batch)
+
+            if sp:
+                sp.record(1)
+
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+
+            if sp:
+                sp.record(2)
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
@@ -319,6 +411,12 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+
+            if sp:
+                sp.record(3)
+                self._profile_pending.append(sp)
+                self._profile_step_idx += 1
+                self._drain_profile_events()
 
             return GenerationBatchResult(
                 logits_output=logits_output,
