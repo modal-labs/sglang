@@ -2810,6 +2810,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        # In some load flows (e.g. dummy load format), load_weights() is skipped.
+        # Keep a guard so we can lazily materialize MLA packed weights before first forward.
+        self._post_load_weights_initialized = False
 
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
@@ -2906,6 +2909,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if not self._post_load_weights_initialized:
+            self.post_load_weights(is_nextn=False, weight_names=None)
+            self._post_load_weights_initialized = True
+
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
@@ -2940,6 +2947,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         self.do_load_weights(weights, is_nextn)
+        self._post_load_weights_initialized = True
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
