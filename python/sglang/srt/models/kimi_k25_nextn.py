@@ -44,8 +44,5 @@ class KimiK25ForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
 
         super().load_weights(language_weights)
 
-    def post_load_weights(self):
-        super().post_load_weights(is_nextn=True)
-
 
 EntryClass = [KimiK25ForConditionalGenerationNextN]
