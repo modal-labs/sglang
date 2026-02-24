@@ -124,6 +124,9 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
+    # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
+    # DFLASH verify is linear (non-tree), so this is always 1.
+    topk: int = 1
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None

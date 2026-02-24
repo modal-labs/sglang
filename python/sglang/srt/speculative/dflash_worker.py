@@ -44,6 +44,14 @@ def _get_fused_kv_materialize_helper():
 class DFlashWorker:
     """DFlash speculative decoding worker (spec-v1, tp>=1/pp=1)."""
 
+    _VERIFY_SKIP_CUSTOM_MASK_BACKENDS = {
+        "FlashInferAttnBackend",
+        "FlashInferMLAAttnBackend",
+        "FlashAttentionBackend",
+        "TRTLLMHAAttnBackend",
+        "TRTLLMMLABackend",
+    }
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -518,15 +526,7 @@ class DFlashWorker:
             positions=positions,
             draft_token_num=self.block_size,
         )
-        backend_name = type(self.model_runner.attn_backend).__name__
-        skip_custom_mask = backend_name in {
-            "FlashInferAttnBackend",
-            "FlashInferMLAAttnBackend",
-            "FlashAttentionBackend",
-            "TRTLLMHAAttnBackend",
-            "TRTLLMMLABackend",
-        }
-        build_custom_mask = not skip_custom_mask
+        _, build_custom_mask = self._resolve_verify_mask_policy()
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
@@ -880,6 +880,67 @@ class DFlashWorker:
             write_layer_kv=_write_layer_kv,
         )
 
+    def _resolve_verify_mask_backend_name(self) -> str:
+        backend = self.model_runner.attn_backend
+        for _ in range(4):
+            full_backend = getattr(backend, "full_attn_backend", None)
+            if full_backend is None:
+                break
+            backend = full_backend
+        return type(backend).__name__
+
+    def _resolve_verify_mask_policy(self) -> tuple[str, bool]:
+        backend_name = self._resolve_verify_mask_backend_name()
+        return backend_name, (
+            backend_name not in self._VERIFY_SKIP_CUSTOM_MASK_BACKENDS
+        )
+
+    def _update_target_mamba_state_after_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        seq_lens_pre_verify: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Commit Mamba intermediate states for accepted verify steps.
+
+        During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
+        cache per-step intermediate states. After acceptance, we need to commit the
+        state corresponding to each request's last accepted step.
+        """
+        attn_backend = self.target_worker.model_runner.attn_backend
+        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            return
+
+        accepted_steps = commit_lens.to(torch.int64) - 1
+        mamba_steps_to_track = None
+
+        if batch.mamba_track_indices is not None:
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != batch.seq_lens // mamba_track_interval
+            )
+            tracking_point = (
+                batch.seq_lens // mamba_track_interval * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            can_track_mask = to_track_mask & (
+                to_track_ith < commit_lens.to(to_track_ith.dtype)
+            )
+            mamba_steps_to_track = torch.where(
+                can_track_mask,
+                to_track_ith.to(torch.int64),
+                torch.full_like(to_track_ith, -1, dtype=torch.int64),
+            )
+
+        attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
+        )
+
     def forward_batch_generation(
         self,
         batch: Union[ScheduleBatch, ModelWorkerBatch],
@@ -964,6 +1025,13 @@ class DFlashWorker:
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
+        need_mamba_verify_commit = hasattr(
+            self.target_worker.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
+        seq_lens_pre_verify = (
+            batch.seq_lens.clone() if need_mamba_verify_commit else None
+        )
 
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
@@ -983,6 +1051,13 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        if need_mamba_verify_commit:
+            assert seq_lens_pre_verify is not None
+            self._update_target_mamba_state_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                commit_lens=commit_lens,
+            )
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
