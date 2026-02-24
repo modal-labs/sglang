@@ -2019,6 +2019,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
+            elif self.spec_algorithm.is_dflash():
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+                # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+                spec_info = DFlashVerifyInput(
+                    draft_token=None,
+                    positions=None,
+                    draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    custom_mask=None,
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.NULL
+                        if self.is_draft_worker
+                        else CaptureHiddenMode.FULL
+                    ),
+                )
 
             elif self.spec_algorithm.is_ngram():
                 from sglang.srt.speculative.ngram_info import NgramVerifyInput

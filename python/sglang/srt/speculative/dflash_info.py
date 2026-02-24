@@ -19,6 +19,32 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
 
+def _compute_paged_keep_slots(
+    *,
+    prefix_lens: torch.Tensor,
+    commit_lens: torch.Tensor,
+    draft_token_num: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Compute how many draft slots per request must remain allocated.
+
+    The allocator frees at page granularity for paged mode, so we can only release
+    full pages from the tail after verify.
+    """
+
+    if page_size <= 1:
+        raise ValueError(f"Expected page_size > 1, got {page_size}.")
+
+    seq_dtype = prefix_lens.dtype
+    extended_lens = prefix_lens + int(draft_token_num)
+    new_lens = prefix_lens + commit_lens.to(seq_dtype)
+    aligned_new_lens = ((new_lens + page_size - 1) // page_size) * page_size
+    keep_lens = torch.minimum(aligned_new_lens, extended_lens)
+    keep_slots = (keep_lens - prefix_lens).to(torch.int64)
+    keep_slots.clamp_(min=0, max=int(draft_token_num))
+    return keep_slots
+
+
 @dataclass
 class DFlashDraftInput(SpecInput):
     """Per-batch DFlash draft state for spec-v1 (non-overlap) scheduling.
@@ -415,10 +441,19 @@ class DFlashVerifyInput(SpecInput):
             batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
             batch.out_cache_loc = out_cache_loc[keep_mask]
         else:
-            # Page-size > 1 is not supported in the initial DFlash implementation.
-            raise NotImplementedError(
-                "DFLASH verify with page_size > 1 is not supported yet."
+            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
+            row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
+            keep_slots = _compute_paged_keep_slots(
+                prefix_lens=batch.seq_lens,
+                commit_lens=commit_lens,
+                draft_token_num=self.draft_token_num,
+                page_size=page_size,
             )
+            free_mask = row_offsets >= keep_slots[:, None]
+            batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
+
+            keep_mask = row_offsets < commit_lens[:, None]
+            batch.out_cache_loc = out_cache_loc[keep_mask]
 
         # Update req-level KV cache accounting.
         for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):

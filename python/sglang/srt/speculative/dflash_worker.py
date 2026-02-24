@@ -9,6 +9,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -463,7 +464,23 @@ class DFlashWorker:
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
-            block_cache_loc = allocator.alloc(bs * self.block_size)
+            if self.page_size == 1:
+                block_cache_loc = allocator.alloc(bs * self.block_size)
+            else:
+                block_end_cpu = seq_lens_cpu + int(self.block_size)
+                last_loc = get_last_loc(
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    block_start,
+                )
+                block_cache_loc = allocator.alloc_extend(
+                    block_start,
+                    seq_lens_cpu,
+                    block_end,
+                    block_end_cpu,
+                    last_loc,
+                    bs * self.block_size,
+                )
             if block_cache_loc is None:
                 raise RuntimeError(
                     f"DFLASH draft OOM when allocating {bs * self.block_size} block tokens."

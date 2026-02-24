@@ -2303,12 +2303,6 @@ class ServerArgs:
                     "Currently DFLASH speculative decoding only supports pp_size == 1."
                 )
 
-            if self.page_size != 1:
-                raise ValueError(
-                    "Currently DFLASH speculative decoding requires page_size == 1. "
-                    f"Got page_size={self.page_size}."
-                )
-
             if self.speculative_draft_model_path is None:
                 raise ValueError(
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."

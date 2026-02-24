@@ -332,6 +332,12 @@ def main() -> None:
     parser.add_argument("--mem-fraction-static", type=float, default=0.75)
     parser.add_argument("--disable-radix-cache", action="store_true")
     parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=None,
+        help="Optional server --page-size override for both baseline and DFLASH runs.",
+    )
     parser.add_argument("--max-running-requests", type=int, default=64)
     parser.add_argument(
         "--tp-sizes",
@@ -361,7 +367,7 @@ def main() -> None:
         "--attention-backends",
         type=str,
         default="flashinfer,fa3",
-        help="Comma-separated list. Will auto-skip fa3 on Blackwell/SM<90.",
+        help="Comma-separated list. Auto-skips unsupported backends for the current GPU.",
     )
     args = parser.parse_args()
 
@@ -397,9 +403,11 @@ def main() -> None:
     is_blackwell = _is_blackwell()
     device_sm = get_device_sm()
     if is_blackwell:
-        attention_backends = [b for b in attention_backends if b == "flashinfer"]
+        attention_backends = [b for b in attention_backends if b != "fa3"]
     if device_sm < 90:
         attention_backends = [b for b in attention_backends if b != "fa3"]
+    if device_sm < 100:
+        attention_backends = [b for b in attention_backends if b != "trtllm_mha"]
     attention_backends = attention_backends or ["flashinfer"]
 
     data_path = _maybe_download_gsm8k(args.data_path)
@@ -471,17 +479,13 @@ def main() -> None:
                 str(args.mem_fraction_static),
                 "--max-running-requests",
                 str(args.max_running_requests),
+                "--cuda-graph-max-bs",
+                "32",
             ]
-            common_server_args.extend(
-                [
-                    "--cuda-graph-bs",
-                    *[str(i) for i in range(1, 33)],
-                    "--cuda-graph-max-bs",
-                    "32",
-                ]
-            )
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
+            if args.page_size is not None:
+                common_server_args.extend(["--page-size", str(int(args.page_size))])
 
             if not args.skip_baseline:
                 print(f"\n=== backend={backend} tp={tp} (baseline) ===")
