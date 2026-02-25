@@ -61,6 +61,8 @@ class DFlashWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -69,6 +71,8 @@ class DFlashWorker:
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
         self.moe_ep_rank = moe_ep_rank
+        self.attn_cp_rank = attn_cp_rank
+        self.moe_dp_rank = moe_dp_rank
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
@@ -121,6 +125,8 @@ class DFlashWorker:
             tp_rank=tp_rank,
             moe_ep_rank=moe_ep_rank,
             pp_rank=0,
+            attn_cp_rank=attn_cp_rank,
+            moe_dp_rank=moe_dp_rank,
             dp_rank=dp_rank,
             nccl_port=nccl_port,
             is_draft_worker=True,
