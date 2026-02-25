@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -14,7 +15,11 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
+from sglang.srt.speculative.dflash_utils import (
+    compute_dflash_accept_len_and_bonus,
+    compute_dflash_sampling_accept_len_and_bonus,
+    is_dflash_sampling_verify_available,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -310,7 +315,7 @@ class DFlashVerifyInput(SpecInput):
         logits_output: LogitsProcessorOutput,
         page_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        """Greedy DFlash verification.
+        """DFlash verification for greedy and non-greedy sampling.
 
         Returns:
             new_verified_id: int64 tensor [bs] (the new current token per request)
@@ -325,14 +330,55 @@ class DFlashVerifyInput(SpecInput):
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
 
+        sampling_info = batch.sampling_info
+        if sampling_info is not None:
+            if len(sampling_info) != bs:
+                raise RuntimeError(
+                    "DFLASH verify sampling_info size mismatch: "
+                    f"len(sampling_info)={len(sampling_info)}, bs={bs}."
+                )
+
+            # Keep speculative verify semantics consistent with normal sampling path.
+            if sampling_info.has_custom_logit_processor:
+                apply_custom_logit_processor(
+                    logits_output.next_token_logits,
+                    sampling_info,
+                    num_tokens_in_batch=self.draft_token_num,
+                )
+
+            if (
+                sampling_info.penalizer_orchestrator.is_required
+                or sampling_info.logit_bias is not None
+            ):
+                linear_penalty = torch.zeros(
+                    (bs, logits_output.next_token_logits.shape[1]),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                sampling_info.apply_logits_bias(linear_penalty)
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+                )
+
         candidates = self.draft_token.view(bs, self.draft_token_num)
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, self.draft_token_num
-        )
-        accept_len, bonus = compute_dflash_accept_len_and_bonus(
-            candidates=candidates,
-            target_predict=target_predict,
-        )
+        if (
+            sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and is_dflash_sampling_verify_available()
+        ):
+            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+            )
+        else:
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                bs, self.draft_token_num
+            )
+            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict,
+            )
 
         # Single D2H transfer: candidates[1:] + accept_len + bonus
         packed = torch.cat(

@@ -86,13 +86,16 @@ def _send_generate(
     prompt: str,
     *,
     max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
     stop: list[str],
     timeout_s: int,
 ) -> dict:
     sampling_params: dict = {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": 1,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
         "max_new_tokens": int(max_new_tokens),
     }
     if stop:
@@ -114,15 +117,18 @@ def _send_generate_batch(
     prompts: list[str],
     *,
     max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
     stop: list[str],
     timeout_s: int,
 ) -> list[dict]:
     if not prompts:
         return []
     sampling_params: dict = {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": 1,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
         "max_new_tokens": int(max_new_tokens),
     }
     if stop:
@@ -162,6 +168,9 @@ def _run_gsm8k_requests(
     prompts: list[str],
     labels: Optional[list[int]],
     max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
     concurrency: int,
     batch_requests: bool,
     stop: list[str],
@@ -189,6 +198,9 @@ def _run_gsm8k_requests(
                 base_url,
                 chunk_prompts,
                 max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
                 stop=stop,
                 timeout_s=timeout_s,
             )
@@ -222,6 +234,9 @@ def _run_gsm8k_requests(
                     base_url,
                     prompt,
                     max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
                     stop=stop,
                     timeout_s=timeout_s,
                 ): i
@@ -328,6 +343,24 @@ def main() -> None:
     )
     parser.add_argument("--num-shots", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for /generate requests. Default 0.0 (greedy).",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Sampling top-p for /generate requests. Default 1.0.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=1,
+        help="Sampling top-k for /generate requests. Default 1 (greedy).",
+    )
     parser.add_argument("--timeout-s", type=int, default=3600)
     parser.add_argument("--mem-fraction-static", type=float, default=0.75)
     parser.add_argument("--disable-radix-cache", action="store_true")
@@ -373,6 +406,12 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this sweep.")
+    if args.temperature < 0.0:
+        raise RuntimeError(f"--temperature must be >= 0, got {args.temperature}.")
+    if not (0.0 < args.top_p <= 1.0):
+        raise RuntimeError(f"--top-p must be in (0, 1], got {args.top_p}.")
+    if args.top_k == 0 or args.top_k < -1:
+        raise RuntimeError(f"--top-k must be -1 (all vocab) or >= 1, got {args.top_k}.")
 
     visible_gpus = int(torch.cuda.device_count())
     tp_sizes = [int(x) for x in args.tp_sizes.split(",") if x.strip()]
@@ -503,6 +542,9 @@ def main() -> None:
                         baseline_url,
                         "Hello",
                         max_new_tokens=8,
+                        temperature=float(args.temperature),
+                        top_p=float(args.top_p),
+                        top_k=int(args.top_k),
                         stop=[],
                         timeout_s=min(int(args.timeout_s), 300),
                     )
@@ -515,6 +557,9 @@ def main() -> None:
                             prompts=prompts[:n],
                             labels=labels[:n],
                             max_new_tokens=int(args.max_new_tokens),
+                            temperature=float(args.temperature),
+                            top_p=float(args.top_p),
+                            top_k=int(args.top_k),
                             concurrency=int(conc),
                             batch_requests=bool(args.batch_requests),
                             stop=default_stop,
@@ -556,6 +601,9 @@ def main() -> None:
                     dflash_url,
                     "Hello",
                     max_new_tokens=8,
+                    temperature=float(args.temperature),
+                    top_p=float(args.top_p),
+                    top_k=int(args.top_k),
                     stop=[],
                     timeout_s=min(int(args.timeout_s), 300),
                 )
@@ -567,6 +615,9 @@ def main() -> None:
                         prompts=prompts[:n],
                         labels=labels[:n],
                         max_new_tokens=int(args.max_new_tokens),
+                        temperature=float(args.temperature),
+                        top_p=float(args.top_p),
+                        top_k=int(args.top_k),
                         concurrency=int(conc),
                         batch_requests=bool(args.batch_requests),
                         stop=default_stop,
@@ -602,6 +653,9 @@ def main() -> None:
     if args.prompt_style == "fewshot_qa":
         md_lines.append(f"- num_shots: `{args.num_shots}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
+    md_lines.append(
+        f"- sampling: `temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}`"
+    )
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
     md_lines.append(f"- tp_sizes: `{', '.join(str(x) for x in tp_sizes)}`")
     md_lines.append(f"- concurrencies: `{', '.join(str(x) for x in concurrencies)}`")

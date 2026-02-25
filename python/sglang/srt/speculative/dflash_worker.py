@@ -19,6 +19,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
+    is_dflash_sampling_verify_available,
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
 )
@@ -75,7 +76,7 @@ class DFlashWorker:
         self.page_size = server_args.page_size
         self.device = target_worker.device
 
-        self._warned_forced_greedy = False
+        self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
@@ -403,12 +404,16 @@ class DFlashWorker:
                 "DFLASH does not support grammar-constrained decoding yet."
             )
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            if not self._warned_forced_greedy and self.tp_rank == 0:
+            if (
+                not is_dflash_sampling_verify_available()
+                and not self._warned_sampling_fallback
+                and self.tp_rank == 0
+            ):
                 logger.warning(
-                    "DFLASH currently supports greedy verification only; "
-                    "ignoring non-greedy sampling params (e.g. temperature/top_p/top_k) and using argmax."
+                    "DFLASH non-greedy verification is unavailable on this build/device; "
+                    "falling back to greedy argmax verification."
                 )
-                self._warned_forced_greedy = True
+                self._warned_sampling_fallback = True
 
         bs = batch.batch_size()
         device = self.model_runner.device
