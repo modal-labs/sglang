@@ -103,9 +103,6 @@ def _get_or_create_chain_verify_buffers(
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
     """Select target layer indices used to build DFlash context features.
 
-    Mirrors the upstream DFlash helper in `docs/dflash/model/utils.py`, but keeps the
-    logic local to SGLang.
-
     Args:
         num_target_layers: Number of transformer layers in the runtime target model.
         num_draft_layers: Number of layers in the DFlash draft model.

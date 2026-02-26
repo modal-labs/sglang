@@ -238,6 +238,16 @@ class DFlashWorker:
                     )
                     break
 
+                rope_is_neox_style = bool(
+                    getattr(attn.rotary_emb, "is_neox_style", True)
+                )
+                if not rope_is_neox_style:
+                    fused_disable_reason = (
+                        "non-neox RoPE is not supported for fused KV path: "
+                        f"layer={layer_idx}, rope_is_neox_style={rope_is_neox_style}"
+                    )
+                    break
+
             if fused_disable_reason is not None:
                 if self.tp_rank == 0:
                     logger.info(

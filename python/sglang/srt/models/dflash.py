@@ -92,6 +92,11 @@ class DFlashAttention(nn.Module):
 
         rope_theta = float(getattr(config, "rope_theta", 1000000))
         rope_scaling = getattr(config, "rope_scaling", None)
+        rope_is_neox_style = bool(
+            getattr(
+                config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
+            )
+        )
         max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
         self.rotary_emb = get_rope(
             head_dim,
@@ -99,6 +104,7 @@ class DFlashAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            is_neox_style=rope_is_neox_style,
         )
 
         self.scaling = head_dim**-0.5
