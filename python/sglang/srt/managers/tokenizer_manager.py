@@ -372,12 +372,76 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
         self.straggler_request_list: List[Tuple] = []
+        self.token_dump_dir = None
+        token_dump_dir = envs.SGLANG_TOKEN_DUMP_DIR.get()
+        if token_dump_dir:
+            try:
+                os.makedirs(token_dump_dir, exist_ok=True)
+                self.token_dump_dir = token_dump_dir
+                logger.info(
+                    "Token dump enabled. Token IDs will be written to %s",
+                    self.token_dump_dir,
+                )
+            except OSError as e:
+                logger.warning(
+                    "Failed to initialize token dump dir %s: %s. Token dump disabled.",
+                    token_dump_dir,
+                    e,
+                )
 
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata
         self.request_metrics_exporter_manager = RequestMetricsExporterManager(
             self.server_args, obj_skip_names, out_skip_names
         )
+
+    @staticmethod
+    def _sanitize_filename_component(value: str) -> str:
+        sanitized = "".join(
+            c if c.isalnum() or c in ("-", "_", ".") else "_" for c in value
+        )
+        return sanitized[:128] or "unknown"
+
+    def _dump_request_tokens(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_ids: Optional[List[int]],
+        token_type_ids: Optional[List[int]] = None,
+    ) -> None:
+        if not self.token_dump_dir or input_ids is None:
+            return
+
+        if not isinstance(input_ids, list):
+            return
+
+        filename = (
+            f"{time.time_ns()}_{os.getpid()}_"
+            f"{self._sanitize_filename_component(obj.rid)}.json"
+        )
+        path = os.path.join(self.token_dump_dir, filename)
+        payload = {
+            "timestamp": datetime.utcnow().isoformat(timespec="microseconds") + "Z",
+            "rid": obj.rid,
+            "request_type": type(obj).__name__,
+            "token_count": len(input_ids),
+            "input_ids": input_ids,
+        }
+        if token_type_ids is not None:
+            payload["token_type_ids"] = token_type_ids
+
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+                f.write("\n")
+            os.replace(tmp_path, path)
+        except OSError as e:
+            logger.warning(
+                "Failed to dump token IDs for rid=%s to %s: %s",
+                obj.rid,
+                path,
+                e,
+            )
 
     def init_weight_update(self):
         # Initial weights status
@@ -966,6 +1030,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
             )
+
+        self._dump_request_tokens(obj, input_ids, token_type_ids)
 
         return tokenized_obj
 
