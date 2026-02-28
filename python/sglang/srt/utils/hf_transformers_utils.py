@@ -119,7 +119,6 @@ for name, cls in _CONFIG_REGISTRY.items():
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
-    revision: Optional[str] = None,
 ):
     if os.path.exists(model_path):
         return model_path
@@ -127,9 +126,7 @@ def download_from_hf(
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
-    return snapshot_download(
-        model_path, allow_patterns=allow_patterns, revision=revision
-    )
+    return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
 def get_hf_text_config(config: PretrainedConfig):

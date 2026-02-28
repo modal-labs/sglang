@@ -362,7 +362,12 @@ def main() -> None:
         help="Sampling top-k for /generate requests. Default 1 (greedy).",
     )
     parser.add_argument("--timeout-s", type=int, default=3600)
-    parser.add_argument("--mem-fraction-static", type=float, default=0.75)
+    parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        default=None,
+        help="Optional server --mem-fraction-static override. If unset, use the server auto heuristic.",
+    )
     parser.add_argument("--disable-radix-cache", action="store_true")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument(
@@ -371,7 +376,7 @@ def main() -> None:
         default=None,
         help="Optional server --page-size override for both baseline and DFLASH runs.",
     )
-    parser.add_argument("--max-running-requests", type=int, default=64)
+    parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument(
         "--tp-sizes",
         type=str,
@@ -514,13 +519,15 @@ def main() -> None:
                 str(tp),
                 "--dtype",
                 str(args.dtype),
-                "--mem-fraction-static",
-                str(args.mem_fraction_static),
                 "--max-running-requests",
                 str(args.max_running_requests),
                 "--cuda-graph-max-bs",
                 "32",
             ]
+            if args.mem_fraction_static is not None:
+                common_server_args.extend(
+                    ["--mem-fraction-static", str(args.mem_fraction_static)]
+                )
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
             if args.page_size is not None:

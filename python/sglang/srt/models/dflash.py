@@ -27,8 +27,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
-    resolve_dflash_block_size,
-    resolve_dflash_target_layer_ids,
+    parse_dflash_draft_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -273,11 +272,14 @@ class DFlashDraftModel(nn.Module):
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
-        target_num_layers = int(getattr(config, "num_target_layers", num_layers))
-        target_layer_ids = resolve_dflash_target_layer_ids(
-            draft_hf_config=config,
-            target_num_layers=target_num_layers,
-            draft_num_layers=num_layers,
+        draft_config = parse_dflash_draft_config(draft_hf_config=config)
+        target_num_layers = (
+            int(draft_config.num_target_layers)
+            if draft_config.num_target_layers is not None
+            else num_layers
+        )
+        target_layer_ids = draft_config.resolve_target_layer_ids(
+            target_num_layers=target_num_layers, draft_num_layers=num_layers
         )
         num_context_features = len(target_layer_ids)
 
@@ -287,7 +289,7 @@ class DFlashDraftModel(nn.Module):
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        self.block_size = resolve_dflash_block_size(draft_hf_config=config, default=16)
+        self.block_size = draft_config.resolve_block_size(default=16)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""

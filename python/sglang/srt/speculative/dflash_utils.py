@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
@@ -8,14 +8,21 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
-logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+_DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
+    {
+        "FlashInferAttnBackend",
+        "FlashInferMLAAttnBackend",
+        "FlashAttentionBackend",
+        "TRTLLMHAAttnBackend",
+        "TRTLLMMLABackend",
+    }
+)
 
 
 if is_cuda():
@@ -39,6 +46,60 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def scale_kv_cell_size_per_token_for_dflash(
+    *,
+    target_cell_size_per_token: int,
+    target_num_layers: int,
+    draft_num_layers: int,
+    draft_cell_size_per_token: Optional[int] = None,
+) -> int:
+    """Compute bytes/token budget for combined target+draft KV pools (DFLASH).
+
+    DFLASH runs a separate draft runner with its own KV pool. The target runner's
+    token capacity must fit both pools in aggregate. For DFLASH checkpoints, the
+    draft KV geometry typically matches the target KV geometry and differs mainly
+    by layer count, so draft KV bytes/token scales linearly with `draft_num_layers`.
+
+    Returns:
+        Approximate per-token bytes for (target KV + draft KV), expressed as a
+        scaled version of `target_cell_size_per_token`, unless an explicit
+        `draft_cell_size_per_token` is provided (in which case we sum them).
+    """
+    if target_cell_size_per_token <= 0:
+        raise ValueError(
+            "target_cell_size_per_token must be positive, "
+            f"got {target_cell_size_per_token}."
+        )
+
+    if draft_cell_size_per_token is not None:
+        draft_cell_size_per_token = int(draft_cell_size_per_token)
+        if draft_cell_size_per_token <= 0:
+            raise ValueError(
+                "draft_cell_size_per_token must be positive when provided, "
+                f"got {draft_cell_size_per_token}."
+            )
+        return int(target_cell_size_per_token) + int(draft_cell_size_per_token)
+
+    if target_num_layers <= 0 or draft_num_layers <= 0:
+        return int(target_cell_size_per_token)
+
+    total_layers = int(target_num_layers) + int(draft_num_layers)
+    return (
+        int(target_cell_size_per_token) * int(total_layers) + int(target_num_layers) - 1
+    ) // int(target_num_layers)
+
+
+def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    backend = attn_backend
+    for _ in range(4):
+        full_backend = getattr(backend, "full_attn_backend", None)
+        if full_backend is None:
+            break
+        backend = full_backend
+    backend_name = type(backend).__name__
+    return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 
 def _get_or_create_chain_verify_buffers(
@@ -140,7 +201,13 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
     ]
 
 
-def get_dflash_config(config: Any) -> dict:
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _get_dflash_config(config: Any) -> dict:
     if isinstance(config, dict):
         cfg = config.get("dflash_config", None)
     else:
@@ -156,145 +223,157 @@ def get_dflash_config(config: Any) -> dict:
         return {}
 
 
-def resolve_dflash_block_size(
+def _parse_optional_int(
+    value: Any,
     *,
-    draft_hf_config: Any,
-    default: Optional[int] = None,
+    field_name: str,
+    min_value: Optional[int] = None,
 ) -> Optional[int]:
-    """Resolve DFLASH block size from draft config.
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except Exception as e:
+        raise ValueError(f"Invalid {field_name}={value!r}.") from e
+    if min_value is not None and parsed < int(min_value):
+        comparator = "positive" if int(min_value) == 1 else f">= {int(min_value)}"
+        raise ValueError(f"{field_name} must be {comparator}, got {parsed}.")
+    return parsed
 
-    Precedence:
-      1) `dflash_config.block_size`
-      2) top-level `block_size`
-      3) `default`
-    """
-    dflash_cfg = get_dflash_config(draft_hf_config)
-    dflash_block_size = dflash_cfg.get("block_size", None)
-    if isinstance(draft_hf_config, dict):
-        top_level_block_size = draft_hf_config.get("block_size", None)
-    else:
-        top_level_block_size = getattr(draft_hf_config, "block_size", None)
 
-    parsed_dflash_block_size = None
-    if dflash_block_size is not None:
-        try:
-            parsed_dflash_block_size = int(dflash_block_size)
-        except Exception as e:
+@dataclass(frozen=True)
+class DFlashDraftConfig:
+    num_hidden_layers: Optional[int]
+    num_target_layers: Optional[int]
+    block_size: Optional[int]
+    target_layer_ids: Optional[List[int]]
+    mask_token: str
+    mask_token_id: Optional[int]
+
+    def require_num_layers(self) -> int:
+        if self.num_hidden_layers is None:
             raise ValueError(
-                f"Invalid DFLASH dflash_config.block_size={dflash_block_size!r}."
-            ) from e
-
-    parsed_top_level_block_size = None
-    if top_level_block_size is not None:
-        try:
-            parsed_top_level_block_size = int(top_level_block_size)
-        except Exception as e:
-            raise ValueError(
-                f"Invalid DFLASH block_size={top_level_block_size!r}."
-            ) from e
-
-    if (
-        parsed_dflash_block_size is not None
-        and parsed_top_level_block_size is not None
-        and parsed_dflash_block_size != parsed_top_level_block_size
-    ):
-        logger.warning(
-            "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; using dflash_config.block_size.",
-            top_level_block_size,
-            dflash_block_size,
-        )
-
-    block_size = (
-        parsed_dflash_block_size
-        if parsed_dflash_block_size is not None
-        else parsed_top_level_block_size
-    )
-    if block_size is None:
-        return default
-
-    if block_size <= 0:
-        raise ValueError(f"DFLASH block_size must be positive, got {block_size}.")
-    return block_size
-
-
-def resolve_dflash_target_layer_ids(
-    *,
-    draft_hf_config: Any,
-    target_num_layers: int,
-    draft_num_layers: int,
-) -> List[int]:
-    """Resolve target layer ids used to build DFlash context features.
-
-    Precedence:
-      1) `draft_hf_config.dflash_config.target_layer_ids`
-      2) `draft_hf_config.target_layer_ids` (fallback to base config)
-      3) default `build_target_layer_ids(target_num_layers, draft_num_layers)`
-
-    Notes:
-        The number of draft transformer layers is *not* fundamentally tied to the number
-        of target-layer features (K) used as DFlash context. We treat
-        `len(target_layer_ids)` as K when explicitly provided. For backward compatibility
-        (and for current released checkpoints), the default still uses K == draft_num_layers.
-    """
-    cfg = get_dflash_config(draft_hf_config)
-    layer_ids = cfg.get("target_layer_ids", None)
-    if layer_ids is None:
-        layer_ids = getattr(draft_hf_config, "target_layer_ids", None)
-    if layer_ids is None:
-        return build_target_layer_ids(target_num_layers, draft_num_layers)
-
-    if not isinstance(layer_ids, (list, tuple)):
-        raise ValueError(
-            "DFLASH dflash_config.target_layer_ids must be a list of ints, "
-            f"got type={type(layer_ids).__name__}."
-        )
-
-    resolved: List[int] = [int(x) for x in layer_ids]
-    if len(resolved) <= 0:
-        raise ValueError(
-            "DFLASH dflash_config.target_layer_ids must be non-empty. "
-            f"Got len(target_layer_ids)={len(resolved)}."
-        )
-
-    for idx, val in enumerate(resolved):
-        if val < 0 or val >= int(target_num_layers):
-            raise ValueError(
-                "DFLASH target_layer_ids contains an out-of-range layer id. "
-                f"target_layer_ids[{idx}]={val}, target_num_layers={int(target_num_layers)}."
+                "DFLASH requires draft num_hidden_layers in config. "
+                "Got config without num_hidden_layers."
             )
-    return resolved
+        return int(self.num_hidden_layers)
+
+    def resolve_block_size(self, *, default: Optional[int] = None) -> Optional[int]:
+        return self.block_size if self.block_size is not None else default
+
+    def resolve_target_layer_ids(
+        self,
+        *,
+        target_num_layers: int,
+        draft_num_layers: Optional[int] = None,
+    ) -> List[int]:
+        target_num_layers = int(target_num_layers)
+        if target_num_layers <= 0:
+            raise ValueError(
+                f"target_num_layers must be positive, got {target_num_layers}."
+            )
+
+        if self.target_layer_ids is None:
+            if draft_num_layers is None:
+                draft_num_layers = self.require_num_layers()
+            return build_target_layer_ids(target_num_layers, int(draft_num_layers))
+
+        resolved = list(self.target_layer_ids)
+        if len(resolved) <= 0:
+            raise ValueError(
+                "DFLASH dflash_config.target_layer_ids must be non-empty. "
+                f"Got len(target_layer_ids)={len(resolved)}."
+            )
+        for idx, val in enumerate(resolved):
+            if val < 0 or val >= target_num_layers:
+                raise ValueError(
+                    "DFLASH target_layer_ids contains an out-of-range layer id. "
+                    f"target_layer_ids[{idx}]={val}, target_num_layers={target_num_layers}."
+                )
+        return resolved
 
 
-def resolve_dflash_mask_token(*, draft_hf_config: Any) -> str:
-    cfg = get_dflash_config(draft_hf_config)
-    mask_token = cfg.get("mask_token", None)
+def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
+    """Parse and validate DFLASH draft config fields from HF config/dict."""
+    dflash_cfg = _get_dflash_config(draft_hf_config)
+
+    num_hidden_layers = _parse_optional_int(
+        _cfg_get(draft_hf_config, "num_hidden_layers", None),
+        field_name="DFLASH draft num_hidden_layers",
+        min_value=1,
+    )
+    raw_num_target_layers = dflash_cfg.get(
+        "num_target_layers",
+        _cfg_get(draft_hf_config, "num_target_layers", None),
+    )
+    num_target_layers = _parse_optional_int(
+        raw_num_target_layers,
+        field_name="DFLASH draft num_target_layers",
+        min_value=1,
+    )
+
+    # Keep support for current checkpoints where block_size is top-level.
+    raw_block_size = dflash_cfg.get(
+        "block_size",
+        _cfg_get(draft_hf_config, "block_size", None),
+    )
+    block_size = _parse_optional_int(
+        raw_block_size,
+        field_name="DFLASH block_size",
+        min_value=1,
+    )
+
+    layer_ids = dflash_cfg.get(
+        "target_layer_ids",
+        _cfg_get(draft_hf_config, "target_layer_ids", None),
+    )
+    parsed_target_layer_ids: Optional[List[int]]
+    if layer_ids is None:
+        parsed_target_layer_ids = None
+    else:
+        if not isinstance(layer_ids, (list, tuple)):
+            raise ValueError(
+                "DFLASH dflash_config.target_layer_ids must be a list of ints, "
+                f"got type={type(layer_ids).__name__}."
+            )
+        parsed_target_layer_ids = [int(x) for x in layer_ids]
+        if len(parsed_target_layer_ids) <= 0:
+            raise ValueError(
+                "DFLASH dflash_config.target_layer_ids must be non-empty. "
+                f"Got len(target_layer_ids)={len(parsed_target_layer_ids)}."
+            )
+
+    mask_token = dflash_cfg.get("mask_token", None)
     if mask_token is None:
-        return DEFAULT_DFLASH_MASK_TOKEN
+        mask_token = DEFAULT_DFLASH_MASK_TOKEN
     if not isinstance(mask_token, str) or not mask_token:
         raise ValueError(
             "DFLASH dflash_config.mask_token must be a non-empty string, "
             f"got {mask_token!r}."
         )
-    return mask_token
 
+    mask_token_id = dflash_cfg.get("mask_token_id", None)
+    if mask_token_id is not None:
+        if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
+            raise ValueError(
+                "DFLASH dflash_config.mask_token_id must be an integer, "
+                f"got {mask_token_id!r} (type={type(mask_token_id).__name__})."
+            )
+        mask_token_id = int(mask_token_id)
+        if mask_token_id < 0:
+            raise ValueError(
+                "DFLASH dflash_config.mask_token_id must be non-negative, "
+                f"got {mask_token_id}."
+            )
 
-def resolve_dflash_mask_token_id(*, draft_hf_config: Any) -> Optional[int]:
-    cfg = get_dflash_config(draft_hf_config)
-    mask_token_id = cfg.get("mask_token_id", None)
-    if mask_token_id is None:
-        return None
-    if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
-        raise ValueError(
-            "DFLASH dflash_config.mask_token_id must be an integer, "
-            f"got {mask_token_id!r} (type={type(mask_token_id).__name__})."
-        )
-    mask_token_id = int(mask_token_id)
-    if mask_token_id < 0:
-        raise ValueError(
-            "DFLASH dflash_config.mask_token_id must be non-negative, "
-            f"got {mask_token_id}."
-        )
-    return mask_token_id
+    return DFlashDraftConfig(
+        num_hidden_layers=num_hidden_layers,
+        num_target_layers=num_target_layers,
+        block_size=block_size,
+        target_layer_ids=parsed_target_layer_ids,
+        mask_token=mask_token,
+        mask_token_id=mask_token_id,
+    )
 
 
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
@@ -409,8 +488,12 @@ def compute_dflash_sampling_accept_len_and_bonus(
         )
 
     if threshold_single is None:
+        from sglang.srt.server_args import get_global_server_args
+
         threshold_single = get_global_server_args().speculative_accept_threshold_single
     if threshold_acc is None:
+        from sglang.srt.server_args import get_global_server_args
+
         threshold_acc = get_global_server_args().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)

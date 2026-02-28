@@ -20,8 +20,8 @@ from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInp
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     is_dflash_sampling_verify_available,
-    resolve_dflash_mask_token,
-    resolve_dflash_mask_token_id,
+    parse_dflash_draft_config,
+    resolve_dflash_verify_mask_policy,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -45,14 +45,6 @@ def _get_fused_kv_materialize_helper():
 
 class DFlashWorker:
     """DFlash speculative decoding worker (spec-v1, tp>=1/pp=1)."""
-
-    _VERIFY_SKIP_CUSTOM_MASK_BACKENDS = {
-        "FlashInferAttnBackend",
-        "FlashInferMLAAttnBackend",
-        "FlashAttentionBackend",
-        "TRTLLMHAAttnBackend",
-        "TRTLLMMLABackend",
-    }
 
     def __init__(
         self,
@@ -135,12 +127,17 @@ class DFlashWorker:
         )
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
+        draft_config = parse_dflash_draft_config(
+            draft_hf_config=self.draft_model_runner.model_config.hf_config
+        )
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
-            self.block_size = int(getattr(self.draft_model, "block_size", 16))
+            self.block_size = int(draft_config.resolve_block_size(default=16))
         else:
             self.block_size = int(server_args.speculative_num_draft_tokens)
-            model_block_size = getattr(self.draft_model, "block_size", None)
+            model_block_size = draft_config.block_size
+            if model_block_size is None:
+                model_block_size = getattr(self.draft_model, "block_size", None)
             if model_block_size is not None and int(model_block_size) != int(
                 self.block_size
             ):
@@ -150,12 +147,8 @@ class DFlashWorker:
                     model_block_size,
                 )
 
-        self._mask_token = resolve_dflash_mask_token(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
-        )
-        self._mask_token_id_override = resolve_dflash_mask_token_id(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
-        )
+        self._mask_token = draft_config.mask_token
+        self._mask_token_id_override = draft_config.mask_token_id
         self._mask_token_id = self._resolve_mask_token_id(
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
@@ -564,7 +557,9 @@ class DFlashWorker:
             positions=positions,
             draft_token_num=self.block_size,
         )
-        _, build_custom_mask = self._resolve_verify_mask_policy()
+        _, build_custom_mask = resolve_dflash_verify_mask_policy(
+            self.model_runner.attn_backend
+        )
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
@@ -916,21 +911,6 @@ class DFlashWorker:
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
-        )
-
-    def _resolve_verify_mask_backend_name(self) -> str:
-        backend = self.model_runner.attn_backend
-        for _ in range(4):
-            full_backend = getattr(backend, "full_attn_backend", None)
-            if full_backend is None:
-                break
-            backend = full_backend
-        return type(backend).__name__
-
-    def _resolve_verify_mask_policy(self) -> tuple[str, bool]:
-        backend_name = self._resolve_verify_mask_backend_name()
-        return backend_name, (
-            backend_name not in self._VERIFY_SKIP_CUSTOM_MASK_BACKENDS
         )
 
     def _update_target_mamba_state_after_verify(

@@ -1152,24 +1152,22 @@ class CudaGraphRunner:
                 )
         elif self.model_runner.spec_algorithm.is_dflash():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+            from sglang.srt.speculative.dflash_utils import (
+                resolve_dflash_verify_mask_policy,
+            )
 
-            backend_name = type(self.model_runner.attn_backend).__name__
             # Avoid enabling custom-mask modes during graph capture for backends that
             # can express DFLASH verify via their built-in causal path.
-            skip_custom_mask = backend_name in {
-                "FlashInferAttnBackend",
-                "FlashInferMLAAttnBackend",
-                "FlashAttentionBackend",
-                "TRTLLMHAAttnBackend",
-                "TRTLLMMLABackend",
-            }
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                 custom_mask=(
                     None
-                    if (self.model_runner.is_draft_worker or skip_custom_mask)
+                    if (self.model_runner.is_draft_worker or not build_custom_mask)
                     else self.buffers.custom_mask
                 ),
                 capture_hidden_mode=(
