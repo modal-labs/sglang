@@ -58,9 +58,7 @@ def scale_kv_cell_size_per_token_for_dflash(
     """Compute bytes/token budget for combined target+draft KV pools (DFLASH).
 
     DFLASH runs a separate draft runner with its own KV pool. The target runner's
-    token capacity must fit both pools in aggregate. For DFLASH checkpoints, the
-    draft KV geometry typically matches the target KV geometry and differs mainly
-    by layer count, so draft KV bytes/token scales linearly with `draft_num_layers`.
+    token capacity must fit both pools in aggregate.
 
     Returns:
         Approximate per-token bytes for (target KV + draft KV), expressed as a
