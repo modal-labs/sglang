@@ -474,9 +474,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
-        # DFLASH tracks per-request draft progress on Req.
-        if hasattr(req, "dflash_draft_seq_len"):
-            req.dflash_draft_seq_len = 0
         return
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
@@ -516,8 +513,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     tree_cache.req_to_token_pool.free(req)
-    if hasattr(req, "dflash_draft_seq_len"):
-        req.dflash_draft_seq_len = 0
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

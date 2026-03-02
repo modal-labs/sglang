@@ -1962,10 +1962,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or self.spec_algorithm.is_dflash()
         ):
             if self.is_draft_worker:
-                raise RuntimeError("This should not happen")
-            else:
-                capture_forward_mode = ForwardMode.TARGET_VERIFY
-                num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+                if not self.spec_algorithm.is_dflash():
+                    raise RuntimeError("This should not happen")
+            capture_forward_mode = ForwardMode.TARGET_VERIFY
+            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL

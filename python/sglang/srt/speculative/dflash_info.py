@@ -423,7 +423,7 @@ class DFlashVerifyInput(SpecInput):
 
                         for j, token_id in enumerate(tokens):
                             if vocab_size is not None and (
-                                int(token_id) > int(vocab_size) or int(token_id) < 0
+                                int(token_id) >= int(vocab_size) or int(token_id) < 0
                             ):
                                 tokens = tokens[: j + 1]
                                 break

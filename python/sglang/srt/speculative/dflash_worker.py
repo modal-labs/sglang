@@ -68,7 +68,6 @@ class DFlashWorker:
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = tp_rank
         self.page_size = server_args.page_size
         self.device = target_worker.device
 
@@ -316,12 +315,6 @@ class DFlashWorker:
         # allocator and req_to_token_pool are shared with target worker
         pass
 
-    def on_req_finished(self, req):
-        # allocator and req_to_token_pool are shared with the target worker;
-        # there is no separate draft allocation to release here.
-        if hasattr(req, "dflash_draft_seq_len"):
-            req.dflash_draft_seq_len = 0
-
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
     ) -> int:
@@ -411,8 +404,8 @@ class DFlashWorker:
             return
 
         if batch.has_grammar:
-            raise ValueError(
-                "DFLASH does not support grammar-constrained decoding yet."
+            raise RuntimeError(
+                "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
             )
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
             if (
@@ -427,7 +420,6 @@ class DFlashWorker:
                 self._warned_sampling_fallback = True
 
         bs = batch.batch_size()
-        device = self.model_runner.device
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -967,8 +959,8 @@ class DFlashWorker:
         **kwargs,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DFLASH speculative decoding does not support return_logprob yet."
+            raise RuntimeError(
+                "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
             )
 
         if isinstance(batch, ModelWorkerBatch):
@@ -1021,8 +1013,6 @@ class DFlashWorker:
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input
-            for req, draft_len in zip(batch.reqs, batch.seq_lens_cpu, strict=True):
-                req.dflash_draft_seq_len = int(draft_len)
 
             return GenerationBatchResult(
                 logits_output=logits_output,

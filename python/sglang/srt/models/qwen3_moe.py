@@ -886,6 +886,11 @@ class Qwen3MoeModel(Qwen2MoeModel):
             alt_stream=alt_stream,
         )
 
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False

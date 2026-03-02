@@ -660,7 +660,7 @@ def main() -> None:
             )
         )
         labels.append(_get_answer_value(lines[i]["answer"]))
-    if not all(l != INVALID for l in labels):
+    if not all(label != INVALID for label in labels):
         raise RuntimeError("Invalid labels in GSM8K data.")
 
     # Results indexed by (backend, tp, concurrency, mode).
