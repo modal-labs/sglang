@@ -5,7 +5,7 @@ launches servers for multiple (attention_backend, tp_size) configs and runs a
 GSM8K workload for each (concurrency, num_questions) setting.
 
 Example usage:
-  ./venv/bin/python benchmark/dflash/bench_dflash_gsm8k_sweep.py --output-md dflash_gsm8k_sweep.md
+  ./venv/bin/python benchmark/dflash/bench_dflash_gsm8k_sweep.py
   ./venv/bin/python benchmark/dflash/bench_dflash_gsm8k_sweep.py --skip-baseline --concurrencies 32 --tp-sizes 8
 """
 
@@ -25,7 +25,6 @@ import requests
 import torch
 from transformers import AutoTokenizer
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -37,25 +36,16 @@ from sglang.utils import download_and_cache_file, read_jsonl
 INVALID = -9999999
 
 
-def _is_blackwell() -> bool:
-    # Prefer explicit env var, but also infer from compute capability (SM100+).
-    if envs.IS_BLACKWELL.get():
-        return True
-    return get_device_sm() >= 100
+def _parse_int_csv(value: str) -> list[int]:
+    return [int(x) for x in value.split(",") if x.strip()]
 
 
-def _get_one_example(lines, i: int, include_answer: bool) -> str:
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
-    if include_answer:
-        ret += " " + lines[i]["answer"]
-    return ret
-
-
-def _get_few_shot_examples(lines, k: int) -> str:
-    ret = ""
-    for i in range(k):
-        ret += _get_one_example(lines, i, True) + "\n\n"
-    return ret
+def _filter_attention_backends(backends: list[str], *, device_sm: int) -> list[str]:
+    if not (80 <= device_sm <= 90):
+        backends = [b for b in backends if b != "fa3"]
+    if device_sm < 100:
+        backends = [b for b in backends if b not in ("fa4", "trtllm_mha")]
+    return backends or ["flashinfer"]
 
 
 def _get_answer_value(answer_str: str) -> int:
@@ -83,47 +73,15 @@ def _flush_cache(base_url: str) -> None:
 
 def _send_generate(
     base_url: str,
-    prompt: str,
+    text: str | list[str],
     *,
     max_new_tokens: int,
     temperature: float,
     top_p: float,
     top_k: int,
-    stop: list[str],
-    timeout_s: int,
-) -> dict:
-    sampling_params: dict = {
-        "temperature": float(temperature),
-        "top_p": float(top_p),
-        "top_k": int(top_k),
-        "max_new_tokens": int(max_new_tokens),
-    }
-    if stop:
-        sampling_params["stop"] = stop
-    resp = requests.post(
-        base_url + "/generate",
-        json={
-            "text": prompt,
-            "sampling_params": sampling_params,
-        },
-        timeout=int(timeout_s),
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _send_generate_batch(
-    base_url: str,
-    prompts: list[str],
-    *,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    stop: list[str],
     timeout_s: int,
 ) -> list[dict]:
-    if not prompts:
+    if isinstance(text, list) and not text:
         return []
     sampling_params: dict = {
         "temperature": float(temperature),
@@ -131,24 +89,35 @@ def _send_generate_batch(
         "top_k": int(top_k),
         "max_new_tokens": int(max_new_tokens),
     }
-    if stop:
-        sampling_params["stop"] = stop
     resp = requests.post(
         base_url + "/generate",
         json={
-            "text": prompts,
+            "text": text,
             "sampling_params": sampling_params,
         },
         timeout=int(timeout_s),
     )
     resp.raise_for_status()
     out = resp.json()
-    if not isinstance(out, list):
+    if isinstance(text, list):
+        if not isinstance(out, list):
+            raise RuntimeError(
+                "Expected a list response for batched /generate, but got "
+                f"type={type(out).__name__}."
+            )
+        if len(out) != len(text):
+            raise RuntimeError(
+                "Batched /generate output length mismatch: "
+                f"got {len(out)} outputs for {len(text)} prompts."
+            )
+        return out
+
+    if isinstance(out, list):
         raise RuntimeError(
-            "Expected a list response for batched /generate, but got "
+            "Expected an object response for single /generate, but got "
             f"type={type(out).__name__}."
         )
-    return out
+    return [out]
 
 
 @dataclass(frozen=True)
@@ -173,7 +142,6 @@ def _run_gsm8k_requests(
     top_k: int,
     concurrency: int,
     batch_requests: bool,
-    stop: list[str],
     timeout_s: int,
     expect_dflash: bool,
 ) -> BenchMetrics:
@@ -187,6 +155,24 @@ def _run_gsm8k_requests(
     correct = 0
     invalid = 0
 
+    def _handle_output(out: dict, label: Optional[int]) -> None:
+        nonlocal total_tokens, spec_verify_ct_sum, correct, invalid
+        meta = out.get("meta_info", {}) or {}
+        total_tokens += int(meta.get("completion_tokens", 0))
+        spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
+        if "spec_accept_length" in meta:
+            try:
+                spec_accept_lengths.append(float(meta["spec_accept_length"]))
+            except (TypeError, ValueError):
+                pass
+
+        if label is not None:
+            pred = _get_answer_value(out.get("text", ""))
+            if pred == INVALID:
+                invalid += 1
+            if pred == label:
+                correct += 1
+
     if batch_requests:
         bs = max(int(concurrency), 1)
         for start_idx in range(0, len(prompts), bs):
@@ -194,72 +180,45 @@ def _run_gsm8k_requests(
             chunk_labels = (
                 labels[start_idx : start_idx + bs] if labels is not None else None
             )
-            outs = _send_generate_batch(
+            outs = _send_generate(
                 base_url,
                 chunk_prompts,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
-                stop=stop,
                 timeout_s=timeout_s,
             )
-            if len(outs) != len(chunk_prompts):
-                raise RuntimeError(
-                    "Batched /generate output length mismatch: "
-                    f"got {len(outs)} outputs for {len(chunk_prompts)} prompts."
-                )
-
-            for j, out in enumerate(outs):
-                meta = out.get("meta_info", {}) or {}
-                total_tokens += int(meta.get("completion_tokens", 0))
-                spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
-                if "spec_accept_length" in meta:
-                    try:
-                        spec_accept_lengths.append(float(meta["spec_accept_length"]))
-                    except (TypeError, ValueError):
-                        pass
-
-                if chunk_labels is not None:
-                    pred = _get_answer_value(out.get("text", ""))
-                    if pred == INVALID:
-                        invalid += 1
-                    if pred == chunk_labels[j]:
-                        correct += 1
+            if chunk_labels is None:
+                for out in outs:
+                    _handle_output(out, None)
+            else:
+                for out, label in zip(outs, chunk_labels):
+                    _handle_output(out, label)
     else:
         with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
             futures = {
                 pool.submit(
                     _send_generate,
-                    base_url,
-                    prompt,
+                    base_url=base_url,
+                    text=prompt,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
-                    stop=stop,
                     timeout_s=timeout_s,
                 ): i
                 for i, prompt in enumerate(prompts)
             }
             for fut in as_completed(futures):
                 i = futures[fut]
-                out = fut.result()
-                meta = out.get("meta_info", {}) or {}
-                total_tokens += int(meta.get("completion_tokens", 0))
-                spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
-                if "spec_accept_length" in meta:
-                    try:
-                        spec_accept_lengths.append(float(meta["spec_accept_length"]))
-                    except (TypeError, ValueError):
-                        pass
-
-                if labels is not None:
-                    pred = _get_answer_value(out.get("text", ""))
-                    if pred == INVALID:
-                        invalid += 1
-                    if pred == labels[i]:
-                        correct += 1
+                outs = fut.result()
+                if len(outs) != 1:
+                    raise RuntimeError(
+                        "Expected exactly one output for single /generate request."
+                    )
+                label = None if labels is None else labels[i]
+                _handle_output(outs[0], label)
 
     latency = time.perf_counter() - start
     toks_per_s = total_tokens / max(latency, 1e-6)
@@ -300,30 +259,286 @@ def _format_table(
     float_fmt: str,
 ) -> str:
     header = ["tp\\conc"] + [str(c) for c in concurrencies]
-    lines = [
-        "| " + " | ".join(header) + " |",
-        "| " + " | ".join(["---"] * len(header)) + " |",
-    ]
+    rows: list[list[str]] = [header]
     for tp in tp_sizes:
         row = [str(tp)]
         for c in concurrencies:
             v = values.get((tp, c), None)
             row.append("N/A" if v is None else format(v, float_fmt))
-        lines.append("| " + " | ".join(row) + " |")
+        rows.append(row)
+
+    col_widths = [
+        max(len(row[col_idx]) for row in rows) for col_idx in range(len(rows[0]))
+    ]
+
+    lines: list[str] = []
+    lines.append("  ".join(cell.rjust(col_widths[i]) for i, cell in enumerate(rows[0])))
+    lines.append("  ".join("-" * w for w in col_widths))
+    for row in rows[1:]:
+        lines.append("  ".join(cell.rjust(col_widths[i]) for i, cell in enumerate(row)))
     return "\n".join(lines)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--output-md",
-        type=str,
-        default=None,
-        help="Write a markdown report to this file (disabled by default).",
+def _build_common_server_args(
+    args: argparse.Namespace, *, backend: str, tp: int
+) -> list[str]:
+    common_server_args: list[str] = [
+        "--trust-remote-code",
+        "--attention-backend",
+        backend,
+        "--tp-size",
+        str(tp),
+        "--dtype",
+        str(args.dtype),
+        "--max-running-requests",
+        str(args.max_running_requests),
+        "--cuda-graph-max-bs",
+        "32",
+    ]
+    if args.mem_fraction_static is not None:
+        common_server_args.extend(
+            ["--mem-fraction-static", str(args.mem_fraction_static)]
+        )
+    if args.disable_radix_cache:
+        common_server_args.append("--disable-radix-cache")
+    if args.page_size is not None:
+        common_server_args.extend(["--page-size", str(int(args.page_size))])
+    return common_server_args
+
+
+def _build_mode_runs(
+    args: argparse.Namespace, common_server_args: list[str]
+) -> list[tuple[str, str, list[str], bool]]:
+    mode_runs: list[tuple[str, str, list[str], bool]] = []
+    if not args.skip_baseline:
+        mode_runs.append(("baseline", "baseline", common_server_args, False))
+    mode_runs.append(
+        (
+            "dflash",
+            "DFLASH",
+            [
+                *common_server_args,
+                "--speculative-algorithm",
+                "DFLASH",
+                "--speculative-draft-model-path",
+                args.draft_model,
+                *(
+                    [
+                        "--speculative-draft-attention-backend",
+                        args.speculative_draft_attention_backend,
+                    ]
+                    if args.speculative_draft_attention_backend
+                    else []
+                ),
+            ],
+            True,
+        )
     )
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
-    parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
-    parser.add_argument("--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
+    return mode_runs
+
+
+def _collect_metric(
+    *,
+    results: dict[tuple[str, int, int, str], BenchMetrics],
+    backend: str,
+    tp_sizes: list[int],
+    concurrencies: list[int],
+    mode: str,
+    field: str,
+) -> dict[tuple[int, int], Optional[float]]:
+    out: dict[tuple[int, int], Optional[float]] = {}
+    for tp in tp_sizes:
+        for conc in concurrencies:
+            metrics = results.get((backend, tp, conc, mode), None)
+            out[(tp, conc)] = None if metrics is None else getattr(metrics, field)
+    return out
+
+
+def _compute_speedup(
+    baseline: dict[tuple[int, int], Optional[float]],
+    dflash: dict[tuple[int, int], Optional[float]],
+) -> dict[tuple[int, int], Optional[float]]:
+    return {
+        key: None if (b is None or d is None or b <= 0) else (d / b)
+        for key, b in baseline.items()
+        for d in [dflash.get(key, None)]
+    }
+
+
+def _print_kv_lines(items: list[tuple[str, object]]) -> None:
+    for key, value in items:
+        print(f"{key}={value}")
+
+
+def _run_mode_for_backend_tp(
+    *,
+    mode_label: str,
+    model_path: str,
+    base_url: str,
+    server_args: list[str],
+    expect_dflash: bool,
+    prompts: list[str],
+    labels: list[int],
+    concurrencies: list[int],
+    num_questions_by_conc: dict[int, int],
+    args: argparse.Namespace,
+) -> dict[int, BenchMetrics]:
+    print(f"\n=== {mode_label} ===")
+    proc = popen_launch_server(
+        model_path,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=server_args,
+    )
+    try:
+        _send_generate(
+            base_url,
+            "Hello",
+            max_new_tokens=8,
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            top_k=int(args.top_k),
+            timeout_s=min(int(args.timeout_s), 300),
+        )
+
+        metrics_by_conc: dict[int, BenchMetrics] = {}
+        for conc in concurrencies:
+            n = num_questions_by_conc[conc]
+            _flush_cache(base_url)
+            metrics = _run_gsm8k_requests(
+                base_url,
+                prompts=prompts[:n],
+                labels=labels[:n],
+                max_new_tokens=int(args.max_new_tokens),
+                temperature=float(args.temperature),
+                top_p=float(args.top_p),
+                top_k=int(args.top_k),
+                concurrency=int(conc),
+                batch_requests=bool(args.batch_requests),
+                timeout_s=int(args.timeout_s),
+                expect_dflash=expect_dflash,
+            )
+            metrics_by_conc[conc] = metrics
+            line = (
+                f"[{mode_label}] conc={conc:>2} n={n:<4} "
+                f"toks/s={metrics.output_toks_per_s:,.2f} "
+                f"latency={metrics.latency_s:.1f}s "
+                f"acc={metrics.accuracy:.3f} invalid={metrics.invalid_rate:.3f}"
+            )
+            if expect_dflash:
+                accept_len = (
+                    "N/A"
+                    if metrics.spec_accept_length is None
+                    else f"{metrics.spec_accept_length:.3f}"
+                )
+                line += (
+                    f" accept_len={accept_len} "
+                    f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
+                )
+            print(line)
+        return metrics_by_conc
+    finally:
+        kill_process_tree(proc.pid)
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            pass
+
+
+def _print_summary(
+    *,
+    args: argparse.Namespace,
+    attention_backends: list[str],
+    tp_sizes: list[int],
+    concurrencies: list[int],
+    device_sm: int,
+    results: dict[tuple[str, int, int, str], BenchMetrics],
+) -> None:
+    print("\n=== DFLASH GSM8K Sweep Summary ===")
+    _print_kv_lines(
+        [
+            ("target_model", args.target_model),
+            ("draft_model", args.draft_model),
+            ("max_new_tokens", args.max_new_tokens),
+            (
+                "sampling",
+                f"temperature:{args.temperature}, top_p:{args.top_p}, top_k:{args.top_k}",
+            ),
+            ("attention_backends", ",".join(attention_backends)),
+            (
+                "speculative_draft_attention_backend",
+                args.speculative_draft_attention_backend,
+            ),
+            ("tp_sizes", ",".join(str(x) for x in tp_sizes)),
+            ("concurrencies", ",".join(str(x) for x in concurrencies)),
+            (
+                "questions_per_concurrency_base",
+                args.questions_per_concurrency_base,
+            ),
+            ("device_sm", device_sm),
+            ("skip_baseline", bool(args.skip_baseline)),
+        ]
+    )
+
+    section_fields = [
+        ("Baseline output tok/s", "baseline", "output_toks_per_s", ",.2f"),
+        ("Baseline accuracy", "baseline", "accuracy", ".3f"),
+        ("DFLASH output tok/s", "dflash", "output_toks_per_s", ",.2f"),
+        ("DFLASH accuracy", "dflash", "accuracy", ".3f"),
+        (
+            "DFLASH acceptance length (mean spec_accept_length)",
+            "dflash",
+            "spec_accept_length",
+            ".3f",
+        ),
+    ]
+
+    for backend in attention_backends:
+        print(f"\n=== Backend: {backend} ===")
+        metrics_map = {
+            (mode, field): _collect_metric(
+                results=results,
+                backend=backend,
+                tp_sizes=tp_sizes,
+                concurrencies=concurrencies,
+                mode=mode,
+                field=field,
+            )
+            for _, mode, field, _ in section_fields
+        }
+        sections: list[tuple[str, dict[tuple[int, int], Optional[float]], str]] = [
+            (title, metrics_map[(mode, field)], fmt)
+            for title, mode, field, fmt in section_fields
+        ]
+        sections.insert(
+            4,
+            (
+                "Speedup (DFLASH / baseline)",
+                _compute_speedup(
+                    metrics_map[("baseline", "output_toks_per_s")],
+                    metrics_map[("dflash", "output_toks_per_s")],
+                ),
+                ".3f",
+            ),
+        )
+
+        for title, values, fmt in sections:
+            print(f"\n{title}")
+            print(
+                _format_table(
+                    tp_sizes=tp_sizes,
+                    concurrencies=concurrencies,
+                    values=values,
+                    float_fmt=fmt,
+                )
+            )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-path", default="test.jsonl")
+    parser.add_argument("--target-model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--draft-model", default="z-lab/Qwen3-8B-DFlash-b16")
     parser.add_argument(
         "--skip-baseline",
         action="store_true",
@@ -334,33 +549,10 @@ def main() -> None:
         action="store_true",
         help="Send prompts as server-side batched /generate requests (batch size = concurrency) instead of client-side concurrent requests.",
     )
-    parser.add_argument(
-        "--prompt-style",
-        type=str,
-        choices=["fewshot_qa", "chat"],
-        default="chat",
-        help="Prompting style: 'chat' matches the DFlash HF demo prompt.",
-    )
-    parser.add_argument("--num-shots", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Sampling temperature for /generate requests. Default 0.0 (greedy).",
-    )
-    parser.add_argument(
-        "--top-p",
-        type=float,
-        default=1.0,
-        help="Sampling top-p for /generate requests. Default 1.0.",
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=1,
-        help="Sampling top-k for /generate requests. Default 1 (greedy).",
-    )
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--timeout-s", type=int, default=3600)
     parser.add_argument(
         "--mem-fraction-static",
@@ -369,7 +561,7 @@ def main() -> None:
         help="Optional server --mem-fraction-static override. If unset, use the server auto heuristic.",
     )
     parser.add_argument("--disable-radix-cache", action="store_true")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument(
         "--page-size",
         type=int,
@@ -377,18 +569,8 @@ def main() -> None:
         help="Optional server --page-size override for both baseline and DFLASH runs.",
     )
     parser.add_argument("--max-running-requests", type=int, default=32)
-    parser.add_argument(
-        "--tp-sizes",
-        type=str,
-        default="1,2,4,8",
-        help="Comma-separated list, filtered by visible CUDA devices.",
-    )
-    parser.add_argument(
-        "--concurrencies",
-        type=str,
-        default="1,2,4,8,16,32",
-        help="Comma-separated list of client concurrency levels.",
-    )
+    parser.add_argument("--tp-sizes", default="1,2,4,8")
+    parser.add_argument("--concurrencies", default="1,2,4,8,16,32")
     parser.add_argument(
         "--questions-per-concurrency-base",
         type=int,
@@ -401,13 +583,17 @@ def main() -> None:
         default=1024,
         help="Cap num_questions per (tp, concurrency) run (default: 1024).",
     )
+    parser.add_argument("--attention-backends", default="flashinfer,fa3,trtllm_mha,fa4")
     parser.add_argument(
-        "--attention-backends",
-        type=str,
-        default="flashinfer,fa3",
-        help="Comma-separated list. Auto-skips unsupported backends for the current GPU.",
+        "--speculative-draft-attention-backend",
+        default=None,
+        help="Optional server --speculative-draft-attention-backend override for DFLASH runs.",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this sweep.")
@@ -419,7 +605,7 @@ def main() -> None:
         raise RuntimeError(f"--top-k must be -1 (all vocab) or >= 1, got {args.top_k}.")
 
     visible_gpus = int(torch.cuda.device_count())
-    tp_sizes = [int(x) for x in args.tp_sizes.split(",") if x.strip()]
+    tp_sizes = _parse_int_csv(args.tp_sizes)
     tp_sizes = [tp for tp in tp_sizes if tp >= 1 and tp <= visible_gpus]
     if not tp_sizes:
         raise RuntimeError(
@@ -427,7 +613,7 @@ def main() -> None:
             "Set CUDA_VISIBLE_DEVICES accordingly."
         )
 
-    concurrencies = [int(x) for x in args.concurrencies.split(",") if x.strip()]
+    concurrencies = _parse_int_csv(args.concurrencies)
     concurrencies = [c for c in concurrencies if c >= 1]
     if not concurrencies:
         raise RuntimeError("No concurrencies specified.")
@@ -444,15 +630,10 @@ def main() -> None:
     attention_backends = [
         s.strip() for s in args.attention_backends.split(",") if s.strip()
     ]
-    is_blackwell = _is_blackwell()
     device_sm = get_device_sm()
-    if is_blackwell:
-        attention_backends = [b for b in attention_backends if b != "fa3"]
-    if device_sm < 90:
-        attention_backends = [b for b in attention_backends if b != "fa3"]
-    if device_sm < 100:
-        attention_backends = [b for b in attention_backends if b != "trtllm_mha"]
-    attention_backends = attention_backends or ["flashinfer"]
+    attention_backends = _filter_attention_backends(
+        attention_backends, device_sm=device_sm
+    )
 
     data_path = _maybe_download_gsm8k(args.data_path)
     lines = list(read_jsonl(data_path))
@@ -461,330 +642,65 @@ def main() -> None:
             f"GSM8K file only has {len(lines)} lines, but need {max_questions}."
         )
 
-    tokenizer = None
-    if args.prompt_style == "chat":
-        tokenizer = AutoTokenizer.from_pretrained(args.target_model)
-
-    few_shot = (
-        _get_few_shot_examples(lines, int(args.num_shots))
-        if args.prompt_style == "fewshot_qa"
-        else ""
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
 
     prompts: list[str] = []
     labels: list[int] = []
     for i in range(max_questions):
-        if args.prompt_style == "fewshot_qa":
-            prompts.append(few_shot + _get_one_example(lines, i, False))
-        else:
-            assert tokenizer is not None
-            user_content = (
-                lines[i]["question"]
-                + "\nPlease reason step by step, and put your final answer within \\boxed{}."
+        user_content = (
+            lines[i]["question"]
+            + "\nPlease reason step by step, and put your final answer within \\boxed{}."
+        )
+        prompts.append(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": user_content}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
             )
-            prompts.append(
-                tokenizer.apply_chat_template(
-                    [{"role": "user", "content": user_content}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-            )
+        )
         labels.append(_get_answer_value(lines[i]["answer"]))
     if not all(l != INVALID for l in labels):
         raise RuntimeError("Invalid labels in GSM8K data.")
 
-    default_stop = (
-        ["Question", "Assistant:", "<|separator|>"]
-        if args.prompt_style == "fewshot_qa"
-        else []
-    )
-
-    # Results indexed by (backend, tp, concurrency) for baseline + dflash.
-    baseline_toks: dict[tuple[str, int, int], Optional[float]] = {}
-    dflash_toks: dict[tuple[str, int, int], Optional[float]] = {}
-    dflash_accept_len: dict[tuple[str, int, int], Optional[float]] = {}
-    baseline_acc: dict[tuple[str, int, int], Optional[float]] = {}
-    dflash_acc: dict[tuple[str, int, int], Optional[float]] = {}
+    # Results indexed by (backend, tp, concurrency, mode).
+    results: dict[tuple[str, int, int, str], BenchMetrics] = {}
 
     for backend in attention_backends:
         for tp in tp_sizes:
             port_base = find_available_port(20000)
+            common_server_args = _build_common_server_args(args, backend=backend, tp=tp)
+            mode_runs = _build_mode_runs(args, common_server_args)
 
-            common_server_args: list[str] = [
-                "--trust-remote-code",
-                "--attention-backend",
-                backend,
-                "--tp-size",
-                str(tp),
-                "--dtype",
-                str(args.dtype),
-                "--max-running-requests",
-                str(args.max_running_requests),
-                "--cuda-graph-max-bs",
-                "32",
-            ]
-            if args.mem_fraction_static is not None:
-                common_server_args.extend(
-                    ["--mem-fraction-static", str(args.mem_fraction_static)]
+            for idx, (
+                mode_key,
+                mode_name,
+                mode_server_args,
+                expect_dflash,
+            ) in enumerate(mode_runs):
+                mode_metrics = _run_mode_for_backend_tp(
+                    mode_label=f"backend={backend} tp={tp} ({mode_name})",
+                    model_path=args.target_model,
+                    base_url=f"http://127.0.0.1:{find_available_port(port_base + idx)}",
+                    server_args=mode_server_args,
+                    expect_dflash=expect_dflash,
+                    prompts=prompts,
+                    labels=labels,
+                    concurrencies=concurrencies,
+                    num_questions_by_conc=num_questions_by_conc,
+                    args=args,
                 )
-            if args.disable_radix_cache:
-                common_server_args.append("--disable-radix-cache")
-            if args.page_size is not None:
-                common_server_args.extend(["--page-size", str(int(args.page_size))])
+                for conc, metrics in mode_metrics.items():
+                    results[(backend, tp, conc, mode_key)] = metrics
 
-            if not args.skip_baseline:
-                print(f"\n=== backend={backend} tp={tp} (baseline) ===")
-                baseline_port = port_base
-                baseline_url = f"http://127.0.0.1:{baseline_port}"
-                baseline_proc = popen_launch_server(
-                    args.target_model,
-                    baseline_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=common_server_args,
-                )
-                try:
-                    # Warm up.
-                    _send_generate(
-                        baseline_url,
-                        "Hello",
-                        max_new_tokens=8,
-                        temperature=float(args.temperature),
-                        top_p=float(args.top_p),
-                        top_k=int(args.top_k),
-                        stop=[],
-                        timeout_s=min(int(args.timeout_s), 300),
-                    )
-
-                    for conc in concurrencies:
-                        n = num_questions_by_conc[conc]
-                        _flush_cache(baseline_url)
-                        metrics = _run_gsm8k_requests(
-                            baseline_url,
-                            prompts=prompts[:n],
-                            labels=labels[:n],
-                            max_new_tokens=int(args.max_new_tokens),
-                            temperature=float(args.temperature),
-                            top_p=float(args.top_p),
-                            top_k=int(args.top_k),
-                            concurrency=int(conc),
-                            batch_requests=bool(args.batch_requests),
-                            stop=default_stop,
-                            timeout_s=int(args.timeout_s),
-                            expect_dflash=False,
-                        )
-                        baseline_toks[(backend, tp, conc)] = metrics.output_toks_per_s
-                        baseline_acc[(backend, tp, conc)] = metrics.accuracy
-                        print(
-                            f"[baseline] conc={conc:>2} n={n:<4} "
-                            f"toks/s={metrics.output_toks_per_s:,.2f} "
-                            f"latency={metrics.latency_s:.1f}s "
-                            f"acc={metrics.accuracy:.3f} invalid={metrics.invalid_rate:.3f}"
-                        )
-                finally:
-                    kill_process_tree(baseline_proc.pid)
-                    try:
-                        baseline_proc.wait(timeout=30)
-                    except Exception:
-                        pass
-
-            print(f"\n=== backend={backend} tp={tp} (DFLASH) ===")
-            dflash_port = find_available_port(port_base + 1)
-            dflash_url = f"http://127.0.0.1:{dflash_port}"
-            dflash_proc = popen_launch_server(
-                args.target_model,
-                dflash_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    *common_server_args,
-                    "--speculative-algorithm",
-                    "DFLASH",
-                    "--speculative-draft-model-path",
-                    args.draft_model,
-                ],
-            )
-            try:
-                _send_generate(
-                    dflash_url,
-                    "Hello",
-                    max_new_tokens=8,
-                    temperature=float(args.temperature),
-                    top_p=float(args.top_p),
-                    top_k=int(args.top_k),
-                    stop=[],
-                    timeout_s=min(int(args.timeout_s), 300),
-                )
-                for conc in concurrencies:
-                    n = num_questions_by_conc[conc]
-                    _flush_cache(dflash_url)
-                    metrics = _run_gsm8k_requests(
-                        dflash_url,
-                        prompts=prompts[:n],
-                        labels=labels[:n],
-                        max_new_tokens=int(args.max_new_tokens),
-                        temperature=float(args.temperature),
-                        top_p=float(args.top_p),
-                        top_k=int(args.top_k),
-                        concurrency=int(conc),
-                        batch_requests=bool(args.batch_requests),
-                        stop=default_stop,
-                        timeout_s=int(args.timeout_s),
-                        expect_dflash=True,
-                    )
-                    dflash_toks[(backend, tp, conc)] = metrics.output_toks_per_s
-                    dflash_accept_len[(backend, tp, conc)] = metrics.spec_accept_length
-                    dflash_acc[(backend, tp, conc)] = metrics.accuracy
-                    print(
-                        f"[DFLASH]   conc={conc:>2} n={n:<4} "
-                        f"toks/s={metrics.output_toks_per_s:,.2f} "
-                        f"latency={metrics.latency_s:.1f}s "
-                        f"acc={metrics.accuracy:.3f} invalid={metrics.invalid_rate:.3f} "
-                        f"accept_len={metrics.spec_accept_length:.3f} "
-                        f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
-                    )
-            finally:
-                kill_process_tree(dflash_proc.pid)
-                try:
-                    dflash_proc.wait(timeout=30)
-                except Exception:
-                    pass
-
-    # Render markdown.
-    md_lines: list[str] = []
-    md_lines.append("# DFLASH GSM8K Sweep")
-    md_lines.append("")
-    md_lines.append("## Settings")
-    md_lines.append(f"- target_model: `{args.target_model}`")
-    md_lines.append(f"- draft_model: `{args.draft_model}`")
-    md_lines.append(f"- prompt_style: `{args.prompt_style}`")
-    if args.prompt_style == "fewshot_qa":
-        md_lines.append(f"- num_shots: `{args.num_shots}`")
-    md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
-    md_lines.append(
-        f"- sampling: `temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}`"
+    _print_summary(
+        args=args,
+        attention_backends=attention_backends,
+        tp_sizes=tp_sizes,
+        concurrencies=concurrencies,
+        device_sm=device_sm,
+        results=results,
     )
-    md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
-    md_lines.append(f"- tp_sizes: `{', '.join(str(x) for x in tp_sizes)}`")
-    md_lines.append(f"- concurrencies: `{', '.join(str(x) for x in concurrencies)}`")
-    md_lines.append(
-        f"- questions_per_concurrency: `base={args.questions_per_concurrency_base}`"
-    )
-    md_lines.append(f"- device_sm: `{device_sm}`")
-    md_lines.append(f"- is_blackwell: `{is_blackwell}`")
-    md_lines.append(f"- skip_baseline: `{bool(args.skip_baseline)}`")
-    md_lines.append("")
-    md_lines.append(
-        "Note: DFLASH and baseline greedy outputs may diverge on some prompts due to numerical differences "
-        "(e.g. verify path vs decode path). This sweep focuses on throughput."
-    )
-    md_lines.append("")
-
-    for backend in attention_backends:
-        md_lines.append(f"## Backend: `{backend}`")
-        md_lines.append("")
-
-        baseline_values = {
-            (tp, conc): baseline_toks.get((backend, tp, conc), None)
-            for tp in tp_sizes
-            for conc in concurrencies
-        }
-        dflash_values = {
-            (tp, conc): dflash_toks.get((backend, tp, conc), None)
-            for tp in tp_sizes
-            for conc in concurrencies
-        }
-        speedup_values: dict[tuple[int, int], Optional[float]] = {}
-        for tp in tp_sizes:
-            for conc in concurrencies:
-                b = baseline_values.get((tp, conc), None)
-                d = dflash_values.get((tp, conc), None)
-                speedup_values[(tp, conc)] = (
-                    None if (b is None or d is None or b <= 0) else (d / b)
-                )
-
-        md_lines.append("### Baseline output tok/s")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values=baseline_values,
-                float_fmt=",.2f",
-            )
-        )
-        md_lines.append("")
-        md_lines.append("### Baseline accuracy")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values={
-                    (tp, conc): baseline_acc.get((backend, tp, conc), None)
-                    for tp in tp_sizes
-                    for conc in concurrencies
-                },
-                float_fmt=".3f",
-            )
-        )
-        md_lines.append("")
-        md_lines.append("### DFLASH output tok/s")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values=dflash_values,
-                float_fmt=",.2f",
-            )
-        )
-        md_lines.append("")
-        md_lines.append("### DFLASH accuracy")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values={
-                    (tp, conc): dflash_acc.get((backend, tp, conc), None)
-                    for tp in tp_sizes
-                    for conc in concurrencies
-                },
-                float_fmt=".3f",
-            )
-        )
-        md_lines.append("")
-        md_lines.append("### Speedup (DFLASH / baseline)")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values=speedup_values,
-                float_fmt=".3f",
-            )
-        )
-        md_lines.append("")
-
-        md_lines.append(
-            "### DFLASH acceptance length (mean per-request spec_accept_length)"
-        )
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values={
-                    (tp, conc): dflash_accept_len.get((backend, tp, conc), None)
-                    for tp in tp_sizes
-                    for conc in concurrencies
-                },
-                float_fmt=".3f",
-            )
-        )
-        md_lines.append("")
-
-    if args.output_md:
-        with open(args.output_md, "w", encoding="utf-8") as f:
-            f.write("\n".join(md_lines))
-            f.write("\n")
-        print(f"\nWrote markdown report to: {args.output_md}")
-    else:
-        print("\nMarkdown report disabled (pass --output-md to write one).")
 
 
 if __name__ == "__main__":

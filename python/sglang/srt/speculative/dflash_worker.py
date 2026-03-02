@@ -84,6 +84,7 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
+        supported_draft_backends = ("flashinfer", "fa3", "fa4")
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
@@ -94,10 +95,11 @@ class DFlashWorker:
                 "falling back to 'flashinfer'."
             )
             draft_backend = "flashinfer"
-        elif draft_backend not in ("flashinfer", "fa3"):
+        elif draft_backend not in supported_draft_backends:
             logger.warning(
-                "DFLASH draft worker only supports attention_backend in {'flashinfer', 'fa3'} for now, "
+                "DFLASH draft worker only supports attention_backend in %s for now, "
                 "but got %r. Falling back to 'flashinfer'.",
+                supported_draft_backends,
                 draft_backend,
             )
             draft_backend = "flashinfer"
