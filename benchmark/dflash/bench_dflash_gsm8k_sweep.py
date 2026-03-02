@@ -665,8 +665,10 @@ def main() -> None:
 
     # Results indexed by (backend, tp, concurrency, mode).
     results: dict[tuple[str, int, int, str], BenchMetrics] = {}
+    # Baseline metrics are backend-agnostic in this sweep; run once per TP and reuse.
+    baseline_cache_by_tp: dict[int, dict[int, BenchMetrics]] = {}
 
-    for backend in attention_backends:
+    for backend_idx, backend in enumerate(attention_backends):
         for tp in tp_sizes:
             port_base = find_available_port(20000)
             common_server_args = _build_common_server_args(args, backend=backend, tp=tp)
@@ -678,18 +680,29 @@ def main() -> None:
                 mode_server_args,
                 expect_dflash,
             ) in enumerate(mode_runs):
-                mode_metrics = _run_mode_for_backend_tp(
-                    mode_label=f"backend={backend} tp={tp} ({mode_name})",
-                    model_path=args.target_model,
-                    base_url=f"http://127.0.0.1:{find_available_port(port_base + idx)}",
-                    server_args=mode_server_args,
-                    expect_dflash=expect_dflash,
-                    prompts=prompts,
-                    labels=labels,
-                    concurrencies=concurrencies,
-                    num_questions_by_conc=num_questions_by_conc,
-                    args=args,
-                )
+                if (
+                    mode_key == "baseline"
+                    and not args.skip_baseline
+                    and backend_idx > 0
+                    and tp in baseline_cache_by_tp
+                ):
+                    mode_metrics = baseline_cache_by_tp[tp]
+                else:
+                    mode_metrics = _run_mode_for_backend_tp(
+                        mode_label=f"backend={backend} tp={tp} ({mode_name})",
+                        model_path=args.target_model,
+                        base_url=f"http://127.0.0.1:{find_available_port(port_base + idx)}",
+                        server_args=mode_server_args,
+                        expect_dflash=expect_dflash,
+                        prompts=prompts,
+                        labels=labels,
+                        concurrencies=concurrencies,
+                        num_questions_by_conc=num_questions_by_conc,
+                        args=args,
+                    )
+                    if mode_key == "baseline" and not args.skip_baseline:
+                        baseline_cache_by_tp[tp] = mode_metrics
+
                 for conc, metrics in mode_metrics.items():
                     results[(backend, tp, conc, mode_key)] = metrics
 
