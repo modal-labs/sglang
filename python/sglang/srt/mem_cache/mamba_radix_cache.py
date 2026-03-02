@@ -444,6 +444,17 @@ class MambaRadixCache(BasePrefixCache):
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
+        _total = sum(len(v) for v in value) if value else 0
+        _trunc = sum(len(v) for v in value[:best_value_len]) if value else 0
+        _kl = len(key.token_ids) if hasattr(key, "token_ids") else len(key)
+        from sglang.utils import logger as _mp_log
+        _mp_log.info(
+            "[MATCH-PREFIX] key_len=%d  tree_matched=%d  "
+            "best_value_chunks=%d  truncated_to=%d  "
+            "has_mamba_state=%s",
+            _kl, _total, best_value_len, _trunc,
+            last_node.mamba_value is not None,
+        )
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:

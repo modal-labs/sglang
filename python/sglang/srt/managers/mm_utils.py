@@ -347,28 +347,59 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
                     continue
 
                 for i, item in enumerate(items):
-                    for offset in items[i].offsets:
-                        input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
+                    _po = getattr(item, "per_offset_pad_values", None)
+                    for j, offset in enumerate(items[i].offsets):
+                        _pv = _po[j] if _po and j < len(_po) else item.pad_value
+                        input_ids_tensor[offset[0] : offset[1] + 1] = _pv
         else:
-            # Create mapping of token_ids to pad_values for each modality
-            token_to_pad_mapping = {}
-            for item in mm_inputs.mm_items:
-                if item.is_image() and mm_inputs.im_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
-                elif item.is_audio() and mm_inputs.audio_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
-                elif item.is_video() and mm_inputs.video_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
-                else:
-                    raise ValueError(
-                        f"No multimodal token id provided for {item.modality}"
-                    )
-
-            # Apply replacements for all tokens at once
-            for token_id, pad_value in token_to_pad_mapping.items():
-                input_ids_tensor[input_ids_tensor == token_id] = pad_value
+            _any_per_offset = any(
+                getattr(item, "per_offset_pad_values", None)
+                for item in mm_inputs.mm_items
+            )
+            if _any_per_offset:
+                for item in mm_inputs.mm_items:
+                    _po = getattr(item, "per_offset_pad_values", None)
+                    if _po and item.offsets:
+                        for j, offset in enumerate(item.offsets):
+                            _pv = _po[j] if j < len(_po) else item.pad_value
+                            input_ids_tensor[offset[0] : offset[1] + 1] = _pv
+                    elif item.is_image() and mm_inputs.im_token_id is not None:
+                        input_ids_tensor[input_ids_tensor == mm_inputs.im_token_id] = item.pad_value
+                    elif item.is_audio() and mm_inputs.audio_token_id is not None:
+                        input_ids_tensor[input_ids_tensor == mm_inputs.audio_token_id] = item.pad_value
+                    elif item.is_video() and mm_inputs.video_token_id is not None:
+                        input_ids_tensor[input_ids_tensor == mm_inputs.video_token_id] = item.pad_value
+            else:
+                token_to_pad_mapping = {}
+                for item in mm_inputs.mm_items:
+                    if item.is_image() and mm_inputs.im_token_id is not None:
+                        token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
+                    elif item.is_audio() and mm_inputs.audio_token_id is not None:
+                        token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
+                    elif item.is_video() and mm_inputs.video_token_id is not None:
+                        token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
+                    else:
+                        raise ValueError(
+                            f"No multimodal token id provided for {item.modality}"
+                        )
+                for token_id, pad_value in token_to_pad_mapping.items():
+                    input_ids_tensor[input_ids_tensor == token_id] = pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
+        from sglang.utils import logger as _oi_log
+        _img_mask = input_ids_tensor >= 1_000_000
+        _n_img = _img_mask.sum().item()
+        if _n_img > 0:
+            _positions = _img_mask.nonzero(as_tuple=True)[0]
+            _first = _positions[0].item()
+            _unique = input_ids_tensor[_img_mask].unique().tolist()
+            _oi_log.info(
+                "[ORIGIN-IDS] total_tokens=%d  n_image_tokens=%d  "
+                "first_img_pos=%d  unique_pad_values=%s  "
+                "tokens_before_img=%s",
+                len(ret_input_ids), _n_img, _first, _unique,
+                ret_input_ids[max(0, _first-3):_first],
+            )
         return ret_input_ids
 
 
@@ -964,8 +995,15 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
+            _all_pad_values = set()
+            for item in items:
+                _po = getattr(item, "per_offset_pad_values", None)
+                if _po:
+                    _all_pad_values.update(_po)
+                else:
+                    _all_pad_values.add(item.pad_value)
             placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
+                sorted(_all_pad_values),
                 device=input_ids.device,
             )
             # calculate per request items length offset
