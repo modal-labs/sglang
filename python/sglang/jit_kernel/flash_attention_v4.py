@@ -135,8 +135,6 @@ def flash_attn_with_kvcache(
         raise NotImplementedError(
             "FA4 path does not support non-consecutive batch indices or left padding."
         )
-    if q_descale is not None or k_descale is not None or v_descale is not None:
-        raise NotImplementedError("FA4 path does not support descale.")
 
     if isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
@@ -155,11 +153,14 @@ def flash_attn_with_kvcache(
         causal=causal,
         softcap=softcap if softcap != 0.0 else None,
         window_size=window_size,
-        num_splits=num_splits if num_splits != 0 else 1,
+        num_splits=num_splits,
         pack_gqa=pack_gqa,
         learnable_sink=sinks,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         return_softmax_lse=True,
     )
 

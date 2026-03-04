@@ -25,9 +25,6 @@ from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
 from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
 
-flash_attn_varlen_func = flash_attn_varlen_func_fa3
-flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
-
 from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_varlen_func as flash_attn_varlen_func_fa4,
 )
@@ -367,6 +364,16 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
 
         self.fa_impl_ver = fa_impl_ver
+        self.flash_attn_varlen_func = (
+            flash_attn_varlen_func_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_varlen_func_fa3
+        )
+        self.flash_attn_with_kvcache = (
+            flash_attn_with_kvcache_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_with_kvcache_fa3
+        )
 
         # Local attention settings
         self.has_local_attention = model_runner.model_config.is_local_attention_model
@@ -386,16 +393,7 @@ class FlashAttentionBackend(AttentionBackend):
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         # We set nums splits to 1 if deterministic inference is enabled.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
-        # Furthermore, FA4 does not support num_splits=0 with CUDA Graph, so we set num_splits to 1 if CUDA Graph is enabled.
-        self.num_splits = (
-            1
-            if model_runner.server_args.enable_deterministic_inference
-            or (
-                self.fa_impl_ver == 4
-                and not model_runner.server_args.disable_cuda_graph
-            )
-            else 0
-        )
+        self.num_splits = 1 if model_runner.server_args.enable_deterministic_inference else 0
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -779,11 +777,9 @@ class FlashAttentionBackend(AttentionBackend):
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
-            and self.fa_impl_ver != 4
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
@@ -814,19 +810,8 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_swa_layer
         )
 
-        flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
-        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
-
-        flash_attn_varlen_func = (
-            flash_attn_varlen_func_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_varlen_func_base
-        )
-        flash_attn_with_kvcache = (
-            flash_attn_with_kvcache_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_with_kvcache_base
-        )
+        flash_attn_varlen_func = self.flash_attn_varlen_func
+        flash_attn_with_kvcache = self.flash_attn_with_kvcache
 
         kwargs = {}
         if sinks is not None:
@@ -994,7 +979,6 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver in [3], "Only FA3 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -1135,6 +1119,7 @@ class FlashAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+        flash_attn_with_kvcache = self.flash_attn_with_kvcache
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
@@ -2531,7 +2516,7 @@ def prepare_swa_spec_page_table_triton(
 class FlashAttentionMultiStepBackend:
 
     def __init__(
-        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int, fa_impl_ver: int = 3
     ):
         self.model_runner = model_runner
         self.topk = topk
@@ -2544,6 +2529,7 @@ class FlashAttentionMultiStepBackend:
                     speculative_step_id=i,
                     topk=self.topk,
                     speculative_num_steps=self.speculative_num_steps,
+                    fa_impl_ver=fa_impl_ver,
                 )
             )
 

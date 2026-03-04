@@ -45,6 +45,7 @@ class DraftBackendFactory:
             "triton": self._create_triton_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
+            "fa4": self._create_fa4_decode_backend,
             "hybrid_linear_attn": (
                 self._create_fa3_decode_backend
                 if not is_blackwell()
@@ -69,6 +70,7 @@ class DraftBackendFactory:
             "triton": self._create_triton_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
+            "fa4": self._create_fa4_prefill_backend,
             "hybrid_linear_attn": (
                 self._create_fa3_prefill_backend
                 if not is_blackwell()
@@ -148,6 +150,15 @@ class DraftBackendFactory:
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
+    def _create_fa4_decode_backend(self):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionMultiStepBackend,
+        )
+
+        return FlashAttentionMultiStepBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps, fa_impl_ver=4
+        )
+
     def _create_flashmla_decode_backend(self):
         from sglang.srt.layers.attention.flashmla_backend import (
             FlashMLAMultiStepDraftBackend,
@@ -219,6 +230,13 @@ class DraftBackendFactory:
         )
 
         return FlashAttentionBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_fa4_prefill_backend(self):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        return FlashAttentionBackend(self.draft_model_runner, skip_prefill=False, fa_impl_ver=4)
 
     def _create_trtllm_mha_prefill_backend(self):
         from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
