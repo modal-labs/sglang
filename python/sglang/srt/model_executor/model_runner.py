@@ -391,7 +391,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             trained_target_layers = dflash_draft_config.num_target_layers
 
             target_num_layers = getattr(
-                self.model_config.hf_config, "num_hidden_layers", None
+                self.model_config.hf_text_config, "num_hidden_layers", None
             )
             if target_num_layers is None:
                 raise ValueError(

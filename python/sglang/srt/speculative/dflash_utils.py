@@ -205,6 +205,25 @@ def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
+def _get_text_config(config: Any) -> Any:
+    if config is None:
+        return None
+    if isinstance(config, dict):
+        return config.get("text_config", config)
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        return text_config
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        try:
+            resolved = get_text_config()
+            if resolved is not None:
+                return resolved
+        except TypeError:
+            pass
+    return config
+
+
 def _get_dflash_config(config: Any) -> dict:
     if isinstance(config, dict):
         cfg = config.get("dflash_config", None)
@@ -294,9 +313,10 @@ class DFlashDraftConfig:
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)
+    draft_text_config = _get_text_config(draft_hf_config)
 
     num_hidden_layers = _parse_optional_int(
-        _cfg_get(draft_hf_config, "num_hidden_layers", None),
+        _cfg_get(draft_text_config, "num_hidden_layers", None),
         field_name="DFLASH draft num_hidden_layers",
         min_value=1,
     )

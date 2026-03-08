@@ -15,7 +15,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
@@ -112,6 +116,7 @@ class DFlashWorker:
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        saved_server_args = get_global_server_args()
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
@@ -126,6 +131,7 @@ class DFlashWorker:
             req_to_token_pool=shared_req_to_token_pool,
             token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
         )
+        set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
         draft_config = parse_dflash_draft_config(
