@@ -384,10 +384,11 @@ def _run_mode_for_backend_tp(
     args: argparse.Namespace,
 ) -> dict[int, BenchMetrics]:
     print(f"\n=== {mode_label} ===")
+    server_start_timeout_s = int(max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, args.timeout_s))
     proc = popen_launch_server(
         model_path,
         base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        timeout=server_start_timeout_s,
         other_args=server_args,
     )
     try:
@@ -553,7 +554,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=1)
-    parser.add_argument("--timeout-s", type=int, default=3600)
+    parser.add_argument(
+        "--timeout-s",
+        type=int,
+        default=3600,
+        help=(
+            "Timeout in seconds for benchmarked /generate calls and server startup "
+            "health checks."
+        ),
+    )
     parser.add_argument(
         "--mem-fraction-static",
         type=float,
@@ -603,6 +612,8 @@ def main() -> None:
         raise RuntimeError(f"--top-p must be in (0, 1], got {args.top_p}.")
     if args.top_k == 0 or args.top_k < -1:
         raise RuntimeError(f"--top-k must be -1 (all vocab) or >= 1, got {args.top_k}.")
+    if args.timeout_s <= 0:
+        raise RuntimeError(f"--timeout-s must be > 0, got {args.timeout_s}.")
 
     visible_gpus = int(torch.cuda.device_count())
     tp_sizes = _parse_int_csv(args.tp_sizes)
