@@ -148,6 +148,42 @@ def _run_gsm8k_requests(
     if labels is not None and len(labels) != len(prompts):
         raise ValueError("labels length must match prompts length")
 
+    # Drop the first batch from metrics to exclude one-time JIT/cuda-graph overhead
+    # that often happens immediately after /flush_cache for large batch sizes.
+    bs = max(int(concurrency), 1)
+    if len(prompts) > bs:
+        warmup_prompts = prompts[:bs]
+        if batch_requests:
+            _send_generate(
+                base_url,
+                warmup_prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                timeout_s=timeout_s,
+            )
+        else:
+            with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
+                futures = [
+                    pool.submit(
+                        _send_generate,
+                        base_url=base_url,
+                        text=prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        timeout_s=timeout_s,
+                    )
+                    for prompt in warmup_prompts
+                ]
+                for fut in as_completed(futures):
+                    fut.result()
+
+        prompts = prompts[bs:]
+        labels = labels[bs:] if labels is not None else None
+
     start = time.perf_counter()
     total_tokens = 0
     spec_verify_ct_sum = 0

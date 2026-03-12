@@ -21,6 +21,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.dflash_info import (
+    apply_dflash_verify_proposed_tokens_to_request,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -313,10 +316,57 @@ class SchedulerOutputProcessorMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    def _resolve_dflash_spec_overlap_token_ids(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> List[List[int]]:
+        """Resolve DFLASH overlap tokens using the same CPU semantics as spec-v1 verify."""
+        assert result.next_token_ids.is_cpu
+        assert result.accept_lens.is_cpu
+
+        flat_next_token_ids = result.next_token_ids.tolist()
+        raw_commit_lens = result.accept_lens.tolist()
+        stride = self.draft_worker.speculative_num_draft_tokens
+
+        predict_tokens: List[List[int]] = []
+        accept_length_per_req_cpu: List[int] = []
+        num_accepted_tokens = 0
+
+        for i, req in enumerate(batch.reqs):
+            if req.finished() or req.is_retracted:
+                predict_tokens.append([])
+                accept_length_per_req_cpu.append(0)
+                continue
+
+            raw_commit_len = int(raw_commit_lens[i])
+
+            proposed_tokens = flat_next_token_ids[
+                i * stride : i * stride + raw_commit_len
+            ]
+            req_result = apply_dflash_verify_proposed_tokens_to_request(
+                req=req,
+                proposed_tokens=proposed_tokens,
+            )
+            req.kv_committed_len += req_result.commit_len
+            predict_tokens.append(req_result.committed_token_ids)
+
+            accepted_draft_tokens = req_result.accepted_draft_tokens
+            accept_length_per_req_cpu.append(accepted_draft_tokens)
+            num_accepted_tokens += accepted_draft_tokens
+            req.spec_verify_ct += 1
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
+
+        result.num_accepted_tokens = num_accepted_tokens
+        result.accept_length_per_req_cpu = accept_length_per_req_cpu
+        return predict_tokens
+
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
+        if batch.spec_algorithm.is_dflash():
+            return self._resolve_dflash_spec_overlap_token_ids(result, batch)
+
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
@@ -366,12 +416,16 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        dflash_spec_v2 = batch.is_spec_v2 and batch.spec_algorithm.is_dflash()
+        dflash_finished_before_resolve = None
 
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
+            if dflash_spec_v2:
+                dflash_finished_before_resolve = [req.finished() for req in batch.reqs]
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
         self.num_generated_tokens += len(batch.reqs)
@@ -391,18 +445,30 @@ class SchedulerOutputProcessorMixin:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
-            if self.enable_overlap and (req.finished() or req.is_retracted):
+            if self.enable_overlap and req.is_retracted:
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # (currently not, e.g. Eagle V1 still check finish during forward)
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                continue
+            if (
+                self.enable_overlap
+                and req.finished()
+                and (
+                    not dflash_spec_v2
+                    or dflash_finished_before_resolve is None
+                    or dflash_finished_before_resolve[i]
+                )
+            ):
                 continue
 
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
-            elif batch.is_spec_v2:
+            elif batch.is_spec_v2 and not dflash_spec_v2:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
+                new_accepted_len = len(next_token_id)
+            elif dflash_spec_v2:
                 new_accepted_len = len(next_token_id)
 
             # Update Mamba last track seqlen
@@ -410,7 +476,8 @@ class SchedulerOutputProcessorMixin:
 
             req.time_stats.set_last_decode_finish_time()
 
-            req.check_finished(new_accepted_len)
+            if not dflash_spec_v2:
+                req.check_finished(new_accepted_len)
 
             if (
                 self.server_args.disaggregation_decode_enable_offload_kvcache
@@ -463,7 +530,7 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None:
+            if req.grammar is not None and not dflash_spec_v2:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     if batch.spec_algorithm.is_none():

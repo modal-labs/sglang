@@ -93,6 +93,8 @@ class DFlashWorker:
         target_req_to_token_pool, target_token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self.req_to_token_pool = target_req_to_token_pool
+        self.token_to_kv_pool_allocator = target_token_to_kv_pool_allocator
         shared_req_to_token_pool = (
             None if self.use_compact_draft_cache else target_req_to_token_pool
         )
@@ -145,6 +147,9 @@ class DFlashWorker:
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
+        # Match the overlap worker shape expected by generic scheduler helpers.
+        self.draft_worker.draft_runner = self.draft_model_runner
+        self.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -165,6 +170,7 @@ class DFlashWorker:
                     self.block_size,
                     model_block_size,
                 )
+        self.speculative_num_draft_tokens = self.block_size
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -365,6 +371,36 @@ class DFlashWorker:
         mask = offsets < lengths.unsqueeze(1)
         return req_to_token[req_pool_indices[:, None], pos2d][mask].to(torch.int64)
 
+    def _gather_target_future_block_cache_locs(
+        self,
+        *,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        block_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Gather a fixed-size reserved block from req_to_token for each request.
+
+        Overlap scheduling pre-allocates future target slots directly in `req_to_token`.
+        The v2 worker will consume those slots as `out_cache_loc` instead of calling
+        into the allocator backup/restore path used by spec-v1.
+        """
+
+        if block_size is None:
+            block_size = int(self.block_size)
+        lengths = torch.full(
+            (req_pool_indices.shape[0],),
+            int(block_size),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        return self._gather_req_to_token_segments(
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            start=start_offset,
+            lengths=lengths,
+        )
+
     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         assert self.draft_window_size is not None
         visible_lens = torch.clamp(
@@ -382,6 +418,43 @@ class DFlashWorker:
         visible_start = seq_lens_i64 - visible_lens_i64
         aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
         return (seq_lens_i64 - aligned_start).to(torch.int32)
+
+    def _rebuild_compact_draft_cache_view(
+        self,
+        *,
+        batch: ScheduleBatch | ModelWorkerBatch,
+        target_seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Rebuild the draft-local req_to_token suffix view from target state."""
+
+        if not self.use_compact_draft_cache:
+            raise RuntimeError(
+                "Compact draft-cache rebuild requested, but draft windowing is disabled."
+            )
+
+        bs = int(batch.req_pool_indices.shape[0])
+        new_draft_seq_lens = self._compute_compact_draft_seq_lens(target_seq_lens)
+        suffix_start = target_seq_lens.to(torch.int64) - new_draft_seq_lens.to(
+            torch.int64
+        )
+        target_req_to_token_pool = getattr(batch, "req_to_token_pool", None)
+        if target_req_to_token_pool is None:
+            target_req_to_token_pool = self.req_to_token_pool
+        suffix_cache_loc = self._gather_req_to_token_segments(
+            req_to_token=target_req_to_token_pool.req_to_token,
+            req_pool_indices=batch.req_pool_indices,
+            start=suffix_start,
+            lengths=new_draft_seq_lens,
+        )
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            self.draft_model_runner.req_to_token_pool.req_to_token,
+            torch.zeros_like(new_draft_seq_lens),
+            new_draft_seq_lens,
+            suffix_cache_loc,
+            bs,
+        )
+        return new_draft_seq_lens
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -849,7 +922,6 @@ class DFlashWorker:
             return
 
         target_req_to_token = batch.req_to_token_pool.req_to_token
-        draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
 
         req_pool_indices = batch.req_pool_indices
         if req_pool_indices.dtype != torch.int64:
@@ -897,20 +969,96 @@ class DFlashWorker:
             ctx_cache_loc = cache2d[mask].to(torch.int64)  # [sum(ctx_lens)]
             ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
 
-        with torch.inference_mode():
-            ctx_hidden = self.draft_model.project_target_hidden(
-                draft_input.target_hidden
-            )  # [sum(ctx), hidden]
-            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
-                raise RuntimeError(
-                    f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
-                )
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=draft_input.target_hidden,
+            cache_loc=ctx_cache_loc,
+            positions=ctx_positions,
+        )
 
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+        if self.use_compact_draft_cache:
+            new_draft_seq_lens = self._rebuild_compact_draft_cache_view(
+                batch=batch,
+                target_seq_lens=batch.seq_lens,
+            )
+            draft_input.draft_seq_lens = new_draft_seq_lens
+        else:
+            draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+        draft_input.ctx_lens = torch.zeros_like(ctx_lens)
+        draft_input.target_hidden = draft_input.target_hidden[:0]
+
+    def _append_target_hidden_to_draft_kv_by_loc(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        mask_valid: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Project target hidden states and materialize draft KV at explicit slots.
+
+        When `mask_valid` is provided, keep the write path dense and zero out invalid
+        K/V rows instead of boolean-packing the inputs. This mirrors the original
+        overlap DFLASH implementation and avoids dynamic-shape gathers on the hot path.
+        """
+
+        if target_hidden is None:
+            raise RuntimeError(
+                "DFLASH draft KV append requires target hidden states, but got None."
+            )
+        if target_hidden.numel() == 0:
+            return
+
+        cache_loc = cache_loc.reshape(-1)
+        positions = positions.reshape(-1)
+        if target_hidden.ndim != 2:
+            raise ValueError(
+                "DFLASH target_hidden must be 2D, "
+                f"got shape={tuple(target_hidden.shape)}."
+            )
+        num_tokens = int(target_hidden.shape[0])
+        if int(cache_loc.numel()) != num_tokens:
+            raise RuntimeError(
+                "DFLASH target_hidden/cache_loc mismatch: "
+                f"{num_tokens} vs {cache_loc.numel()}."
+            )
+        if int(positions.numel()) != num_tokens:
+            raise RuntimeError(
+                "DFLASH positions/cache_loc mismatch: "
+                f"{positions.numel()} vs {cache_loc.numel()}."
+            )
+
+        mask_3d: Optional[torch.Tensor] = None
+        if mask_valid is not None:
+            mask_valid = mask_valid.reshape(-1)
+            if int(mask_valid.numel()) != num_tokens:
+                raise RuntimeError(
+                    "DFLASH mask_valid length mismatch: "
+                    f"mask_valid={int(mask_valid.numel())}, target_hidden={num_tokens}."
+                )
+            if mask_valid.dtype != torch.bool:
+                mask_valid = mask_valid.to(torch.bool)
+            mask_3d = mask_valid.view(-1, 1, 1)
+
+        if cache_loc.dtype != torch.int64:
+            cache_loc = cache_loc.to(torch.int64)
+        if cache_loc.device != self.device:
+            cache_loc = cache_loc.to(self.device, non_blocking=True)
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if positions.device != self.device:
+            positions = positions.to(self.device, non_blocking=True)
+        if target_hidden.device != self.device:
+            target_hidden = target_hidden.to(self.device, non_blocking=True)
+
+        with torch.inference_mode():
+            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            if (
+                mask_3d is None
+                and self._use_fused_kv_materialize
+                and self._fused_kv_helper is not None
+            ):
                 try:
-                    self._append_target_hidden_fused(
-                        ctx_hidden, ctx_positions, ctx_cache_loc
-                    )
+                    self._append_target_hidden_fused(ctx_hidden, positions, cache_loc)
                 except Exception as e:
                     logger.warning(
                         "DFLASH fused KV append failed; falling back to sequential path: %s",
@@ -919,43 +1067,19 @@ class DFlashWorker:
                     self._use_fused_kv_materialize = False
                     self._fused_kv_helper = None
                     self._append_target_hidden_sequential(
-                        ctx_hidden, ctx_positions, ctx_cache_loc
+                        ctx_hidden, positions, cache_loc
                     )
             else:
                 self._append_target_hidden_sequential(
-                    ctx_hidden, ctx_positions, ctx_cache_loc
+                    ctx_hidden, positions, cache_loc, mask_3d
                 )
-
-        if self.use_compact_draft_cache:
-            new_draft_seq_lens = self._compute_compact_draft_seq_lens(batch.seq_lens)
-            suffix_start = batch.seq_lens.to(torch.int64) - new_draft_seq_lens.to(
-                torch.int64
-            )
-            suffix_cache_loc = self._gather_req_to_token_segments(
-                req_to_token=target_req_to_token,
-                req_pool_indices=req_pool_indices,
-                start=suffix_start,
-                lengths=new_draft_seq_lens,
-            )
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                draft_req_to_token,
-                torch.zeros_like(new_draft_seq_lens),
-                new_draft_seq_lens,
-                suffix_cache_loc,
-                bs,
-            )
-            draft_input.draft_seq_lens = new_draft_seq_lens
-        else:
-            draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-        draft_input.ctx_lens = torch.zeros_like(ctx_lens)
-        draft_input.target_hidden = draft_input.target_hidden[:0]
 
     def _append_target_hidden_sequential(
         self,
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        mask_3d: Optional[torch.Tensor] = None,
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
@@ -964,6 +1088,9 @@ class DFlashWorker:
             k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            if mask_3d is not None:
+                k = k.masked_fill(~mask_3d, 0)
+                v = v.masked_fill(~mask_3d, 0)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 ctx_cache_loc,

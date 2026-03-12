@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req, ScheduleBatch
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import (
     compute_dflash_accept_len_and_bonus,
@@ -48,6 +50,291 @@ def _compute_paged_keep_slots(
     keep_slots = (keep_lens - prefix_lens).to(torch.int64)
     keep_slots.clamp_(min=0, max=int(draft_token_num))
     return keep_slots
+
+
+@dataclass
+class DFlashReqVerifyCPUResult:
+    committed_token_ids: List[int]
+    commit_len: int
+    new_verified_token: int
+    accepted_draft_tokens: int
+
+
+def compute_dflash_verify_accept_len_and_bonus_from_logits(
+    *,
+    candidates: torch.Tensor,
+    logits_output: LogitsProcessorOutput,
+    sampling_info,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute DFLASH accept lengths and bonus tokens from target verify logits."""
+
+    bs, draft_token_num = candidates.shape
+    device = logits_output.next_token_logits.device
+
+    if sampling_info is not None:
+        if len(sampling_info) != bs:
+            raise RuntimeError(
+                "DFLASH verify sampling_info size mismatch: "
+                f"len(sampling_info)={len(sampling_info)}, bs={bs}."
+            )
+
+        # Keep speculative verify semantics consistent with the normal sampling path.
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                logits_output.next_token_logits,
+                sampling_info,
+                num_tokens_in_batch=draft_token_num,
+            )
+
+        penalizer_orchestrator = sampling_info.penalizer_orchestrator
+        if (
+            sampling_info.acc_linear_penalties is not None
+            or (
+                penalizer_orchestrator is not None
+                and penalizer_orchestrator.is_required
+            )
+            or sampling_info.logit_bias is not None
+        ):
+            linear_penalty = torch.zeros(
+                (bs, logits_output.next_token_logits.shape[1]),
+                dtype=torch.float32,
+                device=device,
+            )
+            sampling_info.apply_logits_bias(linear_penalty)
+            logits_output.next_token_logits.add_(
+                torch.repeat_interleave(linear_penalty, draft_token_num, dim=0)
+            )
+
+    if (
+        sampling_info is not None
+        and not sampling_info.is_all_greedy
+        and is_dflash_sampling_verify_available()
+    ):
+        return compute_dflash_sampling_accept_len_and_bonus(
+            candidates=candidates,
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=sampling_info,
+        )
+
+    target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+        bs, draft_token_num
+    )
+    return compute_dflash_accept_len_and_bonus(
+        candidates=candidates,
+        target_predict=target_predict,
+    )
+
+
+def apply_dflash_verify_proposed_tokens_to_request(
+    *,
+    req: Req,
+    proposed_tokens: Sequence[int],
+) -> DFlashReqVerifyCPUResult:
+    """Apply proposed verify tokens to a request using v1 DFLASH CPU semantics."""
+
+    output_len_before = len(req.output_ids)
+
+    if (
+        req.grammar is None
+        and not req.sampling_params.stop_strs
+        and not req.sampling_params.stop_regex_strs
+    ):
+        remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
+        if remaining > 0:
+            tokens = [int(tok) for tok in proposed_tokens[:remaining]]
+            if not req.sampling_params.ignore_eos:
+                stop_token_ids = req.sampling_params.stop_token_ids
+                eos_token_ids = req.eos_token_ids
+                tokenizer = req.tokenizer
+                tokenizer_eos = (
+                    tokenizer.eos_token_id if tokenizer is not None else None
+                )
+                additional_stop = (
+                    tokenizer.additional_stop_token_ids
+                    if tokenizer is not None
+                    else None
+                )
+                vocab_size = getattr(req, "vocab_size", None)
+
+                for j, token_id in enumerate(tokens):
+                    if vocab_size is not None and (
+                        int(token_id) >= int(vocab_size) or int(token_id) < 0
+                    ):
+                        tokens = tokens[: j + 1]
+                        break
+                    if stop_token_ids and token_id in stop_token_ids:
+                        tokens = tokens[: j + 1]
+                        break
+                    if eos_token_ids and token_id in eos_token_ids:
+                        tokens = tokens[: j + 1]
+                        break
+                    if tokenizer_eos is not None and int(token_id) == int(
+                        tokenizer_eos
+                    ):
+                        tokens = tokens[: j + 1]
+                        break
+                    if additional_stop and token_id in additional_stop:
+                        tokens = tokens[: j + 1]
+                        break
+
+            req.output_ids.extend(tokens)
+            if tokens:
+                req.check_finished(new_accepted_len=len(tokens))
+    else:
+        for tok in proposed_tokens:
+            token_id = int(tok)
+            req.output_ids.append(token_id)
+            req.check_finished()
+            if req.finished():
+                break
+            if req.grammar is not None:
+                req.grammar.accept_token(token_id)
+
+    committed_token_ids = [int(tok) for tok in req.output_ids[output_len_before:]]
+    commit_len = len(committed_token_ids)
+
+    if req.output_ids:
+        new_verified_token = int(req.output_ids[-1])
+    elif req.origin_input_ids:
+        # If no token was appended in this verify step, keep the current token unchanged.
+        new_verified_token = int(req.origin_input_ids[-1])
+    else:
+        raise RuntimeError(
+            "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
+        )
+
+    return DFlashReqVerifyCPUResult(
+        committed_token_ids=committed_token_ids,
+        commit_len=commit_len,
+        new_verified_token=new_verified_token,
+        accepted_draft_tokens=max(0, commit_len - 1),
+    )
+
+
+def apply_dflash_verify_batch_commit(
+    *,
+    batch: ScheduleBatch | ModelWorkerBatch,
+    commit_lens: torch.Tensor,
+    draft_token_num: int,
+    page_size: int,
+    commit_lens_cpu: List[int] | None = None,
+    req_to_token_pool: ReqToTokenPool | None = None,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
+    free_uncommitted: bool = True,
+    rewrite_req_to_token: bool = True,
+    update_req_kv_state: bool = True,
+    update_seq_lens_cpu: bool = True,
+) -> None:
+    """Commit accepted verify slots into batch/request KV state."""
+
+    bs = int(commit_lens.shape[0])
+    device = commit_lens.device
+    out_cache_loc = batch.out_cache_loc.view(bs, draft_token_num)
+    row_offsets = torch.arange(draft_token_num, device=device)[None, :]
+    if req_to_token_pool is None:
+        req_to_token_pool = getattr(batch, "req_to_token_pool", None)
+    if token_to_kv_pool_allocator is None:
+        token_to_kv_pool_allocator = getattr(batch, "token_to_kv_pool_allocator", None)
+    if req_to_token_pool is None or token_to_kv_pool_allocator is None:
+        raise RuntimeError(
+            "DFLASH verify batch commit requires req_to_token_pool and "
+            "token_to_kv_pool_allocator."
+        )
+
+    keep_mask = row_offsets < commit_lens[:, None]
+    if free_uncommitted:
+        if page_size == 1:
+            token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
+        else:
+            keep_slots = _compute_paged_keep_slots(
+                prefix_lens=batch.seq_lens,
+                commit_lens=commit_lens,
+                draft_token_num=draft_token_num,
+                page_size=page_size,
+            )
+            free_mask = row_offsets >= keep_slots[:, None]
+            token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
+    batch.out_cache_loc = out_cache_loc[keep_mask]
+
+    if update_req_kv_state and getattr(batch, "reqs", None):
+        if commit_lens_cpu is None:
+            commit_lens_cpu = commit_lens.to(device="cpu", dtype=torch.int32).tolist()
+        for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
+            req.kv_committed_len += commit_len
+            req.kv_allocated_len = req.kv_committed_len
+
+    if rewrite_req_to_token:
+        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
+
+    batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+    if update_seq_lens_cpu and batch.seq_lens_cpu is not None:
+        if commit_lens_cpu is None:
+            batch.seq_lens_cpu.add_(
+                commit_lens.to(device="cpu", dtype=batch.seq_lens_cpu.dtype)
+            )
+        else:
+            batch.seq_lens_cpu.add_(
+                torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+            )
+    batch.seq_lens_sum += int(batch.out_cache_loc.numel())
+
+
+def gather_dflash_committed_hidden_states(
+    *,
+    hidden_states: torch.Tensor,
+    commit_lens_cpu: List[int],
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Gather committed verify hidden states as a packed `[sum(commit_lens), hidden]` tensor."""
+
+    bs = len(commit_lens_cpu)
+    hidden = hidden_states.view(bs, draft_token_num, -1)
+    segments: List[torch.Tensor] = []
+    for i, ln in enumerate(commit_lens_cpu):
+        if ln > 0:
+            segments.append(hidden[i, :ln, :])
+    return torch.cat(segments, dim=0) if segments else hidden[:0]
+
+
+def build_dflash_verify_custom_mask(
+    *,
+    seq_lens_cpu: Sequence[int] | torch.Tensor,
+    draft_token_num: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the linear causal allow-mask for DFLASH TARGET_VERIFY."""
+
+    if draft_token_num <= 0:
+        raise ValueError(
+            f"DFLASH draft_token_num must be positive, got {draft_token_num}."
+        )
+
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        prefix_lens_cpu = seq_lens_cpu.tolist()
+    else:
+        prefix_lens_cpu = list(seq_lens_cpu)
+
+    mask_chunks: List[torch.Tensor] = []
+    q_idx = torch.arange(draft_token_num, device=device, dtype=torch.int32).unsqueeze(1)
+    for prefix_len in prefix_lens_cpu:
+        prefix_len_i = int(prefix_len)
+        kv_len = prefix_len_i + draft_token_num
+        k_idx = torch.arange(kv_len, device=device, dtype=torch.int32).unsqueeze(0)
+        allow = k_idx <= (prefix_len_i + q_idx)
+        mask_chunks.append(allow.flatten())
+    return (
+        torch.cat(mask_chunks, dim=0)
+        if mask_chunks
+        else torch.empty((0,), dtype=torch.bool, device=device)
+    )
 
 
 @dataclass
@@ -227,27 +514,10 @@ class DFlashVerifyInput(SpecInput):
             self.custom_mask = None
             return
 
-        if self.draft_token_num <= 0:
-            raise ValueError(
-                f"DFLASH draft_token_num must be positive, got {self.draft_token_num}."
-            )
-        mask_chunks: List[torch.Tensor] = []
-        q_len = int(self.draft_token_num)
-        q_idx = torch.arange(q_len, device=batch.device, dtype=torch.int32).unsqueeze(1)
-        for prefix_len in batch.seq_lens_cpu.tolist():
-            prefix_len_i = int(prefix_len)
-            kv_len = prefix_len_i + q_len
-            k_idx = torch.arange(
-                kv_len, device=batch.device, dtype=torch.int32
-            ).unsqueeze(0)
-            # Allow attending to the full prefix and to tokens up to (and including) the
-            # current query position within the verify block (standard causal masking).
-            allow = k_idx <= (prefix_len_i + q_idx)
-            mask_chunks.append(allow.flatten())
-        self.custom_mask = (
-            torch.cat(mask_chunks, dim=0)
-            if mask_chunks
-            else torch.empty((0,), dtype=torch.bool, device=batch.device)
+        self.custom_mask = build_dflash_verify_custom_mask(
+            seq_lens_cpu=batch.seq_lens_cpu,
+            draft_token_num=int(self.draft_token_num),
+            device=batch.device,
         )
 
     def generate_attn_arg_prefill(
@@ -330,56 +600,12 @@ class DFlashVerifyInput(SpecInput):
 
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
-
-        sampling_info = batch.sampling_info
-        if sampling_info is not None:
-            if len(sampling_info) != bs:
-                raise RuntimeError(
-                    "DFLASH verify sampling_info size mismatch: "
-                    f"len(sampling_info)={len(sampling_info)}, bs={bs}."
-                )
-
-            # Keep speculative verify semantics consistent with normal sampling path.
-            if sampling_info.has_custom_logit_processor:
-                apply_custom_logit_processor(
-                    logits_output.next_token_logits,
-                    sampling_info,
-                    num_tokens_in_batch=self.draft_token_num,
-                )
-
-            if (
-                sampling_info.penalizer_orchestrator.is_required
-                or sampling_info.logit_bias is not None
-            ):
-                linear_penalty = torch.zeros(
-                    (bs, logits_output.next_token_logits.shape[1]),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                sampling_info.apply_logits_bias(linear_penalty)
-                logits_output.next_token_logits.add_(
-                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-                )
-
         candidates = self.draft_token.view(bs, self.draft_token_num)
-        if (
-            sampling_info is not None
-            and not sampling_info.is_all_greedy
-            and is_dflash_sampling_verify_available()
-        ):
-            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-            )
-        else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, self.draft_token_num
-            )
-            accept_len, bonus = compute_dflash_accept_len_and_bonus(
-                candidates=candidates,
-                target_predict=target_predict,
-            )
+        accept_len, bonus = compute_dflash_verify_accept_len_and_bonus_from_logits(
+            candidates=candidates,
+            logits_output=logits_output,
+            sampling_info=batch.sampling_info,
+        )
 
         # Single D2H transfer: candidates[1:] + accept_len + bonus
         packed = torch.cat(
@@ -396,80 +622,13 @@ class DFlashVerifyInput(SpecInput):
             proposed = packed[i, :acc_len].tolist() + [
                 int(packed[i, max_acc + 1].item())
             ]
+            req_result = apply_dflash_verify_proposed_tokens_to_request(
+                req=req, proposed_tokens=proposed
+            )
 
-            appended = 0
-            if (
-                req.grammar is None
-                and not req.sampling_params.stop_strs
-                and not req.sampling_params.stop_regex_strs
-            ):
-                remaining = int(req.sampling_params.max_new_tokens) - len(
-                    req.output_ids
-                )
-                if remaining > 0:
-                    tokens = proposed[:remaining]
-                    if not req.sampling_params.ignore_eos:
-                        stop_token_ids = req.sampling_params.stop_token_ids
-                        eos_token_ids = req.eos_token_ids
-                        tokenizer = req.tokenizer
-                        tokenizer_eos = (
-                            tokenizer.eos_token_id if tokenizer is not None else None
-                        )
-                        additional_stop = (
-                            tokenizer.additional_stop_token_ids
-                            if tokenizer is not None
-                            else None
-                        )
-                        vocab_size = getattr(req, "vocab_size", None)
-
-                        for j, token_id in enumerate(tokens):
-                            if vocab_size is not None and (
-                                int(token_id) >= int(vocab_size) or int(token_id) < 0
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if stop_token_ids and token_id in stop_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if eos_token_ids and token_id in eos_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if tokenizer_eos is not None and int(token_id) == int(
-                                tokenizer_eos
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if additional_stop and token_id in additional_stop:
-                                tokens = tokens[: j + 1]
-                                break
-
-                    req.output_ids.extend(int(tok) for tok in tokens)
-                    appended = len(tokens)
-                    if appended > 0:
-                        req.check_finished(new_accepted_len=appended)
-            else:
-                for tok in proposed:
-                    req.output_ids.append(int(tok))
-                    appended += 1
-                    req.check_finished()
-                    if req.finished():
-                        break
-                    if req.grammar is not None:
-                        req.grammar.accept_token(int(tok))
-
-            if req.output_ids:
-                new_verified_token = int(req.output_ids[-1])
-            elif req.origin_input_ids:
-                # If no token was appended in this verify step, keep the current token unchanged.
-                new_verified_token = int(req.origin_input_ids[-1])
-            else:
-                raise RuntimeError(
-                    "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
-                )
-
-            commit_lens_cpu.append(appended)
-            new_verified_list.append(new_verified_token)
-            accept_length_per_req_cpu.append(max(0, appended - 1))
+            commit_lens_cpu.append(req_result.commit_len)
+            new_verified_list.append(req_result.new_verified_token)
+            accept_length_per_req_cpu.append(req_result.accepted_draft_tokens)
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
 
@@ -478,53 +637,13 @@ class DFlashVerifyInput(SpecInput):
             new_verified_list, dtype=torch.int64, device=device
         )
 
-        # Free uncommitted KV cache slots and compact out_cache_loc.
-        if page_size == 1:
-            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            keep_mask = (
-                torch.arange(self.draft_token_num, device=device)[None, :]
-                < commit_lens[:, None]
-            )
-            batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
-            batch.out_cache_loc = out_cache_loc[keep_mask]
-        else:
-            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
-            keep_slots = _compute_paged_keep_slots(
-                prefix_lens=batch.seq_lens,
-                commit_lens=commit_lens,
-                draft_token_num=self.draft_token_num,
-                page_size=page_size,
-            )
-            free_mask = row_offsets >= keep_slots[:, None]
-            batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
-
-            keep_mask = row_offsets < commit_lens[:, None]
-            batch.out_cache_loc = out_cache_loc[keep_mask]
-
-        # Update req-level KV cache accounting.
-        for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
-            req.kv_committed_len += commit_len
-            req.kv_allocated_len = req.kv_committed_len
-
-        # Update req_to_token pool mapping for newly committed tokens.
-        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            bs,
+        apply_dflash_verify_batch_commit(
+            batch=batch,
+            commit_lens=commit_lens,
+            draft_token_num=self.draft_token_num,
+            page_size=page_size,
+            commit_lens_cpu=commit_lens_cpu,
         )
-
-        # Update batch seq lens.
-        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
-        batch.seq_lens_cpu.add_(
-            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
-        )
-        # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
-        batch.seq_lens_sum += sum(commit_lens_cpu)
 
         # Build next-step context features from the committed verify-input tokens.
         hidden = logits_output.hidden_states
@@ -532,12 +651,11 @@ class DFlashVerifyInput(SpecInput):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, self.draft_token_num, -1)
-        segments: List[torch.Tensor] = []
-        for i, ln in enumerate(commit_lens_cpu):
-            if ln > 0:
-                segments.append(hidden[i, :ln, :])
-        next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
+        next_target_hidden = gather_dflash_committed_hidden_states(
+            hidden_states=hidden,
+            commit_lens_cpu=commit_lens_cpu,
+            draft_token_num=self.draft_token_num,
+        )
 
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
         logits_output.hidden_states = None
