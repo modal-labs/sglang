@@ -40,14 +40,17 @@ class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations.
 
     The overlap `FutureMap` currently expects the same field layout used by Eagle
-    v2 draft inputs, so DFLASH mirrors that envelope here even though only
-    `verified_id`, `new_seq_lens`, and `verify_done` are semantically required.
+    v2 draft inputs, so DFLASH mirrors that envelope here. `draft_seq_lens`
+    tracks the logical resident prefix lengths in the draft-local cache, with
+    `draft_seq_lens_cpu` as the CPU mirror used by attention backend planning.
     """
 
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     verified_id: torch.Tensor
     new_seq_lens: torch.Tensor
+    draft_seq_lens: torch.Tensor
+    draft_seq_lens_cpu: torch.Tensor
     hidden_states: torch.Tensor
     verify_done: Optional[torch.cuda.Event] = None
 
@@ -67,6 +70,8 @@ class DFlashDraftInputV2(SpecInput):
             topk_index=torch.empty((0, 1), device=device, dtype=torch.int64),
             verified_id=torch.empty((0,), device=device, dtype=torch.int32),
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            draft_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            draft_seq_lens_cpu=torch.empty((0,), device="cpu", dtype=torch.int32),
             hidden_states=torch.empty((0, 1), device=device, dtype=torch.float16),
             verify_done=None,
         )
@@ -167,6 +172,8 @@ class DFlashDraftInputV2(SpecInput):
         self.topk_index = self.topk_index[new_indices]
         self.verified_id = self.verified_id[new_indices]
         self.new_seq_lens = self.new_seq_lens[new_indices]
+        self.draft_seq_lens = self.draft_seq_lens[new_indices]
+        self.draft_seq_lens_cpu = self.draft_seq_lens_cpu[new_indices.cpu()]
         self.hidden_states = self.hidden_states[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
@@ -184,6 +191,12 @@ class DFlashDraftInputV2(SpecInput):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
         self.new_seq_lens = torch.cat(
             [self.new_seq_lens, spec_info.new_seq_lens], dim=0
+        )
+        self.draft_seq_lens = torch.cat(
+            [self.draft_seq_lens, spec_info.draft_seq_lens], dim=0
+        )
+        self.draft_seq_lens_cpu = torch.cat(
+            [self.draft_seq_lens_cpu, spec_info.draft_seq_lens_cpu], dim=0
         )
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0

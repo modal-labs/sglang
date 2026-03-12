@@ -60,6 +60,8 @@ class DFlashWorkerV2(DFlashWorker):
         *,
         verified_id: torch.Tensor,
         new_seq_lens: torch.Tensor,
+        draft_seq_lens: torch.Tensor,
+        draft_seq_lens_cpu: torch.Tensor,
         verify_done: Optional[torch.cuda.Event],
     ) -> DFlashDraftInputV2:
         bs = int(new_seq_lens.numel())
@@ -69,6 +71,8 @@ class DFlashWorkerV2(DFlashWorker):
             topk_index=torch.zeros((bs, 1), device=device, dtype=torch.int64),
             verified_id=verified_id.to(dtype=torch.int32),
             new_seq_lens=new_seq_lens.to(dtype=torch.int32),
+            draft_seq_lens=draft_seq_lens.to(dtype=torch.int32),
+            draft_seq_lens_cpu=draft_seq_lens_cpu.to(device="cpu", dtype=torch.int32),
             hidden_states=torch.empty((bs, 1), device=device, dtype=torch.float16),
             verify_done=verify_done,
         )
@@ -124,11 +128,25 @@ class DFlashWorkerV2(DFlashWorker):
             cache_loc=model_worker_batch.out_cache_loc,
             positions=positions,
         )
+        draft_seq_lens = model_worker_batch.seq_lens.to(dtype=torch.int32)
         if self.use_compact_draft_cache:
-            self._rebuild_compact_draft_cache_view(
+            draft_seq_lens = self._rebuild_compact_draft_cache_view(
                 batch=model_worker_batch,
                 target_seq_lens=model_worker_batch.seq_lens,
             )
+            if model_worker_batch.seq_lens_cpu is not None:
+                draft_seq_lens_cpu = self._compute_compact_draft_seq_lens_cpu(
+                    model_worker_batch.seq_lens_cpu
+                )
+            else:
+                draft_seq_lens_cpu = draft_seq_lens.to(device="cpu", dtype=torch.int32)
+        else:
+            if model_worker_batch.seq_lens_cpu is not None:
+                draft_seq_lens_cpu = model_worker_batch.seq_lens_cpu.to(
+                    dtype=torch.int32
+                )
+            else:
+                draft_seq_lens_cpu = draft_seq_lens.to(device="cpu", dtype=torch.int32)
 
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
@@ -139,6 +157,8 @@ class DFlashWorkerV2(DFlashWorker):
         batch_output.next_draft_input = self._make_next_draft_input(
             verified_id=next_token_ids,
             new_seq_lens=model_worker_batch.seq_lens,
+            draft_seq_lens=draft_seq_lens,
+            draft_seq_lens_cpu=draft_seq_lens_cpu,
             verify_done=verify_done,
         )
         return batch_output
@@ -172,6 +192,10 @@ class DFlashWorkerV2(DFlashWorker):
                 next_draft_input=self._make_next_draft_input(
                     verified_id=empty_ids,
                     new_seq_lens=empty_lens,
+                    draft_seq_lens=empty_lens,
+                    draft_seq_lens_cpu=torch.empty(
+                        (0,), dtype=torch.int32, device="cpu"
+                    ),
                     verify_done=verify_done,
                 ),
                 can_run_cuda_graph=False,
@@ -185,14 +209,39 @@ class DFlashWorkerV2(DFlashWorker):
         target_prefix_lens = model_worker_batch.seq_lens
 
         if self.use_compact_draft_cache:
-            block_cache_loc = self._gather_target_future_block_cache_locs(
-                req_to_token=self.req_to_token_pool.req_to_token,
+            if draft_input.draft_seq_lens.numel() != bs:
+                draft_prefix_lens = self._rebuild_compact_draft_cache_view(
+                    batch=model_worker_batch,
+                    target_seq_lens=target_prefix_lens,
+                )
+                draft_prefix_lens_cpu = draft_prefix_lens.to(
+                    device="cpu", dtype=torch.int32
+                )
+            else:
+                draft_prefix_lens = draft_input.draft_seq_lens
+                if draft_prefix_lens.dtype != torch.int32:
+                    draft_prefix_lens = draft_prefix_lens.to(dtype=torch.int32)
+                if draft_prefix_lens.device != self.device:
+                    draft_prefix_lens = draft_prefix_lens.to(
+                        self.device, non_blocking=True
+                    )
+                draft_prefix_lens_cpu = draft_input.draft_seq_lens_cpu
+                if (
+                    draft_prefix_lens_cpu.dtype != torch.int32
+                    or draft_prefix_lens_cpu.device.type != "cpu"
+                ):
+                    draft_prefix_lens_cpu = draft_prefix_lens_cpu.to(
+                        device="cpu", dtype=torch.int32
+                    )
+
+            block_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=model_worker_batch.req_pool_indices,
+                req_to_token=self.req_to_token_pool.req_to_token,
                 start_offset=target_prefix_lens,
-            )
-            draft_prefix_lens = self._rebuild_compact_draft_cache_view(
-                batch=model_worker_batch,
-                target_seq_lens=target_prefix_lens,
+                end_offset=target_prefix_lens + int(self.block_size),
+                batch_size=bs,
+                draft_token_num=int(self.block_size),
+                device=self.device,
             )
             block_end = draft_prefix_lens + int(self.block_size)
             assign_req_to_token_pool_func(
@@ -203,7 +252,7 @@ class DFlashWorkerV2(DFlashWorker):
                 block_cache_loc,
                 bs,
             )
-            draft_seq_lens_sum = int(draft_prefix_lens.sum().item())
+            draft_seq_lens_sum = int(draft_prefix_lens_cpu.sum().item())
         else:
             draft_prefix_lens = target_prefix_lens.to(dtype=torch.int32)
             block_cache_loc = assign_extend_cache_locs_func(
@@ -251,11 +300,10 @@ class DFlashWorkerV2(DFlashWorker):
         )
         positions = positions_2d.reshape(-1)
 
-        draft_seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        if (
-            not self.use_compact_draft_cache
-            and model_worker_batch.seq_lens_cpu is not None
-        ):
+        if self.use_compact_draft_cache:
+            draft_seq_lens_cpu = draft_prefix_lens_cpu
+        elif model_worker_batch.seq_lens_cpu is not None:
+            draft_seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
             if model_worker_batch.seq_lens_cpu.dtype == torch.int32:
                 draft_seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu)
             else:
@@ -263,6 +311,7 @@ class DFlashWorkerV2(DFlashWorker):
                     model_worker_batch.seq_lens_cpu.to(dtype=torch.int32)
                 )
         else:
+            draft_seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
             draft_seq_lens_cpu.copy_(
                 draft_prefix_lens.to(device="cpu", dtype=torch.int32)
             )
@@ -383,10 +432,32 @@ class DFlashWorkerV2(DFlashWorker):
             )
 
         if self.use_compact_draft_cache:
-            self._rebuild_compact_draft_cache_view(
+            new_draft_seq_lens = self._slide_compact_draft_cache_view_after_commit(
                 batch=model_worker_batch,
-                target_seq_lens=new_seq_lens,
+                old_draft_seq_lens=draft_prefix_lens,
+                commit_lens=commit_lens,
+                new_target_seq_lens=new_seq_lens,
             )
+            commit_lens_cpu = commit_lens.to(device="cpu", dtype=torch.int32)
+            if self.page_size <= 1:
+                new_draft_seq_lens_cpu = torch.clamp(
+                    draft_prefix_lens_cpu + commit_lens_cpu,
+                    max=int(self.draft_window_size),
+                )
+            else:
+                new_draft_seq_lens_cpu = new_draft_seq_lens.to(
+                    device="cpu", dtype=torch.int32
+                )
+        else:
+            new_draft_seq_lens = new_seq_lens.to(dtype=torch.int32)
+            if draft_input.draft_seq_lens_cpu.numel() == bs:
+                new_draft_seq_lens_cpu = draft_input.draft_seq_lens_cpu.to(
+                    device="cpu", dtype=torch.int32
+                ) + commit_lens.to(device="cpu", dtype=torch.int32)
+            else:
+                new_draft_seq_lens_cpu = new_draft_seq_lens.to(
+                    device="cpu", dtype=torch.int32
+                )
 
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
@@ -398,6 +469,8 @@ class DFlashWorkerV2(DFlashWorker):
         next_draft_input = self._make_next_draft_input(
             verified_id=bonus,
             new_seq_lens=new_seq_lens,
+            draft_seq_lens=new_draft_seq_lens,
+            draft_seq_lens_cpu=new_draft_seq_lens_cpu,
             verify_done=verify_done,
         )
         return GenerationBatchResult(

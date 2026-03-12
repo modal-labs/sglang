@@ -29,7 +29,14 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+
+if _is_cuda or _is_hip:
+    import triton
+    import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +52,65 @@ def _get_fused_kv_materialize_helper():
 
         _FusedKVMaterializeHelper = FusedKVMaterializeHelper
     return _FusedKVMaterializeHelper
+
+
+if _is_cuda or _is_hip:
+
+    @triton.jit
+    def _slide_req_to_token_pool(
+        req_pool_indices,
+        req_to_token,
+        source_start_offset,
+        lengths,
+        pool_len: tl.constexpr,
+        bs_upper: tl.constexpr,
+    ):
+        BLOCK_SIZE: tl.constexpr = 32
+        pid = tl.program_id(axis=0)
+        token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+        src_start = tl.load(source_start_offset + pid)
+        length = tl.load(lengths + pid)
+
+        src_offset = tl.arange(0, BLOCK_SIZE) + src_start
+        dst_offset = tl.arange(0, BLOCK_SIZE)
+
+        num_loop = tl.cdiv(length, BLOCK_SIZE)
+        for _ in range(num_loop):
+            mask = dst_offset < length
+            data = tl.load(token_pool + src_offset, mask=mask)
+            tl.store(token_pool + dst_offset, data, mask=mask)
+            src_offset += BLOCK_SIZE
+            dst_offset += BLOCK_SIZE
+
+
+def _slide_req_to_token_pool_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    source_start_offset: torch.Tensor,
+    lengths: torch.Tensor,
+    batch_size: int,
+):
+    if (_is_cuda or _is_hip) and req_to_token.is_cuda:
+        _slide_req_to_token_pool[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            source_start_offset,
+            lengths,
+            req_to_token.shape[1],
+            next_power_of_2(batch_size),
+        )
+        return
+
+    req_pool_indices_cpu = req_pool_indices.to(device="cpu")
+    source_start_cpu = source_start_offset.to(device="cpu")
+    lengths_cpu = lengths.to(device="cpu")
+    for i in range(batch_size):
+        length = int(lengths_cpu[i].item())
+        if length <= 0:
+            continue
+        row = req_to_token[req_pool_indices_cpu[i]]
+        start = int(source_start_cpu[i].item())
+        row[:length].copy_(row[start : start + length].clone())
 
 
 class DFlashWorker:
@@ -339,8 +405,8 @@ class DFlashWorker:
 
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
-        # sliding-window path, the draft req->token view is rebuilt from committed
-        # target state before each draft forward, so there is nothing persistent
+        # sliding-window path, the draft req->token view is a derived local mapping
+        # that is refreshed after prefill/verify. There is nothing allocator-owned
         # to flush here.
         pass
 
@@ -371,36 +437,6 @@ class DFlashWorker:
         mask = offsets < lengths.unsqueeze(1)
         return req_to_token[req_pool_indices[:, None], pos2d][mask].to(torch.int64)
 
-    def _gather_target_future_block_cache_locs(
-        self,
-        *,
-        req_to_token: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        start_offset: torch.Tensor,
-        block_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Gather a fixed-size reserved block from req_to_token for each request.
-
-        Overlap scheduling pre-allocates future target slots directly in `req_to_token`.
-        The v2 worker will consume those slots as `out_cache_loc` instead of calling
-        into the allocator backup/restore path used by spec-v1.
-        """
-
-        if block_size is None:
-            block_size = int(self.block_size)
-        lengths = torch.full(
-            (req_pool_indices.shape[0],),
-            int(block_size),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        return self._gather_req_to_token_segments(
-            req_to_token=req_to_token,
-            req_pool_indices=req_pool_indices,
-            start=start_offset,
-            lengths=lengths,
-        )
-
     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         assert self.draft_window_size is not None
         visible_lens = torch.clamp(
@@ -415,6 +451,23 @@ class DFlashWorker:
         # tokens on the left to preserve valid local page structure.
         seq_lens_i64 = seq_lens.to(torch.int64)
         visible_lens_i64 = visible_lens.to(torch.int64)
+        visible_start = seq_lens_i64 - visible_lens_i64
+        aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
+        return (seq_lens_i64 - aligned_start).to(torch.int32)
+
+    def _compute_compact_draft_seq_lens_cpu(
+        self, seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.draft_window_size is not None
+        visible_lens = torch.clamp(
+            seq_lens.to(dtype=torch.int32, device="cpu"),
+            max=int(self.draft_window_size),
+        )
+        if self.page_size <= 1:
+            return visible_lens
+
+        seq_lens_i64 = seq_lens.to(dtype=torch.int64, device="cpu")
+        visible_lens_i64 = visible_lens.to(dtype=torch.int64)
         visible_start = seq_lens_i64 - visible_lens_i64
         aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
         return (seq_lens_i64 - aligned_start).to(torch.int32)
@@ -453,6 +506,39 @@ class DFlashWorker:
             new_draft_seq_lens,
             suffix_cache_loc,
             bs,
+        )
+        return new_draft_seq_lens
+
+    def _slide_compact_draft_cache_view_after_commit(
+        self,
+        *,
+        batch: ScheduleBatch | ModelWorkerBatch,
+        old_draft_seq_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+        new_target_seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.use_compact_draft_cache:
+            raise RuntimeError(
+                "Compact draft-cache slide requested, but draft windowing is disabled."
+            )
+
+        new_draft_seq_lens = self._compute_compact_draft_seq_lens(new_target_seq_lens)
+        source_start = (
+            old_draft_seq_lens.to(torch.int64)
+            + commit_lens.to(torch.int64)
+            - new_draft_seq_lens.to(torch.int64)
+        ).to(torch.int32)
+        if torch.any(source_start < 0):
+            raise RuntimeError(
+                "Computed a negative compact draft-cache source offset after verify."
+            )
+
+        _slide_req_to_token_pool_func(
+            batch.req_pool_indices,
+            self.draft_model_runner.req_to_token_pool.req_to_token,
+            source_start,
+            new_draft_seq_lens,
+            int(batch.req_pool_indices.shape[0]),
         )
         return new_draft_seq_lens
 

@@ -339,6 +339,10 @@ def _build_common_server_args(
         common_server_args.append("--disable-radix-cache")
     if args.page_size is not None:
         common_server_args.extend(["--page-size", str(int(args.page_size))])
+    if args.mamba_scheduler_strategy is not None:
+        common_server_args.extend(
+            ["--mamba-scheduler-strategy", args.mamba_scheduler_strategy]
+        )
     return common_server_args
 
 
@@ -518,6 +522,7 @@ def _print_summary(
                 "speculative_dflash_draft_window_size",
                 args.speculative_dflash_draft_window_size,
             ),
+            ("mamba_scheduler_strategy", args.mamba_scheduler_strategy),
             ("tp_sizes", ",".join(str(x) for x in tp_sizes)),
             ("concurrencies", ",".join(str(x) for x in concurrencies)),
             (
@@ -624,6 +629,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional server --page-size override for both baseline and DFLASH runs.",
+    )
+    parser.add_argument(
+        "--mamba-scheduler-strategy",
+        default=None,
+        choices=["auto", "no_buffer", "extra_buffer"],
+        help="Optional server --mamba-scheduler-strategy override for both baseline and DFLASH runs.",
     )
     parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument("--tp-sizes", default="1,2,4,8")
