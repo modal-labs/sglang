@@ -18,6 +18,7 @@ from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bo
 from sglang.srt.speculative.dflash_worker import DFlashWorker
 from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
 
 class DFlashWorkerV2(DFlashWorker):
@@ -51,11 +52,6 @@ class DFlashWorkerV2(DFlashWorker):
             nccl_port=nccl_port,
             target_worker=target_worker,
         )
-        if self.use_compact_draft_cache:
-            raise ValueError(
-                "DFLASH spec-v2 phase 1 does not support "
-                "speculative_dflash_draft_window_size yet."
-            )
 
     def _validate_phase1_sampling_support(
         self, model_worker_batch: ModelWorkerBatch
@@ -250,6 +246,7 @@ class DFlashWorkerV2(DFlashWorker):
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
         assert self._draft_block_tokens_buf is not None
+        assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
         block_ids = self._draft_block_ids_buf[:bs]
@@ -269,9 +266,9 @@ class DFlashWorkerV2(DFlashWorker):
         positions = positions_2d.reshape(-1)
 
         end_offset = prefix_lens + int(self.block_size)
-        out_cache_loc = assign_extend_cache_locs_func(
+        verify_out_cache_loc = assign_extend_cache_locs_func(
             req_pool_indices=model_worker_batch.req_pool_indices,
-            req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
             start_offset=prefix_lens,
             end_offset=end_offset,
             batch_size=bs,
@@ -279,24 +276,60 @@ class DFlashWorkerV2(DFlashWorker):
             device=device,
         )
 
-        # Use the CPU copy for backend planning (avoid GPU sync in steady-state).
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        if model_worker_batch.seq_lens_cpu is not None:
-            if model_worker_batch.seq_lens_cpu.dtype == torch.int32:
-                seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu)
-            else:
-                seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu.to(torch.int32))
+        if self.use_compact_draft_cache:
+            # Rebuild the draft-local sliding-window view from committed target state.
+            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+
+            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                torch.int64
+            )
+            suffix_cache_loc = self._gather_req_to_token_segments(
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                req_pool_indices=model_worker_batch.req_pool_indices,
+                start=suffix_start,
+                lengths=draft_prefix_lens,
+            )
+            assign_req_to_token_pool_func(
+                model_worker_batch.req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                torch.zeros_like(draft_prefix_lens),
+                draft_prefix_lens,
+                suffix_cache_loc,
+                bs,
+            )
+
+            block_end = self._draft_block_end_buf[:bs]
+            torch.add(draft_prefix_lens, int(self.block_size), out=block_end)
+            assign_req_to_token_pool_func(
+                model_worker_batch.req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                draft_prefix_lens,
+                block_end,
+                verify_out_cache_loc,
+                bs,
+            )
+            draft_seq_lens = draft_prefix_lens
         else:
-            seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
+            # Non-windowed path uses the shared overallocated mapping directly.
+            draft_seq_lens = prefix_lens
+            if model_worker_batch.seq_lens_cpu is not None:
+                if model_worker_batch.seq_lens_cpu.dtype == torch.int32:
+                    seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu)
+                else:
+                    seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu.to(torch.int32))
+            else:
+                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
             input_ids=block_ids.flatten(),
             req_pool_indices=model_worker_batch.req_pool_indices,
-            seq_lens=prefix_lens,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=int(model_worker_batch.seq_lens_sum),
+            seq_lens=draft_seq_lens,
+            out_cache_loc=verify_out_cache_loc,
+            seq_lens_sum=int(draft_seq_lens.sum().item()),
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
             req_to_token_pool=self.draft_model_runner.req_to_token_pool,
@@ -340,7 +373,7 @@ class DFlashWorkerV2(DFlashWorker):
             else ForwardMode.IDLE
         )
         model_worker_batch.input_ids = verify_input_ids
-        model_worker_batch.out_cache_loc = out_cache_loc
+        model_worker_batch.out_cache_loc = verify_out_cache_loc
         model_worker_batch.spec_info = verify_input
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
@@ -397,7 +430,7 @@ class DFlashWorkerV2(DFlashWorker):
         mask2d = offsets[None, :] < commit_lens.to(torch.int64)[:, None]  # [bs, block]
         mask_flat = mask2d.reshape(-1)
 
-        loc2d = out_cache_loc.view(bs, int(self.block_size))
+        loc2d = verify_out_cache_loc.view(bs, int(self.block_size))
         loc2d = torch.where(mask2d, loc2d, loc2d.new_zeros(()))
         loc_flat = loc2d.reshape(-1)
 
