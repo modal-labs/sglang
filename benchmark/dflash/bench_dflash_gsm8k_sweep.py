@@ -324,6 +324,14 @@ def _build_mode_runs(
                 args.draft_model,
                 *(
                     [
+                        "--speculative-dflash-draft-window-size",
+                        str(int(args.speculative_dflash_draft_window_size)),
+                    ]
+                    if args.speculative_dflash_draft_window_size is not None
+                    else []
+                ),
+                *(
+                    [
                         "--speculative-draft-attention-backend",
                         args.speculative_draft_attention_backend,
                     ]
@@ -470,6 +478,10 @@ def _print_summary(
                 "speculative_draft_attention_backend",
                 args.speculative_draft_attention_backend,
             ),
+            (
+                "speculative_dflash_draft_window_size",
+                args.speculative_dflash_draft_window_size,
+            ),
             ("tp_sizes", ",".join(str(x) for x in tp_sizes)),
             ("concurrencies", ",".join(str(x) for x in concurrencies)),
             (
@@ -597,6 +609,12 @@ def parse_args() -> argparse.Namespace:
         "--speculative-draft-attention-backend",
         default=None,
         help="Optional server --speculative-draft-attention-backend override for DFLASH runs.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-draft-window-size",
+        type=int,
+        default=None,
+        help="Optional server --speculative-dflash-draft-window-size override for DFLASH runs.",
     )
     return parser.parse_args()
 

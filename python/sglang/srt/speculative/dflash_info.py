@@ -58,10 +58,12 @@ class DFlashDraftInput(SpecInput):
     It is NOT sent to model attention backends; the DFlash worker uses it to run
     the draft model and to track draft-side cache progress.
 
-    Invariant (per request):
-      - `draft_seq_len + ctx_len == batch.seq_lens[i]`
-        where `ctx_len` is the number of target context-feature tokens carried in
-        `target_hidden` for that request.
+    When draft windowing is disabled, `draft_seq_lens` matches the committed target
+    prefix length already materialized in the draft KV cache. When windowing is
+    enabled, `draft_seq_lens` is the logical resident length in the draft worker's
+    compact req-to-token mapping. In paged mode this may exceed the requested
+    window by up to `page_size - 1` so the local page table remains valid. `ctx_lens`
+    tracks newly committed target tokens that still need draft KV materialization.
     """
 
     # Current token to start the next DFlash block (one per request).
@@ -76,8 +78,7 @@ class DFlashDraftInput(SpecInput):
     # Context lengths per request, used to slice `target_hidden`. Device tensor (int32).
     ctx_lens: torch.Tensor
 
-    # How many tokens are already in the draft KV cache per request.
-    # The next draft step appends ctx_lens[i] tokens starting at draft_seq_lens[i].
+    # How many committed tokens are visible to the draft worker per request.
     draft_seq_lens: torch.Tensor
 
     def __post_init__(self):

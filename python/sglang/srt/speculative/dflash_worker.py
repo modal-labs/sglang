@@ -73,16 +73,28 @@ class DFlashWorker:
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
+        self.draft_window_size: Optional[int] = (
+            int(server_args.speculative_dflash_draft_window_size)
+            if server_args.speculative_dflash_draft_window_size is not None
+            else None
+        )
+        self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
-        # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
-        # while keeping a separate draft KV cache pool (the draft model has different KV values).
-        shared_req_to_token_pool, shared_token_to_kv_pool_allocator = (
+        # Without draft windowing, the draft worker aliases the target request->token
+        # mapping and allocation state. With draft windowing enabled, the draft worker
+        # keeps a private compact req->token table over the same global KV index space,
+        # so radix-cache/prefix-hit KV remains reusable while draft attention sees only
+        # the recent window.
+        target_req_to_token_pool, target_token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
+        )
+        shared_req_to_token_pool = (
+            None if self.use_compact_draft_cache else target_req_to_token_pool
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
@@ -94,8 +106,9 @@ class DFlashWorker:
             draft_backend = "flashinfer"
         elif draft_backend == "trtllm_mha":
             logger.warning(
-                "DFLASH draft worker does not support 'trtllm_mha' yet; "
-                "falling back to 'flashinfer'."
+                "DFLASH draft worker does not support 'trtllm_mha' because the "
+                "draft path requires non-causal attention. Falling back to "
+                "'flashinfer'."
             )
             draft_backend = "flashinfer"
         elif draft_backend not in supported_draft_backends:
@@ -106,7 +119,6 @@ class DFlashWorker:
                 draft_backend,
             )
             draft_backend = "flashinfer"
-
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None
@@ -129,7 +141,7 @@ class DFlashWorker:
             nccl_port=nccl_port,
             is_draft_worker=True,
             req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
+            token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
@@ -162,10 +174,12 @@ class DFlashWorker:
         )
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
                 getattr(draft_server_args, "attention_backend", None),
                 self.draft_model.__class__.__name__,
                 self.block_size,
+                self.draft_window_size,
+                self.use_compact_draft_cache,
             )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
@@ -318,8 +332,56 @@ class DFlashWorker:
         return getattr(self.target_worker, name)
 
     def clear_cache_pool(self):
-        # allocator and req_to_token_pool are shared with target worker
+        # The target worker owns the shared KV allocator/cache. For the compact
+        # sliding-window path, the draft req->token view is rebuilt from committed
+        # target state before each draft forward, so there is nothing persistent
+        # to flush here.
         pass
+
+    def _gather_req_to_token_segments(
+        self,
+        *,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        start: torch.Tensor | None,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        lengths = lengths.to(torch.int64)
+        if lengths.numel() == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        max_len = int(lengths.max().item())
+        if max_len <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        if req_pool_indices.dtype != torch.int64:
+            req_pool_indices = req_pool_indices.to(torch.int64)
+        offsets = torch.arange(
+            max_len, device=self.device, dtype=torch.int64
+        ).unsqueeze(0)
+        if start is None:
+            pos2d = offsets.expand(req_pool_indices.shape[0], -1)
+        else:
+            pos2d = start.to(torch.int64).unsqueeze(1) + offsets
+        mask = offsets < lengths.unsqueeze(1)
+        return req_to_token[req_pool_indices[:, None], pos2d][mask].to(torch.int64)
+
+    def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        assert self.draft_window_size is not None
+        visible_lens = torch.clamp(
+            seq_lens.to(dtype=torch.int32, device=self.device),
+            max=int(self.draft_window_size),
+        )
+        if self.page_size <= 1:
+            return visible_lens
+
+        # Paged FA backends derive the page table from local token positions, so the
+        # compact suffix must start on a page boundary. Keep up to page_size - 1 extra
+        # tokens on the left to preserve valid local page structure.
+        seq_lens_i64 = seq_lens.to(torch.int64)
+        visible_lens_i64 = visible_lens.to(torch.int64)
+        visible_start = seq_lens_i64 - visible_lens_i64
+        aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
+        return (seq_lens_i64 - aligned_start).to(torch.int32)
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -458,23 +520,28 @@ class DFlashWorker:
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        # For spec-v1, the draft KV cache is always materialized to the current target
-        # prefix before drafting the next block.
-        prefix_lens = batch.seq_lens  # int32, device
+        # For spec-v1, the draft KV cache is always materialized before drafting the
+        # next block. `target_prefix_lens` stay absolute for RoPE; `draft_prefix_lens`
+        # are the logical resident lengths in the draft-local cache.
+        target_prefix_lens = batch.seq_lens  # int32, device
+        draft_prefix_lens = draft_input.draft_seq_lens
+        if draft_prefix_lens.dtype != torch.int32:
+            draft_prefix_lens = draft_prefix_lens.to(torch.int32)
+        if draft_prefix_lens.device != self.device:
+            draft_prefix_lens = draft_prefix_lens.to(self.device, non_blocking=True)
 
         positions_2d = self._draft_block_positions_buf[:bs]
-        torch.add(prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d)
+        torch.add(
+            target_prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d
+        )
         positions = positions_2d.reshape(-1)
 
-        block_start = prefix_lens
+        block_start = draft_prefix_lens
         block_end = self._draft_block_end_buf[:bs]
         torch.add(block_start, int(self.block_size), out=block_end)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        if batch.seq_lens_cpu.dtype == torch.int32:
-            seq_lens_cpu.copy_(batch.seq_lens_cpu)
-        else:
-            seq_lens_cpu.copy_(batch.seq_lens_cpu.to(torch.int32))
+        seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
@@ -513,8 +580,8 @@ class DFlashWorker:
             # In this mode, `seq_lens` stores the prefix lengths; attention backends
             # derive kv_len by adding `draft_token_num`.
             draft_spec_info = self._draft_block_spec_info
-            seq_lens = prefix_lens
-            seq_lens_sum = int(batch.seq_lens_sum)
+            seq_lens = draft_prefix_lens
+            seq_lens_sum = int(draft_prefix_lens.sum().item())
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
@@ -777,24 +844,23 @@ class DFlashWorker:
 
         total_ctx = int(draft_input.target_hidden.shape[0])
         if total_ctx <= 0:
+            draft_input.ctx_lens = torch.zeros_like(draft_input.ctx_lens)
+            draft_input.target_hidden = draft_input.target_hidden[:0]
             return
 
-        req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+        target_req_to_token = batch.req_to_token_pool.req_to_token
+        draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
 
         req_pool_indices = batch.req_pool_indices
         if req_pool_indices.dtype != torch.int64:
             req_pool_indices = req_pool_indices.to(torch.int64)
 
         ctx_lens = draft_input.ctx_lens
-        draft_seq_lens = draft_input.draft_seq_lens
         if ctx_lens.dtype != torch.int32:
             ctx_lens = ctx_lens.to(torch.int32)
-        if draft_seq_lens.dtype != torch.int32:
-            draft_seq_lens = draft_seq_lens.to(torch.int32)
         if ctx_lens.device != device:
             ctx_lens = ctx_lens.to(device, non_blocking=True)
-        if draft_seq_lens.device != device:
-            draft_seq_lens = draft_seq_lens.to(device, non_blocking=True)
+        ctx_start = batch.seq_lens.to(torch.int64) - ctx_lens.to(torch.int64)
 
         if bs == 1:
             # Fast path for single request.
@@ -803,8 +869,8 @@ class DFlashWorker:
                 r = self._block_pos_offsets[:max_ctx]
             else:
                 r = torch.arange(max_ctx, device=device, dtype=torch.int64)
-            pos2d = draft_seq_lens.to(torch.int64)[:, None] + r[None, :]  # [1, ctx]
-            cache2d = req_to_token[req_pool_indices[:, None], pos2d]  # [1, ctx]
+            pos2d = ctx_start[:, None] + r[None, :]  # [1, ctx]
+            cache2d = target_req_to_token[req_pool_indices[:, None], pos2d]  # [1, ctx]
             ctx_cache_loc = cache2d.reshape(-1).to(torch.int64)  # [ctx]
             ctx_positions = pos2d.reshape(-1)  # [ctx]
         else:
@@ -821,11 +887,13 @@ class DFlashWorker:
             else:
                 r = torch.arange(max_ctx, device=device, dtype=torch.int64)
             r = r[None, :]  # [1, max_ctx]
-            pos2d = draft_seq_lens.to(torch.int64)[:, None] + r  # [bs, max_ctx]
+            pos2d = ctx_start[:, None] + r  # [bs, max_ctx]
             mask = r < ctx_lens[:, None]
 
             # Batched gather of cache locations and positions.
-            cache2d = req_to_token[req_pool_indices[:, None], pos2d]  # [bs, max_ctx]
+            cache2d = target_req_to_token[
+                req_pool_indices[:, None], pos2d
+            ]  # [bs, max_ctx]
             ctx_cache_loc = cache2d[mask].to(torch.int64)  # [sum(ctx_lens)]
             ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
 
@@ -858,7 +926,28 @@ class DFlashWorker:
                     ctx_hidden, ctx_positions, ctx_cache_loc
                 )
 
-        draft_input.draft_seq_lens = draft_seq_lens + ctx_lens
+        if self.use_compact_draft_cache:
+            new_draft_seq_lens = self._compute_compact_draft_seq_lens(batch.seq_lens)
+            suffix_start = batch.seq_lens.to(torch.int64) - new_draft_seq_lens.to(
+                torch.int64
+            )
+            suffix_cache_loc = self._gather_req_to_token_segments(
+                req_to_token=target_req_to_token,
+                req_pool_indices=req_pool_indices,
+                start=suffix_start,
+                lengths=new_draft_seq_lens,
+            )
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                draft_req_to_token,
+                torch.zeros_like(new_draft_seq_lens),
+                new_draft_seq_lens,
+                suffix_cache_loc,
+                bs,
+            )
+            draft_input.draft_seq_lens = new_draft_seq_lens
+        else:
+            draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
 
@@ -1009,12 +1098,17 @@ class DFlashWorker:
                     return x if x.dtype == torch.int32 else x.to(torch.int32)
                 return torch.tensor(x, dtype=torch.int32, device=device)
 
+            extend_seq_lens = _to_int32_device_tensor(
+                model_worker_batch.extend_seq_lens
+            )
             draft_input = DFlashDraftInput(
                 verified_id=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
-                ctx_lens=_to_int32_device_tensor(model_worker_batch.extend_seq_lens),
-                draft_seq_lens=_to_int32_device_tensor(
-                    model_worker_batch.extend_prefix_lens
+                ctx_lens=extend_seq_lens,
+                draft_seq_lens=(
+                    torch.zeros_like(extend_seq_lens)
+                    if self.use_compact_draft_cache
+                    else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
                 ),
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
