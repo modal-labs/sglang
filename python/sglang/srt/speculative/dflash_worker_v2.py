@@ -56,8 +56,6 @@ class DFlashWorkerV2(DFlashWorker):
                 "DFLASH spec-v2 phase 1 does not support "
                 "speculative_dflash_draft_window_size yet."
             )
-        self._use_fused_kv_materialize = False
-        self._fused_kv_helper = None
 
     def _validate_phase1_sampling_support(
         self, model_worker_batch: ModelWorkerBatch

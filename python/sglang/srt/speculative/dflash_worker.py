@@ -1031,6 +1031,30 @@ class DFlashWorker:
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
+            if mask_3d is None:
+                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                    try:
+                        self._append_target_hidden_fused(
+                            ctx_hidden=ctx_hidden,
+                            ctx_positions=positions,
+                            ctx_cache_loc=cache_loc,
+                        )
+                        return
+                    except Exception as e:
+                        logger.warning(
+                            "DFLASH fused KV append-by-loc failed; falling back to sequential path: %s",
+                            e,
+                        )
+                        self._use_fused_kv_materialize = False
+                        self._fused_kv_helper = None
+
+                self._append_target_hidden_sequential(
+                    ctx_hidden=ctx_hidden,
+                    ctx_positions=positions,
+                    ctx_cache_loc=cache_loc,
+                )
+                return
+
             for layer in self.draft_model.layers:
                 attn = layer.self_attn
                 k, v = attn.kv_proj_only(ctx_hidden)
