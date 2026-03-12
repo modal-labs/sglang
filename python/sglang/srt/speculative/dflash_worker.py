@@ -145,6 +145,8 @@ class DFlashWorker:
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
+        # Keep the same alias that other spec-v2 workers expose.
+        self.draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -165,6 +167,7 @@ class DFlashWorker:
                     self.block_size,
                     model_block_size,
                 )
+        self.speculative_num_draft_tokens = int(self.block_size)
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -950,6 +953,104 @@ class DFlashWorker:
             draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
+
+    def _append_target_hidden_to_draft_kv_by_loc(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        mask_valid: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Materialize target context features into the draft KV cache at explicit slots.
+
+        This helper avoids boolean-index packing for the spec-v2 overlap path, which
+        already computes explicit cache locations from over-allocated req_to_token state.
+        """
+        if target_hidden is None:
+            raise RuntimeError("DFLASH missing target hidden context features.")
+        if target_hidden.numel() == 0:
+            return
+        if target_hidden.ndim != 2:
+            raise ValueError(
+                "DFLASH target_hidden must be 2D, "
+                f"got shape={tuple(target_hidden.shape)}."
+            )
+
+        if cache_loc.ndim != 1:
+            raise ValueError(
+                f"DFLASH cache_loc must be 1D, got shape={tuple(cache_loc.shape)}."
+            )
+        if positions.ndim != 1:
+            raise ValueError(
+                f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
+            )
+        num_tokens = int(target_hidden.shape[0])
+        if int(cache_loc.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH cache_loc length mismatch: "
+                f"cache_loc={int(cache_loc.numel())}, target_hidden={num_tokens}."
+            )
+        if int(positions.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH positions length mismatch: "
+                f"positions={int(positions.numel())}, target_hidden={num_tokens}."
+            )
+
+        device = self.model_runner.device
+        if cache_loc.device != device:
+            cache_loc = cache_loc.to(device, non_blocking=True)
+        if positions.device != device:
+            positions = positions.to(device, non_blocking=True)
+        if target_hidden.device != device:
+            target_hidden = target_hidden.to(device, non_blocking=True)
+
+        if cache_loc.dtype != torch.int64:
+            cache_loc = cache_loc.to(torch.int64)
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+
+        mask_3d: Optional[torch.Tensor] = None
+        if mask_valid is not None:
+            if mask_valid.ndim != 1:
+                raise ValueError(
+                    "DFLASH mask_valid must be 1D, "
+                    f"got shape={tuple(mask_valid.shape)}."
+                )
+            if int(mask_valid.numel()) != num_tokens:
+                raise ValueError(
+                    "DFLASH mask_valid length mismatch: "
+                    f"mask_valid={int(mask_valid.numel())}, target_hidden={num_tokens}."
+                )
+            if mask_valid.device != device:
+                mask_valid = mask_valid.to(device, non_blocking=True)
+            if mask_valid.dtype != torch.bool:
+                mask_valid = mask_valid.to(torch.bool)
+            mask_3d = mask_valid.view(-1, 1, 1)
+
+        with torch.inference_mode():
+            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+
+            for layer in self.draft_model.layers:
+                attn = layer.self_attn
+                k, v = attn.kv_proj_only(ctx_hidden)
+                k = attn.apply_k_norm(k)
+                k = attn.apply_k_rope(positions, k)
+                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+
+                if mask_3d is not None:
+                    k = k.masked_fill(~mask_3d, 0)
+                    v = v.masked_fill(~mask_3d, 0)
+
+                self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+                    attn.attn,
+                    cache_loc,
+                    k,
+                    v,
+                    attn.attn.k_scale,
+                    attn.attn.v_scale,
+                )
 
     def _append_target_hidden_sequential(
         self,
