@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 import torch
@@ -14,11 +15,18 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
+from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_verify_logits_adjustments,
+    compute_dflash_accept_len_and_bonus,
+    compute_dflash_sampling_accept_len_and_bonus,
+    is_dflash_sampling_verify_available,
+)
 from sglang.srt.speculative.dflash_worker import DFlashWorker
 from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+logger = logging.getLogger(__name__)
 
 
 class DFlashWorkerV2(DFlashWorker):
@@ -57,24 +65,19 @@ class DFlashWorkerV2(DFlashWorker):
         self, model_worker_batch: ModelWorkerBatch
     ) -> None:
         sampling_info = model_worker_batch.sampling_info
-        if sampling_info is None:
+        if sampling_info is None or sampling_info.is_all_greedy:
             return
 
-        has_penalties = sampling_info.acc_linear_penalties is not None
-        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-        if penalizer is not None and penalizer.is_required:
-            has_penalties = True
-
         if (
-            not sampling_info.is_all_greedy
-            or has_penalties
-            or sampling_info.logit_bias is not None
-            or sampling_info.has_custom_logit_processor
+            not is_dflash_sampling_verify_available()
+            and not self._warned_sampling_fallback
+            and self.tp_rank == 0
         ):
-            raise ValueError(
-                "DFLASH spec-v2 phase 1 only supports plain greedy decoding. "
-                "Non-greedy sampling, penalties, logit_bias, and custom logit processors are not enabled."
+            logger.warning(
+                "DFLASH non-greedy verification is unavailable on this build/device; "
+                "falling back to greedy argmax verification."
             )
+            self._warned_sampling_fallback = True
 
     def _make_next_draft_input_prefill(
         self,
@@ -391,14 +394,35 @@ class DFlashWorkerV2(DFlashWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        sampling_info = model_worker_batch.sampling_info
+        if sampling_info is not None:
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=int(self.block_size),
+            )
+
         candidates = draft_tokens
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, int(self.block_size)
-        )
-        accept_len, bonus = compute_dflash_accept_len_and_bonus(
-            candidates=candidates,
-            target_predict=target_predict,
-        )
+        if (
+            sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and is_dflash_sampling_verify_available()
+        ):
+            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+        else:
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                bs, int(self.block_size)
+            )
+            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict,
+            )
         commit_lens = accept_len.to(torch.int32) + 1  # [bs]
 
         if need_mamba_verify_commit:

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.utils import is_cuda
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -98,6 +99,95 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
         backend = full_backend
     backend_name = type(backend).__name__
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
+
+
+def apply_dflash_verify_logits_adjustments(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+) -> None:
+    """Apply sampling-time logit adjustments for DFlash verify in place.
+
+    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
+    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
+    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    """
+    if sampling_info is None:
+        return
+    if next_token_logits.ndim != 2:
+        raise ValueError(
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
+        )
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
+
+    bs = len(sampling_info)
+    if next_token_logits.shape[0] != bs * draft_token_num:
+        raise ValueError(
+            "next_token_logits row count mismatch for DFlash verify adjustments. "
+            f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
+        )
+
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
+
+    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    vocab_mask = getattr(sampling_info, "vocab_mask", None)
+    logit_bias = getattr(sampling_info, "logit_bias", None)
+
+    logits_3d: Optional[torch.Tensor] = None
+
+    def get_logits_3d() -> torch.Tensor:
+        nonlocal logits_3d
+        if logits_3d is None:
+            logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
+        return logits_3d
+
+    # Dense fallback only when we need live penalizer application or a vocab mask.
+    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
+    # broadcast over the verify block without materializing a repeated buffer.
+    if (
+        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
+    ) or vocab_mask is not None:
+        linear_penalty = torch.zeros(
+            (bs, next_token_logits.shape[1]),
+            dtype=torch.float32,
+            device=next_token_logits.device,
+        )
+        sampling_info.apply_logits_bias(linear_penalty)
+        get_logits_3d().add_(
+            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+        )
+        return
+
+    if acc_linear_penalties is not None:
+        if (
+            acc_linear_penalties.device != next_token_logits.device
+            or acc_linear_penalties.dtype != next_token_logits.dtype
+        ):
+            acc_linear_penalties = acc_linear_penalties.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+
+    if logit_bias is not None:
+        if (
+            logit_bias.device != next_token_logits.device
+            or logit_bias.dtype != next_token_logits.dtype
+        ):
+            logit_bias = logit_bias.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+        get_logits_3d().add_(logit_bias[:, None, :])
 
 
 def _get_or_create_chain_verify_buffers(
@@ -464,6 +554,8 @@ def compute_dflash_sampling_accept_len_and_bonus(
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
     threshold_single: Optional[float] = None,
     threshold_acc: Optional[float] = None,
     uniform_samples: Optional[torch.Tensor] = None,
@@ -560,12 +652,19 @@ def compute_dflash_sampling_accept_len_and_bonus(
         ).to(dtype=torch.int64)
         vocab_size = int(scaled_logits.shape[-1])
         repeated_top_ks.clamp_(min=1, max=vocab_size)
-        max_top_k = int(repeated_top_ks.max().item())
+        if max_top_k is None:
+            max_top_k = int(repeated_top_ks.max().item())
+        else:
+            max_top_k = int(max_top_k)
+        if max_top_k < 1:
+            max_top_k = 1
+        elif max_top_k > vocab_size:
+            max_top_k = vocab_size
 
         # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
         if 0 < max_top_k < vocab_size:
             topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
-            if not torch.all(repeated_top_ks == max_top_k):
+            if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
                 ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
                     None, :
                 ]

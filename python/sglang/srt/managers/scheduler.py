@@ -1663,26 +1663,6 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
-        if (
-            self.spec_algorithm.is_dflash()
-            and self.enable_overlap
-            and (
-                req.sampling_params.top_k > 1
-                or req.sampling_params.frequency_penalty != 0.0
-                or req.sampling_params.presence_penalty != 0.0
-                or req.sampling_params.repetition_penalty != 1.0
-                or req.sampling_params.logit_bias is not None
-                or req.custom_logit_processor is not None
-            )
-        ):
-            req.set_finish_with_abort(
-                "DFLASH spec-v2 phase 1 only supports plain greedy decoding yet. "
-                "Non-greedy sampling, penalties, logit_bias, and custom logit processors are not enabled."
-            )
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)

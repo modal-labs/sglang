@@ -57,6 +57,8 @@ class DFlashDraftInputV2(SpecInput):
     new_seq_lens: torch.Tensor
     hidden_states: torch.Tensor
     verify_done: Optional[torch.cuda.Event] = None
+    max_top_k: int = 1
+    uniform_top_k_value: Optional[int] = None
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[FutureIndices] = None
@@ -101,6 +103,14 @@ class DFlashDraftInputV2(SpecInput):
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
+
+        top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
+        self.max_top_k = max(max(top_ks), 1) if top_ks else 1
+        self.uniform_top_k_value = (
+            top_ks[0]
+            if top_ks and all(top_k == top_ks[0] for top_k in top_ks)
+            else None
+        )
 
         page_size = batch.token_to_kv_pool_allocator.page_size
 
