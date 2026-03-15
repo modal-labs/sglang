@@ -632,8 +632,30 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(request.input)  # type: ignore
+            for item in request.input:
+                msg = item if isinstance(item, dict) else item.model_dump() if hasattr(item, "model_dump") else dict(item)
+                if isinstance(msg.get("content"), list):
+                    msg["content"] = [
+                        self._convert_responses_content_part(part)
+                        for part in msg["content"]
+                    ]
+                messages.append(msg)
         return messages
+
+    @staticmethod
+    def _convert_responses_content_part(part: dict) -> dict:
+        """Convert Responses API content parts to Chat Completions format."""
+        t = part.get("type", "")
+        if t == "input_image":
+            url = part.get("image_url", "")
+            return {"type": "image_url", "image_url": {"url": url}}
+        if t == "input_text":
+            return {"type": "text", "text": part.get("text", "")}
+        if t == "input_audio":
+            return {"type": "audio_url", "audio_url": {"url": part.get("audio_url", "")}}
+        if t == "input_video":
+            return {"type": "video_url", "video_url": {"url": part.get("video_url", "")}}
+        return part
 
     def _construct_input_messages_with_harmony(
         self,
