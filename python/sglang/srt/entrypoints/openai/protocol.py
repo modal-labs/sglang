@@ -1116,12 +1116,23 @@ class ResponseReasoningParam(BaseModel):
     )
 
 
-class ResponseTool(BaseModel):
-    """Tool definition for responses."""
+class ResponseFunctionTool(BaseModel):
+    """Function tool definition for responses."""
+    type: Literal["function"] = "function"
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[dict] = None
+    strict: Optional[bool] = None
 
+
+class ResponseBuiltinTool(BaseModel):
+    """Built-in tool definition for responses."""
     type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
+        description="Type of built-in tool to enable"
     )
+
+
+ResponseTool = Union[ResponseFunctionTool, ResponseBuiltinTool]
 
 
 ResponseInputOutputItem: TypeAlias = Union[
