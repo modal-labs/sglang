@@ -1573,6 +1573,13 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 async def v1_responses_request(request: dict, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
+    # Patch missing optional fields that the openai library incorrectly requires
+    if isinstance(request.get("input"), list):
+        for item in request["input"]:
+            if isinstance(item.get("content"), list):
+                for part in item["content"]:
+                    if isinstance(part, dict) and part.get("type") == "input_image":
+                        part.setdefault("detail", "auto")
     request_obj = ResponsesRequest(**request)
     result = await raw_request.app.state.openai_serving_responses.create_responses(
         request_obj, raw_request
