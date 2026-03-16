@@ -387,11 +387,27 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
             # Convert ResponsesRequest to ChatCompletionRequest for processing
+            # Convert ResponsesRequest tools to ChatCompletionRequest format
+            chat_tools = None
+            if request.tools:
+                chat_tools = []
+                for tool in request.tools:
+                    if hasattr(tool, 'name'):  # ResponseFunctionTool
+                        chat_tools.append({
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": getattr(tool, "description", None),
+                                "parameters": getattr(tool, "parameters", None),
+                            },
+                        })
             chat_request = ChatCompletionRequest(
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
                 chat_template_kwargs=request.chat_template_kwargs,
+                tools=chat_tools,
+                tool_choice=request.tool_choice if chat_tools else "none",
             )
 
             # Follow SGLang's _process_messages pattern
