@@ -949,13 +949,130 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         )
 
+        # State for non-Harmony (SimpleContext) streaming
+        _prev_text = ""
+        _simple_stream_started = False
+        _tool_parser = None
+        function_tools = [t for t in (request.tools or []) if getattr(t, 'name', None)]
+        if function_tools and self.tool_call_parser:
+            _tool_parser = FunctionCallParser(function_tools, self.tool_call_parser)
+
         async for ctx in result_generator:
 
-            # Only process context objects that implement the `is_expecting_start()` method,
-            # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
-            # Contexts without this method are skipped, as they do not represent a new turn
-            # or are not compatible with per-turn handling in the /v1/responses endpoint.
+            # Non-Harmony path: SimpleContext streams token-by-token
             if not hasattr(ctx, "is_expecting_start"):
+                if ctx.last_output is None:
+                    continue
+                text = ctx.last_output.get("text", "")
+                delta = text[len(_prev_text):]
+                _prev_text = text
+                finish_reason = ctx.last_output.get("meta_info", {}).get("finish_reason")
+
+                if delta:
+                    if _tool_parser:
+                        normal_text, calls = _tool_parser.parse_stream_chunk(delta)
+                    else:
+                        normal_text, calls = delta, []
+
+                    if normal_text and not _simple_stream_started:
+                        _simple_stream_started = True
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item=openai_responses_types.ResponseOutputMessage(
+                                    id=current_item_id, type="message",
+                                    role="assistant", content=[], status="in_progress",
+                                ),
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item_id=current_item_id,
+                                content_index=current_content_index,
+                                part=openai_responses_types.ResponseOutputText(
+                                    type="output_text", text="", annotations=[],
+                                ),
+                            )
+                        )
+                    if normal_text:
+                        yield _send_event(
+                            openai_responses_types.ResponseTextDeltaEvent(
+                                type="response.output_text.delta",
+                                sequence_number=-1,
+                                content_index=current_content_index,
+                                output_index=current_output_index,
+                                item_id=current_item_id,
+                                delta=normal_text,
+                                logprobs=[],
+                            )
+                        )
+                    for call_item in calls:
+                        if call_item.name:
+                            import uuid as _uuid
+                            _fc_id = f"fc_{random_uuid()}"
+                            _call_id = f"call_{_uuid.uuid4().hex[:24]}"
+                            # Close text output item if it was started
+                            if _simple_stream_started:
+                                yield _send_event(
+                                    openai_responses_types.ResponseOutputItemDoneEvent(
+                                        type="response.output_item.done",
+                                        sequence_number=-1,
+                                        output_index=current_output_index,
+                                        item=openai_responses_types.ResponseOutputMessage(
+                                            id=current_item_id, type="message",
+                                            role="assistant",
+                                            content=[openai_responses_types.ResponseOutputText(
+                                                type="output_text", text=_prev_text, annotations=[],
+                                            )],
+                                            status="completed",
+                                        ),
+                                    )
+                                )
+                                current_output_index += 1
+                                _simple_stream_started = False
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item=ResponseFunctionToolCall(
+                                        type="function_call", id=_fc_id,
+                                        call_id=_call_id, name=call_item.name,
+                                        arguments="", status="in_progress",
+                                    ),
+                                )
+                            )
+                        if call_item.parameters:
+                            yield _send_event(
+                                openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                    type="response.function_call_arguments.delta",
+                                    sequence_number=-1,
+                                    item_id=_fc_id,
+                                    output_index=current_output_index,
+                                    delta=call_item.parameters,
+                                )
+                            )
+
+                if finish_reason:
+                    # Flush any remaining tool call data
+                    if _tool_parser and hasattr(_tool_parser, 'detector') and hasattr(_tool_parser.detector, 'prev_tool_call_arr'):
+                        for tc in (_tool_parser.detector.prev_tool_call_arr or []):
+                            if hasattr(tc, 'arguments') and tc.arguments:
+                                yield _send_event(
+                                    openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                                        type="response.function_call_arguments.done",
+                                        sequence_number=-1,
+                                        item_id=_fc_id if '_fc_id' in dir() else current_item_id,
+                                        output_index=current_output_index,
+                                        arguments=tc.arguments,
+                                        name=tc.name or "",
+                                    )
+                                )
                 continue
 
             if ctx.is_expecting_start():
