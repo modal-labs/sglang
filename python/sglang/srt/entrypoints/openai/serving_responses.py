@@ -391,6 +391,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                chat_template_kwargs=request.chat_template_kwargs,
             )
 
             # Follow SGLang's _process_messages pattern
@@ -536,9 +537,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         final_output: Any,
         tokenizer: Any,
     ):
-        # Handle reasoning parsing if enabled
-        if self.reasoning_parser:
-            # Use standard reasoning parser (openai maps to T4Detector internally)
+        # Handle reasoning parsing if enabled, respecting chat_template_kwargs
+        use_reasoning = bool(self.reasoning_parser)
+        if use_reasoning and request.chat_template_kwargs:
+            ctk = request.chat_template_kwargs
+            if ctk.get("enable_thinking") is False or ctk.get("thinking") is False:
+                use_reasoning = False
+        if use_reasoning:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
