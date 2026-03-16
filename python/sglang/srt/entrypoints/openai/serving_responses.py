@@ -57,6 +57,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -83,6 +84,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # template_manager is already set by parent class
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
 
@@ -570,6 +572,19 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_content = None
             content = final_output
 
+        # Parse tool calls from model output
+        tool_calls = []
+        function_tools = [t for t in (request.tools or []) if getattr(t, 'name', None)]
+        if function_tools and self.tool_call_parser and content:
+            parser = FunctionCallParser(function_tools, self.tool_call_parser)
+            if parser.has_tool_call(content):
+                try:
+                    content, call_info_list = parser.parse_non_stream(content)
+                    for call_info in call_info_list:
+                        tool_calls.append(call_info)
+                except Exception as e:
+                    logger.warning(f"Tool call parsing failed: {e}")
+
         output_items = []
         if reasoning_content:
             reasoning_item = ResponseReasoningItem(
@@ -584,12 +599,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
-        if content:
+        if tool_calls:
+            import uuid
+            for call_info in tool_calls:
+                output_items.append(ResponseFunctionToolCall(
+                    type="function_call",
+                    id=f"fc_{random_uuid()}",
+                    call_id=f"call_{uuid.uuid4().hex[:24]}",
+                    name=call_info.name,
+                    arguments=call_info.parameters,
+                    status="completed",
+                ))
+        if content and content.strip():
             output_text = ResponseOutputText(
                 text=content,
-                annotations=[],  # TODO
+                annotations=[],
                 type="output_text",
-                logprobs=None,  # TODO
+                logprobs=None,
             )
             message = ResponseOutputMessage(
                 id=f"msg_{random_uuid()}",
