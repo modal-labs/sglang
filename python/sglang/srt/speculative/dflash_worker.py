@@ -341,6 +341,43 @@ class DFlashWorker:
         # to flush here.
         pass
 
+    def _gather_req_to_token_masked(
+        self,
+        *,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        pos2d: torch.Tensor,
+        mask: torch.Tensor,
+        context: str,
+    ) -> torch.Tensor:
+        if pos2d.ndim != 2:
+            raise RuntimeError(
+                f"{context} expected 2D positions, got shape={tuple(pos2d.shape)}."
+            )
+        if mask.shape != pos2d.shape:
+            raise RuntimeError(
+                f"{context} mask/position shape mismatch: {tuple(mask.shape)} vs {tuple(pos2d.shape)}."
+            )
+
+        if req_pool_indices.dtype != torch.int64:
+            req_pool_indices = req_pool_indices.to(torch.int64)
+        if mask.dtype != torch.bool:
+            mask = mask.to(torch.bool)
+
+        table_width = int(req_to_token.shape[1])
+        if table_width <= 0:
+            if bool(mask.any().item()):
+                raise RuntimeError(
+                    f"{context} req_to_token table is empty but gather mask is non-empty."
+                )
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        # Only the masked-off rectangular padding can be out of range in the normal
+        # ragged-batch case. Replace those don't-care columns with a valid in-range
+        # position before the gather so the kernel only sees real positions.
+        safe_pos2d = pos2d.masked_fill(~mask, 0)
+        return req_to_token[req_pool_indices[:, None], safe_pos2d][mask].to(torch.int64)
+
     def _gather_req_to_token_segments(
         self,
         *,
@@ -366,7 +403,13 @@ class DFlashWorker:
         else:
             pos2d = start.to(torch.int64).unsqueeze(1) + offsets
         mask = offsets < lengths.unsqueeze(1)
-        return req_to_token[req_pool_indices[:, None], pos2d][mask].to(torch.int64)
+        return self._gather_req_to_token_masked(
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            pos2d=pos2d,
+            mask=mask,
+            context="DFLASH req_to_token segment gather",
+        )
 
     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         assert self.draft_window_size is not None
@@ -894,10 +937,13 @@ class DFlashWorker:
             mask = r < ctx_lens[:, None]
 
             # Batched gather of cache locations and positions.
-            cache2d = target_req_to_token[
-                req_pool_indices[:, None], pos2d
-            ]  # [bs, max_ctx]
-            ctx_cache_loc = cache2d[mask].to(torch.int64)  # [sum(ctx_lens)]
+            ctx_cache_loc = self._gather_req_to_token_masked(
+                req_to_token=target_req_to_token,
+                req_pool_indices=req_pool_indices,
+                pos2d=pos2d,
+                mask=mask,
+                context="DFLASH target hidden KV append",
+            )  # [sum(ctx_lens)]
             ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
 
         with torch.inference_mode():
