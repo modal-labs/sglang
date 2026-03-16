@@ -1180,6 +1180,7 @@ class ResponsesRequest(BaseModel):
     user: Optional[str] = None
 
     # Extra SGLang parameters
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
