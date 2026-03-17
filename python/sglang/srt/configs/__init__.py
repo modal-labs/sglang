@@ -29,6 +29,7 @@ from sglang.srt.configs.step3_vl import (
     Step3VLConfig,
 )
 from sglang.srt.configs.step3p5 import Step3p5Config
+from sglang.srt.configs.vibevoice_asr import VibeVoiceConfig
 
 __all__ = [
     "AfmoeConfig",
@@ -61,4 +62,5 @@ __all__ = [
     "JetNemotronConfig",
     "JetVLMConfig",
     "Step3p5Config",
+    "VibeVoiceConfig",
 ]

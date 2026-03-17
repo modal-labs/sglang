@@ -69,11 +69,13 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
     Step3p5Config,
     Step3VLConfig,
+    VibeVoiceConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
+from sglang.srt.models.vibevoice_asr_utils import VibeVoiceASRTextTokenizerFast
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
@@ -105,6 +107,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     JetVLMConfig,
     KimiK25Config,
     Step3p5Config,
+    VibeVoiceConfig,
 ]
 
 _CONFIG_REGISTRY = {
@@ -149,6 +152,10 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+
+    if hasattr(config, "decoder_config"):
+        assert hasattr(config.decoder_config, "num_attention_heads")
+        return config.decoder_config
 
     if hasattr(config, "llm_config"):
         # PointsV1.5 Chat Model
@@ -515,6 +522,51 @@ def get_tokenizer(
         client = create_remote_connector(tokenizer_name)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
+
+    tokenizer_config = None
+    with contextlib.suppress(Exception):
+        tokenizer_config = AutoConfig.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=tokenizer_revision,
+        )
+
+    if getattr(tokenizer_config, "model_type", None) == "vibevoice":
+        vibevoice_kwargs = dict(kwargs)
+        vibevoice_kwargs.pop("revision", None)
+        vibevoice_kwargs.pop("tokenizer_revision", None)
+        local_path = download_from_hf(
+            tokenizer_name,
+            allow_patterns=[
+                "preprocessor_config.json",
+                "tokenizer*",
+                "*.json",
+                "*.model",
+                "vocab.json",
+                "merges.txt",
+            ],
+        )
+        preprocessor_config_path = os.path.join(local_path, "preprocessor_config.json")
+        preprocessor_config = {}
+        if os.path.exists(preprocessor_config_path):
+            with open(preprocessor_config_path, "r") as f:
+                preprocessor_config = json.load(f)
+        language_model_name = preprocessor_config.get(
+            "language_model_pretrained_name",
+            "Qwen/Qwen2.5-1.5B",
+        )
+        tokenizer = VibeVoiceASRTextTokenizerFast.from_pretrained(
+            language_model_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            clean_up_tokenization_spaces=False,
+            **vibevoice_kwargs,
+        )
+        logging.getLogger(tokenizer.__class__.__module__).addFilter(
+            TokenizerWarningsFilter()
+        )
+        attach_additional_stop_token_ids(tokenizer)
+        return patch_tokenizer(tokenizer)
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
