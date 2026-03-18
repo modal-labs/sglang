@@ -48,10 +48,12 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -66,6 +68,35 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_function_tools_for_chat_parser(tools: list[Any] | None) -> list[Tool]:
+    """Convert Responses function tools to chat-style Tool objects."""
+    normalized_tools: list[Tool] = []
+    for tool in tools or []:
+        if getattr(tool, "type", None) != "function":
+            continue
+
+        if hasattr(tool, "function"):
+            normalized_tools.append(tool)
+            continue
+
+        name = getattr(tool, "name", None)
+        if not name:
+            continue
+
+        normalized_tools.append(
+            Tool(
+                type="function",
+                function=Function(
+                    name=name,
+                    description=getattr(tool, "description", None),
+                    parameters=getattr(tool, "parameters", None),
+                    strict=bool(getattr(tool, "strict", False)),
+                ),
+            )
+        )
+    return normalized_tools
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -390,20 +421,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         try:
             # Convert ResponsesRequest to ChatCompletionRequest for processing
             # Convert ResponsesRequest tools to ChatCompletionRequest format
-            chat_tools = None
-            if request.tools:
-                chat_tools = []
-                for tool in request.tools:
-                    if hasattr(tool, 'name'):  # ResponseFunctionTool
-                        chat_tools.append({
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "description": getattr(tool, "description", None),
-                                "parameters": getattr(tool, "parameters", None),
-                                "strict": bool(getattr(tool, "strict", False)),
-                            },
-                        })
+            chat_tools = _normalize_function_tools_for_chat_parser(request.tools) or None
             chat_request = ChatCompletionRequest(
                 model=request.model,
                 messages=messages,
@@ -571,7 +589,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # Parse tool calls from model output
         tool_calls = []
-        function_tools = [t for t in (request.tools or []) if getattr(t, 'name', None)]
+        function_tools = _normalize_function_tools_for_chat_parser(request.tools)
         if function_tools and self.tool_call_parser and content:
             parser = FunctionCallParser(function_tools, self.tool_call_parser)
             if parser.has_tool_call(content):
@@ -1008,7 +1026,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         _prev_text = ""
         _simple_stream_started = False
         _tool_parser = None
-        function_tools = [t for t in (request.tools or []) if getattr(t, 'name', None)]
+        function_tools = _normalize_function_tools_for_chat_parser(request.tools)
         if function_tools and self.tool_call_parser:
             _tool_parser = FunctionCallParser(function_tools, self.tool_call_parser)
 
