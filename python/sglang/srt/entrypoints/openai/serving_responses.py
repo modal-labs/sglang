@@ -401,6 +401,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 "name": tool.name,
                                 "description": getattr(tool, "description", None),
                                 "parameters": getattr(tool, "parameters", None),
+                                "strict": bool(getattr(tool, "strict", False)),
                             },
                         })
             chat_request = ChatCompletionRequest(
@@ -425,16 +426,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 engine_prompts = [processed_messages.prompt_ids]
 
         except Exception as e:
-            logger.warning(f"Chat processing failed, using fallback: {e}")
-            # Fallback to simple encoding
-            prompt_text = ""
-            for msg in messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                prompt_text += f"{role}: {content}\n"
-            prompt_ids = tokenizer.encode(prompt_text)
-            request_prompts = [prompt_ids]
-            engine_prompts = [prompt_ids]
+            logger.warning(f"Chat processing failed, rejecting request: {e}")
+            raise ValueError(
+                "Unable to convert /v1/responses input into chat messages. "
+                "Stateless multi-turn input arrays must use supported "
+                "message/function_call/function_call_output items."
+            ) from e
 
         return messages, request_prompts, engine_prompts
 
@@ -680,13 +677,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append({"role": "user", "content": request.input})
         else:
             for item in request.input:
-                msg = item if isinstance(item, dict) else item.model_dump() if hasattr(item, "model_dump") else dict(item)
-                if isinstance(msg.get("content"), list):
-                    msg["content"] = [
-                        self._convert_responses_content_part(part)
-                        for part in msg["content"]
-                    ]
-                messages.append(msg)
+                messages.append(self._convert_responses_input_item(item))
         return messages
 
     @staticmethod
@@ -696,13 +687,77 @@ class OpenAIServingResponses(OpenAIServingChat):
         if t == "input_image":
             url = part.get("image_url", "")
             return {"type": "image_url", "image_url": {"url": url}}
-        if t == "input_text":
+        if t in {"input_text", "output_text", "text"}:
             return {"type": "text", "text": part.get("text", "")}
         if t == "input_audio":
             return {"type": "audio_url", "audio_url": {"url": part.get("audio_url", "")}}
         if t == "input_video":
             return {"type": "video_url", "video_url": {"url": part.get("video_url", "")}}
         return part
+
+    @classmethod
+    def _convert_responses_input_item(cls, item: Any) -> ChatCompletionMessageParam:
+        """Convert a Responses API input item into Chat Completions message format."""
+        msg = (
+            item
+            if isinstance(item, dict)
+            else item.model_dump()
+            if hasattr(item, "model_dump")
+            else dict(item)
+        )
+        msg_type = msg.get("type", "message")
+
+        if msg_type == "function_call":
+            arguments = msg.get("arguments", "")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            return {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": msg["call_id"],
+                        "type": "function",
+                        "function": {
+                            "name": msg["name"],
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            }
+
+        if msg_type == "function_call_output":
+            output = msg.get("output", "")
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False)
+            return {
+                "role": "tool",
+                "content": output,
+                "tool_call_id": msg["call_id"],
+            }
+
+        if msg_type == "reasoning":
+            reasoning_text = ""
+            content = msg.get("content") or []
+            if content:
+                first_part = content[0]
+                if isinstance(first_part, dict):
+                    reasoning_text = first_part.get("text", "")
+            elif msg.get("summary"):
+                first_summary = msg["summary"][0]
+                if isinstance(first_summary, dict):
+                    reasoning_text = first_summary.get("text", "")
+            return {
+                "role": "assistant",
+                "reasoning_content": reasoning_text,
+                "content": None,
+            }
+
+        if isinstance(msg.get("content"), list):
+            msg["content"] = [
+                cls._convert_responses_content_part(part)
+                for part in msg["content"]
+            ]
+        return msg
 
     def _construct_input_messages_with_harmony(
         self,
