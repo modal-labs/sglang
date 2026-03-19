@@ -718,7 +718,21 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append({"role": "user", "content": request.input})
         else:
             for item in request.input:
-                messages.append(self._convert_responses_input_item(item))
+                converted = self._convert_responses_input_item(item)
+                # Merge function_call tool_calls into a preceding assistant
+                # message so the chat template sees one turn with content +
+                # tool_calls, matching the Chat Completions format.
+                if (
+                    converted.get("role") == "assistant"
+                    and converted.get("tool_calls")
+                    and not converted.get("content")
+                    and messages
+                    and messages[-1].get("role") == "assistant"
+                    and not messages[-1].get("tool_calls")
+                ):
+                    messages[-1]["tool_calls"] = converted["tool_calls"]
+                else:
+                    messages.append(converted)
         return messages
 
     @staticmethod
