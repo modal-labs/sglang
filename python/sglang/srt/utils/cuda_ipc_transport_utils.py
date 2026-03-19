@@ -22,6 +22,23 @@ MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
 SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
 
 
+# Cache for pool-level IPC handles on the consumer side.
+# Key: the pool CUDA IPC handle tuple. Value: opened UntypedStorage.
+_pool_storage_cache: dict = {}
+_pool_cache_lock = threading.Lock()
+
+
+def _pool_handle_cache_get(cache_key, pool_handle):
+    storage = _pool_storage_cache.get(cache_key)
+    if storage is None:
+        with _pool_cache_lock:
+            storage = _pool_storage_cache.get(cache_key)
+            if storage is None:
+                storage = torch.UntypedStorage._new_shared_cuda(*pool_handle)
+                _pool_storage_cache[cache_key] = storage
+    return storage
+
+
 class ShmSyncBuffer:
     def __init__(self, byte_size: int = 4):
         self.buffer = shared_memory.SharedMemory(create=True, size=byte_size)
@@ -80,6 +97,9 @@ class MmItemMemoryPool:
         self.memory_pool = torch.empty(
             memory_size, dtype=torch.int8, device="cuda"
         ).contiguous()
+        storage = self.memory_pool.untyped_storage()
+        self._pool_ipc_handle = storage._share_cuda_()
+        self._pool_device_index = self.memory_pool.device.index
 
         self.sync_flag_list = []
 
@@ -181,8 +201,9 @@ class MmItemMemoryPool:
                 return (
                     available_chunk.sync_flag.meta_data,
                     self.memory_pool[available_chunk.start : available_chunk.end],
+                    available_chunk.start,
                 )
-        return None, None
+        return None, None, None
 
     def recycle_chunks(self):
 
@@ -229,6 +250,9 @@ class CudaIpcTensorTransportProxy:
         data: torch.Tensor,
         info_data: torch.Tensor,
         sync_buffer_meta,
+        pool_ipc_handle=None,
+        pool_byte_offset: int = 0,
+        pool_device_index: int = 0,
     ):
 
         if (not isinstance(data, torch.Tensor)) or (
@@ -238,7 +262,24 @@ class CudaIpcTensorTransportProxy:
                 f"Input 'data' must be a torch.Tensor, but got {type(data)}"
             )
 
-        self.proxy_state = self.get_proxy_state(data, info_data)
+        if pool_ipc_handle is not None:
+            self.proxy_state = {
+                "ipc_extra": {
+                    "pool_handle": pool_ipc_handle,
+                    "pool_byte_offset": pool_byte_offset,
+                    "pool_device_index": pool_device_index,
+                    "shape": data.shape,
+                    "dtype": data.dtype,
+                    "stride": data.stride(),
+                    "storage_offset": 0,
+                    "nbytes": data.numel() * data.element_size(),
+                    "recons_shape": info_data.shape,
+                    "recons_dtype": info_data.dtype,
+                },
+                "tensor_data": None,
+            }
+        else:
+            self.proxy_state = self.get_proxy_state(data, info_data)
         self.reconstruct_tensor = None
         self.sync_data_meta = sync_buffer_meta
         self.sync_buffer = None
@@ -293,34 +334,53 @@ class CudaIpcTensorTransportProxy:
 
         if self.proxy_state["ipc_extra"]:
             ipc_extra = self.proxy_state["ipc_extra"]
-            (
-                handle,
-                shape,
-                dtype,
-                stride,
-                source_device_index,
-                s_offset,
-                recons_shape,
-                recons_dtype,
-            ) = (
-                ipc_extra["handle"],
-                ipc_extra["shape"],
-                ipc_extra["dtype"],
-                ipc_extra["stride"],
-                ipc_extra["device_index"],
-                ipc_extra["storage_offset"],
-                ipc_extra["recons_shape"],
-                ipc_extra["recons_dtype"],
-            )
+            shape = ipc_extra["shape"]
+            dtype = ipc_extra["dtype"]
+            stride = ipc_extra["stride"]
+            s_offset = ipc_extra["storage_offset"]
+            recons_shape = ipc_extra["recons_shape"]
+            recons_dtype = ipc_extra["recons_dtype"]
 
             try:
-                target_device = torch.device(f"cuda:{source_device_index}")
-                with torch.cuda.device(target_device):
-                    storage = torch.UntypedStorage._new_shared_cuda(*handle)
-                    slice_tensor = torch.empty(
-                        0, dtype=dtype, device=target_device
-                    ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
+                if "pool_handle" in ipc_extra:
+                    pool_handle = ipc_extra["pool_handle"]
+                    pool_byte_offset = ipc_extra["pool_byte_offset"]
+                    source_device_index = ipc_extra["pool_device_index"]
+                    target_device = torch.device(f"cuda:{source_device_index}")
+                    cache_key = (
+                        pool_handle
+                        if isinstance(pool_handle, tuple)
+                        else tuple(pool_handle)
+                    )
+                    with torch.cuda.device(target_device):
+                        storage = _pool_handle_cache_get(cache_key, pool_handle)
+                        slice_storage = storage[
+                            pool_byte_offset : pool_byte_offset + ipc_extra["nbytes"]
+                        ]
+                        slice_tensor = torch.empty(
+                            0, dtype=dtype, device=target_device
+                        ).set_(
+                            slice_storage,
+                            storage_offset=s_offset,
+                            size=shape,
+                            stride=stride,
+                        )
+                else:
+                    handle = ipc_extra["handle"]
+                    source_device_index = ipc_extra["device_index"]
+                    target_device = torch.device(f"cuda:{source_device_index}")
+                    with torch.cuda.device(target_device):
+                        storage = torch.UntypedStorage._new_shared_cuda(*handle)
+                        slice_tensor = torch.empty(
+                            0, dtype=dtype, device=target_device
+                        ).set_(
+                            storage,
+                            storage_offset=s_offset,
+                            size=shape,
+                            stride=stride,
+                        )
 
+                with torch.cuda.device(target_device):
                     reconstructed_tensor = torch.empty(
                         recons_shape, dtype=recons_dtype, device=rebuild_device
                     ).contiguous()
