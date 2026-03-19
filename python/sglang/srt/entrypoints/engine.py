@@ -476,6 +476,12 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        tokenizer_manager = getattr(self, "tokenizer_manager", None)
+        if tokenizer_manager is not None:
+            try:
+                tokenizer_manager.shutdown()
+            except Exception:
+                logger.exception("Error while shutting down tokenizer manager")
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):

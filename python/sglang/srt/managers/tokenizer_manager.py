@@ -2070,8 +2070,34 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.dump_requests_before_crash()
                 break
 
+        self.shutdown()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
+
+    def shutdown(self):
+        if getattr(self, "_shutdown", False):
+            return
+        self._shutdown = True
+
+        mm_data_processor = getattr(self, "mm_data_processor", None)
+        if mm_data_processor is not None:
+            try:
+                mm_data_processor.shutdown()
+            except Exception:
+                logger.exception(
+                    "Error while shutting down tokenizer manager multimodal processor"
+                )
+
+        try:
+            from sglang.srt.utils.cuda_ipc_transport_utils import (
+                _pool_handle_cache_clear,
+            )
+
+            _pool_handle_cache_clear()
+        except Exception:
+            logger.exception(
+                "Error while clearing tokenizer manager CUDA IPC pool cache"
+            )
 
     def force_exit_handler(self):
         """Put some custom force exit logic here."""
@@ -2359,6 +2385,7 @@ async def print_exception_wrapper(func):
         logger.error(f"TokenizerManager hit an exception: {traceback}")
         if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
             func.__self__.dump_requests_before_crash()
+            func.__self__.shutdown()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 
@@ -2415,6 +2442,7 @@ class SignalHandler:
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
         self.tokenizer_manager.dump_requests_before_crash()
+        self.tokenizer_manager.shutdown()
         kill_process_tree(os.getpid())
 
 

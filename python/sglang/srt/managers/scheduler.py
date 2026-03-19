@@ -3174,3 +3174,12 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+    finally:
+        try:
+            from sglang.srt.utils.cuda_ipc_transport_utils import (
+                _pool_handle_cache_clear,
+            )
+
+            _pool_handle_cache_clear()
+        except Exception:
+            logger.exception("Error while clearing scheduler CUDA IPC pool cache")

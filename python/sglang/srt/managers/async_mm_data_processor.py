@@ -107,6 +107,15 @@ class AsyncMMDataProcessor:
     def shutdown(self) -> None:
         """Gracefully shutdown resources owned by this wrapper."""
         try:
+            mm_processor_shutdown = getattr(self.mm_processor, "shutdown", None)
+            if callable(mm_processor_shutdown):
+                mm_processor_shutdown()
+        except Exception:
+            logger.exception(
+                "Error while shutting down wrapped multimodal processor"
+            )
+
+        try:
             if self.fallback_exec:
                 self.fallback_exec.shutdown(wait=False)
         except Exception:

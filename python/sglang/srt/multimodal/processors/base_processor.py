@@ -244,12 +244,43 @@ class BaseMultimodalProcessor(ABC):
         ]
 
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
+        self.cudaipc_mmfeature_pool = None
+        self._shutdown = False
 
         if SGL_USE_CUDA_IPC and not skip_mm_pool:
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 MM_FEATURE_CACHE_SIZE,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             )
+
+    def shutdown(self):
+        if self._shutdown:
+            return
+        self._shutdown = True
+
+        if self.cudaipc_mmfeature_pool is not None:
+            try:
+                self.cudaipc_mmfeature_pool.shutdown()
+            except Exception:
+                logger.exception(
+                    "Error while shutting down CUDA IPC multimodal feature pool"
+                )
+
+        try:
+            self.io_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            logger.exception("Error while shutting down multimodal IO executor")
+
+        try:
+            self.cpu_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            logger.exception("Error while shutting down multimodal CPU executor")
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     @property
     def spatial_merge_size(self):
