@@ -60,6 +60,7 @@ from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.utils import convert_json_schema_to_str
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -227,7 +228,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self._make_request_with_harmony(request, prev_response)
                 )
             else:
-                messages, request_prompts, engine_prompts = await self._make_request(
+                messages, request_prompts, engine_prompts, tool_call_constraint = await self._make_request(
                     request, prev_response, tokenizer
                 )
 
@@ -300,6 +301,26 @@ class OpenAIServingResponses(OpenAIServingChat):
                     sampling_params = request.to_sampling_params(
                         default_max_tokens, self.default_sampling_params
                     )
+
+                    has_function_tools = any(
+                        getattr(t, "type", None) == "function"
+                        for t in (request.tools or [])
+                    )
+                    if has_function_tools and self.tool_call_parser:
+                        sampling_params["skip_special_tokens"] = False
+
+                    if not self.use_harmony and tool_call_constraint:
+                        constraint_type, constraint_value = tool_call_constraint
+                        if constraint_type == "structural_tag":
+                            sampling_params[constraint_type] = convert_json_schema_to_str(
+                                constraint_value.model_dump(by_alias=True)
+                            )
+                        elif constraint_type == "json_schema":
+                            sampling_params[constraint_type] = convert_json_schema_to_str(
+                                constraint_value
+                            )
+                        else:
+                            sampling_params[constraint_type] = constraint_value
 
                     context: ConversationContext
                     if self.use_harmony:
@@ -443,6 +464,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request_prompts = [processed_messages.prompt_ids]
                 engine_prompts = [processed_messages.prompt_ids]
 
+            tool_call_constraint = processed_messages.tool_call_constraint
+
         except Exception as e:
             logger.warning(f"Chat processing failed, rejecting request: {e}")
             raise ValueError(
@@ -451,7 +474,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "message/function_call/function_call_output items."
             ) from e
 
-        return messages, request_prompts, engine_prompts
+        return messages, request_prompts, engine_prompts, tool_call_constraint
 
     def _make_request_with_harmony(
         self,
