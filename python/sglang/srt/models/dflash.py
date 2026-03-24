@@ -20,6 +20,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -314,7 +315,7 @@ class DFlashDraftModel(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         get_embedding: bool = False,
         pp_proxy_tensors=None,
-    ) -> torch.Tensor:
+    ) -> LogitsProcessorOutput:
         if input_embeds is None:
             raise ValueError(
                 "DFlashDraftModel requires `input_embeds` (use the target embedding)."
@@ -327,12 +328,16 @@ class DFlashDraftModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
-        if hidden_states.numel() == 0:
-            return hidden_states
-        if residual is None:
-            return self.norm(hidden_states)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if hidden_states.numel() != 0:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
+
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=hidden_states,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
