@@ -645,13 +645,16 @@ class DFlashWorker:
             )
 
             with torch.inference_mode():
-                draft_hidden = self.draft_model_runner.forward(
+                draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
 
+        draft_hidden = draft_logits_output.hidden_states
+        if draft_hidden is None:
+            raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),

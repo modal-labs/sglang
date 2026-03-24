@@ -34,6 +34,9 @@ class SpeculativeAlgorithm(Enum):
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
+    def is_speculative(self) -> bool:
+        return self != SpeculativeAlgorithm.NONE
+
     def is_eagle(self) -> bool:
         # NOTE: EAGLE3 is a variant of EAGLE
         return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3

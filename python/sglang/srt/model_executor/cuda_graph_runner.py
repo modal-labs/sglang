@@ -472,16 +472,9 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if (
-            model_runner.spec_algorithm.is_eagle()
-            or model_runner.spec_algorithm.is_standalone()
-            or model_runner.spec_algorithm.is_ngram()
-            or model_runner.spec_algorithm.is_dflash()
-        ):
+        if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
-                # EAGLE/standalone/ngram draft workers use separate cuda-graph runners; do not
-                # capture TARGET_VERIFY graphs here. DFLASH draft uses a fixed-size block and
-                # reuses TARGET_VERIFY graphs for performance.
+                # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
@@ -1102,15 +1095,21 @@ class CudaGraphRunner:
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
-        if isinstance(output, torch.Tensor):
-            return output[: self.raw_num_token]
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
-                full_logits = output.full_logits[: self.raw_num_token]
+                full_logits = (
+                    output.full_logits[: self.raw_num_token]
+                    if output.full_logits is not None
+                    else None
+                )
             else:
                 full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                next_token_logits = (
+                    output.next_token_logits[: self.raw_num_token]
+                    if output.next_token_logits is not None
+                    else None
+                )
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
