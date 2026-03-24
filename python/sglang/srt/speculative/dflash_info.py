@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -48,20 +48,6 @@ def _compute_paged_keep_slots(
     keep_slots = (keep_lens - prefix_lens).to(torch.int64)
     keep_slots.clamp_(min=0, max=int(draft_token_num))
     return keep_slots
-
-
-def _append_verified_tokens(req: Req, proposed_tokens: List[int]) -> int:
-    appended = 0
-    for token_id in proposed_tokens:
-        token_id = int(token_id)
-        req.output_ids.append(token_id)
-        appended += 1
-        req.check_finished()
-        if req.finished():
-            break
-        if req.grammar is not None:
-            req.grammar.accept_token(token_id)
-    return appended
 
 
 @dataclass
@@ -401,7 +387,16 @@ class DFlashVerifyInput(SpecInput):
                 int(packed[i, max_acc + 1].item())
             ]
 
-            appended = _append_verified_tokens(req, proposed)
+            appended = 0
+            for token_id in proposed:
+                token_id = int(token_id)
+                req.output_ids.append(token_id)
+                appended += 1
+                req.check_finished()
+                if req.finished():
+                    break
+                if req.grammar is not None:
+                    req.grammar.accept_token(token_id)
 
             if req.output_ids:
                 new_verified_token = int(req.output_ids[-1])
