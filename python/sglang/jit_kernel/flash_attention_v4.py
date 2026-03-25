@@ -63,6 +63,9 @@ def flash_attn_varlen_func(
     if window_size == (-1, -1):
         window_size = (None, None)
 
+    if return_softmax_lse and not (q.requires_grad or k.requires_grad or v.requires_grad):
+        q = q.detach().requires_grad_(True)
+
     result = _flash_attn_varlen_func(
         q=q,
         k=k,

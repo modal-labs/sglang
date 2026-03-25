@@ -762,10 +762,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"{self.model_config.hf_config.model_type}"
                 )
 
+        effective_prefill_backend = (
+            server_args.prefill_attention_backend or server_args.attention_backend
+        )
         if (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+            not self.is_draft_worker and
+            (
+                not self.use_mla_backend
+                or effective_prefill_backend
+                not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+            )
         ):
             server_args.disable_chunked_prefix_cache = True
 
