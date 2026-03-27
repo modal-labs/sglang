@@ -1,4 +1,8 @@
+import re
 from typing import List, Union
+
+from decord import VideoReader
+from transformers.video_utils import VideoMetadata
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
@@ -7,30 +11,18 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 
-try:
-    from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
-except ImportError:
-    GlmOcrForConditionalGeneration = None
-
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
-    models = [
-        m
-        for m in [
-            Glm4vForConditionalGeneration,
-            Glm4vMoeForConditionalGeneration,
-            GlmOcrForConditionalGeneration,
-        ]
-        if m is not None
-    ]
+    models = [Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
-        # GLM-V specific tokens
+        # GLM-4.1V and GLM-4.5V specific tokens
         self.IMAGE_TOKEN = "<|image|>"
         self.VIDEO_TOKEN = "<|video|>"
         self.IMAGE_START_TOKEN = "<|begin_of_image|>"
@@ -59,27 +51,34 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
 
-    def compute_mrope_positions(self, input_ids, mm_items):
-        image_grid_thw = None
-        video_grid_thw = None
-        for item in mm_items:
-            if "image_grid_thw" in item.model_specific_data:
-                image_grid_thw = item.model_specific_data["image_grid_thw"]
-            if "video_grid_thw" in item.model_specific_data:
-                video_grid_thw = item.model_specific_data["video_grid_thw"]
+    # adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
+    async def preprocess_video(self, vr: VideoReader):
+        """
+        Preprocess video using VideoReader from Decord backend.
 
-        import torch
+        Args:
+            vr (VideoReader): VideoReader object from decord
 
-        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
-        attention_mask = torch.ones_like(input_ids_tensor)
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
-            input_ids=input_ids_tensor,
-            hf_config=self.hf_config,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            attention_mask=attention_mask,
+        Returns:
+            tuple: A tuple containing processed frames and metadata
+        """
+        video_fps = vr.get_avg_fps()
+        total_num_frames = len(vr)
+        duration = total_num_frames / video_fps if video_fps else 0
+
+        metadata = VideoMetadata(
+            total_num_frames=int(total_num_frames),
+            fps=float(video_fps),
+            duration=float(duration),
+            video_backend="decord",
         )
-        return mrope_positions.squeeze(1), mrope_position_delta
+
+        # Extract all frames
+        indices = list(range(total_num_frames))
+        frames = vr.get_batch(indices).asnumpy()
+        metadata.frames_indices = indices
+
+        return frames, metadata
 
     async def process_mm_data_async(
         self,
@@ -96,10 +95,19 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
+        video_metadata = None
+
         if base_output.videos:
-            base_output.videos = request_obj.video_data
+            videos_processed = [
+                await self.preprocess_video(video) for video in base_output.videos
+            ]
+            base_output.videos, video_metadata = map(list, zip(*videos_processed))
+            # transformer requires the video inputs to be under this format
+            base_output.videos = [base_output.videos]
+            video_metadata = [video_metadata]
+
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output, self.mm_tokens, video_metadata=video_metadata
         )
 
         input_ids = input_ids.flatten()

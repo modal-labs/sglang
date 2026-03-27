@@ -1,15 +1,12 @@
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 from torch import Tensor
 
-# Disable tests on SM103 until the accuracy issues are fixed.
-if torch.cuda.get_device_capability() != (10, 0):
+if torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(
-        reason="Cutlass MLA Requires compute capability of 10.",
+        reason="Cutlass MLA Requires compute capability of 10 or above.",
         allow_module_level=True,
     )
 
@@ -103,4 +100,4 @@ def test_cutlass_mla_decode(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

@@ -1,79 +1,29 @@
-from sglang.srt.layers.moe.token_dispatcher.base import (
+from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     BaseDispatcher,
     BaseDispatcherConfig,
-    CombineInput,
-    CombineInputChecker,
-    CombineInputFormat,
     DispatchOutput,
     DispatchOutputChecker,
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
+    AscendDeepEPLLOutput,
     DeepEPConfig,
     DeepEPDispatcher,
-    DeepEPLLCombineInput,
-    DeepEPLLDispatchOutput,
-    DeepEPNormalCombineInput,
-    DeepEPNormalDispatchOutput,
+    DeepEPLLOutput,
+    DeepEPNormalOutput,
 )
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
-    FlashinferDispatcher,
-    FlashinferDispatchOutput,
-)
-from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
-from sglang.srt.layers.moe.token_dispatcher.mooncake import (
-    MooncakeCombineInput,
-    MooncakeDispatchOutput,
-    MooncakeEPDispatcher,
-)
-from sglang.srt.layers.moe.token_dispatcher.moriep import (
-    MoriEPDispatcher,
-    MoriEPLLCombineInput,
-    MoriEPLLDispatchOutput,
-    MoriEPNormalCombineInput,
-    MoriEPNormalDispatchOutput,
-)
-from sglang.srt.layers.moe.token_dispatcher.nixl import (
-    NixlEPCombineInput,
-    NixlEPDispatcher,
-    NixlEPDispatchOutput,
-)
-from sglang.srt.layers.moe.token_dispatcher.standard import (
-    StandardCombineInput,
-    StandardDispatcher,
-    StandardDispatchOutput,
-)
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 
 __all__ = [
+    "AscendDeepEPLLOutput",
     "BaseDispatcher",
     "BaseDispatcherConfig",
-    "CombineInput",
-    "CombineInputChecker",
-    "CombineInputFormat",
     "DispatchOutput",
     "DispatchOutputFormat",
     "DispatchOutputChecker",
-    "FlashinferDispatchOutput",
-    "FlashinferDispatcher",
-    "MooncakeCombineInput",
-    "MooncakeDispatchOutput",
-    "MooncakeEPDispatcher",
-    "MoriEPNormalDispatchOutput",
-    "MoriEPNormalCombineInput",
-    "MoriEPLLDispatchOutput",
-    "MoriEPLLCombineInput",
-    "MoriEPDispatcher",
-    "NixlEPCombineInput",
-    "NixlEPDispatchOutput",
-    "NixlEPDispatcher",
-    "StandardDispatcher",
     "StandardDispatchOutput",
-    "StandardCombineInput",
     "DeepEPConfig",
     "DeepEPDispatcher",
-    "DeepEPNormalDispatchOutput",
-    "DeepEPLLDispatchOutput",
-    "DeepEPLLCombineInput",
-    "DeepEPNormalCombineInput",
-    "NpuFuseEPDispatcher",
+    "DeepEPNormalOutput",
+    "DeepEPLLOutput",
 ]

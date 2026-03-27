@@ -3,14 +3,11 @@ import atexit
 import json
 import logging
 import threading
-from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import orjson
 import requests
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import ORJSONResponse
+from fastapi import FastAPI, HTTPException, Request, status
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -27,10 +24,10 @@ class RankMetadata:
     """Holds all metadata for a single rank."""
 
     def __init__(self, num_pages: int):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.num_pages = num_pages
         self.free_pages: List[int] = list(range(num_pages))
-        self.key_to_index: OrderedDict[str, int] = OrderedDict()
+        self.key_to_index: Dict[str, int] = {}
         # Todo: Support multi files for HF3FS
 
     def exists_keys(self, keys: List[str]) -> List[bool]:
@@ -49,18 +46,16 @@ class RankMetadata:
             for i, (key, prefix_key) in enumerate(keys):
                 if key in self.key_to_index:
                     results[i] = (True, self.key_to_index[key])
-                    self.key_to_index.move_to_end(key)
                 else:
                     new_keys_to_process.append((i, key, prefix_key))
 
             # Todo: Implementing data eviction logic after HiCache supports prefix information pass-through
             for i, key, prefix_key in new_keys_to_process:
                 if len(self.free_pages) > 0:
-                    page_index = self.free_pages.pop()
+                    page_idx = self.free_pages.pop()
+                    results[i] = (False, page_idx)
                 else:
-                    page_index = self.key_to_index.popitem(last=False)[1]
-
-                results[i] = (False, page_index)
+                    results[i] = (False, -1)
 
             return results
 
@@ -73,7 +68,6 @@ class RankMetadata:
         with self.lock:
             for key, page_index in written_keys_to_confirm:
                 self.key_to_index[key] = page_index
-                self.key_to_index.move_to_end(key)
 
             for page_index in pages_to_release:
                 if page_index not in self.free_pages:
@@ -100,14 +94,7 @@ class RankMetadata:
     def get_page_indices(self, keys: List[str]) -> List[Optional[int]]:
         """Get page indices for keys."""
         with self.lock:
-            results = []
-            for key in keys:
-                if key in self.key_to_index:
-                    results.append(self.key_to_index[key])
-                    self.key_to_index.move_to_end(key)
-                else:
-                    results.append(None)
-            return results
+            return [self.key_to_index.get(key) for key in keys]
 
 
 class GlobalMetadataState:
@@ -137,7 +124,7 @@ class GlobalMetadataState:
                     num_pages = data["num_pages"]
                     rank_meta = RankMetadata(num_pages)
                     rank_meta.free_pages = data["free_pages"]
-                    rank_meta.key_to_index = OrderedDict(data["key_to_index"])
+                    rank_meta.key_to_index = dict(data["key_to_index"])
                     self.ranks[rank_id] = rank_meta
                 logging.info(
                     f"Successfully loaded metadata for {len(self.ranks)} ranks."
@@ -195,8 +182,7 @@ class Hf3fsMetadataServer:
 
     def __init__(self, persistence_path: Optional[str] = None, save_interval: int = 60):
         self.state = GlobalMetadataState(persistence_path, save_interval)
-        self.app = FastAPI(default_response_class=ORJSONResponse)
-
+        self.app = FastAPI()
         self._setup_routes()
 
     def _setup_routes(self):
@@ -213,25 +199,17 @@ class Hf3fsMetadataServer:
 
     def get_rank_metadata(self, rank: int) -> RankMetadata:
         """Get rank metadata with proper error handling."""
-        if rank not in self.state.ranks:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Rank {rank} not initialized. Please call /{rank}/initialize first.",
-            )
-        return self.state.ranks[rank]
-
-    async def _read_json(self, request: Request) -> dict:
-        """Parse request JSON using orjson if available."""
-        body = await request.body()
-        return orjson.loads(body)
-
-    def _json_response(self, content: dict):
-        """Return ORJSONResponse when available to bypass jsonable_encoder."""
-        return ORJSONResponse(content)
+        with self.state.global_lock:
+            if rank not in self.state.ranks:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Rank {rank} not initialized. Please call /{{rank}}/initialize first.",
+                )
+            return self.state.ranks[rank]
 
     async def initialize(self, rank: int, request: Request):
         """Initialize a rank with specified number of pages."""
-        data = await self._read_json(request)
+        data = await request.json()
         num_pages = data["num_pages"]
         with self.state.global_lock:
             if rank in self.state.ranks:
@@ -245,55 +223,57 @@ class Hf3fsMetadataServer:
             else:
                 logging.info(f"Initializing new Rank {rank} with {num_pages} pages.")
                 self.state.ranks[rank] = RankMetadata(num_pages)
-        return Response(status_code=204)
+        return {"message": f"Rank {rank} is ready."}
 
     async def exists(self, rank: int, request: Request):
         """Check if keys exist in metadata."""
-        data = await self._read_json(request)
+        data = await request.json()
         keys = data["keys"]
         metadata = self.get_rank_metadata(rank)
         results = metadata.exists_keys(keys)
-        return self._json_response({"exists": results})
+        return {"exists": results}
 
     async def reserve_and_allocate_page_indices(self, rank: int, request: Request):
         """Reserve and allocate page indices for keys."""
-        data = await self._read_json(request)
+        data = await request.json()
         metadata = self.get_rank_metadata(rank)
         keys = data["keys"]
         results = metadata.reserve_and_allocate_page_indices(keys)
-        return self._json_response({"indices": results})
+        return {"indices": results}
 
     async def confirm_write(self, rank: int, request: Request):
         """Confirm write operations and release pages."""
-        data = await self._read_json(request)
+        data = await request.json()
         metadata = self.get_rank_metadata(rank)
         success_written_keys = data.get("written_keys_to_confirm", [])
         released_pages = data.get("pages_to_release", [])
 
         metadata.confirm_write(success_written_keys, released_pages)
 
-        return Response(status_code=204)
+        return {
+            "message": f"Rank {rank}: Write confirmed for {len(success_written_keys)} keys. {len(released_pages)} pages released."
+        }
 
     async def delete_keys(self, rank: int, request: Request):
         """Delete keys from metadata."""
-        data = await self._read_json(request)
+        data = await request.json()
         metadata = self.get_rank_metadata(rank)
         count = metadata.delete_keys(data["keys"])
-        return Response(status_code=204)
+        return {"message": f"Rank {rank}: {count} keys deleted."}
 
     async def clear(self, rank: int):
         """Clear all metadata for a rank."""
         metadata = self.get_rank_metadata(rank)
         metadata.clear_all()
-        return Response(status_code=204)
+        return {"message": f"Rank {rank}: Metadata cleared."}
 
     async def get_page_indices(self, rank: int, request: Request):
         """Get page indices for keys."""
-        data = await self._read_json(request)
+        data = await request.json()
         metadata = self.get_rank_metadata(rank)
         keys = data["keys"]
         results = metadata.get_page_indices(keys)
-        return self._json_response({"indices": results})
+        return {"indices": results}
 
     def run(self, host: str = "0.0.0.0", port: int = 18000):
         """Run the metadata server."""
@@ -329,22 +309,14 @@ class Hf3fsGlobalMetadataClient(Hf3fsMetadataInterface):
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=["GET", "POST"],
         )
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy, pool_connections=256, pool_maxsize=256
-        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
         self._session.mount("http://", adapter)
 
     def _post(self, endpoint: str, json_data: dict) -> dict:
         try:
-            url = f"{self.base_url}/{endpoint}"
-            headers = {"Content-Type": "application/json"}
-            payload = orjson.dumps(json_data)  # type: ignore[union-attr]
-            response = self._session.post(url, data=payload, headers=headers)
+            response = self._session.post(f"{self.base_url}/{endpoint}", json=json_data)
             response.raise_for_status()
-
-            if response.status_code == 204 or not response.content:
-                return {}
-            return orjson.loads(response.content)  # type: ignore[union-attr]
+            return response.json()
         except requests.exceptions.RequestException as e:
             logging.error(f"Failed to POST to {endpoint} after retries: {e}")
             raise RuntimeError(f"Failed to connect to metadata server: {e}") from e

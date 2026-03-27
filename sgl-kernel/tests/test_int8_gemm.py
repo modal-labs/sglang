@@ -1,9 +1,6 @@
-import sys
-
 import pytest
 import torch
 from sgl_kernel import int8_scaled_mm
-from utils import is_sm10x
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
@@ -33,10 +30,6 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
     torch.testing.assert_close(o, o1)
 
 
-@pytest.mark.skipif(
-    is_sm10x(),
-    reason="int8_scaled_mm is only supported on sm90 and lower",
-)
 @pytest.mark.parametrize("M", [1, 16, 32, 64, 128, 512, 1024, 4096, 8192])
 @pytest.mark.parametrize("N", [16, 128, 512, 1024, 4096, 8192, 16384])
 @pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 16384])
@@ -47,4 +40,4 @@ def test_accuracy(M, N, K, with_bias, out_dtype):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

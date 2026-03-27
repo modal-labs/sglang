@@ -19,21 +19,20 @@ import requests
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.entrypoints.warmup import warmup
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.warmup import warmup
 
 multiprocessing.set_start_method("spawn", force=True)
 
 # Reduce warning
-envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.set(True)
+os.environ["SGL_IN_DEEPGEMM_PRECOMPILE_STAGE"] = "1"
 # Force enable deep gemm
-envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(True)
+os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "1"
 # Force enable mha chunked kv for DeepSeek V3 to avoid missing kv_b_proj DeepGEMM case
-envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.set(0)
+os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"
 
 
 @dataclasses.dataclass
@@ -104,21 +103,15 @@ def launch_server_process_and_send_one_request(
             if response.status_code == 200:
                 # Rank-0 node send a request to sync with other node and then return.
                 if server_args.node_rank == 0:
-                    payload = {
-                        "input_ids": [0, 1, 2, 3],
-                        "sampling_params": {
-                            "max_new_tokens": 8,
-                            "temperature": 0,
-                        },
-                    }
-                    # In PD mode, include fake bootstrap fields so workers don't assert
-                    if server_args.disaggregation_mode != "null":
-                        payload["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
-                        payload["bootstrap_room"] = 0
-
                     response = requests.post(
                         f"{base_url}/generate",
-                        json=payload,
+                        json={
+                            "input_ids": [0, 1, 2, 3],
+                            "sampling_params": {
+                                "max_new_tokens": 8,
+                                "temperature": 0,
+                            },
+                        },
                         timeout=600,
                     )
                     if response.status_code != 200:

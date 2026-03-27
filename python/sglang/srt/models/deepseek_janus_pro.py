@@ -532,6 +532,8 @@ class VisionTransformerBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
+            qkv_backend="sdpa",
+            softmax_in_single_precision=False,
             dropout=attn_drop,
         )
 
@@ -1955,7 +1957,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         self.language_model = LlamaForCausalLM(
             language_config, quant_config=quant_config
         )
-        self.logits_processor = LogitsProcessor(language_config)
+        self.logits_processor = LogitsProcessor(config)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.concat([item.feature for item in items], dim=0)

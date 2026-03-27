@@ -1,17 +1,10 @@
 import torch
 import triton
+from sgl_kernel import ep_moe_post_reorder
 
 from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
-from sglang.utils import is_in_ci
 
-IS_CI = is_in_ci()
-
-# CI environment uses simplified parameters
-if IS_CI:
-    batch_sizes = [64, 128]  # Only test 2 values in CI
-else:
-    batch_sizes = [64, 128, 256, 512, 640, 768, 1024, 2048, 4096]
-
+batch_sizes = [64, 128, 256, 512, 640, 768, 1024, 2048, 4096]
 configs = [(bs,) for bs in batch_sizes]
 
 
@@ -20,9 +13,9 @@ configs = [(bs,) for bs in batch_sizes]
         x_names=["batch_size"],
         x_vals=[list(_) for _ in configs],
         line_arg="provider",
-        line_vals=["triton"],
-        line_names=["Triton Kernel"],
-        styles=[("orange", "-")],
+        line_vals=["cuda", "triton"],
+        line_names=["CUDA Kernel", "Triton Kernel"],
+        styles=[("green", "-"), ("orange", "-")],
         ylabel="us",
         plot_name="ep-moe-post-reorder-performance",
         args={},
@@ -53,7 +46,24 @@ def benchmark(batch_size, provider):
 
     quantiles = [0.5, 0.2, 0.8]
 
-    if provider == "triton":
+    if provider == "cuda":
+        d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
+
+        def run_cuda():
+            ep_moe_post_reorder(
+                d_out,
+                out,
+                s2d,
+                tk_ids,
+                tk_weights,
+                start_expert_id,
+                end_expert_id,
+                topk,
+            )
+
+        ms, min_ms, max_ms = triton.testing.do_bench(run_cuda, quantiles=quantiles)
+
+    elif provider == "triton":
         d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
 
         def run_triton():
@@ -71,9 +81,7 @@ def benchmark(batch_size, provider):
                 block_size,
             )
 
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            run_triton, quantiles=quantiles
-        )
+        ms, min_ms, max_ms = triton.testing.do_bench(run_triton, quantiles=quantiles)
 
     else:
         raise ValueError(f"Unknown provider: {provider}")

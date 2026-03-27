@@ -42,9 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_npu
-
-_is_npu = is_npu()
+from sglang.srt.utils import add_prefix
 
 
 class StablelmMLP(nn.Module):
@@ -139,21 +137,12 @@ class StablelmAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        if not _is_npu:
-            self.rotary_emb = get_rope(
-                self.head_dim,
-                rotary_dim=self.rotary_ndims,
-                max_position=self.config.max_position_embeddings,
-                base=self.config.rope_parameters["rope_theta"],
-            )
-        else:
-            self.rotary_emb = get_rope(
-                self.head_dim,
-                rotary_dim=self.rotary_ndims,
-                max_position=self.config.max_position_embeddings,
-                base=self.config.rope_parameters["rope_theta"],
-                dtype=torch.float32,
-            )
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.rotary_ndims,
+            max_position=self.config.max_position_embeddings,
+            base=self.config.rope_theta,
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -172,12 +161,7 @@ class StablelmAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if not _is_npu:
-            q, k = self.rotary_emb(positions, q, k)
-        else:
-            odtype = q.dtype
-            q, k = self.rotary_emb(positions, q.to(torch.float32), k.to(torch.float32))
-            q, k = q.to(odtype), k.to(odtype)
+        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output

@@ -46,7 +46,7 @@ def _fwd_kernel_stage1(
     Q,
     K_Buffer,
     V_Buffer,
-    sm_scale_withk,
+    sm_scale,
     kv_indptr,
     kv_indices,
     Att_Out,
@@ -69,7 +69,6 @@ def _fwd_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
-    xai_temperature_len: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -85,12 +84,6 @@ def _fwd_kernel_stage1(
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
     kv_splits = tl.load(num_kv_splits + cur_batch)
-
-    if xai_temperature_len > 0:
-        offs_qidx = cur_batch_seq_len - 1
-        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
-        _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
-        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
@@ -124,13 +117,10 @@ def _fwd_kernel_stage1(
                 other=0.0,
             )
             qk = tl.sum(q[None, :] * k, 1)
-            qk *= sm_scale_withk
+            qk *= sm_scale
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
-
-            if xai_temperature_len > 0:
-                qk *= xai_temperature_reg
 
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
@@ -189,9 +179,8 @@ def _decode_att_m_fwd(
     kv_indices,
     num_kv_splits,
     max_kv_splits,
-    sm_scale_withk,
+    sm_scale,
     logit_cap,
-    xai_temperature_len=-1,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -220,7 +209,7 @@ def _decode_att_m_fwd(
         q,
         k_buffer,
         v_buffer,
-        sm_scale_withk,
+        sm_scale,
         kv_indptr,
         kv_indices,
         att_out,
@@ -241,7 +230,6 @@ def _decode_att_m_fwd(
         BLOCK_N=BLOCK,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
-        xai_temperature_len=xai_temperature_len,
         num_warps=num_warps,
         num_stages=2,
         Lk=Lk,
@@ -254,7 +242,7 @@ def _fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
     V_Buffer,
-    sm_scale_withk,
+    sm_scale,
     kv_indptr,
     kv_indices,
     Att_Out,
@@ -278,7 +266,6 @@ def _fwd_grouped_kernel_stage1(
     BLOCK_H: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     logit_cap: tl.constexpr,
-    xai_temperature_len: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
 ):
@@ -303,12 +290,6 @@ def _fwd_grouped_kernel_stage1(
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
     kv_splits = tl.load(num_kv_splits + cur_batch)
-
-    if xai_temperature_len > 0:
-        offs_qidx = cur_batch_seq_len - 1
-        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
-        _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
-        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
 
     offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
 
@@ -365,13 +346,10 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                 )
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
-            qk *= sm_scale_withk
+            qk *= sm_scale
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
-
-            if xai_temperature_len > 0:
-                qk *= xai_temperature_reg[:, None]
 
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
@@ -433,9 +411,8 @@ def _decode_grouped_att_m_fwd(
     kv_indices,
     num_kv_splits,
     max_kv_splits,
-    sm_scale_withk,
+    sm_scale,
     logit_cap,
-    xai_temperature_len=-1,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -479,7 +456,7 @@ def _decode_grouped_att_m_fwd(
         q,
         k_buffer,
         v_buffer,
-        sm_scale_withk,
+        sm_scale,
         kv_indptr,
         kv_indices,
         att_out,
@@ -503,7 +480,6 @@ def _decode_grouped_att_m_fwd(
         BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
-        xai_temperature_len=xai_temperature_len,
         num_warps=4,
         num_stages=num_stages,
         Lk=Lk,
@@ -517,7 +493,6 @@ def _fwd_kernel_stage2(
     Mid_O,
     Mid_O_1,
     O,
-    v_scale,
     kv_indptr,
     num_kv_splits,
     sink_ptr,
@@ -578,7 +553,7 @@ def _fwd_kernel_stage2(
 
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum * v_scale,
+        acc / e_sum,
         mask=mask_d,
     )
 
@@ -588,7 +563,6 @@ def _decode_softmax_reducev_fwd(
     lse,
     q,
     o,
-    v_scale,
     v_buffer,
     kv_indptr,
     num_kv_splits,
@@ -613,7 +587,6 @@ def _decode_softmax_reducev_fwd(
         logits,
         lse,
         o,
-        v_scale,
         kv_indptr,
         num_kv_splits,
         sinks,
@@ -644,11 +617,9 @@ def decode_attention_fwd_normal(
     attn_lse,
     num_kv_splits,
     max_kv_splits,
-    sm_scale_withk,
-    v_scale,
+    sm_scale,
     logit_cap=0.0,
     sinks=None,
-    xai_temperature_len=-1,
 ):
     _decode_att_m_fwd(
         q,
@@ -660,16 +631,14 @@ def decode_attention_fwd_normal(
         kv_indices,
         num_kv_splits,
         max_kv_splits,
-        sm_scale_withk,
+        sm_scale,
         logit_cap,
-        xai_temperature_len,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
         attn_lse,
         q,
         o,
-        v_scale,
         v_buffer,
         kv_indptr,
         num_kv_splits,
@@ -689,11 +658,9 @@ def decode_attention_fwd_grouped(
     attn_lse,
     num_kv_splits,
     max_kv_splits,
-    sm_scale_withk,
-    v_scale,
+    sm_scale,
     logit_cap=0.0,
     sinks=None,
-    xai_temperature_len=-1,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -705,16 +672,14 @@ def decode_attention_fwd_grouped(
         kv_indices,
         num_kv_splits,
         max_kv_splits,
-        sm_scale_withk,
+        sm_scale,
         logit_cap,
-        xai_temperature_len,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
         attn_lse,
         q,
         o,
-        v_scale,
         v_buffer,
         kv_indptr,
         num_kv_splits,
@@ -735,11 +700,8 @@ def decode_attention_fwd(
     num_kv_splits,
     max_kv_splits,
     sm_scale,
-    k_scale,
-    v_scale,
     logit_cap=0.0,
     sinks=None,
-    xai_temperature_len=-1,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -760,11 +722,9 @@ def decode_attention_fwd(
             attn_lse,
             num_kv_splits,
             max_kv_splits,
-            sm_scale * k_scale,
-            v_scale,
+            sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
-            xai_temperature_len=xai_temperature_len,
         )
     else:
         # GQA/MQA/MLA
@@ -779,9 +739,7 @@ def decode_attention_fwd(
             attn_lse,
             num_kv_splits,
             max_kv_splits,
-            sm_scale * k_scale,
-            v_scale,
+            sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
-            xai_temperature_len=xai_temperature_len,
         )

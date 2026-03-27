@@ -11,7 +11,7 @@ _is_hip = is_hip()
 
 
 @triton.jit
-def fused_moe_router_cudacore_kernel(
+def fused_moe_router_kernel(
     input_ptr,  # input (bs, hidden_dim)
     moe_router_weight_ptr,  # input (num_experts, hidden_dim)
     topk_weights_ptr,  # output (bs, topk)
@@ -45,14 +45,11 @@ def fused_moe_router_cudacore_kernel(
     logits = tl.sum((w_router.to(tl.float32) * x[None, :].to(tl.float32)), axis=-1)
 
     # logit softcap
-    if moe_softcapping == 0:
-        logits_softcapped = logits
-    else:
-        logits_scaled = logits / moe_softcapping
-        exped = tl.exp(2 * logits_scaled)
-        top = exped - 1
-        bottom = exped + 1
-        logits_softcapped = top / bottom * moe_softcapping
+    logits_scaled = logits / moe_softcapping
+    exped = tl.exp(2 * logits_scaled)
+    top = exped - 1
+    bottom = exped + 1
+    logits_softcapped = top / bottom * moe_softcapping
 
     # Add bias after softcapping
     if is_correction_bias:
@@ -114,7 +111,7 @@ def fused_moe_router_cudacore_kernel(
     # assert not moe_renormalize, "moe weight renormalization not implemented"
 
 
-def fused_moe_router_cudacore(
+def fused_moe_router_impl(
     x: torch.Tensor,
     router_weight: torch.Tensor,
     topk: int,
@@ -138,7 +135,7 @@ def fused_moe_router_cudacore(
         ),
     }
 
-    fused_moe_router_cudacore_kernel[(bs,)](
+    fused_moe_router_kernel[(bs,)](
         x,
         router_weight,
         topk_weights,
@@ -157,7 +154,7 @@ def fused_moe_router_cudacore(
 
 
 @triton.jit
-def fused_moe_router_tensorcore_kernel(
+def fused_moe_router_large_bs_kernel(
     a_ptr,  # input (bs, hidden_dim)
     b_ptr,  # input (num_experts, hidden_dim)
     topk_weights_ptr,  # output (bs, topk)
@@ -167,15 +164,12 @@ def fused_moe_router_tensorcore_kernel(
     topk: tl.constexpr,  # only support topk <= 2
     moe_softcapping: tl.constexpr,
     moe_renormalize: tl.constexpr,  # not supported
-    correction_bias_ptr,
-    is_correction_bias: tl.constexpr,
     K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     stride_am: tl.constexpr,
     stride_bn: tl.constexpr,
-    dp_attn_workaround_flag: tl.constexpr,
 ):
 
     # 1. get block id
@@ -213,26 +207,9 @@ def fused_moe_router_tensorcore_kernel(
         b_ptrs += BLOCK_SIZE_K
 
     # 4. logit softcap
-    if moe_softcapping == 0:
-        logits_softcapped = acc
-    else:
-        logits_scaled = acc / moe_softcapping
-        exped = tl.exp(2 * logits_scaled)
-        logits_softcapped = (exped - 1) / (exped + 1) * moe_softcapping
-
-    # Add bias after softcapping
-    if is_correction_bias:
-        bias = tl.load(
-            correction_bias_ptr + tl.arange(0, BLOCK_SIZE_N)[None, :],
-            mask=expert_mask.T,
-            other=0.0,
-        )
-        logits_softcapped = logits_softcapped + bias
-
-    if dp_attn_workaround_flag:
-        logits_softcapped = tl.where(
-            logits_softcapped != logits_softcapped, -1e9, logits_softcapped
-        )
+    logits_scaled = acc / moe_softcapping
+    exped = tl.exp(2 * logits_scaled)
+    logits_softcapped = (exped - 1) / (exped + 1) * moe_softcapping
 
     # 5. top1
     arange_block_size_n = tl.arange(0, BLOCK_SIZE_N)[None, :]
@@ -257,7 +234,7 @@ def fused_moe_router_tensorcore_kernel(
 
     # 7. handle topk == 2
     if topk == 2:
-        cond_top2 = (arange_block_size_n < num_experts) & (
+        cond_top2 = (arange_block_size_n < num_experts) and (
             arange_block_size_n != top1[:, None]
         )
         top2 = tl.argmax(
@@ -283,7 +260,7 @@ def fused_moe_router_tensorcore_kernel(
         )
 
 
-def fused_moe_router_tensorcore(
+def fused_moe_router_large_bs_impl(
     x: torch.Tensor,
     router_weight: torch.Tensor,
     topk: int,
@@ -291,7 +268,6 @@ def fused_moe_router_tensorcore(
     BLOCK_SIZE_M: int,
     BLOCK_SIZE_N: int,
     BLOCK_SIZE_K: int,
-    correction_bias: Optional[torch.Tensor] = None,
 ):
     assert len(x.shape) == 2 and x.shape[1] == router_weight.shape[1]
     bs, hidden_dim = x.shape
@@ -303,17 +279,10 @@ def fused_moe_router_tensorcore(
 
     topk_weights = torch.empty((bs, topk), dtype=torch.float32, device=x.device)
     topk_ids = torch.empty((bs, topk), dtype=torch.int32, device=x.device)
-    is_correction_bias = correction_bias is not None
 
     grid = (triton.cdiv(bs, BLOCK_SIZE_M) * triton.cdiv(num_experts, BLOCK_SIZE_N),)
 
-    # TODO(ch-wan): temporary workaround for dp attention. We should support masked
-    # router to skip padded tokens.
-    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-
-    dp_attn_workaround_flag = is_dp_attention_enabled()
-
-    fused_moe_router_tensorcore_kernel[grid](
+    fused_moe_router_large_bs_kernel[grid](
         a_ptr=x,
         b_ptr=router_weight,
         topk_weights_ptr=topk_weights,
@@ -324,14 +293,11 @@ def fused_moe_router_tensorcore(
         moe_softcapping=moe_softcapping,
         moe_renormalize=False,
         K=hidden_dim,
-        correction_bias_ptr=correction_bias,
-        is_correction_bias=is_correction_bias,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         stride_am=hidden_dim,
         stride_bn=hidden_dim,
-        dp_attn_workaround_flag=dp_attn_workaround_flag,
     )
 
     return topk_weights, topk_ids
@@ -344,7 +310,6 @@ def fused_moe_router_shim(
     topk,
     renormalize,
     correction_bias: Optional[torch.Tensor] = None,
-    enable_deterministic_inference: bool = False,
 ):
     assert not renormalize
     assert (
@@ -353,22 +318,16 @@ def fused_moe_router_shim(
     )
     bs, hidden_dim = hidden_states.shape
     num_experts = gating_output.shape[0]
-
     BLOCK_SIZE_M = 32
-
-    BLOCK_SIZE_N = max(num_experts, 16)
-    BLOCK_SIZE_K = (
-        256 if num_experts < 256 else 64
-    )  # if experts are large, need to use smaller k block or shared memory OOM
-
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 256
     if (
-        (bs >= 512 or num_experts > 8)
+        bs >= 512
+        and topk <= 2
+        and num_experts <= BLOCK_SIZE_N
         and hidden_dim % BLOCK_SIZE_K == 0
-        # we keep using single kernel to avoid non-deterministic behavior
-        and not enable_deterministic_inference
     ):
-        # if large batch size or large expert, use kernel that uses tensorcore in matmul
-        return fused_moe_router_tensorcore(
+        return fused_moe_router_large_bs_impl(
             x=hidden_states,
             router_weight=gating_output,
             topk=topk,
@@ -376,11 +335,9 @@ def fused_moe_router_shim(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
-            correction_bias=correction_bias,
         )
     else:
-        # if smaller, use kernel that does not use tensorcore in matmul
-        return fused_moe_router_cudacore(
+        return fused_moe_router_impl(
             x=hidden_states,
             router_weight=gating_output,
             topk=topk,
@@ -417,10 +374,11 @@ class FusedMoeRouter:
             renormalize=False,
         )
 
-    def forward_torch(
+    def forward_vllm(
         self,
         x: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # g, _ = self.router_linear.forward(x)
         g = x.float() @ self.router_linear.weight.T.float()
 
         g = torch.tanh(g.float() / self.moe_softcapping) * self.moe_softcapping

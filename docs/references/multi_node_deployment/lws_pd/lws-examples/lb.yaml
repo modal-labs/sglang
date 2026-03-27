@@ -27,8 +27,7 @@ spec:
           command:
           - python
           - -m
-          - sglang_router.launch_router
-          - --pd-disaggregation
+          - sglang.srt.disaggregation.mini_lb
           - --prefill
           - http://deepseekr10528-prefill-main:30000
           - --decode

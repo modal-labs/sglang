@@ -8,9 +8,6 @@ from typing import List
 import torch
 from tqdm import tqdm
 
-from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
-    Hf3fsLocalMetadataClient,
-)
 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 
 
@@ -57,7 +54,9 @@ def test():
             )
     except Exception as e:
         raise RuntimeError(f"Failed to dump config to {config_path}: {str(e)}")
-    hicache_hf3fs = HiCacheHF3FS.from_env_config(bytes_per_page, dtype)
+
+    rank = 0
+    hicache_hf3fs = HiCacheHF3FS.from_env_config(rank, bytes_per_page, dtype)
 
     numel = 2 * tokens_per_page * layer_num * head_num * head_dim
     assert numel * dtype.itemsize == bytes_per_page
@@ -68,15 +67,12 @@ def test():
         k = f"key_{i}"
         v = torch.randn((numel,)).to(dtype=dtype)
         ok = hicache_hf3fs.set(k, v)
-        if i < (file_size // bytes_per_page):
-            assert ok, f"Failed to insert {k}"
-        else:
-            assert not ok
+        assert ok, f"Failed to insert {k}"
         tensors[k] = v
-    assert hicache_hf3fs.get("key_8") is None
-    assert hicache_hf3fs.get("key_9") is None
+    assert hicache_hf3fs.get("key_0") is None
+    assert hicache_hf3fs.get("key_1") is None
 
-    start = 0
+    start = num_pages - hicache_hf3fs.num_pages
     for i in range(start, start + hicache_hf3fs.num_pages):
         k = f"key_{i}"
         assert hicache_hf3fs.exists(k)
@@ -87,16 +83,13 @@ def test():
 
     assert not hicache_hf3fs.exists("not_exists")
 
-    hicache_hf3fs.delete("key_7")
+    hicache_hf3fs.delete("key_9")
     v2 = torch.randn((numel,)).to(dtype=dtype)
     assert hicache_hf3fs.set("key_new", v2)
     assert torch.allclose(hicache_hf3fs.get("key_new"), v2, atol=1e-3)
 
     hicache_hf3fs.clear()
-    assert (
-        len(hicache_hf3fs.metadata_client.rank_metadata.free_pages)
-        == hicache_hf3fs.metadata_client.rank_metadata.num_pages
-    )
+    assert len(hicache_hf3fs.free_pages) == hicache_hf3fs.num_pages
 
     # batch
     num_pages = 10
@@ -141,14 +134,12 @@ def bench():
     entries = 8
     dtype = store_dtype
     hicache_hf3fs = HiCacheHF3FS(
-        rank=0,
         file_path=file_path,
         file_size=file_size,
         numjobs=numjobs,
         bytes_per_page=bytes_per_page,
         entries=entries,
         dtype=dtype,
-        metadata_client=Hf3fsLocalMetadataClient(),
     )
 
     numel = 2 * tokens_per_page * layer_num * head_num * head_dim
@@ -176,10 +167,7 @@ def bench():
     r_bw = []
     r_size = num_page * bytes_per_page / (1 << 30)
     for i in tqdm(range(warmup + iteration), desc="Benchmarking read (GB/s)"):
-        keys = random.sample(
-            list(hicache_hf3fs.metadata_client.rank_metadata.key_to_index.keys()),
-            num_page,
-        )
+        keys = random.sample(list(hicache_hf3fs.key_to_index.keys()), num_page)
         tik = time.perf_counter()
         results = hicache_hf3fs.batch_get(keys)
         tok = time.perf_counter()
@@ -207,14 +195,12 @@ def allclose():
     entries = 8
     dtype = store_dtype
     hicache_hf3fs = HiCacheHF3FS(
-        rank=0,
         file_path=file_path,
         file_size=file_size,
         numjobs=numjobs,
         bytes_per_page=bytes_per_page,
         entries=entries,
         dtype=dtype,
-        metadata_client=Hf3fsLocalMetadataClient(),
     )
 
     numel = 2 * tokens_per_page * layer_num * head_num * head_dim
@@ -232,10 +218,7 @@ def allclose():
 
     read_keys, read_results = [], []
     for i in tqdm(range(iteration), desc="Benchmarking read (GB/s)"):
-        keys = random.sample(
-            list(hicache_hf3fs.metadata_client.rank_metadata.key_to_index.keys()),
-            num_page,
-        )
+        keys = random.sample(list(hicache_hf3fs.key_to_index.keys()), num_page)
         results = hicache_hf3fs.batch_get(keys)
         read_keys.extend(keys)
         read_results.extend(results)

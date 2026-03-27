@@ -2,7 +2,6 @@ import json as json_lib
 import logging
 import math
 import os
-import re
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -31,9 +30,9 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
+    global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
@@ -173,6 +172,9 @@ class Llama4VisionEncoderLayer(nn.Module):
             use_qkv_parallel=True,
             # vision_model is explicitly ignored in Maverick-17B-128E-Instruct-FP8
             quant_config=None,
+            dropout=0.0,
+            qkv_backend="sdpa",
+            softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
             qkv_bias=True,
@@ -289,7 +291,7 @@ class Llama4UnfoldConvolution(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.unfold(hidden_states)
-        hidden_states = hidden_states.permute(0, 2, 1).contiguous()
+        hidden_states = hidden_states.permute(0, 2, 1)
         hidden_states, _ = self.linear(hidden_states)
         return hidden_states
 
@@ -305,7 +307,7 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
         freq_dim = config.hidden_size // config.num_attention_heads // 2
         rope_freq = 1.0 / (
-            config.rope_parameters["rope_theta"]
+            config.rope_theta
             ** (torch.arange(0, freq_dim, 2)[: (freq_dim // 2)].float() / freq_dim)
         )
         freqs_x = (
@@ -420,11 +422,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    # Pattern to match language model layers only (skip vision_model and multi_modal_projector)
-    lora_pattern = re.compile(
-        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-    )
-
     def __init__(
         self,
         config: Llama4Config,
@@ -445,24 +442,13 @@ class Llama4ForConditionalGeneration(nn.Module):
             )
 
         self.has_vision = (
-            self.has_vision_weights and get_global_server_args().enable_multimodal
+            self.has_vision_weights and global_server_args_dict["enable_multimodal"]
         )
 
         if self.has_vision:
-            # TODO: make this more general
-            ignore_quant_layers = getattr(config, "quantization_config", {}).get(
-                "ignore", {}
-            )
-            if (
-                "model.layers.vision_model*" in ignore_quant_layers
-                and "model.layers.multi_modal_projector*" in ignore_quant_layers
-            ):
-                vision_quant_config = None
-            else:
-                vision_quant_config = quant_config
             self.vision_model = Llama4VisionModel(
                 config.vision_config,
-                quant_config=vision_quant_config,
+                quant_config=quant_config,
                 prefix=add_prefix("vision_model", prefix),
             )
 
@@ -558,10 +544,6 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         return projected_vision_flat
 
-    def should_apply_lora(self, module_name: str) -> bool:
-        """Skip vision model and multi_modal_projector for LoRA."""
-        return bool(self.lora_pattern.match(module_name))
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -578,7 +560,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             forward_batch=forward_batch,
             language_model=self.language_model,
             data_embedding_funcs={
-                Modality.IMAGE: image_embedding_func,
+                Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
         )
@@ -707,7 +689,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         """Handle scale parameter remapping. Returns True if handled."""
         if "scale" in name and "expert" not in name:
             remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            return remapped_name != name
+            return remapped_name is None
         return False
 
     def _handle_stacked_params(
@@ -978,31 +960,6 @@ class Llama4ForConditionalGeneration(nn.Module):
 
     def set_embed(self, embed):
         return self.language_model.set_embed(embed)
-
-    def get_hidden_dim(self, module_name, layer_idx):
-        # return input_dim, output_dim
-        if module_name == "qkv_proj":
-            return (
-                self.config.hidden_size,
-                self.config.head_dim
-                * (
-                    self.config.num_attention_heads
-                    + self.config.num_key_value_heads * 2
-                ),
-            )
-        elif module_name == "o_proj":
-            return (
-                self.config.head_dim * self.config.num_attention_heads,
-                self.config.hidden_size,
-            )
-        elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size * 2
-        elif module_name == "down_proj":
-            decoder_layer = self.language_model.get_layers()[layer_idx]
-            intermediate_size = decoder_layer.get_intermediate_size()
-            return intermediate_size, self.config.hidden_size
-        else:
-            raise NotImplementedError()
 
 
 EntryClass = Llama4ForConditionalGeneration

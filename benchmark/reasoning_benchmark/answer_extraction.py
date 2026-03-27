@@ -227,23 +227,23 @@ def extract_answer(pred_str, exhaust=False):
             pred.append(program_output)
         else:  # use the last number
             pattern = "-?\d*\.?\d+"
-            answers = re.findall(pattern, pred_str.replace(",", ""))
-            if len(answers) >= 1:
-                last_ans = answers[-1]
+            ans = re.findall(pattern, pred_str.replace(",", ""))
+            if len(ans) >= 1:
+                ans = ans[-1]
             else:
-                last_ans = ""
-            if last_ans:
-                pred.append(last_ans)
+                ans = ""
+            if ans:
+                pred.append(ans)
 
     # multiple line
     _pred = []
-    for each_ans in pred:
-        each_ans = each_ans.strip().split("\n")[0]
-        each_ans = each_ans.lstrip(":")
-        each_ans = each_ans.rstrip(".")
-        each_ans = each_ans.rstrip("/")
-        each_ans = strip_string(each_ans)
-        _pred.append(each_ans)
+    for ans in pred:
+        ans = ans.strip().split("\n")[0]
+        ans = ans.lstrip(":")
+        ans = ans.rstrip(".")
+        ans = ans.rstrip("/")
+        ans = strip_string(ans)
+        _pred.append(ans)
     if exhaust:
         return _pred
     else:

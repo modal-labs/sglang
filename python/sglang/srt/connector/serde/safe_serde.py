@@ -19,12 +19,11 @@ class SafeSerializer(Serializer):
 
 class SafeDeserializer(Deserializer):
 
-    def __init__(self):
-        # TODO: dtype options
-        super().__init__(torch.float32)
+    def __init__(self, dtype):
+        super().__init__(dtype)
 
     def from_bytes_normal(self, b: Union[bytearray, bytes]) -> torch.Tensor:
-        return load(bytes(b))["tensor_bytes"]
+        return load(bytes(b))["tensor_bytes"].to(dtype=self.dtype)
 
     def from_bytes(self, b: Union[bytearray, bytes]) -> torch.Tensor:
         return self.from_bytes_normal(b)

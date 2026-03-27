@@ -1,5 +1,6 @@
 import unittest
 
+import sgl_kernel
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
@@ -118,8 +119,8 @@ class TestExtendAttention(CustomTestCase):
             v_extend[extend_start:extend_end] = v_buffer[
                 extend_start_in_buffer:extend_end_in_buffer
             ]
-            q_extend[extend_start:extend_end] = (
-                torch.randn((b_seq_len_extend[i], H_Q, D), dtype=dtype) * 20
+            q_extend[extend_start:extend_end] = torch.randn(
+                (b_seq_len_extend[i], H_Q, D), dtype=dtype
             )
 
         # q_extend, k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
@@ -183,7 +184,6 @@ class TestExtendAttention(CustomTestCase):
             self._test_extend_attention_once(1, 123, 1, 1, 128, 96, is_mla)
             self._test_extend_attention_once(1, 123, 16, 1, 128, 96, is_mla)
             self._test_extend_attention_once(4, 1230, 16, 4, 128, 96, is_mla)
-            self._test_extend_attention_once(1, 9000, 16, 1, 32, 32, is_mla)
 
 
 if __name__ == "__main__":

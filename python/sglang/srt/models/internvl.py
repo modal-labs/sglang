@@ -1,4 +1,4 @@
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -7,18 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
+from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.environ import envs
-from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
-from sglang.srt.layers.conv import Conv2dLayer
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -33,20 +26,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
-from sglang.srt.models.gpt_oss import GptOssForCausalLM
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
-from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
-    InternViTCudaGraphRunner,
-)
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda
 from sglang.utils import logger
-
-_is_cuda = is_cuda()
 
 
 class InternAttention(nn.Module):
@@ -54,8 +37,6 @@ class InternAttention(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig = None,
-        use_data_parallel: bool = False,
-        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
@@ -65,6 +46,7 @@ class InternAttention(nn.Module):
         self.scale = self.head_dim**-0.5
 
         self.attn = VisionAttention(
+            qkv_backend="fa3",
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
             projection_size=self.embed_dim,
@@ -77,8 +59,6 @@ class InternAttention(nn.Module):
             qk_normalization=getattr(config, "qk_normalization", False)
             or getattr(config, "use_qk_norm", False),
             flatten_batch=False,
-            use_data_parallel=use_data_parallel,
-            aux_stream=aux_stream,
         )
 
         self.proj_drop = nn.Dropout(config.dropout)
@@ -87,9 +67,8 @@ class InternAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        out = self.attn(hidden_states, cu_seqlens=cu_seqlens, output_ws=output_ws)
+        out = self.attn(hidden_states, cu_seqlens=cu_seqlens)
         outs = self.proj_drop(out)
         return outs
 
@@ -114,7 +93,7 @@ class InternVisionEmbeddings(nn.Module):
             torch.randn(1, 1, self.embed_dim),
         )
 
-        self.patch_embedding = Conv2dLayer(
+        self.patch_embedding = nn.Conv2d(
             in_channels=3,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -183,39 +162,17 @@ class InternRMSNorm(nn.Module):
 
 
 class InternMLP(nn.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        use_data_parallel: bool = False,
-    ):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.config = config
-        self.act = get_act_fn(config.hidden_act)
-        self.fc1 = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=True,
-            quant_config=None,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
-        self.fc2 = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=True,
-            quant_config=None,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
+        self.act = ACT2FN[config.hidden_act]
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.fc1(hidden_states)
+        hidden_states = self.fc1(hidden_states)
         hidden_states = self.act(hidden_states)
-        hidden_states, _ = self.fc2(hidden_states)
+        hidden_states = self.fc2(hidden_states)
         return hidden_states
 
 
@@ -232,20 +189,13 @@ class InternVisionEncoderLayer(nn.Module):
         config: PretrainedConfig,
         drop_path_rate: float,
         quant_config: QuantizationConfig = None,
-        use_data_parallel: bool = False,
-        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
-        self.attn = InternAttention(
-            config=config,
-            quant_config=quant_config,
-            use_data_parallel=use_data_parallel,
-            aux_stream=aux_stream,
-        )
-        self.mlp = InternMLP(config, use_data_parallel)
+        self.attn = InternAttention(config=config, quant_config=quant_config)
+        self.mlp = InternMLP(config)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
 
@@ -262,7 +212,6 @@ class InternVisionEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        output_ws: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.FloatTensor,
         Optional[torch.FloatTensor],
@@ -275,9 +224,7 @@ class InternVisionEncoderLayer(nn.Module):
 
         hidden_states = hidden_states + self.drop_path1(
             self.attn(
-                self.norm1(hidden_states).to(hidden_states.dtype),
-                cu_seqlens=cu_seqlens,
-                output_ws=output_ws,
+                self.norm1(hidden_states).to(hidden_states.dtype), cu_seqlens=cu_seqlens
             )
             * self.ls1
         )
@@ -303,7 +250,6 @@ class InternVisionEncoder(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -312,23 +258,12 @@ class InternVisionEncoder(nn.Module):
             x.item()
             for x in torch.linspace(0, config.drop_path_rate, config.num_hidden_layers)
         ]
-
-        self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
-        aux_stream = (
-            None if self.enable_cg else (torch.cuda.Stream() if _is_cuda else None)
-        )
         self.layers = nn.ModuleList(
             [
-                InternVisionEncoderLayer(
-                    config, dpr[idx], quant_config, use_data_parallel, aux_stream
-                )
+                InternVisionEncoderLayer(config, dpr[idx], quant_config)
                 for idx in range(config.num_hidden_layers)
             ]
         )
-
-        self.cuda_graph_runner: Optional[InternViTCudaGraphRunner] = None
-        if self.enable_cg:
-            self.cuda_graph_runner = InternViTCudaGraphRunner(self)
 
     def forward(
         self,
@@ -346,14 +281,6 @@ class InternVisionEncoder(nn.Module):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        if self.enable_cg and (not output_hidden_states):
-            # graph path only returns last_hidden_state
-            hidden_states = inputs_embeds.to(device=inputs_embeds.device).contiguous()
-            hidden_states = self.cuda_graph_runner.run(hidden_states)
-            if not return_dict:
-                return (hidden_states,)
-            return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=None)
-
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -394,16 +321,14 @@ class InternVisionModel(PreTrainedModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        use_data_parallel: bool = False,
     ):
         super().__init__(config)
-
         self.config = config
-        self.use_data_parallel = use_data_parallel
+
         self.embeddings = InternVisionEmbeddings(
             config,
         )
-        self.encoder = InternVisionEncoder(config, quant_config, use_data_parallel)
+        self.encoder = InternVisionEncoder(config, quant_config)
 
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
         pos_emb = self.embeddings.position_embedding
@@ -458,36 +383,23 @@ class InternVisionModel(PreTrainedModel):
                 hidden_states = self.embeddings(pixel_values)
             else:
                 raise ValueError(f"wrong pixel_values size: {pixel_values.shape}")
-
-        if self.use_data_parallel:
-            encoder_outputs = run_dp_sharded_vision_model(hidden_states, self.encoder)
-            last_hidden_state = encoder_outputs
-        else:
-            encoder_outputs = self.encoder(
-                inputs_embeds=hidden_states,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-            last_hidden_state = encoder_outputs.last_hidden_state
+        encoder_outputs = self.encoder(
+            inputs_embeds=hidden_states,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        last_hidden_state = encoder_outputs.last_hidden_state
         pooled_output = last_hidden_state[:, 0, :]
 
         if not return_dict:
             return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
-        if self.use_data_parallel:
-            return BaseModelOutputWithPooling(
-                last_hidden_state=last_hidden_state,
-                pooler_output=pooled_output,
-                hidden_states=None,
-                attentions=None,
-            )
-        else:
-            return BaseModelOutputWithPooling(
-                last_hidden_state=last_hidden_state,
-                pooler_output=pooled_output,
-                hidden_states=encoder_outputs.hidden_states,
-                attentions=encoder_outputs.attentions,
-            )
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=pooled_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
 
 
 class InternVLChatModel(nn.Module):
@@ -499,7 +411,6 @@ class InternVLChatModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.quant_config = quant_config
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         image_size = config.force_image_size or config.vision_config.image_size
@@ -521,10 +432,7 @@ class InternVLChatModel(nn.Module):
         logger.info(f"num_image_token: {self.num_image_token}")
         logger.info(f"ps_version: {self.ps_version}")
 
-        self.vision_model = InternVisionModel(
-            config.vision_config,
-            use_data_parallel=self.use_data_parallel,
-        )
+        self.vision_model = InternVisionModel(config.vision_config)
         if config.llm_config.architectures[0] == "Qwen2ForCausalLM":
             self.language_model = Qwen2ForCausalLM(
                 config=config.llm_config, quant_config=quant_config
@@ -535,14 +443,6 @@ class InternVLChatModel(nn.Module):
             )
         elif config.llm_config.architectures[0] == "Qwen3MoeForCausalLM":
             self.language_model = Qwen3MoeForCausalLM(
-                config=config.llm_config, quant_config=quant_config
-            )
-        elif config.llm_config.architectures[0] == "GptOssForCausalLM":
-            self.language_model = GptOssForCausalLM(
-                config=config.llm_config, quant_config=quant_config
-            )
-        elif config.llm_config.architectures[0] == "Qwen3ForCausalLM":
-            self.language_model = Qwen3ForCausalLM(
                 config=config.llm_config, quant_config=quant_config
             )
         else:
@@ -561,13 +461,6 @@ class InternVLChatModel(nn.Module):
             nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size),
         )
-
-        self.external_mm_data_embedding_funcs = {
-            Modality.IMAGE: self.get_image_feature,
-            Modality.VIDEO: self.get_video_feature,
-        }
-
-        self.model = self.language_model.model
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -617,22 +510,8 @@ class InternVLChatModel(nn.Module):
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         pixel_values = torch.cat([item.feature for item in items])
-        # If already precomputed embeddings (not raw pixel values), skip vision encoder.
-        # Normal pixel_values are 4D [N, C, H, W]; precomputed embeddings are 2D or 3D.
-        if pixel_values.dim() != 4:
-            return pixel_values
         image_features = self.extract_feature(pixel_values)
         return image_features
-
-    def get_video_feature(self, items: List[MultimodalDataItem]):
-        # items: each item corresponds to one video (recommended)
-        # item.feature shape: [num_frames, 3, 448, 448]  (or [num_tiles, 3, 448, 448])
-        pixel_values = torch.cat([item.feature for item in items], dim=0)
-        # If already precomputed embeddings, skip vision encoder.
-        if pixel_values.dim() != 4:
-            return pixel_values
-        video_features = self.extract_feature(pixel_values)
-        return video_features
 
     @torch.no_grad()
     def forward(
@@ -643,16 +522,17 @@ class InternVLChatModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        hidden_states = general_mm_embed_routine(
+        hs = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            multimodal_model=self,
-            data_embedding_funcs=self.external_mm_data_embedding_funcs,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+            },
             positions=positions,
         )
 
-        return hidden_states
+        return hs
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
@@ -697,17 +577,9 @@ class InternVLChatModel(nn.Module):
                 ckpt_up_proj_name="up_proj",
                 num_experts=self.config.num_experts,
             )
-        elif "Qwen3ForCausalLM" in self.config.llm_config.architectures:
-            stacked_params_mapping = [
-                # (param_name, shard_name, shard_id)
-                ("qkv_proj", "q_proj", "q"),
-                ("qkv_proj", "k_proj", "k"),
-                ("qkv_proj", "v_proj", "v"),
-                ("gate_up_proj", "gate_proj", 0),
-                ("gate_up_proj", "up_proj", 1),
-            ]
 
         params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -786,6 +658,14 @@ class InternVLChatModel(nn.Module):
                                 self.config, name, loaded_weight
                             )
                         weight_loader(param, loaded_weight)
+
+            loaded_params.add(name)
+        unloaded_params = params_dict.keys() - loaded_params
+        if unloaded_params:
+            raise RuntimeError(
+                f"Some weights are not initialized from checkpoints: {unloaded_params}"
+            )
+        return loaded_params
 
 
 EntryClass = InternVLChatModel

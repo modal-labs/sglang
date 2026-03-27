@@ -11,26 +11,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
-from __future__ import annotations
-
 import json
 import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
-
-if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +80,7 @@ class ExpertLocationMetadata:
     # -------------------------------- construction ------------------------------------
 
     @staticmethod
-    def init_trivial(
-        server_args: ServerArgs, model_config: ModelConfig, moe_ep_rank: int
-    ):
+    def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
         """Trivial location - logical expert i corresponds to physical expert i"""
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
@@ -108,7 +101,6 @@ class ExpertLocationMetadata:
             server_args,
             model_config,
             physical_to_logical_map=physical_to_logical_map,
-            moe_ep_rank=moe_ep_rank,
         )
 
     @staticmethod
@@ -116,7 +108,6 @@ class ExpertLocationMetadata:
         server_args: ServerArgs,
         model_config: ModelConfig,
         physical_to_logical_map,
-        moe_ep_rank: int = None,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
@@ -129,11 +120,8 @@ class ExpertLocationMetadata:
 
         model_config_for_expert_location = common["model_config_for_expert_location"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
-            server_args=server_args,
-            physical_to_logical_map=physical_to_logical_map,
+            physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
-            ep_size=common["ep_size"],
-            moe_ep_rank=moe_ep_rank,
         )
 
         return ExpertLocationMetadata._init_raw(
@@ -238,9 +226,8 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=(
                 compute_logical_to_rank_dispatch_physical_map(
-                    server_args=server_args,
                     logical_to_all_physical_map=logical_to_all_physical_map,
-                    ep_size=ep_size,
+                    num_gpus=ep_size,
                     num_physical_experts=num_physical_experts,
                     # TODO improve when we have real EP rank
                     ep_rank=torch.distributed.get_rank() % ep_size,
@@ -284,19 +271,9 @@ class ExpertLocationMetadata:
     # -------------------------------- usage ------------------------------------
 
     def logical_to_all_physical(
-        self,
-        layer_id: int,
-        logical_expert_id: int,
-        require_global_experts: bool = False,
+        self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
         # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
-        if require_global_experts:
-            num_physical_experts = self.logical_to_all_physical_map_cpu[layer_id].shape[
-                -1
-            ]
-            return list(
-                range(logical_expert_id, num_physical_experts, self.num_logical_experts)
-            )
         return [
             physical_expert_id
             for physical_expert_id in self.logical_to_all_physical_map_cpu[
@@ -320,11 +297,7 @@ def set_global_expert_location_metadata(value):
 
 
 def _compute_logical_to_all_physical_map(
-    server_args: ServerArgs,
-    physical_to_logical_map: torch.Tensor,
-    num_logical_experts: int,
-    ep_size: int,
-    moe_ep_rank: int,
+    physical_to_logical_map: torch.Tensor, num_logical_experts: int
 ):
     # This is rarely called, so we use for loops for maximum clarity
 
@@ -333,8 +306,6 @@ def _compute_logical_to_all_physical_map(
     logical_to_all_physical_map = [
         [[] for _ in range(num_logical_experts)] for _ in range(num_layers)
     ]
-
-    # Find out the candidate physical experts for each logical expert on each layer
     for layer_id in range(num_layers):
         for physical_expert_id in range(num_physical_experts):
             logical_expert_id = physical_to_logical_map[
@@ -343,32 +314,6 @@ def _compute_logical_to_all_physical_map(
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )
-
-    # Replace by the physical expert on local GPU or node if possible
-    if moe_ep_rank is not None:
-        num_gpus_per_node = server_args.ep_size // server_args.nnodes
-        num_local_gpu_physical_experts = num_physical_experts // ep_size
-        num_local_node_physical_experts = (
-            num_local_gpu_physical_experts * num_gpus_per_node
-        )
-        for layer_id in range(num_layers):
-            for logical_expert_id in range(num_logical_experts):
-                # Try to find the nearest physical expert
-                nearest_expert = _find_nearest_expert(
-                    candidate_physical_expert_ids=logical_to_all_physical_map[layer_id][
-                        logical_expert_id
-                    ],
-                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
-                    moe_ep_rank=moe_ep_rank,
-                    num_gpus_per_node=num_gpus_per_node,
-                    num_local_node_physical_experts=num_local_node_physical_experts,
-                )
-
-                # Replace by the nearest physical expert
-                if nearest_expert != -1:
-                    logical_to_all_physical_map[layer_id][logical_expert_id] = [
-                        nearest_expert
-                    ]
 
     logical_to_all_physical_map = _pad_nested_array(
         logical_to_all_physical_map, pad_value=-1
@@ -390,23 +335,20 @@ def _pad_nested_array(arr, pad_value):
 
 # TODO optimize performance (rewrite and/or run in separate process with overlap)
 def compute_logical_to_rank_dispatch_physical_map(
-    server_args: ServerArgs,
     logical_to_all_physical_map: torch.Tensor,
-    ep_size: int,
+    num_gpus: int,
     num_physical_experts: int,
     ep_rank: int,
     seed: int = 42,
 ):
     r = random.Random(seed)
 
-    num_local_gpu_physical_experts = num_physical_experts // ep_size
-    num_gpus_per_node = server_args.ep_size // server_args.nnodes
-    num_local_node_physical_experts = num_local_gpu_physical_experts * num_gpus_per_node
+    num_local_physical_experts = num_physical_experts // num_gpus
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
 
     logical_to_rank_dispatch_physical_map = torch.full(
-        size=(ep_size, num_layers, num_logical_experts),
+        size=(num_gpus, num_layers, num_logical_experts),
         fill_value=-1,
         dtype=dtype,
     )
@@ -420,17 +362,18 @@ def compute_logical_to_rank_dispatch_physical_map(
                 :, layer_id, logical_expert_id
             ]
 
-            for moe_ep_rank in range(ep_size):
-                # Fill with the nearest physical expert
-                output_partial[moe_ep_rank] = _find_nearest_expert(
-                    candidate_physical_expert_ids=candidate_physical_expert_ids,
-                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
-                    moe_ep_rank=moe_ep_rank,
-                    num_gpus_per_node=num_gpus_per_node,
-                    num_local_node_physical_experts=num_local_node_physical_experts,
-                )
+            for gpu_id in range(num_gpus):
+                same_gpu_physical_expert_ids = [
+                    physical_expert_id
+                    for physical_expert_id in candidate_physical_expert_ids
+                    if _compute_gpu_id_of_physical_expert(
+                        physical_expert_id, num_local_physical_experts
+                    )
+                    == gpu_id
+                ]
+                if len(same_gpu_physical_expert_ids) > 0:
+                    output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
 
-            # Fill remaining slots with fair random choices
             num_remain = torch.sum(output_partial == -1).item()
             output_partial[output_partial == -1] = torch.tensor(
                 _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r),
@@ -456,55 +399,9 @@ def _logical_to_all_physical_raw(
 
 
 def _compute_gpu_id_of_physical_expert(
-    physical_expert_id: int, num_local_gpu_physical_experts: int
+    physical_expert_id: int, num_local_physical_experts: int
 ) -> int:
-    return physical_expert_id // num_local_gpu_physical_experts
-
-
-def _compute_node_id_of_physical_expert(
-    physical_expert_id: int, num_local_host_physical_experts: int
-) -> int:
-    return physical_expert_id // num_local_host_physical_experts
-
-
-def _find_nearest_expert(
-    candidate_physical_expert_ids: List[int],
-    num_local_gpu_physical_experts: int,
-    moe_ep_rank: int,
-    num_gpus_per_node: int,
-    num_local_node_physical_experts: int,
-) -> int:
-    # 1. If only one candidate, return it directly
-    if len(candidate_physical_expert_ids) == 1:
-        return candidate_physical_expert_ids[0]
-
-    # 2. Prefer same-GPU experts
-    same_gpu_physical_expert_ids = [
-        physical_expert_id
-        for physical_expert_id in candidate_physical_expert_ids
-        if _compute_gpu_id_of_physical_expert(
-            physical_expert_id, num_local_gpu_physical_experts
-        )
-        == moe_ep_rank
-    ]
-    if len(same_gpu_physical_expert_ids) > 0:
-        return same_gpu_physical_expert_ids[0]
-
-    # 3. Otherwise, prefer same-node experts
-    node_rank = moe_ep_rank // num_gpus_per_node
-    same_node_physical_expert_ids = [
-        physical_expert_id
-        for physical_expert_id in candidate_physical_expert_ids
-        if _compute_node_id_of_physical_expert(
-            physical_expert_id, num_local_node_physical_experts
-        )
-        == node_rank
-    ]
-    if len(same_node_physical_expert_ids) > 0:
-        return same_node_physical_expert_ids[0]
-
-    # 4. At last, leave it as -1 to indicate not found.
-    return -1
+    return physical_expert_id // num_local_physical_experts
 
 
 def _fair_choices(arr: List, k: int, r: random.Random) -> List:
@@ -532,15 +429,11 @@ class ModelConfigForExpertLocation:
 
 
 def compute_initial_expert_location_metadata(
-    server_args: ServerArgs,
-    model_config: ModelConfig,
-    moe_ep_rank: int,
+    server_args: ServerArgs, model_config: ModelConfig
 ) -> Optional[ExpertLocationMetadata]:
     data = server_args.init_expert_location
     if data == "trivial":
-        return ExpertLocationMetadata.init_trivial(
-            server_args, model_config, moe_ep_rank
-        )
+        return ExpertLocationMetadata.init_trivial(server_args, model_config)
 
     # TODO unify with the utils function
     if data.endswith(".pt"):
@@ -555,10 +448,7 @@ def compute_initial_expert_location_metadata(
             "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
         )
         return ExpertLocationMetadata.init_by_mapping(
-            server_args,
-            model_config,
-            **data_dict,
-            moe_ep_rank=moe_ep_rank,
+            server_args, model_config, **data_dict
         )
     elif "logical_count" in data_dict:
         logger.info(

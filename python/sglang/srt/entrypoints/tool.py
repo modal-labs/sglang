@@ -4,8 +4,6 @@ import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from sglang.srt.utils import print_info_once, print_warning_once
-
 if TYPE_CHECKING:
     # Avoid circular import.
     from sglang.srt.entrypoints.context import ConversationContext
@@ -27,7 +25,7 @@ class HarmonyBrowserTool(Tool):
         exa_api_key = os.getenv("EXA_API_KEY")
         if not exa_api_key:
             self.enabled = False
-            print_warning_once("EXA_API_KEY is not set, browsing is disabled")
+            logger.warning_once("EXA_API_KEY is not set, browsing is disabled")
             return
 
         try:
@@ -35,12 +33,12 @@ class HarmonyBrowserTool(Tool):
             from gpt_oss.tools.simple_browser.backend import ExaBackend
         except ImportError:
             self.enabled = False
-            print_warning_once("gpt_oss is not installed, browsing is disabled")
+            logger.warning_once("gpt_oss is not installed, browsing is disabled")
             return
 
         browser_backend = ExaBackend(source="web", api_key=exa_api_key)
         self.browser_tool = SimpleBrowserTool(backend=browser_backend)
-        print_info_once("Browser tool initialized")
+        logger.info_once("Browser tool initialized")
 
     async def get_result(self, context: "ConversationContext") -> Any:
         from sglang.srt.entrypoints.context import HarmonyContext
@@ -66,11 +64,13 @@ class HarmonyPythonTool(Tool):
             from gpt_oss.tools.python_docker.docker_tool import PythonTool
         except ImportError:
             self.enabled = False
-            print_warning_once("gpt_oss is not installed, code interpreter is disabled")
+            logger.warning_once(
+                "gpt_oss is not installed, code interpreter is disabled"
+            )
             return
 
         self.python_tool = PythonTool()
-        print_info_once("Code interpreter tool initialized")
+        logger.info_once("Code interpreter tool initialized")
 
     async def get_result(self, context: "ConversationContext") -> Any:
         from sglang.srt.entrypoints.context import HarmonyContext

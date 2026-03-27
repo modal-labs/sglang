@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -649,9 +650,9 @@ class DeepseekV2Config(PretrainedConfig):
 
 class DeepseekVL2Config(PretrainedConfig):
     model_type = "deepseek_vl_v2"
-    vision_config: DeepseekVL2VisionEncoderConfig = None
-    projector_config: DeepseekVL2MlpProjectorConfig = None
-    language_config: DeepseekV2Config = None
+    vision_config: DeepseekVL2VisionEncoderConfig
+    projector_config: DeepseekVL2MlpProjectorConfig
+    language_config: DeepseekV2Config
 
     tile_tag: str = "2D"
     global_view_pos: str = "head"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -9,7 +10,6 @@ import torch
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -44,9 +44,12 @@ class SamplingBatchInfo:
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
+    # An event used for overlap schedule
+    sampling_info_done: Optional[threading.Event] = None
+
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
-    acc_linear_penalties: torch.Tensor = None  # Used in the overlap mode
+    linear_penalty: torch.Tensor = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -57,9 +60,6 @@ class SamplingBatchInfo:
         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
 
-    # Used for deterministic sampling
-    sampling_seed: Optional[torch.Tensor] = None
-
     # Device
     device: str = "cuda"
 
@@ -68,41 +68,27 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args = get_global_server_args()
-        enable_deterministic = global_server_args.enable_deterministic_inference
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
 
         reqs = batch.reqs
         device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
-        top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
-        )
-        min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
-        sampling_seed = (
+        temperatures = (
             torch.tensor(
-                [
-                    (
-                        r.sampling_params.sampling_seed
-                        if r.sampling_params.sampling_seed is not None
-                        else 42
-                    )
-                    for r in reqs
-                ],
-                dtype=torch.int64,
-                device=device,
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
             )
-            if enable_deterministic
-            else None
+            .view(-1, 1)
+            .to(device, non_blocking=True)
         )
+        top_ps = torch.tensor(
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
+        top_ks = torch.tensor(
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
+        ).to(device, non_blocking=True)
+        min_ps = torch.tensor(
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
@@ -113,9 +99,10 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            global_server_args.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
+        has_custom_logit_processor = global_server_args_dict[
+            "enable_custom_logit_processor"
+        ] and any(  # check the flag first.
+            r.custom_logit_processor for r in reqs
         )  # then check the requests.
 
         if has_custom_logit_processor:
@@ -167,7 +154,6 @@ class SamplingBatchInfo:
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
-            sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
@@ -180,22 +166,7 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
         )
-        ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
-
-    # placeholder for override
-    def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
-        pass
-
-    # placeholder for override
-    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
-        pass
-
-    # placeholder for override
-    def adjusted_filter_batch(
-        self, keep_indices: List[int], keep_indices_device: torch.Tensor
-    ):
-        pass
 
     def __len__(self):
         return len(self.temperatures)
@@ -229,19 +200,19 @@ class SamplingBatchInfo:
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
-            self.acc_linear_penalties = torch.zeros(
+            self.linear_penalty = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
                 device=self.temperatures.device,
             )
-            self.penalizer_orchestrator.apply(self.acc_linear_penalties)
+            self.penalizer_orchestrator.apply(self.linear_penalty)
         else:
-            self.acc_linear_penalties = None
+            self.linear_penalty = None
 
     def apply_logits_bias(self, logits: torch.Tensor):
-        if self.acc_linear_penalties is not None:
+        if self.linear_penalty is not None:
             # Used in the overlap mode
-            logits.add_(self.acc_linear_penalties)
+            logits.add_(self.linear_penalty)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
@@ -264,16 +235,12 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
-            "sampling_seed",
         ]:
             value = getattr(self, item, None)
-            if value is not None:
-                setattr(self, item, value[keep_indices_device])
+            setattr(self, item, value[keep_indices_device])
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
-
-        self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
@@ -372,24 +339,15 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
-            "sampling_seed",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
-            if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
+            setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
-
-        self.adjusted_merge_batch(other)
-
-    def copy_for_forward(self):
-        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
-        self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
 
 
 def merge_bias_tensor(

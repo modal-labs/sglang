@@ -1,7 +1,6 @@
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/test_flash_attn.py
 import itertools
 import math
-import sys
 from typing import Optional
 
 import pytest
@@ -26,10 +25,10 @@ def is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    return (torch.version.cuda >= "12.3") and (
+    return (
         torch.cuda.get_device_capability(device)[0] == 9
         or torch.cuda.get_device_capability(device)[0] == 8
-    )
+    ) and (torch.version.cuda >= "12.3")
 
 
 DISABLE_BACKWARD = True
@@ -1366,4 +1365,4 @@ def test_flash_attn_varlen_output(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

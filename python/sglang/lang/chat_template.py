@@ -398,8 +398,6 @@ register_chat_template(
             "user": ("<start_of_turn>user\n", "<end_of_turn>\n"),
             "assistant": ("<start_of_turn>model\n", "<end_of_turn>\n"),
         },
-        image_token="<start_of_image>",
-        audio_token="<start_of_audio>",
         style=ChatTemplateStyle.PLAIN,
     )
 )
@@ -530,12 +528,6 @@ def match_deepseek(model_path: str):
         r"base", model_path, re.IGNORECASE
     ):
         return "deepseek-v3"
-
-
-@register_chat_template_matching_function
-def match_orion(model_path: str):
-    if "orion" in model_path.lower():
-        return "claude"
 
 
 @register_chat_template_matching_function

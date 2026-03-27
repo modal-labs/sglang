@@ -20,8 +20,9 @@ class BaseConnector(ABC):
     <connector_type://<host>:<port>/<model_name>/files/<filename>
     """
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, device: torch.device = "cpu"):
         self.url = url
+        self.device = device
         self.closed = False
         self.local_dir = tempfile.mkdtemp()
         for sig in (signal.SIGINT, signal.SIGTERM):

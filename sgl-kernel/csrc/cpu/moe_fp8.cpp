@@ -174,18 +174,18 @@ void fused_experts_fp8_kernel_impl(
   const int64_t stride_e = 2 * N * K;
   const int64_t stride_n = K;
 
-  int64_t avg_M = std::max(int64_t(1), M * topk / E);
-  const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(avg_M);
-
-  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
-
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
     // get local pointers
-    int tid = get_thread_num();
+    int tid = at::get_thread_num();
     scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
 
-    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    bool is_brgemm_used = false;
+
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB;
+      int64_t nb = i % NB;
+
       int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
 
       // B shape [K, n_size] in vnni format
@@ -194,13 +194,12 @@ void fused_experts_fp8_kernel_impl(
       const float* __restrict__ Bs =
           w1s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
 
-      // do unpacking for the first row or a new expert
-      int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
-      bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
-
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
+
+      const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
 
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m] / topk;
@@ -212,7 +211,7 @@ void fused_experts_fp8_kernel_impl(
           /*   A            */ A,
           /*   B            */ B,
           /*   C            */ ic0 + offset * 2 * N + nb * BLOCK_N,
-          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * K,
+          /*   Btmp         */ B_tmp + tid * BLOCK_N * std::max(K, N),
           /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
           /*   scale        */ Bs,
           /*   M            */ m_size,
@@ -222,11 +221,10 @@ void fused_experts_fp8_kernel_impl(
           /*   ldb          */ n_size,
           /*   ldc          */ 2 * N,
           /*   brg          */ use_brgemm,
-          /*   block_size_K */ block_size_K,
-          /*   do_unpack    */ do_unpack);
-    });
+          /*   block_size_K */ block_size_K);
+    }
 
-    if (use_brgemm) {
+    if (is_brgemm_used) {
       at::native::cpublas::brgemm_release();
     }
   });
@@ -250,13 +248,21 @@ void fused_experts_fp8_kernel_impl(
   const int64_t stride_oc = IC;
 
   // parallel on [MB2, NB2]
-  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-    int tid = get_thread_num();
+  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
+    int tid = at::get_thread_num();
     alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
 
-    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    bool is_brgemm_used = false;
+
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB2;
+      int64_t nb = i % NB2;
+
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+
+      const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
 
       // A ptr from ic1 of [M * topk, N] in sorted order
       // so as to avoid copy A to tmp buffer again
@@ -269,15 +275,11 @@ void fused_experts_fp8_kernel_impl(
       const float* __restrict__ Bs =
           w2s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
 
-      // do unpacking for the first row or a new expert
-      int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
-      bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
-
       tinygemm_kernel<scalar_t>(
           /*   A            */ A,
           /*   B            */ B,
           /*   C            */ C,
-          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * IC,
+          /*   Btmp         */ B_tmp + tid * BLOCK_N * std::max(K, N),
           /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
           /*   scale        */ Bs,
           /*   M            */ m_size,
@@ -287,8 +289,7 @@ void fused_experts_fp8_kernel_impl(
           /*   ldb          */ n_size,
           /*   ldc          */ BLOCK_N,
           /*   brg          */ use_brgemm,
-          /*   block_size_K */ block_size_K,
-          /*   do_unpack    */ do_unpack);
+          /*   block_size_K */ block_size_K);
 
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
@@ -297,9 +298,9 @@ void fused_experts_fp8_kernel_impl(
         float weight = topk_weights[index];
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
       }
-    });
+    }
 
-    if (use_brgemm) {
+    if (is_brgemm_used) {
       at::native::cpublas::brgemm_release();
     }
   });
@@ -373,23 +374,20 @@ void shared_expert_fp8_kernel_impl(
 
   const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
 
-  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
+  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+    int tid = at::get_thread_num();
 
-  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-    int tid = get_thread_num();
-
-    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB;
+      int64_t nb = i % NB;
       int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
       int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
-
-      // do unpacking for the first row
-      bool do_unpack = (mb == mb0);
 
       tinygemm_kernel<scalar_t>(
           /*   A            */ input + mb * BLOCK_M * K,
           /*   B            */ packed_w1 + nb * BLOCK_N * K,
           /*   C            */ ic0 + mb * BLOCK_M * 2 * N + nb * BLOCK_N,
-          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * K,
+          /*   Btmp         */ B_tmp + tid * BLOCK_N * std::max(K, N),
           /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
           /*   scale        */ w1s + (nb / blocks_n_per_group) * scale_size_K,
           /*   M            */ m_size,
@@ -399,9 +397,8 @@ void shared_expert_fp8_kernel_impl(
           /*   ldb          */ n_size,
           /*   ldc          */ 2 * N,
           /*   brg          */ use_brgemm,
-          /*   block_size_K */ block_size_K,
-          /*   do_unpack    */ do_unpack);
-    });
+          /*   block_size_K */ block_size_K);
+    }
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
@@ -424,23 +421,22 @@ void shared_expert_fp8_kernel_impl(
   scale_size_K = div_up(N, block_size_K);
 
   // parallel on [MB2, NB2]
-  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-    int tid = get_thread_num();
+  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
+    int tid = at::get_thread_num();
     alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
 
-    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB2;
+      int64_t nb = i % NB2;
       int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
-
-      // do unpacking for the first row
-      bool do_unpack = (mb == mb0);
 
       // 2.a gemm: C = A @ B
       tinygemm_kernel<scalar_t>(
           /*   A            */ ic1 + mb * BLOCK_M * N,
           /*   B            */ packed_w2 + nb * BLOCK_N * N,
           /*   C            */ C,
-          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * IC,
+          /*   Btmp         */ B_tmp + tid * BLOCK_N * std::max(K, N),
           /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
           /*   scale        */ w2s + (nb / blocks_n_per_group) * scale_size_K,
           /*   M            */ m_size,
@@ -450,8 +446,7 @@ void shared_expert_fp8_kernel_impl(
           /*   ldb          */ n_size,
           /*   ldc          */ BLOCK_N,
           /*   brg          */ use_brgemm,
-          /*   block_size_K */ block_size_K,
-          /*   do_unpack    */ do_unpack);
+          /*   block_size_K */ block_size_K);
 
       // 2.b copy from C to output and add fused_experts_out
       scalar_t* __restrict__ out = output + mb * BLOCK_M * K + nb * BLOCK_N;
@@ -459,7 +454,7 @@ void shared_expert_fp8_kernel_impl(
       for (int64_t m = 0; m < m_size; ++m) {
         add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, n_size);
       }
-    });
+    }
   });
 
   if (use_brgemm) {

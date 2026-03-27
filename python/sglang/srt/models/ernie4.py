@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights."""
+""" Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights. """
 
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -87,13 +87,12 @@ class Ernie4Moe(nn.Module):
 
         self.topk = TopK(
             top_k=config.moe_k,
-            layer_id=layer_id,
             renormalize=True,
             use_grouped_topk=False,
             correction_bias=self.gate.e_score_correction_bias,
         )
 
-        self.experts = get_moe_impl_class(quant_config)(
+        self.experts = get_moe_impl_class()(
             num_experts=config.moe_num_experts,
             top_k=config.moe_k,
             hidden_size=config.hidden_size,
@@ -155,8 +154,8 @@ class Ernie4DecoderLayer(nn.Module):
         is_mtp: bool = False,
     ):
         super().__init__()
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         # Self attention.
         self.self_attn = Ernie4Attention(

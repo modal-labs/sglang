@@ -1,10 +1,9 @@
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
+from sglang.srt.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
     EmbeddingRequest,
@@ -15,11 +14,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.srt.parser.conversation import generate_embedding_convs
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
-    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):
@@ -74,7 +70,6 @@ class OpenAIServingEmbedding(OpenAIServingBase):
     def _convert_to_internal_request(
         self,
         request: EmbeddingRequest,
-        raw_request: Request = None,
     ) -> tuple[EmbeddingReqInput, EmbeddingRequest]:
         """Convert OpenAI embedding request to internal format"""
         prompt = request.input
@@ -89,18 +84,16 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 # Handle multimodal embedding inputs
                 texts = []
                 images = []
-                videos = []
                 for item in prompt:
                     # Use padding for text if None - this could be improved
                     texts.append(item.text if item.text is not None else "padding")
                     images.append(item.image if item.image is not None else None)
-                    videos.append(item.video if item.video is not None else None)
 
                 generate_prompts = []
                 # Check if we have a chat template for multimodal embeddings
                 if self.template_manager.chat_template_name is not None:
                     convs = generate_embedding_convs(
-                        texts, images, videos, self.template_manager.chat_template_name
+                        texts, images, self.template_manager.chat_template_name
                     )
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
@@ -111,13 +104,11 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                     prompt_kwargs = {
                         "text": generate_prompts[0],
                         "image_data": images[0],
-                        "video_data": videos[0],
                     }
                 else:
                     prompt_kwargs = {
                         "text": generate_prompts,
                         "image_data": images,
-                        "video_data": videos,
                     }
             else:
                 # List of integers (token IDs) or empty list
@@ -126,16 +117,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             # Other types (should not happen but handle gracefully)
             prompt_kwargs = {"input_ids": prompt}
 
-        # Resolve LoRA adapter from model parameter or explicit lora_path
-        lora_path = self._resolve_lora_path(request.model, request.lora_path)
-
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
             rid=request.rid,
-            priority=request.priority,
-            routing_key=self.extract_routing_key(raw_request),
-            dimensions=request.dimensions,
-            lora_path=lora_path,
         )
 
         return adapted_request, request
