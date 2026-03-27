@@ -7,6 +7,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     ScoringRequest,
     ScoringResponse,
+    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 
@@ -25,6 +26,7 @@ class OpenAIServingScore(OpenAIServingBase):
     def _convert_to_internal_request(
         self,
         request: ScoringRequest,
+        raw_request: Request = None,
     ) -> tuple[ScoringRequest, ScoringRequest]:
         """Convert OpenAI scoring request to internal format"""
         # For scoring, we pass the request directly as the tokenizer_manager
@@ -41,7 +43,7 @@ class OpenAIServingScore(OpenAIServingBase):
         """Handle the scoring request"""
         try:
             # Use tokenizer_manager's score_request method directly
-            scores = await self.tokenizer_manager.score_request(
+            result = await self.tokenizer_manager.score_request(
                 query=request.query,
                 items=request.items,
                 label_token_ids=request.label_token_ids,
@@ -50,10 +52,13 @@ class OpenAIServingScore(OpenAIServingBase):
                 request=raw_request,
             )
 
-            # Create response with just the scores, without usage info
             response = ScoringResponse(
-                scores=scores,
+                scores=result.scores,
                 model=request.model,
+                usage=UsageInfo(
+                    prompt_tokens=result.prompt_tokens,
+                    total_tokens=result.prompt_tokens,
+                ),
             )
             return response
 

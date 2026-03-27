@@ -12,10 +12,70 @@ on-the-fly to convert high-precision weights into a lower-precision format.
 **Note: For better performance, usability and convenience, offline quantization is recommended over online quantization.**
 
 If you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time.
-For popular pre-quantized models, please visit [ModelCloud](https://huggingface.co/collections/ModelCloud/vortex-673743382af0a52b2a8b9fe2)
+For popular pre-quantized models, please visit [Unsloth](https://huggingface.co/unsloth), [NVIDIA ModelOpt](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer)
 or [NeuralMagic](https://huggingface.co/collections/neuralmagic) collections on HF for some
 popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
 to guard against abnormal quantization loss regressions.
+
+## Platform Compatibility
+
+The following table summarizes quantization method support across NVIDIA and AMD GPUs.
+
+| Method | NVIDIA GPUs | AMD GPUs (MI300X/MI325X/MI350X) | Notes |
+|--------|:-----------:|:-------------------------------:|-------|
+| `fp8` | Yes | Yes | Aiter or Triton backend on AMD |
+| `mxfp4` | Yes | Yes | Requires CDNA3/CDNA4 with MXFP support; uses Aiter |
+| `blockwise_int8` | Yes | Yes | Triton-based, works on both platforms |
+| `w8a8_int8` | Yes | Yes | |
+| `w8a8_fp8` | Yes | Yes | Aiter or Triton FP8 on AMD |
+| `awq` | Yes | Yes | Uses Triton dequantize on AMD (vs. optimized CUDA kernels on NVIDIA) |
+| `gptq` | Yes | Yes | Uses Triton or vLLM kernels on AMD |
+| `compressed-tensors` | Yes | Yes | Aiter paths for FP8/MoE on AMD |
+| `quark` | Yes | Yes | AMD Quark quantization; Aiter GEMM paths on AMD |
+| `auto-round` | Yes | Yes | Platform-agnostic (Intel auto-round) |
+| `quark_int4fp8_moe` | No | Yes | AMD-only; online INT4-to-FP8 MoE quantization (CDNA3/CDNA4) |
+| `awq_marlin` | Yes | No | Marlin kernels are CUDA-only |
+| `gptq_marlin` | Yes | No | Marlin kernels are CUDA-only |
+| `gguf` | Yes | No | CUDA-only kernels in sgl-kernel |
+| `modelopt` / `modelopt_fp8` | Yes (Hopper/SM90+) | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); requires NVIDIA hardware |
+| `modelopt_fp4` | Yes (Blackwell/SM100+) | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); native FP4 on Blackwell (B200, GB200) |
+| `petit_nvfp4` | No | Yes (MI250/MI300X/MI325X) | Enables NVFP4 on ROCm via [Petit](https://github.com/causalflow-ai/petit-kernel); use `modelopt_fp4` on NVIDIA Blackwell. Auto-selected when loading NVFP4 models on AMD. See [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/) and [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html). |
+| `bitsandbytes` | Yes | Experimental | Depends on bitsandbytes ROCm support |
+| `torchao` (`int4wo`, etc.) | Yes | Partial | `int4wo` not supported on AMD; other methods may work |
+
+On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../platforms/amd_gpu.md) for installation and configuration details.
+
+## GEMM Backends for FP4/FP8 Quantization
+
+:::{note}
+Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. When running FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
+:::
+
+### `--fp8-gemm-backend` (Blockwise FP8 GEMM)
+
+| Backend | Hardware | Description |
+|---------|----------|-------------|
+| `auto` | All | Auto-selects based on hardware |
+| `deep_gemm` | SM90, SM100 | JIT-compiled; enabled when DeepGEMM is installed |
+| `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend; optimal for low-latency |
+| `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS groupwise FP8 GEMM |
+| `flashinfer_deepgemm` | SM90 | Uses swapAB optimization for small M dimensions in decoding |
+| `cutlass` | SM90, SM100/120 | sgl-kernel CUTLASS |
+| `triton` | All | Fallback; widely compatible |
+| `aiter` | ROCm | AMD AITER backend |
+
+**`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 always resolves to Triton.
+
+### `--fp4-gemm-backend` (NVFP4 GEMM)
+
+| Backend | Hardware | Description |
+|---------|----------|-------------|
+| `auto` | SM100/120 | Auto-selects: `flashinfer_cudnn` on SM120; `flashinfer_cutlass` on SM100 |
+| `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS backend |
+| `flashinfer_cudnn` | SM100/120 (CUDA 13+, cuDNN 9.15+) | FlashInfer cuDNN backend; used on SM120 for performance |
+| `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend |
+
+When FlashInfer is unavailable for NVFP4, sgl-kernel CUTLASS is used as an automatic fallback.
 
 ## Offline Quantization
 
@@ -39,6 +99,85 @@ python3 -m sglang.launch_server \
 ```
 
 ### Examples of Offline Model Quantization
+
+#### Using [Unsloth](https://docs.unsloth.ai/basics/inference-and-deployment/sglang-guide)
+
+We strongly suggest the use of Unsloth to quantize and load the model. Please refer to [SGLang Deployment & Inference Guide with Unsloth](https://docs.unsloth.ai/basics/inference-and-deployment/sglang-guide).
+
+#### Using [auto-round](https://github.com/intel/auto-round)
+
+```bash
+# Install
+pip install auto-round
+```
+
+- LLM quantization
+
+```py
+# for LLM
+from auto_round import AutoRound
+model_id = "meta-llama/Llama-3.2-1B-Instruct"
+quant_path = "Llama-3.2-1B-Instruct-autoround-4bit"
+# Scheme examples: "W2A16", "W3A16", "W4A16", "W8A16", "NVFP4", "MXFP4" (no real kernels), "GGUF:Q4_K_M", etc.
+scheme = "W4A16"
+format = "auto_round"
+autoround = AutoRound(model_id, scheme=scheme)
+autoround.quantize_and_save(quant_path, format=format) # quantize and save
+
+```
+
+- VLM quantization
+```py
+# for VLMs
+from auto_round import AutoRoundMLLM
+model_name = "Qwen/Qwen2-VL-2B-Instruct"
+quant_path = "Qwen2-VL-2B-Instruct-autoround-4bit"
+scheme = "W4A16"
+format = "auto_round"
+autoround = AutoRoundMLLM(model_name, scheme)
+autoround.quantize_and_save(quant_path, format=format) # quantize and save
+
+```
+
+- Command Line Usage (Gaudi/CPU/Intel GPU/CUDA)
+
+```bash
+auto-round \
+    --model meta-llama/Llama-3.2-1B-Instruct \
+    --bits 4 \
+    --group_size 128 \
+    --format "auto_round" \
+    --output_dir ./tmp_autoround
+```
+
+- known issues
+
+Several limitations currently affect offline quantized model loading in sglang, These issues might be resolved in future updates of sglang. If you experience any problems, consider using Hugging Face Transformers as an alternative.
+
+1. Mixed-bit Quantization Limitations
+
+    Mixed-bit quantization is not fully supported. Due to vLLM's layer fusion (e.g., QKV fusion), applying different bit-widths to components within the same fused layer can lead to compatibility issues.
+
+
+2. Limited Support for Quantized MoE Models
+
+    Quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). please try to skip quantizing these layers to avoid such errors.
+
+
+3. Limited Support for Quantized VLMs
+    <details>
+        <summary>VLM failure cases</summary>
+
+    Qwen2.5-VL-7B
+
+    auto_round:auto_gptq format:  Accuracy is close to zero.
+
+    GPTQ format:  Fails with:
+    ```
+    The output size is not aligned with the quantized weight shape
+    ```
+    auto_round:auto_awq and AWQ format:  These work as expected.
+    </details>
 
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 
@@ -110,6 +249,234 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+#### Using [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer)
+
+NVIDIA Model Optimizer (ModelOpt) provides advanced quantization techniques optimized for NVIDIA hardware.
+
+**Offline vs. Online Quantization:**
+
+SGLang supports two modes for ModelOpt.
+
+* **Offline Quantization (pre-quantized):**
+    * **Usage:** Download a pre-quantized model from Hugging Face or run `hf_ptq.py` once to create a new quantized checkpoint. Then load this quantized checkpoint.
+    * **Pros:** Fast server startup, quantization can be validated before deployment, efficient resource usage.
+    * **Cons:** Requires an extra preparation step.
+
+* **Online Quantization (quant and serve):**
+    * **Usage:** Load a standard BF16/FP16 model and add a flag. The engine applies quantization *on startup*.
+    * **Pros:** Convenient (no new checkpoint needed).
+    * **Cons:** **High startup time**, increases VRAM usage during initialization (risk of OOM).
+
+The following sections guide you through using the Offline path: loading pre-quantized models or creating your own checkpoints.
+
+##### Using Pre-Quantized Checkpoints
+
+If a model is already quantized (e.g., from Hugging Face), you can load it directly.
+
+* **FP8 Models:**
+    Use `--quantization modelopt_fp8`.
+    ```bash
+    python3 -m sglang.launch_server \
+        --model-path nvidia/Llama-3.1-8B-Instruct-FP8 \
+        --quantization modelopt_fp8 \
+        --port 30000
+    ```
+
+* **FP4 Models:**
+    Use `--quantization modelopt_fp4`.
+    ```bash
+    python3 -m sglang.launch_server \
+        --model-path nvidia/Llama-3.3-70B-Instruct-NVFP4 \
+        --quantization modelopt_fp4 \
+        --port 30000
+    ```
+
+##### Creating Your Own Quantized Checkpoints
+
+If a pre-quantized checkpoint is not available for your model, you can create one using NVIDIA Model Optimizer's `hf_ptq.py` script.
+
+**Why quantize?**
+- Reduce VRAM usage
+- Higher throughput and lower latency
+- More flexible deployment (on smaller GPUs)
+
+**What can be quantized?**
+- The entire model
+- MLP layers only
+- KV cache
+
+**Key options in `hf_ptq.py`:**
+
+`--qformat`: Quantization formats `fp8`, `nvfp4`, `nvfp4_mlp_only`
+
+`--kv_cache_qformat`: KV cache quantization format (default: `fp8`)
+
+**Note:** The default `kv_cache_qformat` may not be optimal for all use cases. Consider setting this explicitly.
+
+**Hardware requirements:** Hopper and higher are recommended. Insufficient GPU memory may cause weight offloading, resulting in extremely long quantization time.
+
+For detailed usage and supported model architectures, see [NVIDIA Model Optimizer LLM PTQ](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq).
+
+SGLang includes a streamlined workflow for quantizing models with ModelOpt and automatically exporting them for deployment.
+
+
+##### Installation
+
+First, install ModelOpt:
+
+```bash
+pip install nvidia-modelopt
+```
+
+##### Quantization and Export Workflow
+
+SGLang provides an example script that demonstrates the complete ModelOpt quantization and export workflow. Run from the SGLang repository root (see [modelopt_quantize_and_export.py](https://github.com/sgl-project/sglang/blob/main/examples/usage/modelopt_quantize_and_export.py)):
+
+```bash
+# Quantize and export a model using ModelOpt FP8 quantization
+python examples/usage/modelopt_quantize_and_export.py quantize \
+    --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --export-dir ./quantized_tinyllama_fp8 \
+    --quantization-method modelopt_fp8
+
+# For FP4 quantization (requires Blackwell GPU)
+python examples/usage/modelopt_quantize_and_export.py quantize \
+    --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --export-dir ./quantized_tinyllama_fp4 \
+    --quantization-method modelopt_fp4
+```
+
+##### Available Quantization Methods
+
+- `modelopt_fp8`: FP8 quantization with optimal performance on NVIDIA Hopper and Blackwell GPUs
+- `modelopt_fp4`: FP4 quantization with optimal performance on Nvidia Blackwell GPUs
+
+##### Python API Usage
+
+You can also use ModelOpt quantization programmatically:
+
+```python
+import sglang as sgl
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.model_loader.loader import get_model_loader
+
+# Configure model with ModelOpt quantization and export
+model_config = ModelConfig(
+    model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    quantization="modelopt_fp8",  # or "modelopt_fp4"
+    trust_remote_code=True,
+)
+
+load_config = LoadConfig(
+    modelopt_export_path="./exported_model",
+    modelopt_checkpoint_save_path="./checkpoint.pth",  # optional, fake quantized checkpoint
+)
+device_config = DeviceConfig(device="cuda")
+
+# Load and quantize the model (export happens automatically)
+model_loader = get_model_loader(load_config, model_config)
+quantized_model = model_loader.load_model(
+    model_config=model_config,
+    device_config=device_config,
+)
+```
+
+##### Deploying Quantized Models
+
+After quantization and export, you can deploy the model with SGLang:
+
+```bash
+# Deploy the exported quantized model
+python -m sglang.launch_server \
+    --model-path ./quantized_tinyllama_fp8 \
+    --quantization modelopt \
+    --port 30000 --host 0.0.0.0
+```
+
+Or using the Python API (use the same path as `modelopt_export_path` from the quantize step):
+
+```python
+import sglang as sgl
+
+def main():
+    # Deploy exported ModelOpt quantized model
+    # Path must match modelopt_export_path from quantize step (e.g., ./exported_model)
+    llm = sgl.Engine(
+        model_path="./exported_model",
+        quantization="modelopt",
+    )
+
+    # Run inference
+    prompts = [
+        "Hello, how are you?",
+        "What is the capital of France?",
+    ]
+    sampling_params = {
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "max_new_tokens": 100,
+    }
+
+    outputs = llm.generate(prompts, sampling_params)
+
+    for i, output in enumerate(outputs):
+        print(f"Prompt: {prompts[i]}")
+        print(f"Output: {output['text']}")
+
+if __name__ == "__main__":
+    main()
+
+```
+
+##### Advanced Features
+
+**Checkpoint Management**: Save and restore fake quantized checkpoints for reuse:
+
+```bash
+# Save the fake quantized checkpoint during quantization
+python examples/usage/modelopt_quantize_and_export.py quantize \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
+    --export-dir ./quantized_model \
+    --quantization-method modelopt_fp8 \
+    --checkpoint-save-path ./my_checkpoint.pth
+
+# The checkpoint can be reused for future quantization runs and skip calibration
+```
+
+**Export-only Workflow**: If you have a pre-existing fake quantized ModelOpt checkpoint, you can export it directly. See [LoadConfig](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/load_config.py) for the full API:
+
+```python
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.model_loader.loader import get_model_loader
+
+model_config = ModelConfig(
+    model_path="meta-llama/Llama-3.2-1B-Instruct",
+    quantization="modelopt_fp8",
+    trust_remote_code=True,
+)
+
+load_config = LoadConfig(
+    modelopt_checkpoint_restore_path="./my_checkpoint.pth",
+    modelopt_export_path="./exported_model",
+)
+
+# Load and export the model (DeviceConfig defaults to device="cuda")
+model_loader = get_model_loader(load_config, model_config)
+model_loader.load_model(model_config=model_config, device_config=DeviceConfig())
+```
+
+##### Benefits of ModelOpt
+
+- **Hardware Optimization**: Specifically optimized for NVIDIA GPU architectures
+- **Advanced Quantization**: Supports cutting-edge FP8 and FP4 quantization techniques
+- **Seamless Integration**: Automatic export to HuggingFace format for easy deployment
+- **Calibration-based**: Uses calibration datasets for optimal quantization quality
+- **Production Ready**: Enterprise-grade quantization with NVIDIA support
+
 ## Online Quantization
 
 To enable online quantization, you can simply specify `--quantization` in the command line. For example, you can launch the server with the following command to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`:
@@ -122,6 +489,8 @@ python3 -m sglang.launch_server \
 ```
 
 Our team is working on supporting more online quantization methods. SGLang will soon support methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`.
+
+### torchao online quantization method
 
 SGLang also supports quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
@@ -144,9 +513,19 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+### `quark_int4fp8_moe` online quantization method
+
+SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will replace [MoE layers](https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/layers/moe/fused_moe_triton/layer.py#L271) originally in high precision (bfloat16, float16 or float32) to use weights dynamically quantized to int4, that are upcasted to float8 during inference to run compute in float8 precision with activations dynamically quantized on the fly to float8.
+
+Other layers (e.g. projections in the attention layers) have their weights quantized online to float8 directly.
+
 ## Reference
 
 - [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 - [LLM Compressor](https://github.com/vllm-project/llm-compressor/)
+- [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer)
+- [NVIDIA Model Optimizer LLM PTQ](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq)
+- [Petit: NVFP4 on ROCm](https://github.com/causalflow-ai/petit-kernel) — [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/), [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html)
 - [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
+- [auto-round](https://github.com/intel/auto-round)

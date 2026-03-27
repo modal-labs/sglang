@@ -11,15 +11,29 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
 
+_KIMI_K2_SPECIAL_TOKENS = [
+    "<|tool_calls_section_begin|>",
+    "<|tool_calls_section_end|>",
+    "<|tool_call_begin|>",
+    "<|tool_call_end|>",
+    "<|tool_call_argument_begin|>",
+]
+
+
+def _strip_special_tokens(text: str) -> str:
+    """Remove all Kimi-K2 tool-call special tokens from text."""
+    for token in _KIMI_K2_SPECIAL_TOKENS:
+        text = text.replace(token, "")
+    return text
+
 
 class KimiK2Detector(BaseFormatDetector):
     """
-    Detector for Kimi K2 model function call format.
+    Detector for Kimi K2 / K2.5 model function call format.
 
     Format Structure:
     ```
@@ -39,16 +53,25 @@ class KimiK2Detector(BaseFormatDetector):
 
         self.tool_call_start_token: str = "<|tool_call_begin|>"
         self.tool_call_end_token: str = "<|tool_call_end|>"
+        self.tool_call_argument_begin_token: str = "<|tool_call_argument_begin|>"
 
+        # Support hyphenated function names (common in MCP tools, e.g. mcp__portal__search-documents)
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>"
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
+            re.DOTALL,
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)"
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
+            re.DOTALL,
         )
 
         self._last_arguments = ""
+
+        # Robust parser for ids like "functions.search:0", "functions.mcp__search-docs:0", or fallback "search:0"
+        self.tool_call_id_regex = re.compile(
+            r"^(?:functions\.)?(?P<name>[\w.\-]+):(?P<index>\d+)$"
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -76,14 +99,18 @@ class KimiK2Detector(BaseFormatDetector):
             tool_calls = []
             for match in function_call_tuples:
                 function_id, function_args = match
-                function_name = function_id.split(".")[1].split(":")[0]
-                function_idx = int(function_id.split(".")[1].split(":")[1])
+                m = self.tool_call_id_regex.match(function_id)
+                if not m:
+                    logger.warning("Unexpected tool_call_id format: %s", function_id)
+                    continue
+                function_name = m.group("name")
+                function_idx = int(m.group("index"))
 
-                logger.info(f"function_name {function_name}")
+                logger.debug(f"function_name {function_name}")
 
                 tool_calls.append(
                     ToolCallItem(
-                        tool_index=function_idx,  # Use the call index in the response, not tool position
+                        tool_index=function_idx,
                         name=function_name,
                         parameters=function_args,
                     )
@@ -113,10 +140,8 @@ class KimiK2Detector(BaseFormatDetector):
 
         if not has_tool_call:
             self._buffer = ""
-            for e_token in [self.eot_token, self.tool_call_end_token]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+            normal_text = _strip_special_tokens(new_text)
+            return StreamingParseResult(normal_text=normal_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
@@ -128,7 +153,11 @@ class KimiK2Detector(BaseFormatDetector):
                 function_id = match.group("tool_call_id")
                 function_args = match.group("function_arguments")
 
-                function_name = function_id.split(".")[1].split(":")[0]
+                m = self.tool_call_id_regex.match(function_id)
+                if not m:
+                    logger.warning("Unexpected tool_call_id format: %s", function_id)
+                    return StreamingParseResult(normal_text="", calls=calls)
+                function_name = m.group("name")
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -151,7 +180,6 @@ class KimiK2Detector(BaseFormatDetector):
                         )
                     )
                     self.current_tool_name_sent = True
-                    # Store the tool call info for serving layer completions endpoint
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": function_name,
                         "arguments": {},
@@ -163,10 +191,11 @@ class KimiK2Detector(BaseFormatDetector):
                         else function_args
                     )
 
-                    parsed_args_diff = argument_diff.split("<|tool_call_end|>", 1)[0]
+                    parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
+                        0
+                    ]
 
                     if parsed_args_diff:
-
                         calls.append(
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
@@ -174,12 +203,12 @@ class KimiK2Detector(BaseFormatDetector):
                                 parameters=parsed_args_diff,
                             )
                         )
-                        self._last_arguments += argument_diff
+                        self._last_arguments += parsed_args_diff
                         self.streamed_args_for_tool[
                             self.current_tool_id
                         ] += parsed_args_diff
 
-                    parsed_args = function_args.split("<|tool_call_end|>", 1)[0]
+                    parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
                     if _is_complete_json(parsed_args):
                         try:
                             parsed_args = json.loads(parsed_args)
@@ -193,12 +222,11 @@ class KimiK2Detector(BaseFormatDetector):
                         tool_call_end_pattern = (
                             r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
                         )
-                        match = re.search(
+                        end_match = re.search(
                             tool_call_end_pattern, current_text, re.DOTALL
                         )
-                        if match:
-                            # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[match.end() :]
+                        if end_match:
+                            self._buffer = current_text[end_match.end() :]
                         else:
                             self._buffer = ""
 
@@ -212,7 +240,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
@@ -225,21 +253,3 @@ class KimiK2Detector(BaseFormatDetector):
             )
 
         return get_info
-
-    def build_ebnf(self, tools: List[Tool]) -> str:
-        """
-        Build EBNF grammar for KimiK2 tool call format.
-
-        NOTE: The call_rule_fmt uses [0-9]+ for the function index to allow the grammar
-        to accept any numeric index (0, 1, 2, etc.) for proper sequential indexing in
-        multiple function call scenarios, while still maintaining the correct KimiK2
-        format structure for constrained generation.
-        """
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            tool_call_separator="",
-            call_rule_fmt='"<|tool_call_begin|>functions.{name}:"[0-9]+"<|tool_call_argument_begin|>"{arguments_rule}"<|tool_call_end|>"',
-            function_format="json",
-        )

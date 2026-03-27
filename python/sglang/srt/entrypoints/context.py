@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copied from vLLM: https://github.com/zyongye/vllm/blob/6a70830065701b163e36a86fd331b41b5feac401/vllm/entrypoints/context.py
-import json
+# Copied from vLLM
 import logging
 from abc import ABC, abstractmethod
 from typing import Union
+
+import orjson
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,8 @@ class HarmonyContext(ConversationContext):
         return self._messages
 
     def need_builtin_tool_call(self) -> bool:
+        if not self.messages:
+            return False
         last_msg = self.messages[-1]
         recipient = last_msg.recipient
         return recipient is not None and (
@@ -138,7 +141,7 @@ class HarmonyContext(ConversationContext):
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)
         tool_name = last_msg.recipient.split(".")[1]
-        args = json.loads(last_msg.content[0].text)
+        args = orjson.loads(last_msg.content[0].text)
         result = await tool_session.call_tool(tool_name, args)
         result_str = result.content[0].text
         content = TextContent(text=result_str)
@@ -178,6 +181,7 @@ class StreamingHarmonyContext(HarmonyContext):
         self.parser = get_streamable_parser_for_assistant()
         self.encoding = get_encoding()
         self.last_tok = None
+        self.num_processed_tokens = 0
 
     @property
     def messages(self) -> list:
@@ -188,7 +192,25 @@ class StreamingHarmonyContext(HarmonyContext):
             # RequestOutput from SGLang with outputs
             output_token_ids = output["output_ids"]
 
-            for token_id in output_token_ids:
+            # Check if we need to handle cumulative tokens
+            meta_info = output.get("meta_info", {})
+            completion_tokens = meta_info.get("completion_tokens")
+            if (
+                completion_tokens is not None
+                and len(output_token_ids) == completion_tokens
+            ):
+                # Case 1: When --incremental-streaming-output is not set.
+                # The output_ids contains all tokens generated so far.
+                # We only need to process the new tokens.
+                new_token_ids = output_token_ids[self.num_processed_tokens :]
+                self.num_processed_tokens = len(output_token_ids)
+            else:
+                # Case 2: When --incremental-streaming-output is set.
+                # The output_ids contains only the new tokens.
+                new_token_ids = output_token_ids
+                self.num_processed_tokens += len(output_token_ids)
+
+            for token_id in new_token_ids:
                 self.parser.process(token_id)
 
         else:
