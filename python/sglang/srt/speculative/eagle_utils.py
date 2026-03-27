@@ -209,7 +209,7 @@ class EagleVerifyOutput:
     # Accepted token ids including the bonus token
     verified_id: torch.Tensor
     # KV indices to free
-    free_cache_loc_cpu: Optional[torch.Tensor]
+    evict_cache_loc: Optional[torch.Tensor]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
 
@@ -260,16 +260,37 @@ class EagleVerifyInput:
         batch: ModelWorkerBatch,
         page_size: int,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    ):
+    ) -> Optional[torch.Tensor]:
         if batch.forward_mode.is_idle():
-            return
+            return None
 
         batch.input_ids = self.draft_token
 
-        end_offset = batch.seq_lens + self.draft_token_num
-
         bs = len(batch.seq_lens)
+
+        if page_size == 1:
+            end_offset = batch.seq_lens + self.draft_token_num
+            evict_cache_loc = None
+        else:
+            last_loc = get_last_loc(
+                req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                batch.seq_lens,
+            )
+
+            alloc_cache_loc = batch.out_cache_loc
+            batch.out_cache_loc = torch.zeros_like(alloc_cache_loc)
+            evict_cache_loc = torch.zeros_like(alloc_cache_loc)
+            merge_cache_loc[(bs,)](
+                last_loc,
+                alloc_cache_loc,
+                batch.out_cache_loc,
+                evict_cache_loc,
+                page_size,
+                self.draft_token_num,
+            )
+            end_offset = batch.seq_lens + self.draft_token_num
+
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             req_to_token_pool.req_to_token,
@@ -279,6 +300,8 @@ class EagleVerifyInput:
             req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
+
+        return evict_cache_loc
 
     def generate_attn_arg_prefill(
         self,
@@ -350,7 +373,7 @@ class EagleVerifyInput:
                 ),
                 logits_output=logits_output,
                 verified_id=torch.empty(0, dtype=torch.long, device=device),
-                free_cache_loc_cpu=None,
+                evict_cache_loc=None,
                 accepted_indices=torch.full(
                     (0, self.spec_steps + 1),
                     -1,
@@ -495,21 +518,71 @@ class EagleVerifyInput:
         evict_mask.scatter_(0, accept_index.to(torch.int64) + 1, False)
         evict_mask = evict_mask[1:]
 
-        if page_size > 1:
-            raise NotImplementedError("Free cache loc cpu is not supported for page size > 1")
-        free_cache_loc_cpu = torch.where(evict_mask, batch.out_cache_loc, 0).to("cpu", non_blocking=True)
+        if page_size == 1:
+            evict_cache_loc = torch.where(evict_mask, batch.out_cache_loc, 0)
+        else:
+            if self.topk == 1:
+                # Only evict full empty page. Do not evict partial empty page
+                align_evict_mask_to_page_size[len(batch.seq_lens),](
+                    batch.seq_lens,
+                    evict_mask,
+                    page_size,
+                    self.draft_token_num,
+                    next_power_of_2(self.draft_token_num),
+                )
+                evict_cache_loc = torch.where(evict_mask, batch.out_cache_loc, 0)
+            else:
+                # Shift the accepted tokens to the beginning.
+                # Only evict the last part
+                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    accept_index,
+                    accept_length,
+                    self.draft_token_num,
+                    page_size,
+                )
+                evict_cache_loc = torch.zeros_like(batch.out_cache_loc)
+
+                # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
+                # accept_index:  [0 -1  2,  3  4 -1,  6 -1 -1]
+                # tgt_cache_loc: [0  1   ,  3  4   ,  6      ]
+                # to_free_slots: [      2,        5,     7  8]
+                # to_free_slots also needs to be page-aligned without the first partial page
+                #
+                # split each row of out_cache_loc into two parts.
+                # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
+                # 2. the second part goes to to_free_slots.
+                get_target_cache_loc[(bs,)](
+                    tgt_cache_loc,
+                    evict_cache_loc,
+                    accept_length,
+                    to_free_num_slots,
+                    batch.out_cache_loc,
+                    self.draft_token_num,
+                    next_power_of_2(self.draft_token_num),
+                    next_power_of_2(bs),
+                )
+
+                # Copy the kv cache
+                token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_cache_loc, src_cache_loc
+                )
 
         # Construct EagleVerifyOutput
-        batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
-        assign_req_to_token_pool[(bs,)](
-            batch.req_pool_indices,
-            req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + accept_length + 1,
-            batch.out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
+        if page_size == 1 or self.topk == 1:
+            batch.out_cache_loc = torch.where(accept_index != -1, batch.out_cache_loc[accept_index], 0)
+            assign_req_to_token_pool[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.seq_lens + accept_length + 1,
+                batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                next_power_of_2(bs),
+            )
+        else:
+            batch.out_cache_loc = tgt_cache_loc
         batch.seq_lens.add_(accept_length + 1)
         # Optimistically estimate the seq_lens_cpu for the next draft forward
         batch.seq_lens_cpu.add_(self.spec_steps + 1)
@@ -528,7 +601,7 @@ class EagleVerifyInput:
             logits_output=logits_output,
             verified_id=verified_id,
             accepted_indices=accept_index,
-            free_cache_loc_cpu=free_cache_loc_cpu,
+            evict_cache_loc=evict_cache_loc,
         )
 
 
@@ -598,30 +671,23 @@ def assign_draft_cache_locs(
     req_pool_indices,
     req_to_token,
     seq_lens,
-    extend_lens,
-    num_new_pages_per_topk,
     out_cache_loc,
+    num_new_pages_per_topk: tl.constexpr,
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
     page_size: tl.constexpr,
-    bs_upper: tl.constexpr,
     iter_upper: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
 
-    if page_size == 1 or topk == 1:
-        copy_len = topk * speculative_num_steps
-        out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
-    else:
-        bs_offset = tl.arange(0, bs_upper)
-        copy_len = tl.load(extend_lens + pid)
-        cum_copy_len = tl.sum(tl.load(extend_lens + bs_offset, mask=bs_offset < pid))
-        out_cache_ptr = out_cache_loc + cum_copy_len
+    copy_len = topk * num_new_pages_per_topk * page_size
+    out_cache_ptr = out_cache_loc + pid * copy_len
 
     # Part 1: Copy from out_cache_loc to req_to_token
-    kv_start = tl.load(seq_lens + pid)
+    prefix_len = tl.load(seq_lens + pid)
+    kv_start = tl.cdiv(prefix_len, page_size) * page_size
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
     num_loop = tl.cdiv(copy_len, BLOCK_SIZE)
     for i in range(num_loop):
@@ -630,31 +696,37 @@ def assign_draft_cache_locs(
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
 
-    if page_size == 1 or topk == 1:
+    if page_size == 1:
         return
 
-    # Part 2: Copy the indices for the last partial page
-    prefix_len = tl.load(seq_lens + pid)
-    last_page_len = prefix_len % page_size
+    # Part 2: Extend token pool for the last partial page
+    last_loc = tl.load(token_pool + prefix_len - 1)
     offsets = tl.arange(0, page_size)
+    mask = offsets < kv_start - prefix_len
+    tl.store(token_pool + prefix_len + offsets, offsets + last_loc + 1, mask=mask)
+
+    if topk == 1:
+        return
+
+    # Part 3: Copy the indices for the last partial page
+    last_page_len = prefix_len % page_size
     mask = offsets < last_page_len
-    num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
     prefix_base = token_pool + prefix_len - last_page_len
 
     for topk_id in range(topk):
         value = tl.load(prefix_base + offsets, mask=mask)
         tl.store(
-            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
+            prefix_base + topk_id * num_new_pages_per_topk * page_size + offsets,
             value,
             mask=mask,
         )
 
-    # Part 3: Remove the padding in out_cache_loc
+    # Part 4: Remove the padding in out_cache_loc
     iter_offest = tl.arange(0, iter_upper)
     for topk_id in range(topk):
         indices = tl.load(
             prefix_base
-            + topk_id * num_new_pages_per_topk_ * page_size
+            + topk_id * num_new_pages_per_topk * page_size
             + last_page_len
             + iter_offest,
             mask=iter_offest < speculative_num_steps,
@@ -821,6 +893,40 @@ def get_target_cache_loc(
     )
 
 
+@triton.jit
+def merge_cache_loc(
+    last_loc,
+    alloc_cache_loc,
+    out_cache_loc,
+    evict_cache_loc,
+    page_size: tl.constexpr,
+    draft_token_num: tl.constexpr,
+):
+    page_offsets = tl.arange(0, page_size)
+    bid = tl.program_id(axis=0)
+
+    # Copy the padding from the last partial page
+    last_loc_ = tl.load(last_loc + bid)
+    pad_len = (page_size - (last_loc_ + 1) % page_size) % page_size
+    pad_indices = page_offsets + last_loc_ + 1
+    tl.store(out_cache_loc + bid * draft_token_num + page_offsets, pad_indices, mask=page_offsets < pad_len)
+
+    # Copy the newly allocated tokens
+    for i in range(0, draft_token_num - pad_len, page_size):
+        write_mask = i + page_offsets < draft_token_num - pad_len
+        alloc_offsets = bid * draft_token_num + i + page_offsets
+        alloc_indices = tl.load(alloc_cache_loc + alloc_offsets, mask=write_mask)
+        tl.store(out_cache_loc + pad_len + alloc_offsets, alloc_indices, mask=write_mask)
+
+    # Evict non-partial pages
+    evict_begin = tl.cdiv(draft_token_num - pad_len, page_size) * page_size
+    for i in range(evict_begin, draft_token_num, page_size):
+        evict_mask = i + page_offsets < draft_token_num
+        evict_offsets = bid * draft_token_num + i + page_offsets
+        evict_indices = tl.load(alloc_cache_loc + evict_offsets, mask=evict_mask)
+        tl.store(evict_cache_loc + evict_offsets, evict_indices, mask=evict_mask)
+
+
 @torch.compile(dynamic=True)
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
@@ -830,8 +936,8 @@ def get_src_tgt_cache_loc(
     draft_token_num: int,
     page_size: int,
 ):
-    src_cache_loc = out_cache_loc[accept_index]
-    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    src_cache_loc = torch.where(accept_index == -1, 0, out_cache_loc[accept_index])
+    tgt_cache_loc = torch.zeros_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
         (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,

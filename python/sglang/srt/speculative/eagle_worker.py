@@ -167,12 +167,6 @@ class EAGLEWorker(TpModelWorker):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
-        # Some dummy tensors
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
-
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
@@ -357,7 +351,7 @@ class EAGLEWorker(TpModelWorker):
             return (
                 logits_output,
                 verify_output.verified_id,
-                verify_output.free_cache_loc_cpu,
+                verify_output.evict_cache_loc,
                 batch.bid,
                 can_run_cuda_graph,
                 batch.spec_info,
@@ -418,20 +412,27 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.verified_id.to(torch.int64)
             )
 
+        num_new_pages_per_topk = batch.draft_out_cache_loc.shape[0] // (num_seqs * self.topk * self.page_size)
+
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            self.extend_lens,
-            self.num_new_pages_per_topk,
             batch.draft_out_cache_loc,
+            num_new_pages_per_topk,
             self.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
             self.page_size,
-            next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps),
         )
+
+        if self.page_size > 1:
+            # Remove padded slots
+            # NOTE (timmy): we don't need to free draft cache locs
+            batch.draft_out_cache_loc = batch.draft_out_cache_loc[
+                : num_seqs * self.topk * self.speculative_num_steps
+            ]
 
         batch.seq_lens_sum = torch.sum(batch.seq_lens_cpu).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
@@ -590,11 +591,10 @@ class EAGLEWorker(TpModelWorker):
         return score_list, token_list, parents_list
 
     def verify(self, batch: ModelWorkerBatch, spec_info: EagleVerifyInput):
-        spec_info.prepare_for_verify(
+        evict_cache_loc = spec_info.prepare_for_verify(
             batch,
             self.page_size,
             self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
         )
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -624,6 +624,9 @@ class EAGLEWorker(TpModelWorker):
             device=self.device,
             vocab_mask=None,
         )
+
+        if evict_cache_loc is not None:
+            res.evict_cache_loc = torch.cat([res.evict_cache_loc, evict_cache_loc])
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
