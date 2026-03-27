@@ -53,7 +53,7 @@ runtime_common = [
     "transformers==4.55.2",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.23",
+    "xgrammar==0.1.32",
 ]
 
 srt = [
