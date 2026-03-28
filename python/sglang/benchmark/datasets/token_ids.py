@@ -10,12 +10,14 @@ from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 class TokenIdsDataset(BaseDataset):
     dataset_path: str
     fixed_output_len: int
+    num_prompts: int
 
     @classmethod
     def from_args(cls, args: Namespace) -> "TokenIdsDataset":
         return cls(
             dataset_path=args.dataset_path,
             fixed_output_len=args.sharegpt_output_len,
+            num_prompts=args.num_prompts,
         )
 
     def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
@@ -32,4 +34,6 @@ class TokenIdsDataset(BaseDataset):
                         output_len=output_len,
                     )
                 )
+                if len(rows) == self.num_prompts:
+                    break
         return rows
