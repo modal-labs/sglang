@@ -81,6 +81,11 @@ from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.observability.request_waypoint_logger import (
+    count_mm_items,
+    emit_request_waypoint,
+    ms_from_s,
+)
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     calibrate_time_diff,
@@ -369,6 +374,246 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.server_args, obj_skip_names, out_skip_names
         )
 
+    @staticmethod
+    def _get_request_waypoint_context(
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> Dict[str, Any]:
+        ctx = getattr(obj, "_request_waypoint_context", None)
+        if ctx is None:
+            ctx = {}
+            setattr(obj, "_request_waypoint_context", ctx)
+        return ctx
+
+    def _emit_request_received_waypoint(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ) -> None:
+        input_mode = (
+            "text"
+            if getattr(obj, "text", None) is not None
+            else "input_ids"
+            if getattr(obj, "input_ids", None) is not None
+            else "input_embeds"
+        )
+        emit_request_waypoint(
+            "waypoint.request.received",
+            {
+                "rid": obj.rid if getattr(obj, "is_single", True) else None,
+                "rids": None if getattr(obj, "is_single", True) else obj.rid,
+                "batch_size": getattr(obj, "batch_size", 1),
+                "stream": getattr(obj, "stream", None),
+                "parallel_sample_num": getattr(obj, "parallel_sample_num", None),
+                "priority": getattr(obj, "priority", None),
+                "routed_dp_rank": getattr(obj, "routed_dp_rank", None),
+                "input_mode": input_mode,
+                "has_mm_input": (
+                    obj.contains_mm_input()
+                    if hasattr(obj, "contains_mm_input")
+                    else False
+                ),
+                "image_count": count_mm_items(getattr(obj, "image_data", None)),
+                "endpoint": str(request.url.path) if request else None,
+                "no_logs": getattr(obj, "no_logs", False),
+            },
+        )
+
+    def _emit_mm_ready_waypoint(
+        self,
+        obj: GenerateReqInput,
+        *,
+        input_ids_before_mm_len: int,
+        input_ids_after_mm_len: int,
+        perf: Dict[str, Any],
+    ) -> None:
+        ctx = self._get_request_waypoint_context(obj)
+        ctx.update(
+            {
+                "mm_cpu_ms": ms_from_s(perf.get("total_s")),
+                "image_count": perf.get("image_count"),
+                "image_patch_total": perf.get("image_patch_total"),
+                "video_patch_total": perf.get("video_patch_total"),
+            }
+        )
+        emit_request_waypoint(
+            "waypoint.request.mm_ready",
+            {
+                "rid": obj.rid,
+                "mm_cpu_ms": ms_from_s(perf.get("total_s")),
+                "mm_load_ms": ms_from_s(perf.get("load_s")),
+                "mm_preprocess_ms": ms_from_s(perf.get("preprocess_s")),
+                "mm_process_ms": ms_from_s(perf.get("process_s")),
+                "mm_rope_ms": ms_from_s(perf.get("rope_s")),
+                "image_count": perf.get("image_count"),
+                "image_patch_total": perf.get("image_patch_total"),
+                "video_patch_total": perf.get("video_patch_total"),
+                "input_ids_before_mm": input_ids_before_mm_len,
+                "input_ids_after_mm": input_ids_after_mm_len,
+                "mm_token_growth": input_ids_after_mm_len - input_ids_before_mm_len,
+                "no_logs": getattr(obj, "no_logs", False),
+            },
+        )
+
+    def _emit_first_token_waypoint(
+        self,
+        state: ReqState,
+        recv_obj: Union[
+            BatchStrOutput, BatchEmbeddingOutput, BatchMultimodalOutput, BatchTokenIDOutput
+        ],
+        i: int,
+        scheduler_time_stats,
+    ) -> None:
+        ctx = getattr(state.obj, "_request_waypoint_context", {})
+        queue_latency = (
+            recv_obj.queue_times[i]
+            if getattr(recv_obj, "queue_times", None)
+            else (
+                scheduler_time_stats.maybe_get_queueing_time()
+                if scheduler_time_stats is not None
+                else None
+            )
+        )
+        request_process_latency = (
+            recv_obj.request_process_latencies[i]
+            if getattr(recv_obj, "request_process_latencies", None)
+            else (
+                scheduler_time_stats.get_request_process_latency()
+                if scheduler_time_stats is not None
+                else None
+            )
+        )
+        prefill_waiting_latency = (
+            recv_obj.prefill_waiting_latencies[i]
+            if getattr(recv_obj, "prefill_waiting_latencies", None)
+            else (
+                scheduler_time_stats.get_prefill_waiting_latency()
+                if scheduler_time_stats is not None
+                else None
+            )
+        )
+        prefill_launch_latency = (
+            recv_obj.prefill_launch_latencies[i]
+            if getattr(recv_obj, "prefill_launch_latencies", None)
+            else (
+                scheduler_time_stats.get_prefill_launch_latency()
+                if scheduler_time_stats is not None
+                else None
+            )
+        )
+        prefill_forward_latency = (
+            recv_obj.prefill_forward_latencies[i]
+            if getattr(recv_obj, "prefill_forward_latencies", None)
+            else (
+                scheduler_time_stats.get_prefill_forward_latency()
+                if scheduler_time_stats is not None
+                else None
+            )
+        )
+        emit_request_waypoint(
+            "waypoint.request.first_token",
+            {
+                "rid": state.obj.rid,
+                "ttft_ms": ms_from_s(state.time_stats.get_first_token_latency()),
+                "tokenize_ms": ms_from_s(state.time_stats.get_tokenize_latency()),
+                "api_dispatch_ms": ms_from_s(
+                    state.time_stats.get_api_server_dispatch_latency()
+                ),
+                "request_process_ms": ms_from_s(request_process_latency),
+                "queue_ms": ms_from_s(queue_latency),
+                "prefill_waiting_ms": ms_from_s(prefill_waiting_latency),
+                "prefill_launch_ms": ms_from_s(prefill_launch_latency),
+                "prefill_forward_ms": ms_from_s(prefill_forward_latency),
+                "mm_cpu_ms": ctx.get("mm_cpu_ms"),
+                "prompt_tokens": recv_obj.prompt_tokens[i],
+                "completion_tokens": (
+                    recv_obj.completion_tokens[i]
+                    if getattr(recv_obj, "completion_tokens", None)
+                    else None
+                ),
+                "cached_tokens": (
+                    recv_obj.cached_tokens[i]
+                    if getattr(recv_obj, "cached_tokens", None)
+                    else None
+                ),
+                "retraction_count": (
+                    recv_obj.retraction_counts[i]
+                    if getattr(recv_obj, "retraction_counts", None)
+                    else None
+                ),
+                "dp_rank": (
+                    recv_obj.dp_ranks[i] if getattr(recv_obj, "dp_ranks", None) else None
+                ),
+                "no_logs": getattr(state.obj, "no_logs", False),
+            },
+        )
+
+    def _emit_finished_waypoint(
+        self,
+        state: ReqState,
+        meta_info: Dict[str, Any],
+        scheduler_time_stats=None,
+    ) -> None:
+        ctx = getattr(state.obj, "_request_waypoint_context", {})
+        finish_reason = meta_info.get("finish_reason")
+        finish_reason_type = (
+            finish_reason.get("type") if isinstance(finish_reason, dict) else finish_reason
+        )
+        matched_stop = (
+            finish_reason.get("matched") if isinstance(finish_reason, dict) else None
+        )
+        queue_latency = (
+            ms_from_s(scheduler_time_stats.maybe_get_queueing_time())
+            if scheduler_time_stats is not None
+            else ms_from_s(meta_info.get("queue_time"))
+        )
+        request_process_latency = (
+            ms_from_s(scheduler_time_stats.get_request_process_latency())
+            if scheduler_time_stats is not None
+            else ms_from_s(meta_info.get("request_process_latency"))
+        )
+        prefill_waiting_latency = (
+            ms_from_s(scheduler_time_stats.get_prefill_waiting_latency())
+            if scheduler_time_stats is not None
+            else ms_from_s(meta_info.get("prefill_waiting_latency"))
+        )
+        prefill_launch_latency = (
+            ms_from_s(scheduler_time_stats.get_prefill_launch_latency())
+            if scheduler_time_stats is not None
+            else ms_from_s(meta_info.get("prefill_launch_latency"))
+        )
+        prefill_forward_latency = (
+            ms_from_s(scheduler_time_stats.get_prefill_forward_latency())
+            if scheduler_time_stats is not None
+            else ms_from_s(meta_info.get("prefill_forward_latency"))
+        )
+        emit_request_waypoint(
+            "waypoint.request.finished",
+            {
+                "rid": state.obj.rid,
+                "finish_reason": finish_reason_type,
+                "matched_stop": matched_stop,
+                "e2e_ms": ms_from_s(meta_info.get("e2e_latency")),
+                "ttft_ms": ms_from_s(state.time_stats.get_first_token_latency()),
+                "decode_ms": ms_from_s(state.time_stats.get_decode_latency()),
+                "tokenize_ms": ms_from_s(meta_info.get("tokenize_latency")),
+                "api_dispatch_ms": ms_from_s(
+                    meta_info.get("api_server_dispatch_latency")
+                ),
+                "request_process_ms": request_process_latency,
+                "queue_ms": queue_latency,
+                "prefill_waiting_ms": prefill_waiting_latency,
+                "prefill_launch_ms": prefill_launch_latency,
+                "prefill_forward_ms": prefill_forward_latency,
+                "mm_cpu_ms": ctx.get("mm_cpu_ms"),
+                "prompt_tokens": meta_info.get("prompt_tokens"),
+                "completion_tokens": meta_info.get("completion_tokens"),
+                "cached_tokens": meta_info.get("cached_tokens"),
+                "retraction_count": meta_info.get("total_retractions"),
+                "dp_rank": meta_info.get("dp_rank"),
+                "no_logs": getattr(state.obj, "no_logs", False),
+            },
+        )
+
     def init_weight_update(self):
         # Initial weights status
         self.initial_weights_loaded = True
@@ -509,6 +754,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
+        self._emit_request_received_waypoint(obj, request)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -716,6 +962,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._validate_mm_limits(obj)
 
             mm_inputs = None
+            input_ids_before_mm_len = len(input_ids) if input_ids is not None else 0
 
             if (
                 not self.server_args.language_only
@@ -754,6 +1001,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            waypoint_mm_perf = (
+                mm_inputs.pop("waypoint_mm_perf", None)
+                if isinstance(mm_inputs, dict)
+                else None
+            )
+            if waypoint_mm_perf is not None:
+                self._emit_mm_ready_waypoint(
+                    obj,
+                    input_ids_before_mm_len=input_ids_before_mm_len,
+                    input_ids_after_mm_len=(
+                        len(input_ids) if input_ids is not None else input_ids_before_mm_len
+                    ),
+                    perf=waypoint_mm_perf,
+                )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -982,6 +1243,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
+                no_logs=obj.no_logs,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
             )
@@ -1518,6 +1780,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
                 continue
 
+            scheduler_time_stats = None
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -1569,6 +1832,24 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     meta_info[k] = v[i]
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+            if getattr(recv_obj, "queue_times", None):
+                meta_info["queue_time"] = recv_obj.queue_times[i]
+            if getattr(recv_obj, "request_process_latencies", None):
+                meta_info["request_process_latency"] = recv_obj.request_process_latencies[
+                    i
+                ]
+            if getattr(recv_obj, "prefill_waiting_latencies", None):
+                meta_info["prefill_waiting_latency"] = recv_obj.prefill_waiting_latencies[
+                    i
+                ]
+            if getattr(recv_obj, "prefill_launch_latencies", None):
+                meta_info["prefill_launch_latency"] = recv_obj.prefill_launch_latencies[
+                    i
+                ]
+            if getattr(recv_obj, "prefill_forward_latencies", None):
+                meta_info["prefill_forward_latency"] = recv_obj.prefill_forward_latencies[
+                    i
+                ]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
@@ -1617,6 +1898,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+                if not isinstance(recv_obj, BatchEmbeddingOutput):
+                    self._emit_first_token_waypoint(
+                        state, recv_obj, i, scheduler_time_stats
+                    )
 
             if state.finished:
                 state.time_stats.trace_ctx.trace_set_root_attrs(
@@ -1643,6 +1928,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             scheduler_time_stats, completion_tokens
                         )
                     )
+                self._emit_finished_waypoint(state, meta_info, scheduler_time_stats)
 
                 del self.rid_to_state[rid]
 
@@ -2173,6 +2459,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        self._emit_finished_waypoint(state, meta_info)
         state.out_list.append(out)
         state.event.set()
 

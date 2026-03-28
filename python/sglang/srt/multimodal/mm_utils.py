@@ -32,6 +32,8 @@ import ast
 import itertools
 import math
 import re
+import threading
+import time
 from io import BytesIO
 from typing import Literal
 
@@ -46,6 +48,8 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.utils import flatten_nested_list
+
+_dp_mm_timing_tls = threading.local()
 
 
 def has_valid_data(data) -> bool:
@@ -428,6 +432,66 @@ def get_dp_encoder_lb_assignment(
     return (shuffle_indices, gpu_sample_counts, gpu_loads)
 
 
+def reset_dp_mm_timing_accumulator() -> None:
+    if not _request_waypoint_logging_enabled():
+        return
+    _dp_mm_timing_tls.accumulator = {
+        "dp_assign_ms": 0.0,
+        "vit_forward_ms": 0.0,
+        "all_gather_ms": 0.0,
+        "reorder_ms": 0.0,
+    }
+
+
+def consume_dp_mm_timing_accumulator() -> dict | None:
+    acc = getattr(_dp_mm_timing_tls, "accumulator", None)
+    if acc is None:
+        return None
+    _dp_mm_timing_tls.accumulator = None
+    return acc
+
+
+def _accumulate_dp_mm_timing(
+    *,
+    dp_assign_ms: float,
+    vit_forward_ms: float,
+    all_gather_ms: float,
+    reorder_ms: float,
+) -> None:
+    acc = getattr(_dp_mm_timing_tls, "accumulator", None)
+    if acc is None:
+        acc = {
+            "dp_assign_ms": 0.0,
+            "vit_forward_ms": 0.0,
+            "all_gather_ms": 0.0,
+            "reorder_ms": 0.0,
+        }
+    acc["dp_assign_ms"] += dp_assign_ms
+    acc["vit_forward_ms"] += vit_forward_ms
+    acc["all_gather_ms"] += all_gather_ms
+    acc["reorder_ms"] += reorder_ms
+    _dp_mm_timing_tls.accumulator = acc
+
+
+def _request_waypoint_logging_enabled() -> bool:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return bool(get_global_server_args().enable_request_waypoint_logging)
+    except Exception:
+        return False
+
+
+def _reduce_max_stage_ms(
+    values: list[float], *, device: torch.device, group
+) -> list[float]:
+    tensor = torch.tensor(values, device=device, dtype=torch.float32)
+    torch.distributed.all_reduce(
+        tensor, op=torch.distributed.ReduceOp.MAX, group=group.device_group
+    )
+    return [float(v) for v in tensor.detach().cpu().tolist()]
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_vision_model(
     image_input: torch.Tensor, vision_model: torch.nn.Module
@@ -506,9 +570,14 @@ def run_dp_sharded_mrope_vision_model(
     if tp_size == 1:
         return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
 
+    collect_timing = _request_waypoint_logging_enabled()
+
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
     tp_rank_local = get_attention_tp_rank()
+
+    if collect_timing:
+        dp_assign_started_at = time.perf_counter()
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
@@ -548,6 +617,10 @@ def run_dp_sharded_mrope_vision_model(
             device=pixel_values.device,
             dtype=pixel_values.dtype,
         )
+    dp_assign_ms = 0.0
+    if collect_timing:
+        dp_assign_ms = (time.perf_counter() - dp_assign_started_at) * 1000.0
+
     # embed_dim_reduction_factor = 2 * 2
     if rope_type == "rope_2d":
         embed_dim_reduction_factor = (
@@ -564,6 +637,12 @@ def run_dp_sharded_mrope_vision_model(
     # to work
     max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
+
+    vit_forward_ms = 0.0
+    if collect_timing and pixel_values.device.type == "cuda":
+        forward_started = torch.cuda.Event(enable_timing=True)
+        forward_finished = torch.cuda.Event(enable_timing=True)
+        forward_started.record()
 
     # Run the vision model on the local pixel_values_local
     if rope_type == "rope_2d":
@@ -593,6 +672,10 @@ def run_dp_sharded_mrope_vision_model(
                 device=pixel_values.device,
                 dtype=pixel_values.dtype,
             )
+    if collect_timing and pixel_values.device.type == "cuda":
+        forward_finished.record()
+        forward_finished.synchronize()
+        vit_forward_ms = forward_started.elapsed_time(forward_finished)
 
     # Pad the output based on max_len_per_rank
     # for tensor_model_parallel_all_gather to work
@@ -619,11 +702,24 @@ def run_dp_sharded_mrope_vision_model(
     else:
         image_embeds_local_padded = image_embeds_local
 
+    all_gather_ms = 0.0
+    if collect_timing and pixel_values.device.type == "cuda":
+        gather_started = torch.cuda.Event(enable_timing=True)
+        gather_finished = torch.cuda.Event(enable_timing=True)
+        gather_started.record()
+
     # Do all_gather to collect embeddings from all ranks
     gathered_embeds = get_attention_tp_group().all_gather(
         image_embeds_local_padded, dim=0
     )
+    if collect_timing and pixel_values.device.type == "cuda":
+        gather_finished.record()
+        gather_finished.synchronize()
+        all_gather_ms = gather_started.elapsed_time(gather_finished)
 
+    reorder_started_at = 0.0
+    if collect_timing:
+        reorder_started_at = time.perf_counter()
     # Remove padding and reconstruct per-rank embeddings
     rank_embeddings = list[torch.Tensor]()
     for rank in range(tp_size):
@@ -659,4 +755,25 @@ def run_dp_sharded_mrope_vision_model(
                 embed_start += img_patches
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
+    reorder_ms = 0.0
+    if collect_timing:
+        if pixel_values.device.type == "cuda":
+            torch.cuda.synchronize(pixel_values.device)
+        reorder_ms = (time.perf_counter() - reorder_started_at) * 1000.0
+
+        if tp_size > 1:
+            dp_assign_ms, vit_forward_ms, all_gather_ms, reorder_ms = (
+                _reduce_max_stage_ms(
+                    [dp_assign_ms, vit_forward_ms, all_gather_ms, reorder_ms],
+                    device=pixel_values.device,
+                    group=get_attention_tp_group(),
+                )
+            )
+        if tp_rank_local == 0:
+            _accumulate_dp_mm_timing(
+                dp_assign_ms=dp_assign_ms,
+                vit_forward_ms=vit_forward_ms,
+                all_gather_ms=all_gather_ms,
+                reorder_ms=reorder_ms,
+            )
     return out_embeddings
