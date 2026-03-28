@@ -5,6 +5,7 @@ Multi-modality utils
 import copy
 import hashlib
 import pickle
+import time
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -15,6 +16,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
@@ -25,6 +27,16 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.mm_utils import (
+    consume_dp_mm_timing_accumulator,
+    reset_dp_mm_timing_accumulator,
+)
+from sglang.srt.observability.request_waypoint_logger import (
+    emit_request_waypoint,
+    ms_from_s,
+    request_waypoints_enabled,
+    sum_grid_patches,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
@@ -1215,6 +1227,52 @@ def general_mm_embed_routine(
                 if forward_batch.mm_inputs[i] is not None
             ]
             server_args = get_global_server_args()
+            waypoint_started_at = 0.0
+            waypoint_payload = None
+            if request_waypoints_enabled() and get_attention_tp_rank() == 0:
+                reset_dp_mm_timing_accumulator()
+                item_flatten_list = []
+                for mm_input in mm_inputs_list:
+                    item_flatten_list.extend(
+                        [item for item in mm_input.mm_items if item is not None]
+                    )
+                image_items = [item for item in item_flatten_list if item.is_image()]
+                video_items = [item for item in item_flatten_list if item.is_video()]
+                waypoint_started_at = time.perf_counter()
+                waypoint_payload = {
+                    "rids": forward_batch.rids,
+                    "forward_mode": str(forward_batch.forward_mode),
+                    "batch_size": int(forward_batch.batch_size),
+                    "mm_request_count": len(mm_inputs_list),
+                    "extend_seq_lens": [int(x) for x in extend_seq_lens],
+                    "image_item_count": sum(
+                        len(item.offsets) if item.offsets else 1 for item in image_items
+                    ),
+                    "image_patch_total": sum_grid_patches(
+                        [
+                            getattr(item, "image_grid_thw", None)
+                            for item in image_items
+                            if getattr(item, "image_grid_thw", None) is not None
+                        ]
+                    ),
+                    "video_patch_total": sum_grid_patches(
+                        [
+                            getattr(item, "video_grid_thw", None)
+                            for item in video_items
+                            if getattr(item, "video_grid_thw", None) is not None
+                        ]
+                    ),
+                    "precomputed_item_count": sum(
+                        1
+                        for item in item_flatten_list
+                        if getattr(item, "precomputed_embeddings", None) is not None
+                    ),
+                    "feature_item_count": sum(
+                        1
+                        for item in item_flatten_list
+                        if getattr(item, "feature", None) is not None
+                    ),
+                }
             if server_args and server_args.enable_adaptive_dispatch_to_encoder:
                 # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
                 input_embeds, other_info = _embed_mm_inputs_with_split(
@@ -1241,6 +1299,25 @@ def general_mm_embed_routine(
                     placeholder_tokens=placeholder_tokens,
                     use_deepstack=use_deepstack,
                 )
+            if waypoint_payload is not None:
+                waypoint_payload["mm_embed_ms"] = ms_from_s(
+                    time.perf_counter() - waypoint_started_at
+                )
+                dp_timing = consume_dp_mm_timing_accumulator()
+                if dp_timing is not None:
+                    waypoint_payload.update(
+                        {
+                            "dp_assign_ms": round(dp_timing["dp_assign_ms"], 3),
+                            "vit_forward_ms": round(
+                                dp_timing["vit_forward_ms"], 3
+                            ),
+                            "all_gather_ms": round(
+                                dp_timing["all_gather_ms"], 3
+                            ),
+                            "reorder_ms": round(dp_timing["reorder_ms"], 3),
+                        }
+                    )
+                emit_request_waypoint("waypoint.batch.mm_embed", waypoint_payload)
 
             # add for qwen3_vl deepstack
             if use_deepstack:

@@ -557,6 +557,7 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        no_logs: bool = False,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
@@ -622,6 +623,7 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.no_logs = no_logs
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -795,6 +797,7 @@ class Req(ReqDllmMixin):
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
+        self.last_logged_cache_match_retraction_count = -1
 
         # For observability
         self.metrics_collector = metrics_collector

@@ -80,6 +80,19 @@ def convert_time_cross_thread(
     return time_value + old_diff - new_diff
 
 
+def _should_serialize_request_timing() -> bool:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        return (
+            server_args.enable_request_waypoint_logging
+            or server_args.enable_request_time_stats_logging
+        )
+    except Exception:
+        return False
+
+
 @dataclass
 class RequestStageConfig:
     stage_name: str
@@ -379,14 +392,35 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_interval(self):
         return time.perf_counter() - self.last_time
 
+    def get_tokenize_latency(self):
+        if self.created_time > 0.0 and self.tokenize_finish_time > 0.0:
+            return self.tokenize_finish_time - self.created_time
+        return None
+
+    def get_api_server_dispatch_latency(self):
+        if (
+            self.api_server_dispatch_time > 0.0
+            and self.api_server_dispatch_finish_time > 0.0
+        ):
+            return (
+                self.api_server_dispatch_finish_time - self.api_server_dispatch_time
+            )
+        return None
+
     def get_first_token_latency(self):
-        return self.first_token_time - self.created_time
+        if self.first_token_time > 0.0 and self.created_time > 0.0:
+            return self.first_token_time - self.created_time
+        return None
 
     def get_e2e_latency(self):
-        return self.finished_time - self.created_time
+        if self.finished_time > 0.0 and self.created_time > 0.0:
+            return self.finished_time - self.created_time
+        return None
 
     def get_decode_latency(self):
-        return self.finished_time - self.first_token_time
+        if self.finished_time > 0.0 and self.first_token_time > 0.0:
+            return self.finished_time - self.first_token_time
+        return None
 
     def get_response_sent_to_client_realtime(self):
         return convert_time_to_realtime(self.response_sent_to_client_time)
@@ -411,6 +445,14 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             meta_info["request_finished_ts"] = convert_time_to_realtime(
                 self.finished_time
             )
+        if (tokenize_latency := self.get_tokenize_latency()) is not None:
+            meta_info["tokenize_latency"] = tokenize_latency
+        if (
+            api_server_dispatch_latency := self.get_api_server_dispatch_latency()
+        ) is not None:
+            meta_info["api_server_dispatch_latency"] = api_server_dispatch_latency
+        if (time_to_first_token := self.get_first_token_latency()) is not None:
+            meta_info["time_to_first_token"] = time_to_first_token
 
         if (
             scheduler_time_stats
@@ -422,7 +464,7 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             )
 
         decode_latency = self.get_decode_latency()
-        if decode_latency > 0.0 and completion_tokens > 0:
+        if decode_latency is not None and decode_latency > 0.0 and completion_tokens > 0:
             meta_info["decode_throughput"] = completion_tokens / decode_latency
         return meta_info
 
@@ -556,7 +598,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not self.enable_metrics:
+        if not self.enable_metrics and not _should_serialize_request_timing():
             return {}
 
         state = {
@@ -565,6 +607,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_run_batch_start_time": self.prefill_run_batch_start_time,
             "prefill_run_batch_end_time": self.prefill_run_batch_end_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "scheduler_recv_time": self.scheduler_recv_time,
+            "queue_time_snapshot": self.maybe_get_queueing_time(),
+            "request_process_latency_snapshot": self.get_request_process_latency(),
+            "prefill_waiting_latency_snapshot": self.get_prefill_waiting_latency(),
+            "prefill_launch_latency_snapshot": self.get_prefill_launch_latency(),
+            "prefill_forward_latency_snapshot": self.get_prefill_forward_latency(),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -903,10 +951,20 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
+    def maybe_get_queueing_time(self) -> Optional[float]:
+        if self.wait_queue_entry_time > 0.0 and self.forward_entry_time > 0.0:
+            return self.get_queueing_time()
+        return getattr(self, "queue_time_snapshot", None)
+
+    def get_request_process_latency(self) -> Optional[float]:
+        if self.scheduler_recv_time > 0.0 and self.wait_queue_entry_time > 0.0:
+            return self.wait_queue_entry_time - self.scheduler_recv_time
+        return getattr(self, "request_process_latency_snapshot", None)
+
     def get_prefill_waiting_latency(self) -> Optional[float]:
         if self.prefill_run_batch_start_time > 0.0:
             return self.prefill_run_batch_start_time - self.forward_entry_time
-        return None
+        return getattr(self, "prefill_waiting_latency_snapshot", None)
 
     def get_prefill_launch_latency(self) -> Optional[float]:
         if (
@@ -914,7 +972,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             and self.prefill_run_batch_end_time > 0.0
         ):
             return self.prefill_run_batch_end_time - self.prefill_run_batch_start_time
-        return None
+        return getattr(self, "prefill_launch_latency_snapshot", None)
+
+    def get_prefill_forward_latency(self) -> Optional[float]:
+        if self.prefill_finished_time > 0.0 and self.forward_entry_time > 0.0:
+            return self.prefill_finished_time - self.forward_entry_time
+        return getattr(self, "prefill_forward_latency_snapshot", None)
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
@@ -1033,9 +1096,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             )
         meta_data.update(
             {
-                "queue_time": self.get_queueing_time(),
+                "queue_time": self.maybe_get_queueing_time(),
+                "request_process_latency": self.get_request_process_latency(),
                 "prefill_waiting_latency": self.get_prefill_waiting_latency(),
                 "prefill_launch_latency": self.get_prefill_launch_latency(),
+                "prefill_forward_latency": self.get_prefill_forward_latency(),
             }
         )
         return meta_data
