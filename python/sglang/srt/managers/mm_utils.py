@@ -1741,7 +1741,7 @@ def get_new_expanded_mm_items(original_mm_items):
                 total_feature_len = feature_len
                 for i in range(num_items):
                     start, end = slice_indices[i], slice_indices[i + 1]
-                    new_item = copy.deepcopy(item)
+                    new_item = copy.copy(item)
                     if item.feature is not None:
                         new_item.feature = _slice_value(item.feature, start, end)
                     if item.precomputed_embeddings is not None:
@@ -1758,6 +1758,8 @@ def get_new_expanded_mm_items(original_mm_items):
                         total_feature_len=total_feature_len,
                     )
                     new_item.hash = None
+                    new_item.pad_value = None
+                    new_item.__dict__.pop("per_offset_pad_values", None)
                     expanded_mm_items.append(new_item)
 
             elif item.is_video():
@@ -1832,7 +1834,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         frame_start_indices[video_idx + 1],
                     )
 
-                    new_item = copy.deepcopy(item)
+                    new_item = copy.copy(item)
                     if item.feature is not None:
                         new_item.feature = _slice_value(item.feature, start, end)
                     if item.precomputed_embeddings is not None:
@@ -1851,6 +1853,8 @@ def get_new_expanded_mm_items(original_mm_items):
                         total_feature_len=total_feature_len,
                     )
                     new_item.hash = None
+                    new_item.pad_value = None
+                    new_item.__dict__.pop("per_offset_pad_values", None)
                     expanded_mm_items.append(new_item)
             else:
                 expanded_mm_items.append(item)
