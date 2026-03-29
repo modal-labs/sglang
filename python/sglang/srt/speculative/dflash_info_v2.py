@@ -114,36 +114,30 @@ class DFlashDraftInputV2(SpecInput):
 
         page_size = batch.token_to_kv_pool_allocator.page_size
 
-        cur_kv_lens_cpu: list[int] = []
-        nxt_kv_lens_cpu: list[int] = []
-        num_needed_tokens = 0
+        cur_kv_lens_cpu_t = torch.tensor(
+            [req.kv_allocated_len for req in batch.reqs],
+            dtype=torch.int32,
+            device="cpu",
+        )
 
-        for req in batch.reqs:
-            # Keep at least 2 * block_size headroom beyond committed tokens.
-            needed = req.kv_committed_len + 2 * block_size - req.kv_allocated_len
-            if needed < 0:
-                needed = 0
-            cur_kv_lens_cpu.append(req.kv_allocated_len)
-            nxt_kv_lens_cpu.append(req.kv_allocated_len + needed)
-            num_needed_tokens += needed
-            req.kv_allocated_len += needed
+        with plan_stream_ctx:
+            if plan_stream is not None and self.verify_done is not None:
+                plan_stream.wait_event(self.verify_done)
 
-        if num_needed_tokens > 0:
-            cur_kv_lens_cpu_t = torch.tensor(
-                cur_kv_lens_cpu, dtype=torch.int32, device="cpu"
-            )
-            nxt_kv_lens_cpu_t = torch.tensor(
-                nxt_kv_lens_cpu, dtype=torch.int32, device="cpu"
+            cur_kv_lens = cur_kv_lens_cpu_t.to(device=batch.device)
+            committed_kv_lens = batch.seq_lens.to(dtype=torch.int32)
+            nxt_kv_lens = torch.maximum(cur_kv_lens, committed_kv_lens + 2 * block_size)
+            nxt_kv_lens_cpu_t = nxt_kv_lens.to(device="cpu")
+            num_needed_tokens = int(
+                (nxt_kv_lens_cpu_t - cur_kv_lens_cpu_t).sum().item()
             )
 
-            with plan_stream_ctx:
+            if num_needed_tokens > 0:
                 if page_size == 1:
                     out_cache_loc = alloc_token_slots(
                         batch.tree_cache, num_needed_tokens
                     )
                 else:
-                    cur_kv_lens = cur_kv_lens_cpu_t.to(device=batch.device)
-                    nxt_kv_lens = nxt_kv_lens_cpu_t.to(device=batch.device)
                     last_loc = get_last_loc(
                         batch.req_to_token_pool.req_to_token,
                         batch.req_pool_indices,
@@ -161,14 +155,11 @@ class DFlashDraftInputV2(SpecInput):
 
                 # Updating req_to_token is a write to a shared tensor: it must not overlap
                 # with the previous batch's forward, which also reads req_to_token.
-                if plan_stream is not None and self.verify_done is not None:
-                    plan_stream.wait_event(self.verify_done)
-
                 assign_req_to_token_pool_func(
                     batch.req_pool_indices,
                     batch.req_to_token_pool.req_to_token,
-                    cur_kv_lens_cpu_t.to(device=batch.device),
-                    nxt_kv_lens_cpu_t.to(device=batch.device),
+                    cur_kv_lens,
+                    nxt_kv_lens,
                     out_cache_loc,
                     bs,
                 )
@@ -180,6 +171,10 @@ class DFlashDraftInputV2(SpecInput):
                     plan_stream
                 )
 
+        nxt_kv_lens_cpu = nxt_kv_lens_cpu_t.tolist()
+        for req, new_alloc_len in zip(batch.reqs, nxt_kv_lens_cpu, strict=True):
+            req.kv_allocated_len = int(new_alloc_len)
+
         # NOTE: In overlap scheduling, per-request CPU state (e.g., `req.kv_committed_len`)
         # can lag behind `batch.seq_lens` by one iteration because result processing is
         # overlapped with the next forward. Avoid using lagging CPU state for buffer sizing,
@@ -187,10 +182,8 @@ class DFlashDraftInputV2(SpecInput):
         #
         # `seq_lens_sum` is used for allocation sizing in attention backends (e.g., FlashInfer
         # kv_indices buffers). Use allocated KV lengths as a safe upper bound.
-        batch.seq_lens_cpu = torch.tensor(
-            nxt_kv_lens_cpu, dtype=torch.int64, device="cpu"
-        )
-        batch.seq_lens_sum = int(sum(nxt_kv_lens_cpu))
+        batch.seq_lens_cpu = nxt_kv_lens_cpu_t.to(dtype=torch.int64)
+        batch.seq_lens_sum = int(nxt_kv_lens_cpu_t.sum().item())
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:

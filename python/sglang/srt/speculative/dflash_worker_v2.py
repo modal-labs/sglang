@@ -228,6 +228,12 @@ class DFlashWorkerV2(DFlashWorker):
                 can_run_cuda_graph=False,
             )
 
+        # `seq_lens` is carried over from the previous overlap iteration and may have been
+        # produced on another stream.
+        model_worker_batch.seq_lens.record_stream(
+            torch.get_device_module(self.device).current_stream()
+        )
+
         bs = len(model_worker_batch.seq_lens)
         device = self.device
 
