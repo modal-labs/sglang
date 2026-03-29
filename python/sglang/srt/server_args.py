@@ -411,6 +411,7 @@ class ServerArgs:
     gc_warning_threshold_secs: float = 0.0
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    enable_request_waypoint_logging: bool = False
     kv_events_config: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
@@ -4307,6 +4308,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_request_time_stats_logging,
             help="Enable per request time stats logging",
+        )
+        parser.add_argument(
+            "--enable-request-waypoint-logging",
+            action="store_true",
+            default=ServerArgs.enable_request_waypoint_logging,
+            help="Enable structured per-request waypoint logging at info level.",
         )
         parser.add_argument(
             "--kv-events-config",
