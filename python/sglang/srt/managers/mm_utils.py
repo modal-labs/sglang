@@ -562,7 +562,7 @@ def _can_use_per_item_image_cache_fallback(
 
 
 def _get_per_item_image_embeddings_with_fallback(
-    data_embedding_func: DataEmbeddingFunc,
+    data_embedding_func: "DataEmbeddingFunc",
     embedding_items_per_req: List[MultimodalDataItem],
 ) -> tuple[Optional[EmbeddingResult], int, int]:
     per_item_embeddings: List[Optional[torch.Tensor]] = [None] * len(
