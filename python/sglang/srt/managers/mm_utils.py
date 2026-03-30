@@ -72,6 +72,20 @@ def count_logical_items(items: List[MultimodalDataItem] | None) -> int:
     return total
 
 
+def count_image_patches(items: List[MultimodalDataItem] | None) -> int:
+    if not items:
+        return 0
+    return sum_grid_patches(
+        [
+            getattr(item, "image_grid_thw", None)
+            for item in items
+            if item is not None
+            and item.is_image()
+            and getattr(item, "image_grid_thw", None) is not None
+        ]
+    )
+
+
 def count_cached_logical_image_items(
     mm_input: MultimodalInputs | None,
     *,
@@ -118,6 +132,9 @@ def empty_image_embed_waypoint_stats() -> dict[str, int]:
         "image_item_count_prefix_cached": 0,
         "image_item_count_embedding_cached": 0,
         "image_item_count_vit_encoded": 0,
+        "image_patch_count_prefix_cached": 0,
+        "image_patch_count_embedding_cached": 0,
+        "image_patch_count_vit_encoded": 0,
     }
 
 
@@ -564,12 +581,13 @@ def _can_use_per_item_image_cache_fallback(
 def _get_per_item_image_embeddings_with_fallback(
     data_embedding_func: "DataEmbeddingFunc",
     embedding_items_per_req: List[MultimodalDataItem],
-) -> tuple[Optional[EmbeddingResult], int, int]:
+) -> tuple[Optional[EmbeddingResult], int, int, int, int]:
     per_item_embeddings: List[Optional[torch.Tensor]] = [None] * len(
         embedding_items_per_req
     )
     missing_items: List[MultimodalDataItem] = []
     missing_indices: List[int] = []
+    hit_items: List[MultimodalDataItem] = []
     cache_hit_count = 0
 
     for idx, item in enumerate(embedding_items_per_req):
@@ -579,18 +597,19 @@ def _get_per_item_image_embeddings_with_fallback(
             missing_indices.append(idx)
             continue
         per_item_embeddings[idx] = cached_embedding.embedding
+        hit_items.append(item)
         cache_hit_count += 1
 
     if missing_items:
         missing_embedding = data_embedding_func(missing_items)
         if not isinstance(missing_embedding, torch.Tensor):
-            return None, 0, 0
+            return None, 0, 0, 0, 0
 
         missing_embedding_splits = _split_embedding_by_items(
             missing_embedding, missing_items
         )
         if missing_embedding_splits is None:
-            return None, 0, 0
+            return None, 0, 0, 0, 0
 
         for idx, item, item_embedding in zip(
             missing_indices, missing_items, missing_embedding_splits
@@ -604,7 +623,7 @@ def _get_per_item_image_embeddings_with_fallback(
                 _warn_embedding_cache_full()
 
     if any(embedding is None for embedding in per_item_embeddings):
-        return None, 0, 0
+        return None, 0, 0, 0, 0
 
     assert per_item_embeddings[0] is not None
     target_device = next(
@@ -626,6 +645,8 @@ def _get_per_item_image_embeddings_with_fallback(
         EmbeddingResult(embedding=torch.cat(assembled_embeddings, dim=0)),
         cache_hit_count,
         len(missing_items),
+        count_image_patches(hit_items),
+        count_image_patches(missing_items),
     )
 
 
@@ -823,9 +844,16 @@ def _get_chunked_prefill_embedding(
             and all(item.is_image() for item in embedding_items_per_req)
             else 0
         )
+        image_patch_count = (
+            count_image_patches(embedding_items_per_req)
+            if embedding_items_per_req
+            and all(item.is_image() for item in embedding_items_per_req)
+            else 0
+        )
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             waypoint_image_stats["image_item_count_prefix_cached"] += image_item_count
+            waypoint_image_stats["image_patch_count_prefix_cached"] += image_patch_count
             continue
         item_hashes = [item.hash for item in embedding_items_per_req]
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
@@ -839,6 +867,8 @@ def _get_chunked_prefill_embedding(
                     embedding_per_req,
                     image_cache_hit_count,
                     image_vit_encode_count,
+                    image_cache_hit_patch_count,
+                    image_vit_encode_patch_count,
                 ) = _get_per_item_image_embeddings_with_fallback(
                     data_embedding_func, embedding_items_per_req
                 )
@@ -850,6 +880,12 @@ def _get_chunked_prefill_embedding(
                     waypoint_image_stats[
                         "image_item_count_vit_encoded"
                     ] += image_vit_encode_count
+                    waypoint_image_stats[
+                        "image_patch_count_embedding_cached"
+                    ] += image_cache_hit_patch_count
+                    waypoint_image_stats[
+                        "image_patch_count_vit_encoded"
+                    ] += image_vit_encode_patch_count
 
         if embedding_per_req is None:
             embedding = data_embedding_func(embedding_items_per_req)
@@ -861,11 +897,15 @@ def _get_chunked_prefill_embedding(
             if not embedding_cache.set(embedding_items_hash, embedding_per_req):
                 _warn_embedding_cache_full()
             waypoint_image_stats["image_item_count_vit_encoded"] += image_item_count
+            waypoint_image_stats["image_patch_count_vit_encoded"] += image_patch_count
         else:
             if not used_per_item_image_fallback:
                 waypoint_image_stats[
                     "image_item_count_embedding_cached"
                 ] += image_item_count
+                waypoint_image_stats[
+                    "image_patch_count_embedding_cached"
+                ] += image_patch_count
 
         extend_prefix_len = prefix_length[i]
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
@@ -1596,6 +1636,18 @@ def general_mm_embed_routine(
                         ],
                         "image_item_count_encoded": image_waypoint_stats[
                             "image_item_count_vit_encoded"
+                        ],
+                        "image_patch_count_prefix_cached": image_waypoint_stats[
+                            "image_patch_count_prefix_cached"
+                        ],
+                        "image_patch_count_embedding_cached": image_waypoint_stats[
+                            "image_patch_count_embedding_cached"
+                        ],
+                        "image_patch_count_vit_encoded": image_waypoint_stats[
+                            "image_patch_count_vit_encoded"
+                        ],
+                        "image_patch_count_encoded": image_waypoint_stats[
+                            "image_patch_count_vit_encoded"
                         ],
                     }
                 )
