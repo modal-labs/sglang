@@ -90,6 +90,106 @@ def scale_kv_cell_size_per_token_for_dflash(
     ) // int(target_num_layers)
 
 
+@dataclass(frozen=True)
+class DFlashAutoMemoryPlan:
+    max_mamba_cache_size: int
+    min_required_tokens: int
+    required_rest_memory_gb: float
+
+
+def resolve_dflash_max_mamba_cache_size(
+    *,
+    max_running_requests: int,
+    mamba_ratio: int,
+    explicit_max_mamba_cache_size: Optional[int] = None,
+) -> int:
+    if max_running_requests <= 0:
+        raise ValueError(
+            f"max_running_requests must be positive, got {max_running_requests}."
+        )
+    if mamba_ratio <= 0:
+        raise ValueError(f"mamba_ratio must be positive, got {mamba_ratio}.")
+    if explicit_max_mamba_cache_size is not None:
+        explicit_max_mamba_cache_size = int(explicit_max_mamba_cache_size)
+        if explicit_max_mamba_cache_size <= 0:
+            raise ValueError(
+                "explicit_max_mamba_cache_size must be positive when provided, "
+                f"got {explicit_max_mamba_cache_size}."
+            )
+        return explicit_max_mamba_cache_size
+    return int(max_running_requests) * int(mamba_ratio)
+
+
+def resolve_dflash_auto_memory_plan(
+    *,
+    rest_memory_gb: float,
+    post_model_load_memory_gb: float,
+    cell_size: int,
+    max_running_requests: int,
+    mamba_cache_per_req: int,
+    speculative_num_draft_tokens: int,
+    chunked_prefill_size: Optional[int],
+    max_prefill_tokens: int,
+    page_size: int,
+    mamba_ratio: int,
+    explicit_max_mamba_cache_size: Optional[int] = None,
+) -> DFlashAutoMemoryPlan:
+    if cell_size <= 0:
+        raise ValueError(f"cell_size must be positive, got {cell_size}.")
+    if mamba_cache_per_req <= 0:
+        raise ValueError(
+            f"mamba_cache_per_req must be positive, got {mamba_cache_per_req}."
+        )
+    if speculative_num_draft_tokens < 0:
+        raise ValueError(
+            "speculative_num_draft_tokens must be non-negative, "
+            f"got {speculative_num_draft_tokens}."
+        )
+    if max_prefill_tokens <= 0:
+        raise ValueError(
+            f"max_prefill_tokens must be positive, got {max_prefill_tokens}."
+        )
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}.")
+
+    max_mamba_cache_size = resolve_dflash_max_mamba_cache_size(
+        max_running_requests=max_running_requests,
+        mamba_ratio=mamba_ratio,
+        explicit_max_mamba_cache_size=explicit_max_mamba_cache_size,
+    )
+
+    if chunked_prefill_size is not None and int(chunked_prefill_size) > 0:
+        min_required_tokens = int(chunked_prefill_size)
+    else:
+        min_required_tokens = int(max_prefill_tokens)
+    min_required_tokens = max(min_required_tokens, int(page_size))
+
+    linear_state_bytes = int(mamba_cache_per_req) * (
+        int(max_mamba_cache_size)
+        + int(max_running_requests) * int(speculative_num_draft_tokens)
+    )
+    required_rest_memory_gb = (
+        linear_state_bytes + int(min_required_tokens) * int(cell_size)
+    ) / float(1 << 30)
+    if required_rest_memory_gb > float(post_model_load_memory_gb):
+        raise RuntimeError(
+            "Not enough GPU memory for DFLASH auto sizing. "
+            f"Required at least {required_rest_memory_gb:.2f} GB after weight load, "
+            f"but only {float(post_model_load_memory_gb):.2f} GB is available. "
+            f"max_running_requests={max_running_requests}, "
+            f"max_mamba_cache_size={max_mamba_cache_size}, "
+            f"min_required_tokens={min_required_tokens}."
+        )
+
+    return DFlashAutoMemoryPlan(
+        max_mamba_cache_size=int(max_mamba_cache_size),
+        min_required_tokens=int(min_required_tokens),
+        required_rest_memory_gb=max(
+            float(rest_memory_gb), float(required_rest_memory_gb)
+        ),
+    )
+
+
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     backend = attn_backend
     for _ in range(4):

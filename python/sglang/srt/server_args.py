@@ -1109,6 +1109,7 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
+        self._auto_mem_fraction_static = self.mem_fraction_static is None
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
@@ -1246,7 +1247,7 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
+                elif self.speculative_algorithm not in {"NGRAM", "DFLASH"}:
                     # eagle draft models and cuda graphs
                     reserved_mem += 4 * 1024
 
