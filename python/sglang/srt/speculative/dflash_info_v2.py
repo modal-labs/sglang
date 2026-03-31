@@ -120,7 +120,17 @@ class DFlashDraftInputV2(SpecInput):
             device="cpu",
         )
 
+        caller_stream = None
+        if plan_stream is not None:
+            caller_stream = torch.get_device_module(batch.device).current_stream()
+
         with plan_stream_ctx:
+            if plan_stream is not None and caller_stream is not None:
+                # `batch.seq_lens`, `batch.req_pool_indices`, and related tensors may
+                # have just been rebuilt on the scheduler stream by filter/merge ops.
+                # The plan stream must wait for those writes before reading them.
+                plan_stream.wait_stream(caller_stream)
+
             if plan_stream is not None and self.verify_done is not None:
                 plan_stream.wait_event(self.verify_done)
 
@@ -163,13 +173,11 @@ class DFlashDraftInputV2(SpecInput):
                     out_cache_loc,
                     bs,
                 )
-
-            if plan_stream is not None:
-                # Ensure subsequent work enqueued on the default stream (and therefore the
-                # scheduler's forward stream) observes the req_to_token update.
-                torch.get_device_module(batch.device).current_stream().wait_stream(
-                    plan_stream
-                )
+        if caller_stream is not None:
+            # Enqueue the dependency on the caller's stream, not inside the
+            # plan-stream context, so forward work cannot observe partially
+            # prepared req_to_token / KV allocation state.
+            caller_stream.wait_stream(plan_stream)
 
         nxt_kv_lens_cpu = nxt_kv_lens_cpu_t.tolist()
         for req, new_alloc_len in zip(batch.reqs, nxt_kv_lens_cpu, strict=True):

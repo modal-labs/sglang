@@ -102,7 +102,7 @@ class DFlashWorkerV2(DFlashWorker):
         *,
         verified_id: torch.Tensor,
         new_seq_lens: torch.Tensor,
-        verify_done: torch.cuda.Event,
+        verify_done: Optional[torch.cuda.Event] = None,
     ) -> DFlashDraftInputV2:
         bs = int(new_seq_lens.numel())
         device = verified_id.device
@@ -185,14 +185,13 @@ class DFlashWorkerV2(DFlashWorker):
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
 
-            verify_done = torch.get_device_module(device).Event()
-            verify_done.record()
-
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 verified_id=next_token_ids,
                 seq_lens=model_worker_batch.seq_lens,
-                verify_done=verify_done,
             )
+            verify_done = torch.get_device_module(device).Event()
+            verify_done.record()
+            batch_output.next_draft_input.verify_done = verify_done
             return batch_output
 
         # Decode / target-verify stage.
@@ -210,21 +209,18 @@ class DFlashWorkerV2(DFlashWorker):
         if model_worker_batch.forward_mode.is_idle():
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
+            next_draft_input = self._make_next_draft_input_decode(
+                verified_id=torch.empty((0,), device=self.device, dtype=torch.int32),
+                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int32),
+            )
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
+            next_draft_input.verify_done = verify_done
             return GenerationBatchResult(
                 logits_output=None,
                 next_token_ids=empty_ids,
                 accept_lens=empty_lens,
-                next_draft_input=self._make_next_draft_input_decode(
-                    verified_id=torch.empty(
-                        (0,), device=self.device, dtype=torch.int32
-                    ),
-                    new_seq_lens=torch.empty(
-                        (0,), device=self.device, dtype=torch.int32
-                    ),
-                    verify_done=verify_done,
-                ),
+                next_draft_input=next_draft_input,
                 can_run_cuda_graph=False,
             )
 
@@ -480,12 +476,13 @@ class DFlashWorkerV2(DFlashWorker):
         logits_output.hidden_states = None
 
         new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        next_draft_input = self._make_next_draft_input_decode(
+            verified_id=bonus,
+            new_seq_lens=new_seq_lens,
+        )
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
-
-        next_draft_input = self._make_next_draft_input_decode(
-            verified_id=bonus, new_seq_lens=new_seq_lens, verify_done=verify_done
-        )
+        next_draft_input.verify_done = verify_done
 
         return GenerationBatchResult(
             logits_output=logits_output,
