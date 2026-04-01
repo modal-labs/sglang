@@ -417,6 +417,7 @@ class MultimodalProcessorOutput:
 
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
+    waypoint_mm_perf: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def from_dict(d: dict) -> "MultimodalProcessorOutput":
@@ -434,6 +435,8 @@ class MultimodalProcessorOutput:
             audio_end_id=d.get("audio_end_id"),
             mrope_positions=d.get("mrope_positions"),
             mrope_position_delta=d.get("mrope_position_delta"),
+            token_type_ids=d.get("token_type_ids"),
+            waypoint_mm_perf=d.get("waypoint_mm_perf"),
         )
 
 
@@ -623,6 +626,7 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        no_logs: bool = False,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
@@ -693,6 +697,7 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.no_logs = no_logs
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -866,6 +871,7 @@ class Req(ReqDllmMixin):
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
+        self.last_logged_cache_match_retraction_count = -1
 
         # For observability
         self.metrics_collector = metrics_collector

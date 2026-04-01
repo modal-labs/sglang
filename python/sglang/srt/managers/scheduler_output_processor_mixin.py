@@ -951,6 +951,11 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
         retraction_counts = []
+        queue_times = []
+        request_process_latencies = []
+        prefill_waiting_latencies = []
+        prefill_launch_latencies = []
+        prefill_forward_latencies = []
         output_hidden_states = None
         load = self.get_load()
         routed_experts = None
@@ -1052,6 +1057,19 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
 
                 retraction_counts.append(req.retraction_count)
+                queue_times.append(req.time_stats.maybe_get_queueing_time())
+                request_process_latencies.append(
+                    req.time_stats.get_request_process_latency()
+                )
+                prefill_waiting_latencies.append(
+                    req.time_stats.get_prefill_waiting_latency()
+                )
+                prefill_launch_latencies.append(
+                    req.time_stats.get_prefill_launch_latency()
+                )
+                prefill_forward_latencies.append(
+                    req.time_stats.get_prefill_forward_latency()
+                )
 
                 time_stats.append(req.time_stats)
 
@@ -1199,6 +1217,11 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    queue_times=queue_times,
+                    request_process_latencies=request_process_latencies,
+                    prefill_waiting_latencies=prefill_waiting_latencies,
+                    prefill_launch_latencies=prefill_launch_latencies,
+                    prefill_forward_latencies=prefill_forward_latencies,
                 )
             )
 

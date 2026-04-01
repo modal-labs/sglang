@@ -5,6 +5,7 @@ Multi-modality utils
 import copy
 import hashlib
 import pickle
+import time
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -15,6 +16,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
@@ -25,6 +27,16 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.mm_utils import (
+    consume_dp_mm_timing_accumulator,
+    reset_dp_mm_timing_accumulator,
+)
+from sglang.srt.observability.request_waypoint_logger import (
+    emit_request_waypoint,
+    ms_from_s,
+    request_waypoints_enabled,
+    sum_grid_patches,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
@@ -38,6 +50,102 @@ _is_npu = is_npu()
 
 # TODO(mick): nccl
 # cuda_ipc: for intranode tensor sharing
+
+
+def count_logical_image_items(mm_input: MultimodalInputs | None) -> int:
+    if mm_input is None:
+        return 0
+    return count_logical_items([item for item in mm_input.mm_items if item.is_image()])
+
+
+def count_logical_items(items: List[MultimodalDataItem] | None) -> int:
+    if not items:
+        return 0
+    total = 0
+    for item in items:
+        if item is None:
+            continue
+        if item.offsets:
+            total += len(item.offsets)
+        else:
+            total += 1
+    return total
+
+
+def count_image_patches(items: List[MultimodalDataItem] | None) -> int:
+    if not items:
+        return 0
+    return sum_grid_patches(
+        [
+            getattr(item, "image_grid_thw", None)
+            for item in items
+            if item is not None
+            and item.is_image()
+            and getattr(item, "image_grid_thw", None) is not None
+        ]
+    )
+
+
+def count_cached_logical_image_items(
+    mm_input: MultimodalInputs | None,
+    *,
+    prefix_match_tokens: int,
+) -> int:
+    if mm_input is None or prefix_match_tokens <= 0:
+        return 0
+    cached = 0
+    for item in mm_input.mm_items:
+        if not item.is_image():
+            continue
+        if item.offsets:
+            cached += sum(1 for _start, end in item.offsets if end < prefix_match_tokens)
+        else:
+            cached += 1
+    return cached
+
+
+def count_encoded_logical_image_items(
+    mm_input: MultimodalInputs | None,
+    *,
+    extend_prefix_len: int,
+    extend_seq_len: int,
+) -> int:
+    if mm_input is None or extend_seq_len <= 0:
+        return 0
+    chunk_start = extend_prefix_len
+    chunk_end = extend_prefix_len + extend_seq_len
+    encoded = 0
+    for item in mm_input.mm_items:
+        if not item.is_image():
+            continue
+        if item.offsets:
+            encoded += sum(
+                1 for start, end in item.offsets if end >= chunk_start and start < chunk_end
+            )
+        else:
+            encoded += 1
+    return encoded
+
+
+def empty_image_embed_waypoint_stats() -> dict[str, int]:
+    return {
+        "image_item_count_prefix_cached": 0,
+        "image_item_count_embedding_cached": 0,
+        "image_item_count_vit_encoded": 0,
+        "image_patch_count_prefix_cached": 0,
+        "image_patch_count_embedding_cached": 0,
+        "image_patch_count_vit_encoded": 0,
+    }
+
+
+def merge_image_embed_waypoint_stats(*stats_list: dict[str, int] | None) -> dict[str, int]:
+    merged = empty_image_embed_waypoint_stats()
+    for stats in stats_list:
+        if not stats:
+            continue
+        for key in merged:
+            merged[key] += int(stats.get(key, 0))
+    return merged
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 
@@ -363,6 +471,15 @@ def init_mm_embedding_cache(max_size: int = 0):
     embedding_cache = MultiModalStaticCache(max_size)
 
 
+def _warn_embedding_cache_full():
+    print_warning_once(
+        "Multimodal embedding cache is full. This typically occurs when a single "
+        "embedding exceeds the cache size limit. Consider increasing the "
+        "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
+        "embedding size."
+    )
+
+
 def get_embedding_chunk(
     embedding: torch.Tensor,
     extend_prefix_len: int,
@@ -410,7 +527,6 @@ def get_embedding_chunk(
 
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
-    items_size: List[int],
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
@@ -421,32 +537,38 @@ def _get_precomputed_embedding(
     If none have precomputed_embeddings, return None.
     """
     precomputed_embeddings = []
-    max_iterations = min(len(items_size) - 1, len(prefix_length))
-
-    for i in range(max_iterations):
-        if items_size[i] == items_size[i + 1]:
+    for idx, item in enumerate(items):
+        if item.precomputed_embeddings is None:
+            precomputed_embeddings.append(None)
             continue
-
-        items_per_req = items[items_size[i] : items_size[i + 1]]
-        extend_len = extend_length[i] if i < len(extend_length) else 0
-        items_offset = items_offset_list[i]
-
-        if any(item.precomputed_embeddings is None for item in items_per_req):
-            chunk = None
-        else:
-            req_embeddings = torch.concat(
-                [item.precomputed_embeddings for item in items_per_req]
-            )
-            chunk, _, _ = get_embedding_chunk(
-                embedding=req_embeddings,
-                extend_prefix_len=prefix_length[i],
-                extend_seq_len=extend_len,
-                items_offset=items_offset,
-            )
-
-        if chunk is None and len(items_per_req) > 1:
-            return None
-        precomputed_embeddings.append(chunk)
+        seq_start_idx = prefix_length[idx]
+        seq_end_idx = seq_start_idx + extend_length[idx] - 1
+        prefix_embedding_length = []
+        extend_embedding_length = []
+        for mm_start_idx, mm_end_idx in items_offset_list[idx]:
+            if mm_start_idx > seq_end_idx:
+                break
+            if seq_start_idx > mm_start_idx:
+                prefix_embedding_length.append(
+                    min(seq_start_idx - mm_start_idx, mm_end_idx - mm_start_idx + 1)
+                )
+            if mm_end_idx >= seq_start_idx:
+                extend_embedding_length.append(
+                    min(
+                        mm_end_idx - seq_start_idx + 1,
+                        seq_end_idx - mm_start_idx + 1,
+                        mm_end_idx - mm_start_idx + 1,
+                        seq_end_idx - seq_start_idx + 1,
+                    )
+                )
+        prefix_embedding_length = int(np.sum(prefix_embedding_length))
+        extend_embedding_length = int(np.sum(extend_embedding_length))
+        precomputed_embeddings.append(
+            item.precomputed_embeddings[
+                prefix_embedding_length : prefix_embedding_length
+                + extend_embedding_length
+            ]
+        )
 
     if any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
@@ -482,7 +604,7 @@ def _get_chunked_embedding_full(
     extend_seq_len: int,
     input_ids: torch.Tensor,
     device: torch.device,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+) -> Tuple[Optional[torch.Tensor], torch.Tensor, bool]:
     """
     Fallback: encode all items at once, cache combined result, extract chunk.
     Used for non-bundled items or EVS results.
@@ -490,6 +612,7 @@ def _get_chunked_embedding_full(
     item_hashes = [item.hash for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
     embedding_per_req = embedding_cache.get(item_hashes)
+    cache_hit = embedding_per_req is not None
 
     if embedding_per_req is None:
         _move_items_to_device(embedding_items_per_req, device)
@@ -499,7 +622,8 @@ def _get_chunked_embedding_full(
             if isinstance(embedding, torch.Tensor)
             else embedding
         )
-        embedding_cache.set(embedding_items_hash, embedding_per_req)
+        if not embedding_cache.set(embedding_items_hash, embedding_per_req):
+            _warn_embedding_cache_full()
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]
@@ -519,7 +643,7 @@ def _get_chunked_embedding_full(
         extend_seq_len=extend_seq_len,
         items_offset=items_offset,
     )
-    return embedding_per_req_chunk, input_ids
+    return embedding_per_req_chunk, input_ids, cache_hit
 
 
 def _get_chunked_embedding_by_item(
@@ -529,20 +653,19 @@ def _get_chunked_embedding_by_item(
     extend_prefix_len: int,
     extend_seq_len: int,
     device: torch.device,
-) -> Optional[torch.Tensor]:
+) -> Tuple[Optional[torch.Tensor], dict[str, int]]:
     """
-    Per-image chunk-aware encoding: only encode images overlapping with the
-    current chunk, cache each image individually.
-    Items must already be split per-image (each item has exactly one offset).
+    Per-image chunk-aware encoding: only encode items overlapping with the
+    current chunk, cache each item individually, and report waypoint stats for
+    image items.
     """
+    waypoint_image_stats = empty_image_embed_waypoint_stats()
     chunk_start = extend_prefix_len
     chunk_end = extend_prefix_len + extend_seq_len  # exclusive
 
     if extend_seq_len <= 0:
-        return None
+        return None, waypoint_image_stats
 
-    # 1. Find items overlapping with current chunk
-    # offsets are (start, end) inclusive on both ends
     overlapping = []
     for idx, (item, offset) in enumerate(zip(embedding_items_per_req, items_offset)):
         start, end = offset
@@ -550,47 +673,60 @@ def _get_chunked_embedding_by_item(
             overlapping.append((idx, item, start, end))
 
     if not overlapping:
-        return None
+        return None, waypoint_image_stats
 
-    # 2. Check per-image cache for each overlapping item
-    cached_embeddings = {}  # idx -> tensor
-    miss_items = []  # (idx, item, start, end)
+    cached_embeddings = {}
+    hit_items = []
+    miss_items = []
     for idx, item, start, end in overlapping:
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
+            hit_items.append(item)
         else:
             miss_items.append((idx, item, start, end))
 
-    # 3. Batch encode all cache-miss items in one ViT call
+    miss_item_list = [item for _, item, _, _ in miss_items]
     if miss_items:
-        miss_item_list = [item for _, item, _, _ in miss_items]
         _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
         all_miss_embedding = all_miss_embedding.reshape(
             -1, all_miss_embedding.shape[-1]
         )
 
-        # Split output by per-item token count
         token_counts = [end - start + 1 for _, _, start, end in miss_items]
         split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
             cached_embeddings[idx] = emb
             emb_result = EmbeddingResult(embedding=emb)
-            embedding_cache.set(item.hash, emb_result)
+            if not embedding_cache.set(item.hash, emb_result):
+                _warn_embedding_cache_full()
 
-    # 4. Assemble chunk: for each overlapping item, extract the overlap slice
     chunk_slices = []
     for idx, _, start, end in overlapping:
-        emb = cached_embeddings[idx]  # shape: (end - start + 1, hidden)
+        emb = cached_embeddings[idx]
         overlap_start = max(start, chunk_start)
-        overlap_end = min(end, chunk_end - 1)  # inclusive
+        overlap_end = min(end, chunk_end - 1)
         local_start = overlap_start - start
-        local_end = overlap_end - start + 1  # exclusive for slicing
+        local_end = overlap_end - start + 1
         chunk_slices.append(emb[local_start:local_end])
 
-    return torch.cat(chunk_slices, dim=0)
+    if all(item.is_image() for _, item, _, _ in overlapping):
+        waypoint_image_stats["image_item_count_embedding_cached"] += count_logical_items(
+            hit_items
+        )
+        waypoint_image_stats["image_item_count_vit_encoded"] += count_logical_items(
+            miss_item_list
+        )
+        waypoint_image_stats["image_patch_count_embedding_cached"] += count_image_patches(
+            hit_items
+        )
+        waypoint_image_stats["image_patch_count_vit_encoded"] += count_image_patches(
+            miss_item_list
+        )
+
+    return torch.cat(chunk_slices, dim=0), waypoint_image_stats
 
 
 def _get_chunked_prefill_embedding(
@@ -601,14 +737,11 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
-) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """
-    Chunked prefill embedding: encode per-request items and extract the chunk.
-    Items are already split per-image at processor stage.
-    """
+) -> tuple[torch.Tensor | None, torch.Tensor, dict[str, int]]:
+    """Chunked prefill embedding with waypoint stats for image reuse."""
     embedding_list = []
+    waypoint_image_stats = empty_image_embed_waypoint_stats()
     device = input_ids.device
-    # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
     for i in range(max_iterations):
@@ -620,18 +753,38 @@ def _get_chunked_prefill_embedding(
 
         extend_prefix_len = prefix_length[i]
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
+        is_image_only = bool(embedding_items_per_req) and all(
+            item.is_image() for item in embedding_items_per_req
+        )
+        all_prefixed = all(offset_end < prefix_length[i] for _, offset_end in items_offset)
 
-        # Skip if all items already prefilled
-        if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
+        if all_prefixed:
+            if is_image_only:
+                waypoint_image_stats["image_item_count_prefix_cached"] += count_logical_items(
+                    embedding_items_per_req
+                )
+                waypoint_image_stats["image_patch_count_prefix_cached"] += count_image_patches(
+                    embedding_items_per_req
+                )
             continue
 
-        # Use per-image path when all items have exactly one offset (already
-        # split per-image) — this avoids encoding images not in this chunk.
-        # Fall back to combined path for non-split items or EVS.
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
+        is_per_item = all(len(item.offsets) == 1 for item in embedding_items_per_req)
 
-        if is_per_image:
-            chunk_embedding = _get_chunked_embedding_by_item(
+        if is_per_item:
+            if is_image_only:
+                prefix_cached_items = [
+                    item
+                    for item, (_start, end) in zip(embedding_items_per_req, items_offset)
+                    if end < extend_prefix_len
+                ]
+                waypoint_image_stats["image_item_count_prefix_cached"] += count_logical_items(
+                    prefix_cached_items
+                )
+                waypoint_image_stats["image_patch_count_prefix_cached"] += count_image_patches(
+                    prefix_cached_items
+                )
+
+            chunk_embedding, chunk_waypoint_stats = _get_chunked_embedding_by_item(
                 data_embedding_func,
                 embedding_items_per_req,
                 items_offset,
@@ -639,10 +792,13 @@ def _get_chunked_prefill_embedding(
                 extend_seq_len,
                 device,
             )
+            waypoint_image_stats = merge_image_embed_waypoint_stats(
+                waypoint_image_stats, chunk_waypoint_stats
+            )
             if chunk_embedding is not None:
                 embedding_list.append(chunk_embedding)
         else:
-            chunk_embedding, input_ids = _get_chunked_embedding_full(
+            chunk_embedding, input_ids, cache_hit = _get_chunked_embedding_full(
                 data_embedding_func,
                 embedding_items_per_req,
                 items_offset,
@@ -651,12 +807,25 @@ def _get_chunked_prefill_embedding(
                 input_ids,
                 device,
             )
+            if is_image_only:
+                image_item_count = count_logical_items(embedding_items_per_req)
+                image_patch_count = count_image_patches(embedding_items_per_req)
+                if cache_hit:
+                    waypoint_image_stats["image_item_count_embedding_cached"] += (
+                        image_item_count
+                    )
+                    waypoint_image_stats["image_patch_count_embedding_cached"] += (
+                        image_patch_count
+                    )
+                else:
+                    waypoint_image_stats["image_item_count_vit_encoded"] += image_item_count
+                    waypoint_image_stats["image_patch_count_vit_encoded"] += image_patch_count
             if chunk_embedding is not None:
                 embedding_list.append(chunk_embedding)
 
     if len(embedding_list) == 0:
-        return None, input_ids
-    return torch.concat(embedding_list, dim=0), input_ids
+        return None, input_ids, waypoint_image_stats
+    return torch.concat(embedding_list, dim=0), input_ids, waypoint_image_stats
 
 
 def _get_multimodal_mask(
@@ -706,7 +875,7 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, dict[str, int]]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
 
@@ -727,11 +896,12 @@ def get_embedding_and_mask(
         - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
     """
     # 1. Get embedding
+    waypoint_image_stats = empty_image_embed_waypoint_stats()
     embedding = _get_precomputed_embedding(
-        embedding_items, items_size, prefix_length, extend_length, items_offset_list
+        embedding_items, prefix_length, extend_length, items_offset_list
     )
     if embedding is None:
-        embedding, input_ids = _get_chunked_prefill_embedding(
+        embedding, input_ids, waypoint_image_stats = _get_chunked_prefill_embedding(
             data_embedding_func,
             embedding_items,
             items_size,
@@ -741,14 +911,14 @@ def get_embedding_and_mask(
             input_ids,
         )
         if embedding is None:
-            return None, None, input_ids
+            return None, None, input_ids, waypoint_image_stats
     # 2. Get mask
     if _is_npu:
         torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
     embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
-    return embedding, special_multimodal_mask, input_ids
+    return embedding, special_multimodal_mask, input_ids, waypoint_image_stats
 
 
 def embed_mm_inputs(
@@ -785,6 +955,8 @@ def embed_mm_inputs(
     item_flatten_list = []
     for mm_inputs in mm_inputs_list:
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
+    has_image_items = any(item.is_image() for item in item_flatten_list)
+    image_waypoint_stats = empty_image_embed_waypoint_stats()
 
     # deepstack_embeddings: per-modality
     modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
@@ -832,7 +1004,7 @@ def embed_mm_inputs(
                 )
             items_size = torch.cumsum(items_size, dim=0).tolist()
 
-            embedding, mask, input_ids = get_embedding_and_mask(
+            embedding, mask, input_ids, modality_waypoint_stats = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
                 placeholder_tensor=placeholder_tensor,
@@ -842,6 +1014,10 @@ def embed_mm_inputs(
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
             )
+            if modality == Modality.IMAGE:
+                image_waypoint_stats = merge_image_embed_waypoint_stats(
+                    image_waypoint_stats, modality_waypoint_stats
+                )
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
@@ -892,6 +1068,9 @@ def embed_mm_inputs(
             input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
                 input_embeds.device, input_embeds.dtype
             )
+
+    if has_image_items:
+        other_info["waypoint_image_embed_stats"] = image_waypoint_stats
 
     return input_embeds, other_info
 
@@ -950,6 +1129,13 @@ def _embed_mm_inputs_with_split(
     vocab_size = input_embedding.num_embeddings
     input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1))
     other_info = {}
+    has_image_items = any(
+        item.is_image()
+        for mm_input in mm_inputs_list
+        for item in mm_input.mm_items
+        if item is not None
+    )
+    image_waypoint_stats = empty_image_embed_waypoint_stats()
 
     input_deepstack_embeds = None
     if use_deepstack and multimodal_model is not None:
@@ -980,6 +1166,9 @@ def _embed_mm_inputs_with_split(
             input_ids=sub_input_ids,
             **embed_kwargs,
         )
+        image_waypoint_stats = merge_image_embed_waypoint_stats(
+            image_waypoint_stats, sub_info.get("waypoint_image_embed_stats")
+        )
 
         offset = 0
         for bi in group_batch_indices:
@@ -996,6 +1185,9 @@ def _embed_mm_inputs_with_split(
                     "input_deepstack_embeds"
                 ][offset : offset + req_len]
             offset += req_len
+
+    if has_image_items:
+        other_info["waypoint_image_embed_stats"] = image_waypoint_stats
 
     return input_embeds, other_info
 
@@ -1047,6 +1239,54 @@ def general_mm_embed_routine(
                 if forward_batch.mm_inputs[i] is not None
             ]
             server_args = get_global_server_args()
+            waypoint_started_at = 0.0
+            waypoint_payload = None
+            if request_waypoints_enabled() and get_attention_tp_rank() == 0:
+                reset_dp_mm_timing_accumulator()
+                item_flatten_list = []
+                for mm_input in mm_inputs_list:
+                    item_flatten_list.extend(
+                        [item for item in mm_input.mm_items if item is not None]
+                    )
+                image_items = [item for item in item_flatten_list if item.is_image()]
+                video_items = [item for item in item_flatten_list if item.is_video()]
+                image_item_count_total = sum(
+                    count_logical_image_items(mm_input) for mm_input in mm_inputs_list
+                )
+                waypoint_started_at = time.perf_counter()
+                waypoint_payload = {
+                    "rids": forward_batch.rids,
+                    "forward_mode": str(forward_batch.forward_mode),
+                    "batch_size": int(forward_batch.batch_size),
+                    "mm_request_count": len(mm_inputs_list),
+                    "extend_seq_lens": [int(x) for x in extend_seq_lens],
+                    "image_item_count": image_item_count_total,
+                    "image_item_count_total": image_item_count_total,
+                    "image_patch_total": sum_grid_patches(
+                        [
+                            getattr(item, "image_grid_thw", None)
+                            for item in image_items
+                            if getattr(item, "image_grid_thw", None) is not None
+                        ]
+                    ),
+                    "video_patch_total": sum_grid_patches(
+                        [
+                            getattr(item, "video_grid_thw", None)
+                            for item in video_items
+                            if getattr(item, "video_grid_thw", None) is not None
+                        ]
+                    ),
+                    "precomputed_item_count": sum(
+                        1
+                        for item in item_flatten_list
+                        if getattr(item, "precomputed_embeddings", None) is not None
+                    ),
+                    "feature_item_count": sum(
+                        1
+                        for item in item_flatten_list
+                        if getattr(item, "feature", None) is not None
+                    ),
+                }
             if server_args and server_args.enable_adaptive_dispatch_to_encoder:
                 # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
                 input_embeds, other_info = _embed_mm_inputs_with_split(
@@ -1073,6 +1313,56 @@ def general_mm_embed_routine(
                     placeholder_tokens=placeholder_tokens,
                     use_deepstack=use_deepstack,
                 )
+            if waypoint_payload is not None:
+                image_waypoint_stats = other_info.get(
+                    "waypoint_image_embed_stats", empty_image_embed_waypoint_stats()
+                )
+                waypoint_payload.update(
+                    {
+                        "image_item_count_prefix_cached": image_waypoint_stats[
+                            "image_item_count_prefix_cached"
+                        ],
+                        "image_item_count_embedding_cached": image_waypoint_stats[
+                            "image_item_count_embedding_cached"
+                        ],
+                        "image_item_count_vit_encoded": image_waypoint_stats[
+                            "image_item_count_vit_encoded"
+                        ],
+                        "image_item_count_encoded": image_waypoint_stats[
+                            "image_item_count_vit_encoded"
+                        ],
+                        "image_patch_count_prefix_cached": image_waypoint_stats[
+                            "image_patch_count_prefix_cached"
+                        ],
+                        "image_patch_count_embedding_cached": image_waypoint_stats[
+                            "image_patch_count_embedding_cached"
+                        ],
+                        "image_patch_count_vit_encoded": image_waypoint_stats[
+                            "image_patch_count_vit_encoded"
+                        ],
+                        "image_patch_count_encoded": image_waypoint_stats[
+                            "image_patch_count_vit_encoded"
+                        ],
+                    }
+                )
+                waypoint_payload["mm_embed_ms"] = ms_from_s(
+                    time.perf_counter() - waypoint_started_at
+                )
+                dp_timing = consume_dp_mm_timing_accumulator()
+                if dp_timing is not None:
+                    waypoint_payload.update(
+                        {
+                            "dp_assign_ms": round(dp_timing["dp_assign_ms"], 3),
+                            "vit_forward_ms": round(
+                                dp_timing["vit_forward_ms"], 3
+                            ),
+                            "all_gather_ms": round(
+                                dp_timing["all_gather_ms"], 3
+                            ),
+                            "reorder_ms": round(dp_timing["reorder_ms"], 3),
+                        }
+                    )
+                emit_request_waypoint("waypoint.batch.mm_embed", waypoint_payload)
 
             # add for qwen3_vl deepstack
             if use_deepstack:
