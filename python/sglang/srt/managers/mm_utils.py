@@ -397,6 +397,147 @@ def init_mm_embedding_cache(max_size: int = 0):
     embedding_cache = MultiModalStaticCache(max_size)
 
 
+def _warn_embedding_cache_full():
+    print_warning_once(
+        "Multimodal embedding cache is full. This typically occurs when a single "
+        "embedding exceeds the cache size limit. Consider increasing the "
+        "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
+        "embedding size."
+    )
+
+
+def _get_mm_cache_key(item_hashes: List[int]) -> Optional[int]:
+    return MultiModalStaticCache.combine_hashes(item_hashes)
+
+
+def _get_single_item_token_length(item: MultimodalDataItem) -> Optional[int]:
+    if not item.offsets or len(item.offsets) != 1:
+        return None
+    start, end = item.offsets[0]
+    return end - start + 1
+
+
+def _split_embedding_by_items(
+    embedding: torch.Tensor,
+    items: List[MultimodalDataItem],
+) -> Optional[List[torch.Tensor]]:
+    if embedding is None:
+        return None
+
+    if embedding.dim() > 2:
+        embedding = embedding.reshape(-1, embedding.shape[-1])
+
+    token_lengths = []
+    total_length = 0
+    for item in items:
+        token_length = _get_single_item_token_length(item)
+        if token_length is None:
+            return None
+        token_lengths.append(token_length)
+        total_length += token_length
+
+    if embedding.shape[0] != total_length:
+        return None
+
+    split_embeddings = []
+    start_idx = 0
+    for token_length in token_lengths:
+        end_idx = start_idx + token_length
+        split_embeddings.append(embedding[start_idx:end_idx])
+        start_idx = end_idx
+    return split_embeddings
+
+
+def _can_use_per_item_image_cache_fallback(
+    embedding_items_per_req: List[MultimodalDataItem],
+    items_offset: List[Tuple[int, int]],
+) -> bool:
+    if len(embedding_items_per_req) <= 1:
+        return False
+    if len(items_offset) != len(embedding_items_per_req):
+        return False
+    if not all(item.is_image() for item in embedding_items_per_req):
+        return False
+
+    for item, offset in zip(embedding_items_per_req, items_offset):
+        if getattr(item, "precomputed_embeddings", None) is not None:
+            return False
+        if not item.offsets or len(item.offsets) != 1:
+            return False
+        if tuple(item.offsets[0]) != tuple(offset):
+            return False
+
+    return True
+
+
+def _get_per_item_image_embeddings_with_fallback(
+    data_embedding_func: "DataEmbeddingFunc",
+    embedding_items_per_req: List[MultimodalDataItem],
+) -> tuple[Optional[EmbeddingResult], int, int]:
+    per_item_embeddings: List[Optional[torch.Tensor]] = [None] * len(
+        embedding_items_per_req
+    )
+    missing_items: List[MultimodalDataItem] = []
+    missing_indices: List[int] = []
+    cache_hit_count = 0
+
+    for idx, item in enumerate(embedding_items_per_req):
+        cached_embedding = embedding_cache.get([item.hash])
+        if cached_embedding is None:
+            missing_items.append(item)
+            missing_indices.append(idx)
+            continue
+        per_item_embeddings[idx] = cached_embedding.embedding
+        cache_hit_count += 1
+
+    if missing_items:
+        missing_embedding = data_embedding_func(missing_items)
+        if not isinstance(missing_embedding, torch.Tensor):
+            return None, 0, 0
+
+        missing_embedding_splits = _split_embedding_by_items(
+            missing_embedding, missing_items
+        )
+        if missing_embedding_splits is None:
+            return None, 0, 0
+
+        for idx, item, item_embedding in zip(
+            missing_indices, missing_items, missing_embedding_splits
+        ):
+            cached_chunk = item_embedding.detach().clone()
+            per_item_embeddings[idx] = cached_chunk
+            cache_key = _get_mm_cache_key([item.hash])
+            if cache_key is not None and not embedding_cache.set(
+                cache_key, EmbeddingResult(embedding=cached_chunk)
+            ):
+                _warn_embedding_cache_full()
+
+    if any(embedding is None for embedding in per_item_embeddings):
+        return None, 0, 0
+
+    assert per_item_embeddings[0] is not None
+    target_device = next(
+        (
+            embedding.device
+            for embedding in per_item_embeddings
+            if embedding is not None and embedding.device.type != "cpu"
+        ),
+        per_item_embeddings[0].device,
+    )
+    assembled_embeddings = []
+    for item_embedding in per_item_embeddings:
+        assert item_embedding is not None
+        if item_embedding.device != target_device:
+            item_embedding = item_embedding.to(target_device)
+        assembled_embeddings.append(item_embedding)
+
+    return (
+        EmbeddingResult(embedding=torch.cat(assembled_embeddings, dim=0)),
+        cache_hit_count,
+        len(missing_items),
+    )
+
+
 def get_embedding_chunk(
     embedding: torch.Tensor,
     extend_prefix_len: int,
@@ -586,6 +727,13 @@ def _get_chunked_prefill_embedding(
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
         embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
+            if _can_use_per_item_image_cache_fallback(
+                embedding_items_per_req, items_offset
+            ):
+                embedding_per_req, _, _ = _get_per_item_image_embeddings_with_fallback(
+                    data_embedding_func, embedding_items_per_req
+                )
+        if embedding_per_req is None:
             embedding = data_embedding_func(embedding_items_per_req)
             embedding_per_req = (
                 EmbeddingResult(embedding=embedding)
@@ -593,12 +741,7 @@ def _get_chunked_prefill_embedding(
                 else embedding
             )
             if not embedding_cache.set(embedding_items_hash, embedding_per_req):
-                print_warning_once(
-                    "Multimodal embedding cache is full. This typically occurs when a single "
-                    "embedding exceeds the cache size limit. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
-                    "embedding size."
-                )
+                _warn_embedding_cache_full()
 
         extend_prefix_len = prefix_length[i]
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
