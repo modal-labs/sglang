@@ -7,6 +7,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.utils import is_cuda
@@ -97,6 +98,38 @@ class DFlashAutoMemoryPlan:
     required_rest_memory_gb: float
 
 
+def resolve_dflash_concurrency_required_tokens(
+    *,
+    max_running_requests: int,
+    page_size: int,
+    speculative_num_draft_tokens: int,
+) -> int:
+    if max_running_requests <= 0:
+        raise ValueError(
+            f"max_running_requests must be positive, got {max_running_requests}."
+        )
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}.")
+    if speculative_num_draft_tokens < 0:
+        raise ValueError(
+            "speculative_num_draft_tokens must be non-negative, "
+            f"got {speculative_num_draft_tokens}."
+        )
+
+    estimated_max_decode_tokens_per_req = int(
+        envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+    )
+    per_request_tokens = (
+        int(page_size)
+        + int(page_size)
+        + max(
+            int(estimated_max_decode_tokens_per_req),
+            2 * int(speculative_num_draft_tokens),
+        )
+    )
+    return int(max_running_requests) * per_request_tokens
+
+
 def resolve_dflash_max_mamba_cache_size(
     *,
     max_running_requests: int,
@@ -163,6 +196,14 @@ def resolve_dflash_auto_memory_plan(
     else:
         min_required_tokens = int(max_prefill_tokens)
     min_required_tokens = max(min_required_tokens, int(page_size))
+    min_required_tokens = max(
+        min_required_tokens,
+        resolve_dflash_concurrency_required_tokens(
+            max_running_requests=max_running_requests,
+            page_size=page_size,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        ),
+    )
 
     linear_state_bytes = int(mamba_cache_per_req) * (
         int(max_mamba_cache_size)
