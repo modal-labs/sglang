@@ -6,6 +6,7 @@ import sglang.srt.managers.mm_utils as mm_utils
 from sglang.srt.managers.mm_utils import (
     _can_use_per_item_image_cache_fallback,
     _get_per_item_image_embeddings_with_fallback,
+    count_image_patches,
     init_mm_embedding_cache,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -69,7 +70,13 @@ class TestMmUtilsPerItemEmbeddingFallback(unittest.TestCase):
             EmbeddingResult(embedding=cache_c),
         )
 
-        embedding_result, cache_hit_count, vit_encode_count = (
+        (
+            embedding_result,
+            cache_hit_count,
+            vit_encode_count,
+            cache_hit_patch_count,
+            vit_encode_patch_count,
+        ) = (
             _get_per_item_image_embeddings_with_fallback(
                 self._fake_embedder, [item_a, item_b, item_c]
             )
@@ -78,6 +85,10 @@ class TestMmUtilsPerItemEmbeddingFallback(unittest.TestCase):
         self.assertIsNotNone(embedding_result)
         self.assertEqual(cache_hit_count, 2)
         self.assertEqual(vit_encode_count, 1)
+        self.assertEqual(
+            cache_hit_patch_count, count_image_patches([item_a, item_c])
+        )
+        self.assertEqual(vit_encode_patch_count, count_image_patches([item_b]))
         self.assertEqual(self.embedder_calls, [[item_b.hash]])
 
         expected = torch.cat(

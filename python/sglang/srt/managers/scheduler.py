@@ -142,7 +142,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    count_cached_logical_image_items,
+    count_logical_image_items,
+    init_mm_embedding_cache,
+    unwrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
@@ -189,6 +194,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.request_waypoint_logger import emit_request_waypoint
 from sglang.srt.observability.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
     PrefillStats,
@@ -1719,6 +1725,7 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 routing_key=recv_req.routing_key,
+                no_logs=recv_req.no_logs,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -2385,6 +2392,64 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.is_stats_logging_rank
+                and req.last_logged_cache_match_retraction_count
+                != req.retraction_count
+            ):
+                prefix_match_tokens = len(req.prefix_indices)
+                input_tokens_padded = len(req.origin_input_ids)
+                input_tokens_unpadded = len(req.origin_input_ids_unpadded)
+                encoder_len = 0
+                image_count_total = 0
+                image_count_cached = 0
+                if req.multimodal_inputs is not None:
+                    image_count_total = count_logical_image_items(req.multimodal_inputs)
+                    image_count_cached = count_cached_logical_image_items(
+                        req.multimodal_inputs,
+                        prefix_match_tokens=prefix_match_tokens,
+                    )
+                    if req.multimodal_inputs.num_image_tokens is not None:
+                        encoder_len = req.multimodal_inputs.num_image_tokens
+                    else:
+                        encoder_len = sum(
+                            offset[1] - offset[0] + 1
+                            for item in req.multimodal_inputs.mm_items
+                            for offset in (item.offsets or [])
+                        )
+                emit_request_waypoint(
+                    "waypoint.request.cache_match",
+                    {
+                        "rid": req.rid,
+                        "input_tokens_unpadded": input_tokens_unpadded,
+                        "input_tokens_padded": input_tokens_padded,
+                        "output_tokens": len(req.output_ids),
+                        "prefix_match_tokens": prefix_match_tokens,
+                        "prefix_match_ratio": (
+                            round(prefix_match_tokens / input_tokens_padded, 4)
+                            if input_tokens_padded > 0
+                            else None
+                        ),
+                        "host_hit_tokens": req.host_hit_length,
+                        "storage_hit_tokens": req.storage_hit_length,
+                        "encoder_len": encoder_len,
+                        "encoder_cached": (
+                            prefix_match_tokens >= encoder_len if encoder_len > 0 else True
+                        ),
+                        "image_count_total": image_count_total,
+                        "image_count_prefix_cached": image_count_cached,
+                        "image_count_prefix_uncached": max(
+                            image_count_total - image_count_cached, 0
+                        ),
+                        "image_count_cached": image_count_cached,
+                        "image_count_to_encode": max(
+                            image_count_total - image_count_cached, 0
+                        ),
+                        "retraction_count": req.retraction_count,
+                        "no_logs": req.no_logs,
+                    },
+                )
+                req.last_logged_cache_match_retraction_count = req.retraction_count
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2546,6 +2611,26 @@ class Scheduler(
             logger.warning(msg_prefix + msg_details)
 
             for req in retracted_reqs:
+                if self.is_stats_logging_rank:
+                    emit_request_waypoint(
+                        "waypoint.request.retracted",
+                        {
+                            "rid": req.rid,
+                            "retraction_count": req.retraction_count,
+                            "input_tokens_unpadded": len(req.origin_input_ids_unpadded),
+                            "input_tokens_padded": len(req.origin_input_ids),
+                            "output_tokens": len(req.output_ids),
+                            "reason": (
+                                "kv_cache_pool_full"
+                                if kv_full_retract_flag
+                                else "decode_retract"
+                            ),
+                            "new_token_ratio_before": round(old_ratio, 4),
+                            "new_token_ratio_after": round(new_token_ratio, 4),
+                            "new_tokens_gained": new_token_gained,
+                            "no_logs": req.no_logs,
+                        },
+                    )
                 self._add_request_to_queue(req, is_retracted=True)
                 if self.enable_hisparse:
                     self.hisparse_coordinator.retract_req(req)

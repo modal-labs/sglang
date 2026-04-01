@@ -1018,6 +1018,13 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
 
+    # Explicit scheduler timing breakdowns for request waypoint logging.
+    queue_times: Optional[List[Optional[float]]] = None
+    request_process_latencies: Optional[List[Optional[float]]] = None
+    prefill_waiting_latencies: Optional[List[Optional[float]]] = None
+    prefill_launch_latencies: Optional[List[Optional[float]]] = None
+    prefill_forward_latencies: Optional[List[Optional[float]]] = None
+
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
@@ -1079,6 +1086,13 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+
+    # Explicit scheduler timing breakdowns for request waypoint logging.
+    queue_times: Optional[List[Optional[float]]] = None
+    request_process_latencies: Optional[List[Optional[float]]] = None
+    prefill_waiting_latencies: Optional[List[Optional[float]]] = None
+    prefill_launch_latencies: Optional[List[Optional[float]]] = None
+    prefill_forward_latencies: Optional[List[Optional[float]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None

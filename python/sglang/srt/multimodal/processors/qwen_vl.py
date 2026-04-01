@@ -589,6 +589,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
         get_rope_index_time = time.perf_counter()
+        image_patch_total = (
+            int(sum(int(math.prod(grid)) for grid in ret.image_grid_thw.tolist()))
+            if hasattr(ret, "image_grid_thw") and ret.image_grid_thw is not None
+            else 0
+        )
+        video_patch_total = (
+            int(sum(int(math.prod(grid)) for grid in ret.video_grid_thw.tolist()))
+            if hasattr(ret, "video_grid_thw") and ret.video_grid_thw is not None
+            else 0
+        )
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
             f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
@@ -608,4 +618,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "audio_token_id": self.mm_tokens.audio_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
+            "waypoint_mm_perf": {
+                "load_s": load_time - entry_time,
+                "preprocess_s": preprocess_time - load_time,
+                "process_s": process_time - preprocess_time,
+                "rope_s": get_rope_index_time - process_time,
+                "total_s": get_rope_index_time - entry_time,
+                "image_count": len(base_output.images or []),
+                "image_patch_total": image_patch_total,
+                "video_patch_total": video_patch_total,
+            },
         }

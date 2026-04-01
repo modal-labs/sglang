@@ -192,6 +192,19 @@ def _handle_output_by_index(output, i):
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
+            queue_times=_extract_field_by_index(output, "queue_times", i, check_length=False),
+            request_process_latencies=_extract_field_by_index(
+                output, "request_process_latencies", i, check_length=False
+            ),
+            prefill_waiting_latencies=_extract_field_by_index(
+                output, "prefill_waiting_latencies", i, check_length=False
+            ),
+            prefill_launch_latencies=_extract_field_by_index(
+                output, "prefill_launch_latencies", i, check_length=False
+            ),
+            prefill_forward_latencies=_extract_field_by_index(
+                output, "prefill_forward_latencies", i, check_length=False
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             token_steps=_extract_field_by_index(
@@ -274,6 +287,19 @@ def _handle_output_by_index(output, i):
                 output, "customized_info", i, check_length=False
             ),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
+            queue_times=_extract_field_by_index(output, "queue_times", i, check_length=False),
+            request_process_latencies=_extract_field_by_index(
+                output, "request_process_latencies", i, check_length=False
+            ),
+            prefill_waiting_latencies=_extract_field_by_index(
+                output, "prefill_waiting_latencies", i, check_length=False
+            ),
+            prefill_launch_latencies=_extract_field_by_index(
+                output, "prefill_launch_latencies", i, check_length=False
+            ),
+            prefill_forward_latencies=_extract_field_by_index(
+                output, "prefill_forward_latencies", i, check_length=False
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
