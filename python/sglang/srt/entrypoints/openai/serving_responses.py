@@ -48,15 +48,19 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.utils import convert_json_schema_to_str
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -65,6 +69,35 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_function_tools_for_chat_parser(tools: list[Any] | None) -> list[Tool]:
+    """Convert Responses function tools to chat-style Tool objects."""
+    normalized_tools: list[Tool] = []
+    for tool in tools or []:
+        if getattr(tool, "type", None) != "function":
+            continue
+
+        if hasattr(tool, "function"):
+            normalized_tools.append(tool)
+            continue
+
+        name = getattr(tool, "name", None)
+        if not name:
+            continue
+
+        normalized_tools.append(
+            Tool(
+                type="function",
+                function=Function(
+                    name=name,
+                    description=getattr(tool, "description", None),
+                    parameters=getattr(tool, "parameters", None),
+                    strict=bool(getattr(tool, "strict", False)),
+                ),
+            )
+        )
+    return normalized_tools
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -83,6 +116,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # template_manager is already set by parent class
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
 
@@ -194,7 +228,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self._make_request_with_harmony(request, prev_response)
                 )
             else:
-                messages, request_prompts, engine_prompts = await self._make_request(
+                messages, request_prompts, engine_prompts, tool_call_constraint = await self._make_request(
                     request, prev_response, tokenizer
                 )
 
@@ -268,6 +302,26 @@ class OpenAIServingResponses(OpenAIServingChat):
                         default_max_tokens, self.default_sampling_params
                     )
 
+                    has_function_tools = any(
+                        getattr(t, "type", None) == "function"
+                        for t in (request.tools or [])
+                    )
+                    if has_function_tools and self.tool_call_parser:
+                        sampling_params["skip_special_tokens"] = False
+
+                    if not self.use_harmony and tool_call_constraint:
+                        constraint_type, constraint_value = tool_call_constraint
+                        if constraint_type == "structural_tag":
+                            sampling_params[constraint_type] = convert_json_schema_to_str(
+                                constraint_value.model_dump(by_alias=True)
+                            )
+                        elif constraint_type == "json_schema":
+                            sampling_params[constraint_type] = convert_json_schema_to_str(
+                                constraint_value
+                            )
+                        else:
+                            sampling_params[constraint_type] = constraint_value
+
                     context: ConversationContext
                     if self.use_harmony:
                         if request.stream:
@@ -278,8 +332,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context = SimpleContext()
 
                     # Create GenerateReqInput for SGLang
+                    prompt_kwargs = (
+                        {"text": engine_prompt}
+                        if isinstance(engine_prompt, str)
+                        else {"input_ids": engine_prompt}
+                    )
                     adapted_request = GenerateReqInput(
-                        input_ids=engine_prompt,
+                        **prompt_kwargs,
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
@@ -382,10 +441,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
             # Convert ResponsesRequest to ChatCompletionRequest for processing
+            # Convert ResponsesRequest tools to ChatCompletionRequest format
+            chat_tools = _normalize_function_tools_for_chat_parser(request.tools) or None
             chat_request = ChatCompletionRequest(
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                chat_template_kwargs=request.chat_template_kwargs,
+                tools=chat_tools,
+                tool_choice=request.tool_choice if chat_tools else "none",
             )
 
             # Follow SGLang's _process_messages pattern
@@ -400,19 +464,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request_prompts = [processed_messages.prompt_ids]
                 engine_prompts = [processed_messages.prompt_ids]
 
-        except Exception as e:
-            logger.warning(f"Chat processing failed, using fallback: {e}")
-            # Fallback to simple encoding
-            prompt_text = ""
-            for msg in messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                prompt_text += f"{role}: {content}\n"
-            prompt_ids = tokenizer.encode(prompt_text)
-            request_prompts = [prompt_ids]
-            engine_prompts = [prompt_ids]
+            tool_call_constraint = processed_messages.tool_call_constraint
 
-        return messages, request_prompts, engine_prompts
+        except Exception as e:
+            logger.warning(f"Chat processing failed, rejecting request: {e}")
+            raise ValueError(
+                "Unable to convert /v1/responses input into chat messages. "
+                "Stateless multi-turn input arrays must use supported "
+                "message/function_call/function_call_output items."
+            ) from e
+
+        return messages, request_prompts, engine_prompts, tool_call_constraint
 
     def _make_request_with_harmony(
         self,
@@ -468,10 +530,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
             # Calculate usage from actual output
-            if hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
-                num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+            if isinstance(final_res, dict) and "meta_info" in final_res:
+                num_prompt_tokens = final_res["meta_info"].get("prompt_tokens", 0)
+                num_generated_tokens = final_res["meta_info"].get("completion_tokens", 0)
+                num_cached_tokens = final_res["meta_info"].get("cached_tokens", 0)
+                num_reasoning_tokens = final_res["meta_info"].get("reasoning_tokens", 0)
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
@@ -530,9 +593,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         final_output: Any,
         tokenizer: Any,
     ):
-        # Handle reasoning parsing if enabled
-        if self.reasoning_parser:
-            # Use standard reasoning parser (openai maps to T4Detector internally)
+        # Handle reasoning parsing if enabled, respecting chat_template_kwargs
+        use_reasoning = bool(self.reasoning_parser)
+        if use_reasoning and request.chat_template_kwargs:
+            ctk = request.chat_template_kwargs
+            if ctk.get("enable_thinking") is False or ctk.get("thinking") is False:
+                use_reasoning = False
+        if use_reasoning:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
@@ -542,6 +609,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         else:
             reasoning_content = None
             content = final_output
+
+        # Parse tool calls from model output
+        tool_calls = []
+        function_tools = _normalize_function_tools_for_chat_parser(request.tools)
+        if function_tools and self.tool_call_parser and content:
+            parser = FunctionCallParser(function_tools, self.tool_call_parser)
+            if parser.has_tool_call(content):
+                try:
+                    content, call_info_list = parser.parse_non_stream(content)
+                    for call_info in call_info_list:
+                        tool_calls.append(call_info)
+                except Exception as e:
+                    logger.warning(f"Tool call parsing failed: {e}")
 
         output_items = []
         if reasoning_content:
@@ -557,12 +637,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
-        if content:
+        if tool_calls:
+            import uuid
+            for call_info in tool_calls:
+                output_items.append(ResponseFunctionToolCall(
+                    type="function_call",
+                    id=f"fc_{random_uuid()}",
+                    call_id=f"call_{uuid.uuid4().hex[:24]}",
+                    name=call_info.name,
+                    arguments=call_info.parameters,
+                    status="completed",
+                ))
+        if content and content.strip():
             output_text = ResponseOutputText(
                 text=content,
-                annotations=[],  # TODO
+                annotations=[],
                 type="output_text",
-                logprobs=None,  # TODO
+                logprobs=None,
             )
             message = ResponseOutputMessage(
                 id=f"msg_{random_uuid()}",
@@ -626,8 +717,102 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(request.input)  # type: ignore
+            for item in request.input:
+                converted = self._convert_responses_input_item(item)
+                # Merge function_call tool_calls into a preceding assistant
+                # message so the chat template sees one turn with content +
+                # tool_calls, matching the Chat Completions format.
+                if (
+                    converted.get("role") == "assistant"
+                    and converted.get("tool_calls")
+                    and not converted.get("content")
+                    and messages
+                    and messages[-1].get("role") == "assistant"
+                    and not messages[-1].get("tool_calls")
+                ):
+                    messages[-1]["tool_calls"] = converted["tool_calls"]
+                else:
+                    messages.append(converted)
         return messages
+
+    @staticmethod
+    def _convert_responses_content_part(part: dict) -> dict:
+        """Convert Responses API content parts to Chat Completions format."""
+        t = part.get("type", "")
+        if t == "input_image":
+            url = part.get("image_url", "")
+            return {"type": "image_url", "image_url": {"url": url}}
+        if t in {"input_text", "output_text", "text"}:
+            return {"type": "text", "text": part.get("text", "")}
+        if t == "input_audio":
+            return {"type": "audio_url", "audio_url": {"url": part.get("audio_url", "")}}
+        if t == "input_video":
+            return {"type": "video_url", "video_url": {"url": part.get("video_url", "")}}
+        return part
+
+    @classmethod
+    def _convert_responses_input_item(cls, item: Any) -> ChatCompletionMessageParam:
+        """Convert a Responses API input item into Chat Completions message format."""
+        msg = (
+            item
+            if isinstance(item, dict)
+            else item.model_dump()
+            if hasattr(item, "model_dump")
+            else dict(item)
+        )
+        msg_type = msg.get("type", "message")
+
+        if msg_type == "function_call":
+            arguments = msg.get("arguments", "")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            return {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": msg["call_id"],
+                        "type": "function",
+                        "function": {
+                            "name": msg["name"],
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            }
+
+        if msg_type == "function_call_output":
+            output = msg.get("output", "")
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False)
+            return {
+                "role": "tool",
+                "content": output,
+                "tool_call_id": msg["call_id"],
+            }
+
+        if msg_type == "reasoning":
+            reasoning_text = ""
+            content = msg.get("content") or []
+            if content:
+                first_part = content[0]
+                if isinstance(first_part, dict):
+                    reasoning_text = first_part.get("text", "")
+            elif msg.get("summary"):
+                first_summary = msg["summary"][0]
+                if isinstance(first_summary, dict):
+                    reasoning_text = first_summary.get("text", "")
+            return {
+                "role": "assistant",
+                "reasoning_content": reasoning_text,
+                "content": None,
+            }
+
+        if isinstance(msg.get("content"), list):
+            msg["content"] = [
+                cls._convert_responses_content_part(part)
+                for part in msg["content"]
+            ]
+        return msg
 
     def _construct_input_messages_with_harmony(
         self,
@@ -874,13 +1059,130 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         )
 
+        # State for non-Harmony (SimpleContext) streaming
+        _prev_text = ""
+        _simple_stream_started = False
+        _tool_parser = None
+        function_tools = _normalize_function_tools_for_chat_parser(request.tools)
+        if function_tools and self.tool_call_parser:
+            _tool_parser = FunctionCallParser(function_tools, self.tool_call_parser)
+
         async for ctx in result_generator:
 
-            # Only process context objects that implement the `is_expecting_start()` method,
-            # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
-            # Contexts without this method are skipped, as they do not represent a new turn
-            # or are not compatible with per-turn handling in the /v1/responses endpoint.
+            # Non-Harmony path: SimpleContext streams token-by-token
             if not hasattr(ctx, "is_expecting_start"):
+                if ctx.last_output is None:
+                    continue
+                text = ctx.last_output.get("text", "")
+                delta = text[len(_prev_text):]
+                _prev_text = text
+                finish_reason = ctx.last_output.get("meta_info", {}).get("finish_reason")
+
+                if delta:
+                    if _tool_parser:
+                        normal_text, calls = _tool_parser.parse_stream_chunk(delta)
+                    else:
+                        normal_text, calls = delta, []
+
+                    if normal_text and not _simple_stream_started:
+                        _simple_stream_started = True
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item=openai_responses_types.ResponseOutputMessage(
+                                    id=current_item_id, type="message",
+                                    role="assistant", content=[], status="in_progress",
+                                ),
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item_id=current_item_id,
+                                content_index=current_content_index,
+                                part=openai_responses_types.ResponseOutputText(
+                                    type="output_text", text="", annotations=[],
+                                ),
+                            )
+                        )
+                    if normal_text:
+                        yield _send_event(
+                            openai_responses_types.ResponseTextDeltaEvent(
+                                type="response.output_text.delta",
+                                sequence_number=-1,
+                                content_index=current_content_index,
+                                output_index=current_output_index,
+                                item_id=current_item_id,
+                                delta=normal_text,
+                                logprobs=[],
+                            )
+                        )
+                    for call_item in calls:
+                        if call_item.name:
+                            import uuid as _uuid
+                            _fc_id = f"fc_{random_uuid()}"
+                            _call_id = f"call_{_uuid.uuid4().hex[:24]}"
+                            # Close text output item if it was started
+                            if _simple_stream_started:
+                                yield _send_event(
+                                    openai_responses_types.ResponseOutputItemDoneEvent(
+                                        type="response.output_item.done",
+                                        sequence_number=-1,
+                                        output_index=current_output_index,
+                                        item=openai_responses_types.ResponseOutputMessage(
+                                            id=current_item_id, type="message",
+                                            role="assistant",
+                                            content=[openai_responses_types.ResponseOutputText(
+                                                type="output_text", text=_prev_text, annotations=[],
+                                            )],
+                                            status="completed",
+                                        ),
+                                    )
+                                )
+                                current_output_index += 1
+                                _simple_stream_started = False
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item=ResponseFunctionToolCall(
+                                        type="function_call", id=_fc_id,
+                                        call_id=_call_id, name=call_item.name,
+                                        arguments="", status="in_progress",
+                                    ),
+                                )
+                            )
+                        if call_item.parameters:
+                            yield _send_event(
+                                openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                    type="response.function_call_arguments.delta",
+                                    sequence_number=-1,
+                                    item_id=_fc_id,
+                                    output_index=current_output_index,
+                                    delta=call_item.parameters,
+                                )
+                            )
+
+                if finish_reason:
+                    # Flush any remaining tool call data
+                    if _tool_parser and hasattr(_tool_parser, 'detector') and hasattr(_tool_parser.detector, 'prev_tool_call_arr'):
+                        for tc in (_tool_parser.detector.prev_tool_call_arr or []):
+                            if hasattr(tc, 'arguments') and tc.arguments:
+                                yield _send_event(
+                                    openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                                        type="response.function_call_arguments.done",
+                                        sequence_number=-1,
+                                        item_id=_fc_id if '_fc_id' in dir() else current_item_id,
+                                        output_index=current_output_index,
+                                        arguments=tc.arguments,
+                                        name=tc.name or "",
+                                    )
+                                )
                 continue
 
             if ctx.is_expecting_start():
