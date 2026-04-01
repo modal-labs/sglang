@@ -290,14 +290,44 @@ class MultimodalDataItem:
             self.hash = uuid.uuid4().int
             self.pad_value = _compute_pad_value(self.hash)
             return
-        if self.hash is None:
-            if self.feature is not None:
-                hashed_feature = self.feature
-            else:
-                hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
-        assert self.hash is not None
-        self.pad_value = _compute_pad_value(self.hash)
+        hashed_feature = self.feature if self.feature is not None else self.precomputed_embeddings
+        n_offsets = len(self.offsets) if self.offsets else 0
+        _per_offset = None
+        _feat_len = -1
+        _sizes = None
+        _feat_type = type(hashed_feature).__name__
+        _resolved = hashed_feature
+        if isinstance(hashed_feature, CudaIpcTensorTransportProxy):
+            _resolved = hashed_feature.reconstruct_on_target_device(torch.cuda.current_device())
+        if n_offsets > 1 and _resolved is not None and self.offsets:
+            _feat_len = len(_resolved) if hasattr(_resolved, "__len__") else -1
+            _sizes = [off[1] - off[0] + 1 for off in self.offsets]
+            _total_offsets = sum(_sizes)
+            if _feat_len == n_offsets:
+                _per_offset = [
+                    _compute_pad_value(hash_feature(_resolved[i]))
+                    for i in range(n_offsets)
+                ]
+            elif _feat_len > 0 and _total_offsets > 0 and _feat_len % _total_offsets == 0:
+                _ratio = _feat_len // _total_offsets
+                _per_offset = []
+                _pos = 0
+                for _s in _sizes:
+                    _chunk = _s * _ratio
+                    _per_offset.append(
+                        _compute_pad_value(hash_feature(_resolved[_pos:_pos + _chunk]))
+                    )
+                    _pos += _chunk
+        if _per_offset:
+            self.per_offset_pad_values = _per_offset
+            if self.hash is None:
+                self.hash = hash_feature(hashed_feature)
+            self.pad_value = self.per_offset_pad_values[0]
+        else:
+            if self.hash is None:
+                self.hash = hash_feature(hashed_feature)
+            assert self.hash is not None
+            self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality

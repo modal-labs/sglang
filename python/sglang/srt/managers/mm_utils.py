@@ -342,8 +342,14 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
                 continue
 
             for i, item in enumerate(items):
-                for offset in items[i].offsets:
-                    input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
+                per_offset_pad_values = getattr(item, "per_offset_pad_values", None)
+                for j, offset in enumerate(items[i].offsets):
+                    pad_value = (
+                        per_offset_pad_values[j]
+                        if per_offset_pad_values and j < len(per_offset_pad_values)
+                        else item.pad_value
+                    )
+                    input_ids_tensor[offset[0] : offset[1] + 1] = pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
@@ -800,8 +806,15 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
+            _all_pad_values = set()
+            for item in items:
+                _po = getattr(item, "per_offset_pad_values", None)
+                if _po:
+                    _all_pad_values.update(_po)
+                else:
+                    _all_pad_values.add(item.pad_value)
             placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
+                sorted(_all_pad_values),
                 device=input_ids.device,
             )
             # calculate per request items length offset
@@ -1419,6 +1432,8 @@ def get_new_expanded_mm_items(original_mm_items):
                         total_feature_len=total_feature_len,
                     )
                     new_item.hash = None
+                    new_item.pad_value = None
+                    new_item.__dict__.pop("per_offset_pad_values", None)
                     expanded_mm_items.append(new_item)
 
             elif item.is_video():
@@ -1513,6 +1528,8 @@ def get_new_expanded_mm_items(original_mm_items):
                         total_feature_len=total_feature_len,
                     )
                     new_item.hash = None
+                    new_item.pad_value = None
+                    new_item.__dict__.pop("per_offset_pad_values", None)
                     expanded_mm_items.append(new_item)
             else:
                 if not _try_simple_split(item, num_items, expanded_mm_items):
