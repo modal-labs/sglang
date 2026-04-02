@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     compute_dflash_accept_len_and_bonus,
@@ -22,6 +26,9 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.tp_worker import TpModelWorker
 
 
 def _compute_paged_keep_slots(
@@ -249,6 +256,42 @@ class DFlashVerifyInput(SpecInput):
             if mask_chunks
             else torch.empty((0,), dtype=torch.bool, device=batch.device)
         )
+
+    def prepare_for_v2_verify(
+        self,
+        batch: ModelWorkerBatch,
+        target_worker: "TpModelWorker",
+    ) -> tuple[ForwardBatch, bool]:
+        """Prepare a DFLASH verify forward batch for overlap scheduling.
+
+        Unlike spec-v1, the overlap path already computes and stores
+        `batch.out_cache_loc` before this method is called. This helper only
+        packages the verify forward and pre-initializes either CUDA-graph replay
+        metadata or eager attention metadata so the actual forward can run with
+        `skip_attn_backend_init=True`.
+        """
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = self.capture_hidden_mode
+        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        can_run_cuda_graph = bool(
+            target_worker.model_runner.graph_runner
+            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+        )
+        if can_run_cuda_graph:
+            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+        elif not batch.forward_mode.is_idle():
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
+
+        return verify_forward_batch, can_run_cuda_graph
 
     def generate_attn_arg_prefill(
         self,

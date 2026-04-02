@@ -285,6 +285,8 @@ class DFlashWorker:
                 num_kv_heads=first_attn.num_kv_heads,
                 head_dim=first_attn.head_dim,
                 device=self.device,
+                max_position_hint=self.target_worker.model_runner.model_config.context_len
+                + int(self.block_size),
             )
             if self.tp_rank == 0:
                 logger.info(

@@ -1,8 +1,10 @@
+import contextlib
 import logging
 from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -27,6 +29,14 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
 logger = logging.getLogger(__name__)
+
+
+def _get_plan_stream(device: str):
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
+        return plan_stream, plan_stream_ctx
+    return None, contextlib.nullcontext()
 
 
 class DFlashWorkerV2(DFlashWorker):
@@ -60,6 +70,7 @@ class DFlashWorkerV2(DFlashWorker):
             nccl_port=nccl_port,
             target_worker=target_worker,
         )
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     def _validate_phase1_sampling_support(
         self, model_worker_batch: ModelWorkerBatch
@@ -377,15 +388,7 @@ class DFlashWorkerV2(DFlashWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
-        model_worker_batch.forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if not model_worker_batch.forward_mode.is_idle()
-            else ForwardMode.IDLE
-        )
-        model_worker_batch.input_ids = verify_input_ids
         model_worker_batch.out_cache_loc = verify_out_cache_loc
-        model_worker_batch.spec_info = verify_input
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
         need_mamba_verify_commit = hasattr(
             self.target_worker.model_runner.attn_backend,
@@ -395,8 +398,21 @@ class DFlashWorkerV2(DFlashWorker):
             model_worker_batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
+        with self.plan_stream_ctx:
+            verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
+                model_worker_batch, self.target_worker
+            )
+        if self.plan_stream:
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
+
         target_out = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
+            model_worker_batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+            **kwargs,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
@@ -456,7 +472,6 @@ class DFlashWorkerV2(DFlashWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
-        # Keep KV append dense to avoid boolean-index packing (which can introduce sync).
         offsets = self._block_pos_offsets  # [block_size]
         mask2d = offsets[None, :] < commit_lens.to(torch.int64)[:, None]  # [bs, block]
         mask_flat = mask2d.reshape(-1)
