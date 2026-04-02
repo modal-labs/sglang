@@ -1313,7 +1313,11 @@ class Scheduler(
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched,
         # as current spec-v1 still filters batch inside verify stage.
-        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        timeout_s = (
+            self.server_args.req_running_timeout
+            if self.server_args.req_running_timeout is not None
+            else envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        )
         if timeout_s <= 0:
             return
         if self.running_batch.is_empty():
@@ -3269,6 +3273,7 @@ class Scheduler(
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",
+                "req_running_timeout",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
             ]
