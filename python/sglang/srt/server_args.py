@@ -377,6 +377,7 @@ class ServerArgs:
     constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
     soft_watchdog_timeout: Optional[float] = None
+    req_running_timeout: Optional[float] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     model_checksum: Optional[str] = None
@@ -4155,6 +4156,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.soft_watchdog_timeout,
             help="Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
+        )
+        parser.add_argument(
+            "--req-running-timeout",
+            type=float,
+            default=ServerArgs.req_running_timeout,
+            help="Set running request timeout in seconds. When unset, falls back to SGLANG_REQ_RUNNING_TIMEOUT.",
         )
         parser.add_argument(
             "--dist-timeout",
