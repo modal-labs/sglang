@@ -2097,6 +2097,13 @@ class Scheduler(
             ),
             req_to_abort,
         )
+        logging.warning(
+            "queue abort rid=%s waiting_queue_len=%d max_queued_requests=%s message=%s",
+            req_to_abort.rid,
+            len(self.waiting_queue),
+            self.max_queued_requests,
+            message,
+        )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
@@ -2122,6 +2129,13 @@ class Scheduler(
                         rid=req.rid,
                     ),
                     req,
+                )
+                logging.warning(
+                    "waiting timeout abort rid=%s waited_s=%.3f timeout_s=%.3f waiting_queue_len=%d",
+                    req.rid,
+                    time.perf_counter() - entry_time,
+                    timeout_s,
+                    len(self.waiting_queue),
                 )
                 deleted_reqs.add(req)
 
