@@ -336,6 +336,7 @@ def _build_common_server_args(
         "32",
         "--mamba-scheduler-strategy",
         str(args.mamba_scheduler_strategy),
+        "--enforce-piecewise-cuda-graph",
     ]
     if args.mem_fraction_static is not None:
         common_server_args.extend(
