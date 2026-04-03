@@ -2572,6 +2572,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
+        # Draft workers only run DECODE and DRAFT_EXTEND, never plain EXTEND/MIXED prefill.
+        if self.is_draft_worker:
+            return
+
         if self.server_args.disable_piecewise_cuda_graph:
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
@@ -2658,6 +2662,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
+
+        for layer in language_model.model.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn_mha"):
+                mha_attn = layer.self_attn.attn_mha
+                mha_attn.attn_layer_id = len(self.attention_layers)
+                object.__setattr__(mha_attn, "_mla_layer", layer.self_attn)
+                self.attention_layers.append(mha_attn)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA

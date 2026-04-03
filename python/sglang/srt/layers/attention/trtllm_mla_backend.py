@@ -586,11 +586,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
             # when chunked prefix cache is disabled.
-            # Also fallback to flashinfer MLA backend when in piecewise cuda graph, since it only supports MLA forward mode.
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
                 self.disable_chunked_prefix_cache and has_prefix
-            ) or is_in_piecewise_cuda_graph()
+            )
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
@@ -603,7 +602,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     torch.cumsum(seq_lens, dim=0),
                 )
             ).int()
-            max_seq_len = max(forward_batch.extend_seq_lens_cpu)
+            max_seq_len = int(max(forward_batch.extend_seq_lens_cpu))
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
                 max_seq_len,
                 cum_seq_lens_q,

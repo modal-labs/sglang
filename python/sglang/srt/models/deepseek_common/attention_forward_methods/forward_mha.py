@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -18,6 +19,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
+from sglang.srt.utils.custom_op import register_custom_op
 
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
@@ -301,30 +303,15 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
-            forward_batch.extend_prefix_lens_cpu
-        )
-        # Only initialize the info once
-        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
-            forward_batch.prepare_chunked_prefix_cache_info(q.device)
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
-
-        forward_batch.mha_return_lse = has_extend_prefix
-        # Do mha for extended part without prefix
-        forward_batch.set_attn_attend_prefix_cache(False)
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-
-        # Do mha attention with chunked prefix cache if there are any sequence with prefix
-        if has_extend_prefix:
-            attn_output, lse = attn_output
-            forward_batch.set_attn_attend_prefix_cache(True)
-            attn_output = self._chunked_prefix_attn_mha(
-                q=q,
-                accum_output=attn_output,
-                accum_lse=lse,
-                forward_batch=forward_batch,
+        if get_forward_context() is not None:
+            attn_output = q.new_empty(
+                (q.shape[0], self.num_local_heads * self.v_head_dim)
             )
+            unified_chunked_kv_attention(
+                q, k, v, attn_output, self.attn_mha.attn_layer_id
+            )
+        else:
+            attn_output = chunked_kv_attention(q, k, v, forward_batch, self.attn_mha)
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -396,7 +383,9 @@ class DeepseekMHAForwardMixin:
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
 
-            output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            output, lse = forward_batch.attn_backend.forward(
+                q, k, v, self.attn_mha, forward_batch, False
+            )
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
@@ -522,3 +511,69 @@ class DeepseekMHAForwardMixin:
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
         return k
+
+
+def chunked_kv_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    forward_batch: ForwardBatch,
+    attn_mha,
+):
+    mla_layer = attn_mha._mla_layer
+
+    has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
+        forward_batch.extend_prefix_lens_cpu
+    )
+    # Only initialize the info once
+    if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+        forward_batch.prepare_chunked_prefix_cache_info(q.device)
+        if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+            forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+
+    forward_batch.mha_return_lse = has_extend_prefix
+    # Do mha for extended part without prefix
+    forward_batch.set_attn_attend_prefix_cache(False)
+    attn_output = forward_batch.attn_backend.forward(q, k, v, attn_mha, forward_batch, False)
+
+    # Do mha attention with chunked prefix cache if there are any sequence with prefix
+    if has_extend_prefix:
+        attn_output, lse = attn_output
+        forward_batch.set_attn_attend_prefix_cache(True)
+        attn_output = mla_layer._chunked_prefix_attn_mha(
+            q=q,
+            accum_output=attn_output,
+            accum_lse=lse,
+            forward_batch=forward_batch,
+        )
+
+    return attn_output
+
+
+@register_custom_op(mutates_args=["attn_output"])
+@register_split_op()
+def unified_chunked_kv_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """PCG split op for MHA_CHUNKED_KV extend + prefix-chunk attention.
+
+    By handling all attention inside a single eagerly-run op, the
+    CUDA-graph-compiled pieces on either side remain topology-static
+    regardless of how many prefix chunks are present.
+    """
+    context = get_forward_context()
+    assert context is not None
+
+    forward_batch = context.forward_batch
+    assert forward_batch is not None
+    assert context.attention_layers is not None
+    attn_mha = context.attention_layers[layer_id]
+
+    result = chunked_kv_attention(q, k, v, forward_batch, attn_mha)
+
+    attn_output.copy_(result.reshape(attn_output.shape))
+

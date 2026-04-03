@@ -122,16 +122,12 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    if forward_batch.forward_mode.is_extend_without_speculative() and (
-        not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
-    ):
-        return AttnForwardMethod.MHA_CHUNKED_KV
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
+    if forward_batch.forward_mode.is_extend_without_speculative():
+        if not attn.disable_chunked_prefix_cache:
+            return AttnForwardMethod.MHA_CHUNKED_KV
+        if _get_sum_extend_prefix_lens(forward_batch) == 0:
+            return AttnForwardMethod.MHA_CHUNKED_KV
+    return _dispatch_mla_subtype(attn, forward_batch)
 
 
 def handle_attention_aiter(attn, forward_batch):

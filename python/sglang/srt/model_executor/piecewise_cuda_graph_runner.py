@@ -413,6 +413,8 @@ class PiecewiseCudaGraphRunner:
         return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            return False
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
