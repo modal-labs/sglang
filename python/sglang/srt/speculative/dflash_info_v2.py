@@ -1,12 +1,4 @@
-"""DFLASH spec-v2 overlap scheduling data structures (WIP).
-
-The spec-v2 path will mirror the scheduler integration used by Eagle v2:
-- the worker returns `(next_token_ids, accept_lens, next_draft_input)`
-- scheduler output processing (not the worker) mutates `req.output_ids`
-
-This file is intentionally introduced early to keep spec-v2-specific state
-isolated from the existing spec-v1 implementation in `dflash_info.py`.
-"""
+"""DFLASH spec-v2 overlap scheduling data structures."""
 
 from __future__ import annotations
 
@@ -50,7 +42,8 @@ def _get_overlap_plan_stream(
 class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations (spec-v2)."""
 
-    # Required by overlap FutureMap plumbing (match Eagle v2 field names).
+    # Legacy Eagle-shaped fields kept only for dataclass compatibility. DFLASH
+    # overlap only relays verified_id/new_seq_lens through FutureMap.
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     verified_id: torch.Tensor
@@ -73,11 +66,11 @@ class DFlashDraftInputV2(SpecInput):
     @classmethod
     def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
         return cls(
-            topk_p=torch.empty((0, 1), device=device, dtype=torch.float32),
-            topk_index=torch.empty((0, 1), device=device, dtype=torch.int64),
+            topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
             verified_id=torch.empty((0,), device=device, dtype=torch.int32),
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
-            hidden_states=torch.empty((0, 1), device=device, dtype=torch.float16),
+            hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
             verify_done=None,
         )
 

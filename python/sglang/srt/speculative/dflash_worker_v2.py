@@ -100,11 +100,11 @@ class DFlashWorkerV2(DFlashWorker):
         bs = int(seq_lens.numel())
         device = verified_id.device
         return DFlashDraftInputV2(
-            topk_p=torch.ones((bs, 1), device=device, dtype=torch.float32),
-            topk_index=torch.zeros((bs, 1), device=device, dtype=torch.int64),
+            topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
+            topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
             verified_id=verified_id.to(dtype=torch.int32),
             new_seq_lens=seq_lens.to(dtype=torch.int32),
-            hidden_states=torch.empty((bs, 1), device=device, dtype=torch.float16),
+            hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
         )
 
@@ -118,11 +118,11 @@ class DFlashWorkerV2(DFlashWorker):
         bs = int(new_seq_lens.numel())
         device = verified_id.device
         return DFlashDraftInputV2(
-            topk_p=torch.ones((bs, 1), device=device, dtype=torch.float32),
-            topk_index=torch.zeros((bs, 1), device=device, dtype=torch.int64),
+            topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
+            topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
             verified_id=verified_id.to(dtype=torch.int32),
             new_seq_lens=new_seq_lens.to(dtype=torch.int32),
-            hidden_states=torch.empty((bs, 1), device=device, dtype=torch.float16),
+            hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
         )
 
@@ -258,6 +258,7 @@ class DFlashWorkerV2(DFlashWorker):
                 "`shard_indices` attributes."
             )
 
+        block_size = int(self.block_size)
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -267,7 +268,7 @@ class DFlashWorkerV2(DFlashWorker):
 
         block_ids = self._draft_block_ids_buf[:bs]
         block_ids.fill_(int(self._mask_token_id))
-        block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
+        block_ids[:, 0].copy_(draft_input.verified_id)
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -275,20 +276,20 @@ class DFlashWorkerV2(DFlashWorker):
         prefix_lens = model_worker_batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
         torch.add(
-            prefix_lens.to(torch.int64).unsqueeze(1),
+            prefix_lens.unsqueeze(1),
             self._block_pos_offsets,
             out=positions_2d,
         )
         positions = positions_2d.reshape(-1)
 
-        end_offset = prefix_lens + int(self.block_size)
+        end_offset = prefix_lens + block_size
         verify_out_cache_loc = assign_extend_cache_locs_func(
             req_pool_indices=model_worker_batch.req_pool_indices,
             req_to_token=self.model_runner.req_to_token_pool.req_to_token,
             start_offset=prefix_lens,
             end_offset=end_offset,
             batch_size=bs,
-            draft_token_num=int(self.block_size),
+            draft_token_num=block_size,
             device=device,
         )
 
@@ -317,7 +318,7 @@ class DFlashWorkerV2(DFlashWorker):
             )
 
             block_end = self._draft_block_end_buf[:bs]
-            torch.add(draft_prefix_lens, int(self.block_size), out=block_end)
+            torch.add(draft_prefix_lens, block_size, out=block_end)
             assign_req_to_token_pool_func(
                 model_worker_batch.req_pool_indices,
                 self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -327,16 +328,15 @@ class DFlashWorkerV2(DFlashWorker):
                 bs,
             )
             draft_seq_lens = draft_prefix_lens
+            draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
             # Non-windowed path uses the shared overallocated mapping directly.
             draft_seq_lens = prefix_lens
             if model_worker_batch.seq_lens_cpu is not None:
-                if model_worker_batch.seq_lens_cpu.dtype == torch.int32:
-                    seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu)
-                else:
-                    seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu.to(torch.int32))
+                seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu)
             else:
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
+            draft_seq_lens_sum = int(model_worker_batch.seq_lens_sum)
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -345,7 +345,7 @@ class DFlashWorkerV2(DFlashWorker):
             req_pool_indices=model_worker_batch.req_pool_indices,
             seq_lens=draft_seq_lens,
             out_cache_loc=verify_out_cache_loc,
-            seq_lens_sum=int(draft_seq_lens.sum().item()),
+            seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
             req_to_token_pool=self.draft_model_runner.req_to_token_pool,
@@ -389,6 +389,7 @@ class DFlashWorkerV2(DFlashWorker):
         )
 
         model_worker_batch.out_cache_loc = verify_out_cache_loc
+        sampling_info = model_worker_batch.sampling_info
 
         need_mamba_verify_commit = hasattr(
             self.target_worker.model_runner.attn_backend,
@@ -417,7 +418,6 @@ class DFlashWorkerV2(DFlashWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        sampling_info = model_worker_batch.sampling_info
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
@@ -476,6 +476,7 @@ class DFlashWorkerV2(DFlashWorker):
         mask2d = offsets[None, :] < commit_lens.to(torch.int64)[:, None]  # [bs, block]
         mask_flat = mask2d.reshape(-1)
 
+        raw_loc_flat = verify_out_cache_loc.reshape(-1)
         loc2d = verify_out_cache_loc.view(bs, int(self.block_size))
         loc2d = torch.where(mask2d, loc2d, loc2d.new_zeros(()))
         loc_flat = loc2d.reshape(-1)
@@ -483,8 +484,11 @@ class DFlashWorkerV2(DFlashWorker):
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=loc_flat,
+            cache_loc_unmasked=raw_loc_flat,
             positions=positions,
             mask_valid=mask_flat,
+            commit_lens=commit_lens,
+            block_size=int(self.block_size),
         )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.

@@ -73,22 +73,9 @@ class FutureMap:
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
 
-        # Get a reference for each tensor
-        topk_p0 = draft_input.topk_p[0]
-        topk_index0 = draft_input.topk_index[0]
         verified_id0 = draft_input.verified_id[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
 
-        self.topk_p_buf = torch.empty(
-            (self.future_buffer_len, *topk_p0.shape),
-            dtype=topk_p0.dtype,
-            device=self.device,
-        )
-        self.topk_index_buf = torch.empty(
-            (self.future_buffer_len, *topk_index0.shape),
-            dtype=topk_index0.dtype,
-            device=self.device,
-        )
         self.verified_id_buf = torch.empty(
             (self.future_buffer_len, *verified_id0.shape),
             dtype=verified_id0.dtype,
@@ -97,6 +84,23 @@ class FutureMap:
         self.new_seq_lens_buf = torch.empty(
             (self.future_buffer_len, *new_seq_lens0.shape),
             dtype=new_seq_lens0.dtype,
+            device=self.device,
+        )
+
+        if self.spec_algo.is_dflash():
+            return
+
+        # Get a reference for each tensor
+        topk_p0 = draft_input.topk_p[0]
+        topk_index0 = draft_input.topk_index[0]
+        self.topk_p_buf = torch.empty(
+            (self.future_buffer_len, *topk_p0.shape),
+            dtype=topk_p0.dtype,
+            device=self.device,
+        )
+        self.topk_index_buf = torch.empty(
+            (self.future_buffer_len, *topk_index0.shape),
+            dtype=topk_index0.dtype,
             device=self.device,
         )
 
@@ -134,10 +138,13 @@ class FutureMap:
             # caching allocator (torch GC) could reclaim the memory before
             # the GPU finishes reading it.
             indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.topk_p = self.topk_p_buf[indices]
-            draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.verified_id = self.verified_id_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+            if self.spec_algo.is_dflash():
+                return
+
+            draft_input.topk_p = self.topk_p_buf[indices]
+            draft_input.topk_index = self.topk_index_buf[indices]
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
 
@@ -169,9 +176,12 @@ class FutureMap:
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
 
-        self.topk_p_buf[intv] = draft_input.topk_p
-        self.topk_index_buf[intv] = draft_input.topk_index
         self.verified_id_buf[intv] = draft_input.verified_id
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
+        if self.spec_algo.is_dflash():
+            return
+
+        self.topk_p_buf[intv] = draft_input.topk_p
+        self.topk_index_buf[intv] = draft_input.topk_index
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states

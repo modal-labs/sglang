@@ -453,6 +453,5 @@ class FusedKVMaterializeHelper:
             k_out=tmp_k,
             v_out=tmp_v,
         )
-
-        for layer_id in range(self.n_layers):
-            write_layer_kv(layer_id, cache_k[layer_id], cache_v[layer_id])
+        for layer_idx in range(self.n_layers):
+            write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])

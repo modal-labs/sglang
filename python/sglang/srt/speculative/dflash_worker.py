@@ -1012,6 +1012,9 @@ class DFlashWorker:
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
         mask_valid: Optional[torch.Tensor] = None,
+        cache_loc_unmasked: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+        block_size: Optional[int] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1060,6 +1063,16 @@ class DFlashWorker:
             cache_loc = cache_loc.to(torch.int64)
         if positions.dtype != torch.int64:
             positions = positions.to(torch.int64)
+        if cache_loc_unmasked is not None:
+            if cache_loc_unmasked.device != device:
+                cache_loc_unmasked = cache_loc_unmasked.to(device, non_blocking=True)
+            if cache_loc_unmasked.dtype != torch.int64:
+                cache_loc_unmasked = cache_loc_unmasked.to(torch.int64)
+        if commit_lens is not None:
+            if commit_lens.device != device:
+                commit_lens = commit_lens.to(device, non_blocking=True)
+            if commit_lens.dtype != torch.int32:
+                commit_lens = commit_lens.to(torch.int32)
 
         mask_3d: Optional[torch.Tensor] = None
         if mask_valid is not None:
@@ -1081,6 +1094,56 @@ class DFlashWorker:
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+
+            if (
+                mask_valid is not None
+                and commit_lens is not None
+                and block_size is not None
+            ):
+                raw_cache_loc = (
+                    cache_loc_unmasked if cache_loc_unmasked is not None else cache_loc
+                )
+                bs = int(commit_lens.shape[0])
+                if bs == 0:
+                    return
+                cache_loc_2d = raw_cache_loc.view(bs, int(block_size))
+
+                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                    try:
+                        self._append_target_hidden_fused(
+                            ctx_hidden=ctx_hidden,
+                            ctx_positions=positions,
+                            ctx_cache_loc=cache_loc,
+                            ctx_cache_loc_2d=cache_loc_2d,
+                            commit_lens=commit_lens,
+                        )
+                        return
+                    except Exception as e:
+                        logger.warning(
+                            "DFLASH fused prefix-direct KV append failed; falling back to the per-layer prefix-direct path: %s",
+                            e,
+                        )
+                        self._use_fused_kv_materialize = False
+                        self._fused_kv_helper = None
+
+                for layer in self.draft_model.layers:
+                    attn = layer.self_attn
+                    k, v = attn.kv_proj_only(ctx_hidden)
+                    k = attn.apply_k_norm(k)
+                    k = attn.apply_k_rope(positions, k)
+                    k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                    v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+
+                    self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
+                        attn.attn,
+                        cache_loc_2d,
+                        commit_lens,
+                        k,
+                        v,
+                        attn.attn.k_scale,
+                        attn.attn.v_scale,
+                    )
+                return
 
             if mask_3d is None:
                 if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
@@ -1154,23 +1217,37 @@ class DFlashWorker:
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        ctx_cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
-        layers = self.draft_model.layers
 
         def _write_layer_kv(
-            layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor
+            layer_idx: int,
+            cache_k: torch.Tensor,
+            cache_v: torch.Tensor,
         ) -> None:
-            attn = layers[layer_idx].self_attn.attn
-            token_to_kv_pool.set_kv_buffer(
-                attn,
-                ctx_cache_loc,
-                cache_k,
-                cache_v,
-                attn.k_scale,
-                attn.v_scale,
-            )
+            attn = self.draft_model.layers[layer_idx].self_attn.attn
+            if ctx_cache_loc_2d is not None and commit_lens is not None:
+                token_to_kv_pool.set_kv_buffer_prefix_valid(
+                    attn,
+                    ctx_cache_loc_2d,
+                    commit_lens,
+                    cache_k,
+                    cache_v,
+                    attn.k_scale,
+                    attn.v_scale,
+                )
+            else:
+                token_to_kv_pool.set_kv_buffer(
+                    attn,
+                    ctx_cache_loc,
+                    cache_k,
+                    cache_v,
+                    attn.k_scale,
+                    attn.v_scale,
+                )
 
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
