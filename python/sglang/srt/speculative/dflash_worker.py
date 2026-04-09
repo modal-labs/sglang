@@ -83,6 +83,8 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self._use_triton_prepare_block = is_cuda()
+        self._use_triton_accept_bonus = is_cuda()
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -201,6 +203,9 @@ class DFlashWorker:
         self._draft_block_tokens_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
+        self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = DFlashVerifyInput(
@@ -213,11 +218,13 @@ class DFlashWorker:
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
+        self._draft_greedy_local_max_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_local_arg_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_local_cap: int = 0
         self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-
         self._use_fused_kv_materialize = is_cuda()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
@@ -324,6 +331,9 @@ class DFlashWorker:
         )
         self._draft_block_tokens_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
+        )
+        self._draft_verify_out_cache_loc_buf = torch.empty(
+            (new_cap, block_size), dtype=torch.int64, device=device
         )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
@@ -561,38 +571,40 @@ class DFlashWorker:
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
-        block_ids = self._draft_block_ids_buf[:bs]
-        block_ids.fill_(int(self._mask_token_id))
-        block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
-
-        noise_embedding = embed_module(block_ids)
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
-
-        # For spec-v1, the draft KV cache is always materialized before drafting the
-        # next block. `target_prefix_lens` stay absolute for RoPE; `draft_prefix_lens`
-        # are the logical resident lengths in the draft-local cache.
-        target_prefix_lens = batch.seq_lens  # int32, device
-        draft_prefix_lens = draft_input.draft_seq_lens
-        if draft_prefix_lens.dtype != torch.int32:
-            draft_prefix_lens = draft_prefix_lens.to(torch.int32)
-        if draft_prefix_lens.device != self.device:
-            draft_prefix_lens = draft_prefix_lens.to(self.device, non_blocking=True)
-
-        positions_2d = self._draft_block_positions_buf[:bs]
-        torch.add(
-            target_prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d
-        )
-        positions = positions_2d.reshape(-1)
-
-        block_start = draft_prefix_lens
-        block_end = self._draft_block_end_buf[:bs]
-        torch.add(block_start, int(self.block_size), out=block_end)
-
-        seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
+            block_ids = self._draft_block_ids_buf[:bs]
+            block_ids.fill_(int(self._mask_token_id))
+            block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
+
+            noise_embedding = embed_module(block_ids)
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+
+            # For spec-v1, the draft KV cache is always materialized before drafting the
+            # next block. `target_prefix_lens` stay absolute for RoPE; `draft_prefix_lens`
+            # are the logical resident lengths in the draft-local cache.
+            target_prefix_lens = batch.seq_lens  # int32, device
+            draft_prefix_lens = draft_input.draft_seq_lens
+            if draft_prefix_lens.dtype != torch.int32:
+                draft_prefix_lens = draft_prefix_lens.to(torch.int32)
+            if draft_prefix_lens.device != self.device:
+                draft_prefix_lens = draft_prefix_lens.to(self.device, non_blocking=True)
+
+            positions_2d = self._draft_block_positions_buf[:bs]
+            torch.add(
+                target_prefix_lens.unsqueeze(1),
+                self._block_pos_offsets,
+                out=positions_2d,
+            )
+            positions = positions_2d.reshape(-1)
+
+            block_start = draft_prefix_lens
+            block_end = self._draft_block_end_buf[:bs]
+            torch.add(block_start, int(self.block_size), out=block_end)
+
+            seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
             if self.page_size == 1:
                 block_cache_loc = allocator.alloc(bs * self.block_size)
             else:
@@ -738,18 +750,51 @@ class DFlashWorker:
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
+        def _ensure_local_reduce_buffers(
+            chunk_len: int,
+            value_dtype: torch.dtype,
+            device: torch.device,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if (
+                self._draft_greedy_local_cap < chunk_len
+                or self._draft_greedy_local_max_buf is None
+                or self._draft_greedy_local_arg_buf is None
+                or self._draft_greedy_local_max_buf.dtype != value_dtype
+                or self._draft_greedy_local_max_buf.device != device
+                or self._draft_greedy_local_arg_buf.device != device
+            ):
+                cap = max(int(chunk_size), chunk_len)
+                self._draft_greedy_local_max_buf = torch.empty(
+                    (cap,), dtype=value_dtype, device=device
+                )
+                self._draft_greedy_local_arg_buf = torch.empty(
+                    (cap,), dtype=torch.int64, device=device
+                )
+                self._draft_greedy_local_cap = cap
+            return (
+                self._draft_greedy_local_max_buf[:chunk_len],
+                self._draft_greedy_local_arg_buf[:chunk_len],
+            )
+
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
+        #
+        # DFLASH draft sampling only materializes a small fixed block of hidden states
+        # each step. On tp=1, splitting those states into many 256-token chunks adds
+        # extra matmul/argmax launches without reducing peak memory meaningfully.
         if tp_size == 1 and num_added == 0:
-            for start in range(0, num_tokens, int(chunk_size)):
-                end = min(num_tokens, start + int(chunk_size))
+            fast_chunk_size = max(int(chunk_size), 1024)
+            for start in range(0, num_tokens, fast_chunk_size):
+                end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_token_ids[start:end] = (
-                        torch.argmax(base_logits, dim=-1).to(torch.long)
-                        + org_vocab_start
+                    local_max, local_arg = _ensure_local_reduce_buffers(
+                        end - start, base_logits.dtype, hs.device
                     )
+                    torch.max(base_logits, dim=-1, out=(local_max, local_arg))
+                    out_token_ids[start:end].copy_(local_arg)
+                    out_token_ids[start:end].add_(org_vocab_start)
                 else:
                     out_token_ids[start:end] = 0
             return out_token_ids
@@ -762,7 +807,10 @@ class DFlashWorker:
             # Base vocab logits.
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
-                local_max, local_arg = torch.max(base_logits, dim=-1)
+                local_max, local_arg = _ensure_local_reduce_buffers(
+                    chunk_len, base_logits.dtype, hs.device
+                )
+                torch.max(base_logits, dim=-1, out=(local_max, local_arg))
             else:
                 local_max = torch.full(
                     (chunk_len,),

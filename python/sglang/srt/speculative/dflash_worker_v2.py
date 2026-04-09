@@ -27,6 +27,12 @@ from sglang.srt.speculative.dflash_worker import DFlashWorker
 from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
+    _compute_dflash_accept_bonus_triton_unchecked,
+)
+from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
+    _prepare_dflash_draft_block_unchecked,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,35 +269,75 @@ class DFlashWorkerV2(DFlashWorker):
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
         assert self._draft_block_tokens_buf is not None
+        assert self._draft_verify_out_cache_loc_buf is not None
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
         block_ids = self._draft_block_ids_buf[:bs]
-        block_ids.fill_(int(self._mask_token_id))
-        block_ids[:, 0].copy_(draft_input.verified_id)
+        prefix_lens = model_worker_batch.seq_lens
+        positions_2d = self._draft_block_positions_buf[:bs]
+        verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        if self._use_triton_prepare_block:
+            try:
+                _prepare_dflash_draft_block_unchecked(
+                    verified_id=draft_input.verified_id.view(-1),
+                    prefix_lens=prefix_lens.view(-1),
+                    req_pool_indices=model_worker_batch.req_pool_indices.view(-1),
+                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    block_ids_out=block_ids,
+                    positions_out=positions_2d,
+                    cache_loc_out=verify_out_cache_loc_2d,
+                    mask_token_id=int(self._mask_token_id),
+                )
+            except Exception as e:
+                self._use_triton_prepare_block = False
+                logger.warning(
+                    "DFLASH Triton prepare_block failed; falling back to eager path: %s",
+                    e,
+                )
+                block_ids.fill_(int(self._mask_token_id))
+                block_ids[:, 0].copy_(draft_input.verified_id)
+                torch.add(
+                    prefix_lens.unsqueeze(1),
+                    self._block_pos_offsets,
+                    out=positions_2d,
+                )
+                end_offset = prefix_lens + block_size
+                verify_out_cache_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=model_worker_batch.req_pool_indices,
+                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    start_offset=prefix_lens,
+                    end_offset=end_offset,
+                    batch_size=bs,
+                    draft_token_num=block_size,
+                    device=device,
+                )
+                verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+        else:
+            block_ids.fill_(int(self._mask_token_id))
+            block_ids[:, 0].copy_(draft_input.verified_id)
+            torch.add(
+                prefix_lens.unsqueeze(1),
+                self._block_pos_offsets,
+                out=positions_2d,
+            )
+            end_offset = prefix_lens + block_size
+            verify_out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=model_worker_batch.req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                start_offset=prefix_lens,
+                end_offset=end_offset,
+                batch_size=bs,
+                draft_token_num=block_size,
+                device=device,
+            )
+            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        prefix_lens = model_worker_batch.seq_lens
-        positions_2d = self._draft_block_positions_buf[:bs]
-        torch.add(
-            prefix_lens.unsqueeze(1),
-            self._block_pos_offsets,
-            out=positions_2d,
-        )
         positions = positions_2d.reshape(-1)
-
-        end_offset = prefix_lens + block_size
-        verify_out_cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=model_worker_batch.req_pool_indices,
-            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-            start_offset=prefix_lens,
-            end_offset=end_offset,
-            batch_size=bs,
-            draft_token_num=block_size,
-            device=device,
-        )
+        verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -331,12 +377,21 @@ class DFlashWorkerV2(DFlashWorker):
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
             # Non-windowed path uses the shared overallocated mapping directly.
+            # Backend planning only needs a safe upper bound for the committed
+            # prefix lengths, not the full allocator reservation length.
             draft_seq_lens = prefix_lens
-            if model_worker_batch.seq_lens_cpu is not None:
+            if draft_input.planning_seq_lens_cpu is not None:
+                seq_lens_cpu.copy_(draft_input.planning_seq_lens_cpu)
+                draft_seq_lens_sum = int(draft_input.planning_seq_lens_sum)
+            elif draft_input.reserved_seq_lens_cpu is not None:
+                seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
+                draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            elif model_worker_batch.seq_lens_cpu is not None:
                 seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu)
+                draft_seq_lens_sum = int(model_worker_batch.seq_lens_sum)
             else:
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
-            draft_seq_lens_sum = int(model_worker_batch.seq_lens_sum)
+                draft_seq_lens_sum = int(prefix_lens.sum().item())
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -398,11 +453,21 @@ class DFlashWorkerV2(DFlashWorker):
         seq_lens_pre_verify = (
             model_worker_batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
+        seq_lens_cpu_backup = model_worker_batch.seq_lens_cpu
+        seq_lens_sum_backup = model_worker_batch.seq_lens_sum
+        if draft_input.planning_seq_lens_cpu is not None:
+            model_worker_batch.seq_lens_cpu = draft_input.planning_seq_lens_cpu
+            model_worker_batch.seq_lens_sum = int(draft_input.planning_seq_lens_sum)
+        elif draft_input.reserved_seq_lens_cpu is not None:
+            model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
+            model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
         with self.plan_stream_ctx:
             verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
                 model_worker_batch, self.target_worker
             )
+        model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
+        model_worker_batch.seq_lens_sum = seq_lens_sum_backup
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
@@ -438,15 +503,75 @@ class DFlashWorkerV2(DFlashWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
+            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+            out_tokens = torch.empty(
+                (bs, int(self.block_size)), dtype=torch.int64, device=device
+            )
+            if int(self.block_size) > 1:
+                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+            out_tokens[:, int(self.block_size) - 1].fill_(0)
+            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
-            accept_len, bonus = compute_dflash_accept_len_and_bonus(
-                candidates=candidates,
-                target_predict=target_predict,
-            )
-        commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+            if self._use_triton_accept_bonus:
+                try:
+                    accept_len = torch.empty((bs,), dtype=torch.int32, device=device)
+                    commit_lens = torch.empty((bs,), dtype=torch.int32, device=device)
+                    bonus = torch.empty((bs,), dtype=candidates.dtype, device=device)
+                    out_tokens = torch.empty(
+                        (bs, int(self.block_size)),
+                        dtype=candidates.dtype,
+                        device=device,
+                    )
+                    _compute_dflash_accept_bonus_triton_unchecked(
+                        candidates=candidates,
+                        target_top1=target_predict,
+                        accept_lens_out=accept_len,
+                        commit_lens_out=commit_lens,
+                        bonus_ids_out=bonus,
+                        out_tokens_out=out_tokens,
+                    )
+                except Exception as e:
+                    self._use_triton_accept_bonus = False
+                    logger.warning(
+                        "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
+                        e,
+                    )
+                    accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
+                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                    out_tokens = torch.empty(
+                        (bs, int(self.block_size)),
+                        dtype=torch.int64,
+                        device=device,
+                    )
+                    if int(self.block_size) > 1:
+                        out_tokens[:, : int(self.block_size) - 1].copy_(
+                            candidates[:, 1:]
+                        )
+                    out_tokens[:, int(self.block_size) - 1].fill_(0)
+                    out_tokens.scatter_(
+                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                    )
+            else:
+                accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
+                commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                out_tokens = torch.empty(
+                    (bs, int(self.block_size)), dtype=torch.int64, device=device
+                )
+                if int(self.block_size) > 1:
+                    out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+                out_tokens[:, int(self.block_size) - 1].fill_(0)
+                out_tokens.scatter_(
+                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                )
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
@@ -455,14 +580,6 @@ class DFlashWorkerV2(DFlashWorker):
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 commit_lens=commit_lens,
             )
-
-        out_tokens = torch.empty(
-            (bs, int(self.block_size)), dtype=torch.int64, device=device
-        )
-        if int(self.block_size) > 1:
-            out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-        out_tokens[:, int(self.block_size) - 1].fill_(0)
-        out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
