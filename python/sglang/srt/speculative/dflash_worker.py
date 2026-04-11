@@ -1009,12 +1009,13 @@ class DFlashWorker:
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
                 )
 
+            wrote_with_fused_kv = False
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                 try:
                     self._append_target_hidden_fused(
                         ctx_hidden, ctx_positions, ctx_cache_loc
                     )
-                    return
+                    wrote_with_fused_kv = True
                 except Exception as e:
                     logger.warning(
                         "DFLASH fused KV append failed; falling back to sequential path: %s",
@@ -1022,9 +1023,10 @@ class DFlashWorker:
                     )
                     self._use_fused_kv_materialize = False
                     self._fused_kv_helper = None
-            self._append_target_hidden_sequential(
-                ctx_hidden, ctx_positions, ctx_cache_loc
-            )
+            if not wrote_with_fused_kv:
+                self._append_target_hidden_sequential(
+                    ctx_hidden, ctx_positions, ctx_cache_loc
+                )
 
         if self.use_compact_draft_cache:
             new_draft_seq_lens = self._compute_compact_draft_seq_lens(batch.seq_lens)
