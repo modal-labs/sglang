@@ -24,8 +24,8 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class _MockTokenizerManager:
@@ -37,6 +37,7 @@ class _MockTokenizerManager:
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
+            stream_response_default_include_usage=False,
         )
         # Mock hf_config for _use_dpsk_v32_encoding check
         mock_hf_config = Mock()
@@ -782,6 +783,115 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    # ------------- X-Data-Parallel-Rank header tests -------------
+    def test_extract_routed_dp_rank_from_header_no_header(self):
+        """Test that None is returned when no header is present."""
+        self.fastapi_request.headers = {}
+        result = self.chat.extract_routed_dp_rank_from_header(
+            self.fastapi_request, body_routed_dp_rank=None
+        )
+        self.assertIsNone(result)
+
+    def test_extract_routed_dp_rank_from_header_with_header(self):
+        """Test that header value is extracted correctly."""
+        self.fastapi_request.headers = {"x-data-parallel-rank": "2"}
+        result = self.chat.extract_routed_dp_rank_from_header(
+            self.fastapi_request, body_routed_dp_rank=None
+        )
+        self.assertEqual(result, 2)
+
+    def test_extract_routed_dp_rank_header_overrides_body(self):
+        """Test that header value has higher priority than body."""
+        self.fastapi_request.headers = {"x-data-parallel-rank": "3"}
+        result = self.chat.extract_routed_dp_rank_from_header(
+            self.fastapi_request, body_routed_dp_rank=1
+        )
+        self.assertEqual(result, 3)  # header wins
+
+    def test_extract_routed_dp_rank_from_header_invalid(self):
+        """Test that invalid header value raises HTTPException."""
+        from fastapi import HTTPException
+
+        self.fastapi_request.headers = {"x-data-parallel-rank": "abc"}
+        with self.assertRaises(HTTPException) as context:
+            self.chat.extract_routed_dp_rank_from_header(
+                self.fastapi_request, body_routed_dp_rank=None
+            )
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("must be an integer", context.exception.detail)
+
+
+class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
+    """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
+
+    def setUp(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = "kimi_k2"
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+
+    def test_required_with_parser_uses_function_call_parser(self):
+        """tool_choice='required' should use FunctionCallParser when tool_call_parser is set."""
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            call_info = Mock()
+            call_info.name = "get_weather"
+            call_info.parameters = '{"location":"Tokyo"}'
+            call_info.tool_index = 0
+
+            parser_instance = ParserMock.return_value
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.parse_non_stream.return_value = ("", [call_info])
+
+            finish_reason = {"type": "stop", "matched": None}
+            tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+            tool_calls, text, fr = self.chat._process_tool_calls(
+                text="<|tool_calls_section_begin|>...<|tool_calls_section_end|>",
+                tools=tools,
+                finish_reason=finish_reason,
+                tool_choice="required",
+            )
+
+            self.assertIsNotNone(tool_calls)
+            self.assertEqual(len(tool_calls), 1)
+            self.assertEqual(tool_calls[0].function.name, "get_weather")
+            self.assertEqual(fr["type"], "tool_calls")
+
+    def test_required_without_parser_falls_back_to_json(self):
+        """tool_choice='required' without parser should parse as JSON array."""
+        self.chat.tool_call_parser = None
+
+        finish_reason = {"type": "stop", "matched": None}
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+        tool_calls, text, fr = self.chat._process_tool_calls(
+            text='[{"name":"get_weather","parameters":{"location":"Tokyo"}}]',
+            tools=tools,
+            finish_reason=finish_reason,
+            tool_choice="required",
+        )
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].function.name, "get_weather")
+
+    def test_required_without_parser_invalid_json_returns_none(self):
+        """tool_choice='required' without parser and invalid JSON returns tool_calls=None."""
+        self.chat.tool_call_parser = None
+
+        finish_reason = {"type": "stop", "matched": None}
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+        tool_calls, text, fr = self.chat._process_tool_calls(
+            text="<|tool_calls_section_begin|>not json",
+            tools=tools,
+            finish_reason=finish_reason,
+            tool_choice="required",
+        )
+
+        self.assertIsNone(tool_calls)
 
 
 if __name__ == "__main__":

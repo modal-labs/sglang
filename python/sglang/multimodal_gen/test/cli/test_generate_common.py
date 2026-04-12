@@ -36,11 +36,14 @@ def run_command(command) -> Optional[float]:
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
+        bufsize=0,
     ) as process:
-        for line in process.stdout:
-            sys.stdout.write(line)
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
         process.wait()
         if process.returncode == 0:
             return True
@@ -52,11 +55,30 @@ class CLIBase(unittest.TestCase):
     model_path: str = None
     extra_args = []
     data_type: DataType = None
+    log_level: str = "info"
     # tested on h100
 
     width: int = 720
     height: int = 720
     output_path: str = "test_outputs"
+
+    def setUp(self):
+        super().setUp()
+        if not os.path.exists(self.output_path):
+            os.makedirs(self.output_path, exist_ok=True)
+        if os.path.exists(self.output_path):
+            for f in os.listdir(self.output_path):
+                path = os.path.join(self.output_path, f)
+                if os.path.isfile(path):
+                    os.remove(path)
+
+    def tearDown(self):
+        super().tearDown()
+        if os.path.exists(self.output_path):
+            for f in os.listdir(self.output_path):
+                path = os.path.join(self.output_path, f)
+                if os.path.isfile(path):
+                    os.remove(path)
 
     def get_base_command(self):
         return [
@@ -65,7 +87,7 @@ class CLIBase(unittest.TestCase):
             "--prompt",
             "A curious raccoon",
             "--save-output",
-            "--log-level=debug",
+            f"--log-level={self.log_level}",
             f"--width={self.width}",
             f"--height={self.height}",
             f"--output-path={self.output_path}",
