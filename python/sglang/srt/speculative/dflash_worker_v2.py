@@ -21,6 +21,7 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
+    generate_dflash_token_bitmask,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.dflash_worker import DFlashWorker
@@ -429,6 +430,8 @@ class DFlashWorkerV2(DFlashWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        has_grammar = getattr(model_worker_batch, "has_grammar", False)
+        draft_tokens_cpu = draft_tokens.cpu() if has_grammar else None
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -483,11 +486,32 @@ class DFlashWorkerV2(DFlashWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        vocab_mask = None
+        grammar = None
+        if has_grammar:
+            reqs = getattr(model_worker_batch, "reqs", None)
+            if reqs is not None and draft_tokens_cpu is not None:
+                vocab_mask, grammar = generate_dflash_token_bitmask(
+                    reqs,
+                    draft_tokens_cpu,
+                    int(self.block_size),
+                    logits_output.next_token_logits.shape[-1],
+                )
+                if vocab_mask is not None and sampling_info is not None:
+                    sampling_info.vocab_mask = None
+
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+            )
+        if vocab_mask is not None:
+            assert grammar is not None
+            vocab_mask = vocab_mask.to(device)
+            grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits,
+                vocab_mask=vocab_mask,
             )
 
         candidates = draft_tokens

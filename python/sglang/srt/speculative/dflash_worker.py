@@ -23,6 +23,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
+    generate_dflash_token_bitmask,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
@@ -529,10 +530,6 @@ class DFlashWorker:
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
 
-        if batch.has_grammar:
-            raise RuntimeError(
-                "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
-            )
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
             if (
                 not is_dflash_sampling_verify_available()
@@ -1444,6 +1441,11 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
+        if batch.has_grammar:
+            draft_tokens_cpu = verify_input.draft_token.view(
+                batch.batch_size(), self.block_size
+            ).cpu()
+
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
@@ -1451,6 +1453,20 @@ class DFlashWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
+
+        vocab_mask = None
+        if batch.has_grammar:
+            vocab_mask, grammar = generate_dflash_token_bitmask(
+                batch.reqs,
+                draft_tokens_cpu,
+                self.block_size,
+                logits_output.next_token_logits.shape[-1],
+            )
+            if vocab_mask is not None:
+                vocab_mask = vocab_mask.to(self.device)
+                verify_input.grammar = grammar
+                if batch.sampling_info is not None:
+                    batch.sampling_info.vocab_mask = None
 
         (
             new_verified_id,
@@ -1461,6 +1477,7 @@ class DFlashWorker:
             batch=batch,
             logits_output=logits_output,
             page_size=self.page_size,
+            vocab_mask=vocab_mask,
         )
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

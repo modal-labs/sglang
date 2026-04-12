@@ -125,7 +125,9 @@ class GrammarManager:
                 if i in ready_req_idxs:
                     continue
 
-                if req.finished() or req.grammar is None:  # It is aborted by AbortReq
+                if (
+                    req.finished() or req.to_finish is not None or req.grammar is None
+                ):  # It is aborted by AbortReq
                     ready_req_idxs.add(i)
                     continue
 
@@ -167,7 +169,9 @@ class GrammarManager:
         for i in synced_ready_req_idxs:
             req = self.grammar_queue[i]
             return_reqs.append(req)
-            if req.finished() or req.grammar is None:  # It is aborted by AbortReq
+            if (
+                req.finished() or req.to_finish is not None or req.grammar is None
+            ):  # It is aborted by AbortReq
                 continue
 
             req.grammar = req.grammar.result()
