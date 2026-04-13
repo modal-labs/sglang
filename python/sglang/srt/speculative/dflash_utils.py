@@ -258,7 +258,8 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -780,7 +781,8 @@ def compute_dflash_sampling_accept_len_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape

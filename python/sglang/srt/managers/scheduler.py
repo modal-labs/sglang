@@ -802,6 +802,7 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
+
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -1559,6 +1560,7 @@ class Scheduler(
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
+
                 status_code = (
                     HTTPStatus.BAD_REQUEST
                     if error_code == 400
@@ -2050,13 +2052,13 @@ class Scheduler(
             # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
             direction = 1 if self.schedule_low_priority_values_first else -1
 
-            def key_fn(item: tuple[int, Req]) -> tuple[int, float]:
-                return (
+            idx, candidate_req = max(
+                enumerate(self.waiting_queue),
+                key=lambda item: (
                     direction * item[1].priority,
                     item[1].time_stats.wait_queue_entry_time,
-                )
-
-            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+                ),
+            )
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority
             )
@@ -2467,8 +2469,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
