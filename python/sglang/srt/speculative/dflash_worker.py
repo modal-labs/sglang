@@ -30,7 +30,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,9 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
-        self._use_triton_prepare_block = is_cuda()
-        self._use_triton_accept_bonus = is_cuda()
+        self._supports_gpu_triton = is_cuda() or is_hip()
+        self._use_triton_prepare_block = self._supports_gpu_triton
+        self._use_triton_accept_bonus = self._supports_gpu_triton
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -145,6 +146,7 @@ class DFlashWorker:
             is_draft_worker=True,
             req_to_token_pool=shared_req_to_token_pool,
             token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
+            memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
@@ -1005,11 +1007,13 @@ class DFlashWorker:
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
                 )
 
+            wrote_with_fused_kv = False
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                 try:
                     self._append_target_hidden_fused(
                         ctx_hidden, ctx_positions, ctx_cache_loc
                     )
+                    wrote_with_fused_kv = True
                 except Exception as e:
                     logger.warning(
                         "DFLASH fused KV append failed; falling back to sequential path: %s",
@@ -1017,10 +1021,7 @@ class DFlashWorker:
                     )
                     self._use_fused_kv_materialize = False
                     self._fused_kv_helper = None
-                    self._append_target_hidden_sequential(
-                        ctx_hidden, ctx_positions, ctx_cache_loc
-                    )
-            else:
+            if not wrote_with_fused_kv:
                 self._append_target_hidden_sequential(
                     ctx_hidden, ctx_positions, ctx_cache_loc
                 )
@@ -1056,15 +1057,14 @@ class DFlashWorker:
         target_hidden: torch.Tensor,
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
-        mask_valid: Optional[torch.Tensor] = None,
-        cache_loc_unmasked: Optional[torch.Tensor] = None,
+        cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
-        block_size: Optional[int] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
-        This helper avoids boolean-index packing for the spec-v2 overlap path, which
-        already computes explicit cache locations from over-allocated req_to_token state.
+        For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
+        `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
+        only the live prefix rows without constructing masked/packed index tensors.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1095,6 +1095,21 @@ class DFlashWorker:
                 "DFLASH positions length mismatch: "
                 f"positions={int(positions.numel())}, target_hidden={num_tokens}."
             )
+        if cache_loc_2d is not None:
+            if cache_loc_2d.ndim != 2:
+                raise ValueError(
+                    "DFLASH cache_loc_2d must be 2D, "
+                    f"got shape={tuple(cache_loc_2d.shape)}."
+                )
+            if int(cache_loc_2d.numel()) != num_tokens:
+                raise ValueError(
+                    "DFLASH cache_loc_2d size mismatch: "
+                    f"cache_loc_2d={int(cache_loc_2d.numel())}, target_hidden={num_tokens}."
+                )
+            if commit_lens is None:
+                raise ValueError(
+                    "DFLASH cache_loc_2d requires commit_lens for prefix-valid writes."
+                )
 
         device = self.model_runner.device
         if cache_loc.device != device:
@@ -1108,51 +1123,29 @@ class DFlashWorker:
             cache_loc = cache_loc.to(torch.int64)
         if positions.dtype != torch.int64:
             positions = positions.to(torch.int64)
-        if cache_loc_unmasked is not None:
-            if cache_loc_unmasked.device != device:
-                cache_loc_unmasked = cache_loc_unmasked.to(device, non_blocking=True)
-            if cache_loc_unmasked.dtype != torch.int64:
-                cache_loc_unmasked = cache_loc_unmasked.to(torch.int64)
+        if cache_loc_2d is not None:
+            if cache_loc_2d.device != device:
+                cache_loc_2d = cache_loc_2d.to(device, non_blocking=True)
+            if cache_loc_2d.dtype != torch.int64:
+                cache_loc_2d = cache_loc_2d.to(torch.int64)
         if commit_lens is not None:
             if commit_lens.device != device:
                 commit_lens = commit_lens.to(device, non_blocking=True)
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
-        mask_3d: Optional[torch.Tensor] = None
-        if mask_valid is not None:
-            if mask_valid.ndim != 1:
-                raise ValueError(
-                    "DFLASH mask_valid must be 1D, "
-                    f"got shape={tuple(mask_valid.shape)}."
-                )
-            if int(mask_valid.numel()) != num_tokens:
-                raise ValueError(
-                    "DFLASH mask_valid length mismatch: "
-                    f"mask_valid={int(mask_valid.numel())}, target_hidden={num_tokens}."
-                )
-            if mask_valid.device != device:
-                mask_valid = mask_valid.to(device, non_blocking=True)
-            if mask_valid.dtype != torch.bool:
-                mask_valid = mask_valid.to(torch.bool)
-            mask_3d = mask_valid.view(-1, 1, 1)
-
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
-            if (
-                mask_valid is not None
-                and commit_lens is not None
-                and block_size is not None
-            ):
-                raw_cache_loc = (
-                    cache_loc_unmasked if cache_loc_unmasked is not None else cache_loc
-                )
+            if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
+                if int(cache_loc_2d.shape[0]) != bs:
+                    raise ValueError(
+                        "DFLASH cache_loc_2d batch size mismatch: "
+                        f"cache_loc_2d={tuple(cache_loc_2d.shape)}, commit_lens={tuple(commit_lens.shape)}."
+                    )
                 if bs == 0:
                     return
-                cache_loc_2d = raw_cache_loc.view(bs, int(block_size))
-
                 if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                     try:
                         self._append_target_hidden_fused(
@@ -1190,50 +1183,27 @@ class DFlashWorker:
                     )
                 return
 
-            if mask_3d is None:
-                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
-                    try:
-                        self._append_target_hidden_fused(
-                            ctx_hidden=ctx_hidden,
-                            ctx_positions=positions,
-                            ctx_cache_loc=cache_loc,
-                        )
-                        return
-                    except Exception as e:
-                        logger.warning(
-                            "DFLASH fused KV append-by-loc failed; falling back to sequential path: %s",
-                            e,
-                        )
-                        self._use_fused_kv_materialize = False
-                        self._fused_kv_helper = None
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._append_target_hidden_fused(
+                        ctx_hidden=ctx_hidden,
+                        ctx_positions=positions,
+                        ctx_cache_loc=cache_loc,
+                    )
+                    return
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH fused KV append-by-loc failed; falling back to sequential path: %s",
+                        e,
+                    )
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
 
-                self._append_target_hidden_sequential(
-                    ctx_hidden=ctx_hidden,
-                    ctx_positions=positions,
-                    ctx_cache_loc=cache_loc,
-                )
-                return
-
-            for layer in self.draft_model.layers:
-                attn = layer.self_attn
-                k, v = attn.kv_proj_only(ctx_hidden)
-                k = attn.apply_k_norm(k)
-                k = attn.apply_k_rope(positions, k)
-                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-
-                if mask_3d is not None:
-                    k = k.masked_fill(~mask_3d, 0)
-                    v = v.masked_fill(~mask_3d, 0)
-
-                self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
-                    attn.attn,
-                    cache_loc,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
-                )
+            self._append_target_hidden_sequential(
+                ctx_hidden=ctx_hidden,
+                ctx_positions=positions,
+                ctx_cache_loc=cache_loc,
+            )
 
     def _append_target_hidden_sequential(
         self,
@@ -1267,6 +1237,8 @@ class DFlashWorker:
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        if self._fused_kv_helper is None:
+            raise RuntimeError("DFLASH fused KV helper is not initialized.")
 
         def _write_layer_kv(
             layer_idx: int,

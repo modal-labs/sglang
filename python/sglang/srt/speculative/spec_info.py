@@ -4,8 +4,6 @@ from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
-from sglang.srt.environ import envs
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -56,11 +54,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return (
-            self.is_eagle()
-            or self.is_standalone()
-            or (self.is_dflash() and envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get())
-        )
+        return self.is_eagle() or self.is_standalone() or self.is_dflash()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -73,11 +67,6 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             if enable_overlap:
-                if not envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get():
-                    raise ValueError(
-                        "DFLASH does not support overlap scheduling (spec v2) by default. "
-                        "Set env SGLANG_ENABLE_DFLASH_SPEC_V2=True to opt in."
-                    )
                 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
                 return DFlashWorkerV2

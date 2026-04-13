@@ -613,23 +613,12 @@ class DFlashWorkerV2(DFlashWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
-        offsets = self._block_pos_offsets  # [block_size]
-        mask2d = offsets[None, :] < commit_lens.to(torch.int64)[:, None]  # [bs, block]
-        mask_flat = mask2d.reshape(-1)
-
-        raw_loc_flat = verify_out_cache_loc.reshape(-1)
-        loc2d = verify_out_cache_loc.view(bs, int(self.block_size))
-        loc2d = torch.where(mask2d, loc2d, loc2d.new_zeros(()))
-        loc_flat = loc2d.reshape(-1)
-
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=loc_flat,
-            cache_loc_unmasked=raw_loc_flat,
+            cache_loc=verify_out_cache_loc,
+            cache_loc_2d=verify_out_cache_loc_2d,
             positions=positions,
-            mask_valid=mask_flat,
             commit_lens=commit_lens,
-            block_size=int(self.block_size),
         )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
