@@ -258,8 +258,7 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -690,6 +689,69 @@ def compute_dflash_accept_len_and_bonus(
     return accept_len, bonus.to(torch.int64)
 
 
+def traverse_dflash_chain(
+    draft_tokens: torch.Tensor,
+    grammar,
+    vocab_mask: torch.Tensor,
+):
+    """Walk a linear DFLASH draft chain and emit per-position grammar masks."""
+    block_size = len(draft_tokens)
+
+    if grammar.is_terminated():
+        return
+
+    grammar.fill_vocab_mask(vocab_mask, 0)
+
+    accepted = 0
+    try:
+        for pos in range(1, block_size):
+            if grammar.is_terminated():
+                break
+
+            try:
+                grammar.accept_token(int(draft_tokens[pos]))
+                accepted += 1
+                if not grammar.is_terminated():
+                    grammar.fill_vocab_mask(vocab_mask, pos)
+            except ValueError:
+                break
+    finally:
+        if accepted > 0:
+            grammar.rollback(accepted)
+
+
+def generate_dflash_token_bitmask(
+    reqs: List,
+    draft_tokens_cpu: torch.Tensor,
+    block_size: int,
+    vocab_size: int,
+):
+    """Generate per-position grammar masks for DFLASH verify."""
+    bs = len(reqs)
+    vocab_mask = None
+    grammar = None
+
+    for i, req in enumerate(reqs):
+        if req.grammar is None:
+            continue
+
+        if vocab_mask is None:
+            vocab_mask = req.grammar.allocate_vocab_mask(
+                vocab_size=vocab_size,
+                batch_size=bs * block_size,
+                device="cpu",
+            )
+
+        grammar = req.grammar
+        traverse_dflash_chain(
+            draft_tokens_cpu[i],
+            req.grammar,
+            vocab_mask[i * block_size : (i + 1) * block_size],
+        )
+
+    return vocab_mask, grammar
+
+
 def compute_dflash_sampling_accept_len_and_bonus(
     *,
     candidates: torch.Tensor,
@@ -718,8 +780,7 @@ def compute_dflash_sampling_accept_len_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape

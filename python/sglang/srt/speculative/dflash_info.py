@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -173,6 +174,7 @@ class DFlashVerifyInput(SpecInput):
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
+    grammar: BaseGrammarObject | None = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -358,6 +360,7 @@ class DFlashVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         page_size: int,
+        vocab_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
         """DFlash verification for greedy and non-greedy sampling.
 
@@ -385,6 +388,15 @@ class DFlashVerifyInput(SpecInput):
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=self.draft_token_num,
+            )
+        if vocab_mask is not None:
+            if self.grammar is None:
+                raise RuntimeError(
+                    "DFLASH verify received a grammar vocab mask without a grammar object."
+                )
+            self.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits,
+                vocab_mask=vocab_mask,
             )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
