@@ -282,7 +282,6 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-
     return None
 
 
@@ -2051,14 +2050,11 @@ class Scheduler(
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
             # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
             direction = 1 if self.schedule_low_priority_values_first else -1
-
-            idx, candidate_req = max(
-                enumerate(self.waiting_queue),
-                key=lambda item: (
-                    direction * item[1].priority,
-                    item[1].time_stats.wait_queue_entry_time,
-                ),
+            key_fn = lambda item: (
+                direction * item[1].priority,
+                item[1].time_stats.wait_queue_entry_time,
             )
+            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority
             )
