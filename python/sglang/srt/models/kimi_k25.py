@@ -719,6 +719,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                     else ""
                 ),
             )
+            self.model = self.language_model.model
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
