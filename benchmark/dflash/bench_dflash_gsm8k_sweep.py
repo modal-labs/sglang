@@ -44,7 +44,7 @@ def _filter_attention_backends(backends: list[str], *, device_sm: int) -> list[s
     if not (80 <= device_sm <= 90):
         backends = [b for b in backends if b != "fa3"]
     if device_sm < 100:
-        backends = [b for b in backends if b not in ("fa4", "trtllm_mha")]
+        backends = [b for b in backends if b not in ("fa4", "trtllm_mla", "trtllm_mha")]
     return backends or ["flashinfer"]
 
 
@@ -337,6 +337,9 @@ def _build_common_server_args(
         "--mamba-scheduler-strategy",
         str(args.mamba_scheduler_strategy),
         "--enforce-piecewise-cuda-graph",
+        "--dp",
+        "8",
+        "--enable-dp-attention",
     ]
     if args.mem_fraction_static is not None:
         common_server_args.extend(
@@ -658,7 +661,10 @@ def parse_args() -> argparse.Namespace:
         default=1024,
         help="Cap num_questions per (tp, concurrency) run (default: 1024).",
     )
-    parser.add_argument("--attention-backends", default="flashinfer,fa3,trtllm_mha,fa4")
+    parser.add_argument(
+        "--attention-backends",
+        default="flashinfer,fa3,trtllm_mla,trtllm_mha,fa4",
+    )
     parser.add_argument(
         "--speculative-draft-attention-backend",
         default=None,
