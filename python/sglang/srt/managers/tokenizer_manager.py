@@ -508,7 +508,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         self,
         state: ReqState,
         recv_obj: Union[
-            BatchStrOutput, BatchEmbeddingOutput, BatchMultimodalOutput, BatchTokenIDOutput
+            BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput
         ],
         i: int,
         scheduler_time_stats,
