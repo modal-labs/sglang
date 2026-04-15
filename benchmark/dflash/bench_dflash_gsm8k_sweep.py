@@ -729,7 +729,9 @@ def main() -> None:
             f"GSM8K file only has {len(lines)} lines, but need {max_questions}."
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model, trust_remote_code=True
+    )
 
     prompts: list[str] = []
     labels: list[int] = []
