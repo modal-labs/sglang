@@ -1191,6 +1191,7 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
+        self._auto_mem_fraction_static = self.mem_fraction_static is None
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
@@ -1346,7 +1347,7 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
+                elif self.speculative_algorithm not in {"NGRAM", "DFLASH"}:
                     # eagle draft models and cuda graphs
                     reserved_mem += 4 * 1024
 
@@ -3177,10 +3178,18 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
-            )
+            if envs.SGLANG_ENABLE_SPEC_V2.get():
+                self.disable_overlap_schedule = False
+                logger.warning(
+                    "DFLASH spec v2 is enabled and overlap schedule is turned on (experimental)."
+                )
+            else:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled when using DFLASH speculative decoding. "
+                    "Set env SGLANG_ENABLE_SPEC_V2=True to "
+                    "enable the experimental overlap scheduler for DFLASH."
+                )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False

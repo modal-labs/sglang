@@ -29,6 +29,10 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.speculative.dflash_utils import (
+    resolve_dflash_auto_memory_plan,
+    resolve_dflash_max_mamba_cache_size,
+)
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -55,6 +59,10 @@ _is_hip = is_hip()
 class ModelRunnerKVCacheMixin:
 
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
         post_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -62,9 +70,48 @@ class ModelRunnerKVCacheMixin:
             cpu_group=get_world_group().cpu_group,
         )
 
+        # Upstream moved KV cell-size computation into pool_configurator.py.
+        # Reuse the same configurator here so DFLASH auto-memory planning stays
+        # consistent with the actual pool-sizing path.
+        configurator = create_memory_pool_configurator(self)
+        cell_size = int(configurator._cell_size)
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
+        if (
+            getattr(self.server_args, "_auto_mem_fraction_static", False)
+            and self.spec_algorithm.is_dflash()
+            and (config := self.mambaish_config) is not None
+            and self.server_args.max_running_requests is not None
+        ):
+            max_running_requests = self.server_args.max_running_requests // self.dp_size
+            if max_running_requests > 0:
+                memory_plan = resolve_dflash_auto_memory_plan(
+                    rest_memory_gb=rest_memory,
+                    post_model_load_memory_gb=post_model_load_memory,
+                    cell_size=cell_size,
+                    max_running_requests=max_running_requests,
+                    mamba_cache_per_req=config.mamba2_cache_params.mamba_cache_per_req,
+                    speculative_num_draft_tokens=int(
+                        self.server_args.speculative_num_draft_tokens or 0
+                    ),
+                    chunked_prefill_size=self.server_args.chunked_prefill_size,
+                    max_prefill_tokens=int(self.server_args.max_prefill_tokens),
+                    page_size=int(self.server_args.page_size),
+                    mamba_ratio=self._calculate_mamba_ratio(),
+                    explicit_max_mamba_cache_size=self.server_args.max_mamba_cache_size,
+                )
+                if memory_plan.required_rest_memory_gb > float(rest_memory):
+                    logger.info(
+                        "Raise effective DFLASH rest-memory budget from %.2f GB to %.2f GB "
+                        "(max_running_requests=%d, max_mamba_cache_size=%d, min_required_tokens=%d).",
+                        rest_memory,
+                        memory_plan.required_rest_memory_gb,
+                        max_running_requests,
+                        memory_plan.max_mamba_cache_size,
+                        memory_plan.min_required_tokens,
+                    )
+                    rest_memory = memory_plan.required_rest_memory_gb
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
@@ -96,6 +143,17 @@ class ModelRunnerKVCacheMixin:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
+            )
+        elif (
+            self.spec_algorithm.is_dflash()
+            and server_args.max_running_requests is not None
+        ):
+            # DFLASH hybrid runs should reserve resident mamba cache directly
+            # from the requested concurrency so the later request clamp becomes
+            # a safety backstop instead of the normal path.
+            server_args.max_mamba_cache_size = resolve_dflash_max_mamba_cache_size(
+                max_running_requests=server_args.max_running_requests // self.dp_size,
+                mamba_ratio=self._calculate_mamba_ratio(),
             )
         elif (
             server_args.disable_radix_cache
