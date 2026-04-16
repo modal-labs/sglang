@@ -835,6 +835,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
+        self.capture_aux_hidden = False
+
     def separate_deepstack_embeds(self, embedding):
         assert (
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
@@ -1032,12 +1034,22 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
-                return self.logits_processor(
-                    input_ids,
-                    hidden_states,
-                    self.lm_head,
-                    forward_batch,
-                )
+                if self.capture_aux_hidden:
+                    hidden_states, aux_hidden_states = hidden_states
+                    return self.logits_processor(
+                        input_ids,
+                        hidden_states,
+                        self.lm_head,
+                        forward_batch,
+                        aux_hidden_states,
+                    )
+                else:                    
+                    return self.logits_processor(
+                        input_ids,
+                        hidden_states,
+                        self.lm_head,
+                        forward_batch,
+                    )
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
@@ -1126,6 +1138,23 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def set_eagle3_layers_to_capture(self, aux_hidden_states_layers: Optional[List[int]] = None):
+        self.capture_aux_hidden = True
+        self.model.capture_aux_hidden = True
+
+        self.model.aux_layers = aux_hidden_states_layers
+        
+        if self.model.aux_layers is None:
+            num_hidden_layers = self.config.num_hidden_layers
+            
+            self.model.aux_layers = [
+                1,
+                num_hidden_layers // 2 - 1,
+                num_hidden_layers - 4,
+            ]
+
+        print(f"Capturing layers: {self.model.aux_layers}")
 
 
 EntryClass = Qwen3VLForConditionalGeneration

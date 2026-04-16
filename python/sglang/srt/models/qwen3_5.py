@@ -699,6 +699,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.capture_aux_hidden = False
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -724,6 +726,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
+
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
@@ -736,6 +740,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                 )
+                if self.capture_aux_hidden and layer_idx in self.aux_layers:
+                    aux_hidden_states.append(hidden_states + residual)
+
 
             # Process deepstack embeddings if provided
             if (
@@ -764,7 +771,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        if not aux_hidden_states:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
