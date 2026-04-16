@@ -226,7 +226,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self._make_request_with_harmony(request, prev_response)
                 )
             else:
-                messages, request_prompts, engine_prompts, tool_call_constraint = await self._make_request(
+                messages, request_prompts, engine_prompts, processed_messages, tool_call_constraint = await self._make_request(
                     request, prev_response, tokenizer
                 )
 
@@ -337,8 +337,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
+                        image_data=processed_messages.image_data,
+                        video_data=processed_messages.video_data,
+                        audio_data=processed_messages.audio_data,
                         sampling_params=sampling_params,
                         stream=request.stream,
+                        modalities=processed_messages.modalities,
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
@@ -472,7 +476,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "message/function_call/function_call_output items."
             ) from e
 
-        return messages, request_prompts, engine_prompts, tool_call_constraint
+        return (
+            messages,
+            request_prompts,
+            engine_prompts,
+            processed_messages,
+            tool_call_constraint,
+        )
 
     def _make_request_with_harmony(
         self,
