@@ -927,8 +927,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers_to_capture = []
-
         # Decoder layers
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
