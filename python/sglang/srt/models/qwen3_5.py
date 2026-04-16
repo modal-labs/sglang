@@ -731,6 +731,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
+            if self.capture_aux_hidden and layer_idx in self.aux_layers:
+                aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
+            
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -740,8 +743,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                 )
-                if self.capture_aux_hidden and layer_idx in self.aux_layers:
-                    aux_hidden_states.append(hidden_states + residual)
 
 
             # Process deepstack embeddings if provided

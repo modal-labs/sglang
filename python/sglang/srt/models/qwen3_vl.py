@@ -1148,11 +1148,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.model.aux_layers is None:
             num_hidden_layers = self.config.num_hidden_layers
             
+            # add 1 to adjust for fused layernorm offset
             self.model.aux_layers = [
-                1,
-                num_hidden_layers // 2 - 1,
-                num_hidden_layers - 4,
+                1 + 1,
+                num_hidden_layers // 2 - 1 + 1,
+                num_hidden_layers - 4 + 1,
             ]
+        else:
+            self.model.aux_layers = [layer_idx + 1 for layer_idx in self.model.aux_layers]
 
         print(f"Capturing layers: {self.model.aux_layers}")
 
