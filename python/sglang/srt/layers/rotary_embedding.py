@@ -1911,7 +1911,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                         else 0
                     )
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        torch.arange(text_len, device=position_ids.device).view(1, -1).expand(3, -1) + st_idx
                     )
 
                     if model_type in (
@@ -1969,7 +1969,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     )
                     text_len = len(input_tokens) - st
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        torch.arange(text_len, device=position_ids.device).view(1, -1).expand(3, -1) + st_idx
                     )
 
                 llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
@@ -2080,7 +2080,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     text_len = min_ed - st
                     if text_len != 0:
                         llm_pos_ids_list.append(
-                            torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                            torch.arange(text_len, device=position_ids.device).view(1, -1).expand(3, -1) + st_idx
                         )
                         st_idx += text_len
                     # Audio in Video
@@ -2261,7 +2261,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     )
                     text_len = len(input_tokens) - st
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        torch.arange(text_len, device=position_ids.device).view(1, -1).expand(3, -1) + st_idx
                     )
 
                 llm_positions = torch.cat(
@@ -2648,7 +2648,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     else:
                         text_len = end_idx - start_idx
                         llm_pos_ids_list.append(
-                            torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                            torch.arange(text_len, device=position_ids.device).view(1, -1).expand(3, -1) + st_idx
                         )
 
                         video_frame_num = 1
