@@ -106,6 +106,7 @@ class DFlashWorkerV2(DFlashWorker):
         verified_id: torch.Tensor,
         seq_lens: torch.Tensor,
         verify_done: Optional[torch.cuda.Event] = None,
+        cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DFlashDraftInputV2:
         bs = int(seq_lens.numel())
         device = verified_id.device
@@ -116,6 +117,7 @@ class DFlashWorkerV2(DFlashWorker):
             new_seq_lens=seq_lens.to(dtype=torch.int32),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
+            cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
     def _make_next_draft_input_decode(
@@ -124,6 +126,7 @@ class DFlashWorkerV2(DFlashWorker):
         verified_id: torch.Tensor,
         new_seq_lens: torch.Tensor,
         verify_done: Optional[torch.cuda.Event] = None,
+        cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DFlashDraftInputV2:
         bs = int(new_seq_lens.numel())
         device = verified_id.device
@@ -134,6 +137,7 @@ class DFlashWorkerV2(DFlashWorker):
             new_seq_lens=new_seq_lens.to(dtype=torch.int32),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
+            cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
     def forward_batch_generation(
@@ -209,6 +213,7 @@ class DFlashWorkerV2(DFlashWorker):
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 verified_id=next_token_ids,
                 seq_lens=model_worker_batch.seq_lens,
+                cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
             )
             verify_done = torch.get_device_module(device).Event()
             verify_done.record()
@@ -466,16 +471,17 @@ class DFlashWorkerV2(DFlashWorker):
             model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
+        caller_stream = torch.get_device_module(self.device).current_stream()
         with self.plan_stream_ctx:
+            if self.plan_stream is not None:
+                self.plan_stream.wait_stream(caller_stream)
             verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
                 model_worker_batch, self.target_worker
             )
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
-            )
+            caller_stream.wait_stream(self.plan_stream)
 
         target_out = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
@@ -549,9 +555,7 @@ class DFlashWorkerV2(DFlashWorker):
                     )
                     commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                     out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=torch.int64,
-                        device=device,
+                        (bs, int(self.block_size)), dtype=torch.int64, device=device
                     )
                     if int(self.block_size) > 1:
                         out_tokens[:, : int(self.block_size) - 1].copy_(
@@ -608,6 +612,7 @@ class DFlashWorkerV2(DFlashWorker):
         next_draft_input = self._make_next_draft_input_decode(
             verified_id=bonus,
             new_seq_lens=new_seq_lens,
+            cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
         )
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
@@ -619,4 +624,5 @@ class DFlashWorkerV2(DFlashWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
+            prepared_kv_allocated_lens_cpu=draft_input.reserved_seq_lens_cpu,
         )

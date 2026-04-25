@@ -51,6 +51,7 @@ class DFlashDraftInputV2(SpecInput):
     verify_done: Optional[torch.cuda.Event] = None
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
+    cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None
     planning_seq_lens_cpu: Optional[torch.Tensor] = None
     planning_seq_lens_sum: Optional[int] = None
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -155,6 +156,7 @@ class DFlashDraftInputV2(SpecInput):
         planning_kv_lens_cpu_t = self._prepare_planning_kv_lens_cpu_buf[:bs]
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
+        cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_global_server_args().speculative_num_draft_tokens)
@@ -174,7 +176,12 @@ class DFlashDraftInputV2(SpecInput):
         uniform_top_k = True
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
-            cur_alloc_len = int(req.kv_allocated_len)
+            if cur_allocated_seq_lens_cpu is not None and i < len(
+                cur_allocated_seq_lens_cpu
+            ):
+                cur_alloc_len = int(cur_allocated_seq_lens_cpu[i])
+            else:
+                cur_alloc_len = int(req.kv_allocated_len)
             planning_len = committed_len + block_size
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
             top_k = int(req.sampling_params.top_k)
@@ -216,8 +223,8 @@ class DFlashDraftInputV2(SpecInput):
 
             cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
             nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
-            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=False)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=False)
+            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
+            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
 
             if num_needed_tokens > 0:
                 if page_size == 1:
@@ -271,6 +278,17 @@ class DFlashDraftInputV2(SpecInput):
         self.reserved_seq_lens_sum = reserved_seq_lens_sum
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if self.cur_allocated_seq_lens_cpu is not None:
+            self.cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu[
+                new_indices.cpu()
+            ]
+        if self.planning_seq_lens_cpu is not None:
+            self.planning_seq_lens_cpu = self.planning_seq_lens_cpu[new_indices.cpu()]
+            self.planning_seq_lens_sum = int(self.planning_seq_lens_cpu.sum().item())
+        if self.reserved_seq_lens_cpu is not None:
+            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
+            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
@@ -282,6 +300,34 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = self.hidden_states[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+        if self.cur_allocated_seq_lens_cpu is not None:
+            assert spec_info.cur_allocated_seq_lens_cpu is not None
+            self.cur_allocated_seq_lens_cpu = torch.cat(
+                [self.cur_allocated_seq_lens_cpu, spec_info.cur_allocated_seq_lens_cpu]
+            )
+        elif spec_info.cur_allocated_seq_lens_cpu is not None:
+            self.cur_allocated_seq_lens_cpu = spec_info.cur_allocated_seq_lens_cpu
+
+        if self.planning_seq_lens_cpu is not None:
+            assert spec_info.planning_seq_lens_cpu is not None
+            self.planning_seq_lens_cpu = torch.cat(
+                [self.planning_seq_lens_cpu, spec_info.planning_seq_lens_cpu]
+            )
+            self.planning_seq_lens_sum = int(self.planning_seq_lens_cpu.sum().item())
+        elif spec_info.planning_seq_lens_cpu is not None:
+            self.planning_seq_lens_cpu = spec_info.planning_seq_lens_cpu
+            self.planning_seq_lens_sum = spec_info.planning_seq_lens_sum
+
+        if self.reserved_seq_lens_cpu is not None:
+            assert spec_info.reserved_seq_lens_cpu is not None
+            self.reserved_seq_lens_cpu = torch.cat(
+                [self.reserved_seq_lens_cpu, spec_info.reserved_seq_lens_cpu]
+            )
+            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+        elif spec_info.reserved_seq_lens_cpu is not None:
+            self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
+            self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
+
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = FutureIndices(
