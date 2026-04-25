@@ -33,6 +33,7 @@ from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
 from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
     _prepare_dflash_draft_block_unchecked,
 )
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,9 @@ class DFlashWorkerV2(DFlashWorker):
             nccl_port=nccl_port,
             target_worker=target_worker,
         )
+        supports_gpu_triton = is_cuda() or is_hip()
+        self._use_triton_prepare_block = supports_gpu_triton
+        self._use_triton_accept_bonus = supports_gpu_triton
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     def _validate_phase1_sampling_support(

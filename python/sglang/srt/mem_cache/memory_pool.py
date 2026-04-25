@@ -1109,19 +1109,17 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer.layer_id
 
         if loc_2d.ndim != 2:
-            raise ValueError(
-                f"DFLASH loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}."
-            )
+            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
         if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
             raise ValueError(
-                "DFLASH commit_lens must match loc_2d batch size: "
+                "commit_lens must match loc_2d batch size: "
                 f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
             )
 
         num_rows = int(loc_2d.numel())
         if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
             raise ValueError(
-                "DFLASH dense KV rows must match loc_2d size: "
+                "dense KV rows must match loc_2d size: "
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
 

@@ -29,7 +29,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +83,6 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
-        self._supports_gpu_triton = is_cuda() or is_hip()
-        self._use_triton_prepare_block = self._supports_gpu_triton
-        self._use_triton_accept_bonus = self._supports_gpu_triton
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
