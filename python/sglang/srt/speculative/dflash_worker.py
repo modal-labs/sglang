@@ -107,7 +107,7 @@ class DFlashWorker:
         elif draft_backend == "trtllm_mha":
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
-                "draft path requires non-causal attention. Falling back to "
+                "draft path requires per-layer DFlash attention. Falling back to "
                 "'flashinfer'."
             )
             draft_backend = "flashinfer"
@@ -562,7 +562,7 @@ class DFlashWorker:
                 "`shard_indices` attributes."
             )
 
-        # --- 2) Draft a non-causal block with the draft model.
+        # --- 2) Draft a fixed block with the draft model.
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None

@@ -259,7 +259,7 @@ class DFlashWorkerV2(DFlashWorker):
         bs = len(model_worker_batch.seq_lens)
         device = self.device
 
-        # --- 1) Draft a non-causal block with the draft model.
+        # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
