@@ -106,6 +106,8 @@ class SchedulerMetricsMixin:
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
         self.spec_num_forward_ct = 0
+        self.spec_pred_accept_length_sum = 0.0
+        self.spec_pred_accept_length_ct = 0
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
@@ -180,10 +182,20 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(
+        self: Scheduler,
+        bs: int,
+        num_accepted_tokens: int,
+        predicted_accept_lengths: Optional[List[float]] = None,
+    ):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
+        if predicted_accept_lengths is not None:
+            self.spec_pred_accept_length_sum += sum(
+                float(x) for x in predicted_accept_lengths
+            )
+            self.spec_pred_accept_length_ct += len(predicted_accept_lengths)
 
     def _init_estimated_perf_constants(self: Scheduler) -> None:
         model_config = self.model_config
@@ -323,6 +335,8 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         self.spec_num_accepted_tokens = 0
         self.spec_num_forward_ct = 0
+        self.spec_pred_accept_length_sum = 0.0
+        self.spec_pred_accept_length_ct = 0
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
 
@@ -632,8 +646,16 @@ class SchedulerMetricsMixin:
             )
             self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
+            msg += f"accept len: {spec_accept_length:.2f}, "
+            if self.spec_pred_accept_length_ct > 0:
+                spec_pred_accept_length = (
+                    self.spec_pred_accept_length_sum / self.spec_pred_accept_length_ct
+                )
+                msg += f"pred accept len: {spec_pred_accept_length:.2f}, "
+            msg += f"accept rate: {spec_accept_rate:.2f}, "
             self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            self.spec_pred_accept_length_sum = 0.0
+            self.spec_pred_accept_length_ct = 0
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:

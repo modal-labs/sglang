@@ -342,6 +342,10 @@ class SchedulerOutputProcessorMixin:
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
+        if result.predicted_accept_lens is not None:
+            result.predicted_accept_length_per_req_cpu = [
+                float(x) for x in result.predicted_accept_lens.tolist()
+            ]
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -425,7 +429,11 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self.update_spec_metrics(
+                batch.batch_size(),
+                result.num_accepted_tokens,
+                result.predicted_accept_length_per_req_cpu,
+            )
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph

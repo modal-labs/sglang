@@ -792,6 +792,9 @@ class PiecewiseCudaGraphRunner:
                             if output.hidden_states is not None
                             else None
                         ),
+                        dflash_predicted_accept_lens=(
+                            output.dflash_predicted_accept_lens
+                        ),
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output

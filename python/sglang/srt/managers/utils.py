@@ -28,6 +28,7 @@ class GenerationBatchResult:
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_accepted_tokens: int = 0
     accept_length_per_req_cpu: Optional[List[int]] = None
+    predicted_accept_length_per_req_cpu: Optional[List[float]] = None
     can_run_cuda_graph: bool = False
 
     # For output processing
@@ -42,6 +43,7 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+    predicted_accept_lens: Optional[torch.Tensor] = None
     prepared_kv_allocated_lens_cpu: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
@@ -87,6 +89,10 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+        if self.predicted_accept_lens is not None:
+            self.predicted_accept_lens = self.predicted_accept_lens.to(
+                "cpu", non_blocking=True
+            )
 
         if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()

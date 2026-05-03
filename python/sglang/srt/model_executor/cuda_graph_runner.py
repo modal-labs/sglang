@@ -1221,6 +1221,11 @@ class CudaGraphRunner:
                     else None
                 ),
                 customized_info=output.customized_info,
+                dflash_predicted_accept_lens=(
+                    output.dflash_predicted_accept_lens[: self.raw_bs]
+                    if output.dflash_predicted_accept_lens is not None
+                    else None
+                ),
             )
         else:
             assert isinstance(output, PPProxyTensors)

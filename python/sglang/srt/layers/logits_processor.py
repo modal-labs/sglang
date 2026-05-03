@@ -106,6 +106,9 @@ class LogitsProcessorOutput:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # DFLASH draft-model verify-head metric. Shape: [batch_size].
+    dflash_predicted_accept_lens: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:

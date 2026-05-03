@@ -173,6 +173,7 @@ class DFlashVerifyInput(SpecInput):
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
+    predicted_accept_lens: torch.Tensor | None = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

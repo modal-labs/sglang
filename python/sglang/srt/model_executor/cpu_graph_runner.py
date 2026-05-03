@@ -823,6 +823,11 @@ class CPUGraphRunner:
                 if output.hidden_states is not None
                 else None
             ),
+            dflash_predicted_accept_lens=(
+                output.dflash_predicted_accept_lens[: self.raw_bs]
+                if output.dflash_predicted_accept_lens is not None
+                else None
+            ),
         )
 
     def get_spec_info(self, num_tokens: int):
