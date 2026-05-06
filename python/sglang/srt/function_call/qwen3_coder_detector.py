@@ -4,6 +4,7 @@ import logging
 import re
 from typing import Any, List, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -53,16 +54,18 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+        self.current_param_config: dict = {}
+        self.skip_current_tool: bool = False
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
-    def _get_arguments_config(
+    def _lookup_tool_config(
         self, func_name: str, tools: Optional[list[Tool]]
-    ) -> dict:
-        """Extract argument configuration for a function."""
+    ) -> tuple[dict, bool]:
+        """Extract argument configuration for a function and whether it is declared."""
         if tools is None:
-            return {}
+            return {}, False
         for config in tools:
             try:
                 config_type = config.type
@@ -75,16 +78,22 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 try:
                     params = config_function.parameters
                 except AttributeError:
-                    return {}
+                    return {}, True
 
                 if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
+                    return params["properties"], True
                 elif isinstance(params, dict):
-                    return params
+                    return params, True
                 else:
-                    return {}
+                    return {}, True
         logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
-        return {}
+        return {}, False
+
+    def _get_arguments_config(
+        self, func_name: str, tools: Optional[list[Tool]]
+    ) -> dict:
+        param_config, _ = self._lookup_tool_config(func_name, tools)
+        return param_config
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -197,7 +206,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     func_name = func_body[:name_end]
                     params_str = func_body[name_end + 1 :]
 
-                    param_config = self._get_arguments_config(func_name, tools)
+                    param_config, is_declared = self._lookup_tool_config(
+                        func_name, tools
+                    )
+                    if not is_declared and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue
                     parsed_params = {}
 
                     for p_match in self.tool_call_parameter_regex.findall(params_str):
@@ -275,20 +288,28 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 end_angle = current_slice.find(">")
                 if end_angle != -1:
                     func_name = current_slice[len(self.tool_call_prefix) : end_angle]
-
-                    self.current_tool_id += 1
-                    self.current_tool_name_sent = True
+                    param_config, is_declared = self._lookup_tool_config(
+                        func_name, tools
+                    )
                     self.current_tool_param_count = 0
                     self.json_started = False
                     self.current_func_name = func_name
-
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
+                    self.current_param_config = param_config
+                    self.skip_current_tool = (
+                        not is_declared
+                        and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
                     )
+
+                    if not self.skip_current_tool:
+                        self.current_tool_id += 1
+                        self.current_tool_name_sent = True
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=func_name,
+                                parameters="",
+                            )
+                        )
 
                     self.parsed_pos += end_angle + 1
                     continue
@@ -340,6 +361,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         if raw_value.endswith("\n"):
                             raw_value = raw_value[:-1]
 
+                        if self.skip_current_tool:
+                            total_len = (name_end + 1) + end_pos + end_token_len
+                            self.parsed_pos += total_len
+                            continue
+
                         # JSON Construction
                         if not self.json_started:
                             calls.append(
@@ -349,11 +375,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             )
                             self.json_started = True
 
-                        param_config = self._get_arguments_config(
-                            self.current_func_name, tools
-                        )
                         converted_val = self._convert_param_value(
-                            raw_value, param_name, param_config, self.current_func_name
+                            raw_value,
+                            param_name,
+                            self.current_param_config,
+                            self.current_func_name,
                         )
 
                         # Construct JSON fragment: "key": value
@@ -384,6 +410,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # 4. Function End: </function>
             # -------------------------------------------------------
             if current_slice.startswith(self.function_end_token):
+                if self.skip_current_tool:
+                    self.parsed_pos += len(self.function_end_token)
+                    self.current_func_name = None
+                    self.current_param_config = {}
+                    self.skip_current_tool = False
+                    continue
+
                 if not self.json_started:
                     calls.append(
                         ToolCallItem(tool_index=self.current_tool_id, parameters="{")
@@ -395,6 +428,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
                 self.parsed_pos += len(self.function_end_token)
                 self.current_func_name = None
+                self.current_param_config = {}
+                self.skip_current_tool = False
                 continue
 
             # -------------------------------------------------------
@@ -403,6 +438,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if current_slice.startswith(self.tool_call_end_token):
                 self.parsed_pos += len(self.tool_call_end_token)
                 self.is_inside_tool_call = False  # [FIX] Exit tool call region
+                self.current_func_name = None
+                self.current_param_config = {}
+                self.skip_current_tool = False
                 continue
 
             # -------------------------------------------------------
