@@ -1332,7 +1332,9 @@ class ResponsesResponse(BaseModel):
     output: List[
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
-    status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    status: Literal[
+        "queued", "in_progress", "completed", "failed", "cancelled", "incomplete"
+    ]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
     tool_choice: str = "auto"

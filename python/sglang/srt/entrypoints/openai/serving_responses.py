@@ -101,6 +101,26 @@ def _normalize_function_tools_for_chat_parser(tools: list[Any] | None) -> list[T
     return normalized_tools
 
 
+def _convert_usage_info_to_response_usage(usage_info: dict[str, Any]) -> dict[str, Any]:
+    prompt_tokens_details = usage_info.get("prompt_tokens_details") or {}
+    if not isinstance(prompt_tokens_details, dict):
+        prompt_tokens_details = {}
+
+    cached_tokens = prompt_tokens_details.get("cached_tokens")
+    if cached_tokens is None:
+        cached_tokens = usage_info.get("cached_tokens", 0)
+
+    return {
+        "input_tokens": usage_info.get("prompt_tokens") or 0,
+        "input_tokens_details": {"cached_tokens": cached_tokens or 0},
+        "output_tokens": usage_info.get("completion_tokens") or 0,
+        "output_tokens_details": {
+            "reasoning_tokens": usage_info.get("reasoning_tokens") or 0
+        },
+        "total_tokens": usage_info.get("total_tokens") or 0,
+    }
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -776,6 +796,20 @@ class OpenAIServingResponses(OpenAIServingChat):
             return {"type": "video_url", "video_url": {"url": part.get("video_url", "")}}
         return part
 
+    @staticmethod
+    def _convert_responses_text_parts_to_string(content: list[Any]) -> Optional[str]:
+        text_parts = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                return None
+            if part.get("type") not in {"input_text", "output_text", "text"}:
+                return None
+            text_parts.append(part.get("text", ""))
+        return "".join(text_parts)
+
     @classmethod
     def _convert_responses_input_item(cls, item: Any) -> ChatCompletionMessageParam:
         """Convert a Responses API input item into Chat Completions message format."""
@@ -833,10 +867,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "content": None,
             }
 
-        if isinstance(msg.get("content"), list):
+        role = msg.get("role")
+        content = msg.get("content")
+        if role in {"assistant", "system", "developer"} and isinstance(content, list):
+            text = cls._convert_responses_text_parts_to_string(content)
+            if text is not None:
+                msg["content"] = text
+                return msg
+
+        if isinstance(content, list):
             msg["content"] = [
                 cls._convert_responses_content_part(part)
-                for part in msg["content"]
+                for part in content
             ]
         return msg
 
@@ -1094,10 +1136,18 @@ class OpenAIServingResponses(OpenAIServingChat):
         _simple_text_output_index = -1
         _simple_completed_output_items: dict[int, Any] = {}
         _simple_tool_call_states: dict[int, dict[str, Any]] = {}
+        _simple_finish_reason = None
         _tool_parser = None
         function_tools = _normalize_function_tools_for_chat_parser(request.tools)
         if function_tools and self.tool_call_parser:
             _tool_parser = FunctionCallParser(function_tools, self.tool_call_parser)
+
+        def _get_finish_reason_type(finish_reason):
+            return (
+                finish_reason.get("type")
+                if isinstance(finish_reason, dict)
+                else finish_reason
+            )
 
         def _make_simple_text_content(text: str):
             return openai_responses_types.ResponseOutputText(
@@ -1147,7 +1197,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
             ]
 
-        def _finish_simple_text_item():
+        def _finish_simple_text_item(status: str = "completed"):
             nonlocal _simple_text
             nonlocal _simple_stream_started, _simple_text_item_id
             nonlocal _simple_text_output_index
@@ -1161,7 +1211,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
                 role="assistant",
                 content=[text_content],
-                status="completed",
+                status=status,
             )
             _simple_completed_output_items[_simple_text_output_index] = message
 
@@ -1266,7 +1316,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return events
 
-        def _finish_simple_tool_call_state(state: dict[str, Any]):
+        def _finish_simple_tool_call_state(
+            state: dict[str, Any], status: str = "completed"
+        ):
             if state["done"]:
                 return []
 
@@ -1277,7 +1329,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 call_id=state["call_id"],
                 name=state["name"],
                 arguments=state["arguments"],
-                status="completed",
+                status=status,
             )
             _simple_completed_output_items[state["output_index"]] = item
 
@@ -1302,7 +1354,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
             ]
 
-        def _finish_simple_tool_calls(exclude_tool_index: Optional[int] = None):
+        def _finish_simple_tool_calls(
+            exclude_tool_index: Optional[int] = None, status: str = "completed"
+        ):
             events = []
             for tool_index, state in sorted(
                 _simple_tool_call_states.items(),
@@ -1310,13 +1364,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             ):
                 if tool_index == exclude_tool_index:
                     continue
-                events.extend(_finish_simple_tool_call_state(state))
+                events.extend(_finish_simple_tool_call_state(state, status=status))
             return events
 
-        def _finish_simple_stream_items():
+        def _finish_simple_stream_items(status: str = "completed"):
             events = []
-            events.extend(_finish_simple_text_item())
-            events.extend(_finish_simple_tool_calls())
+            events.extend(_finish_simple_text_item(status=status))
+            events.extend(_finish_simple_tool_calls(status=status))
             return events
 
         async for ctx in result_generator:
@@ -1330,6 +1384,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 finish_reason = ctx.last_output.get("meta_info", {}).get(
                     "finish_reason"
                 )
+                if finish_reason:
+                    _simple_finish_reason = finish_reason
 
                 if delta:
                     if _tool_parser:
@@ -1368,7 +1424,12 @@ class OpenAIServingResponses(OpenAIServingChat):
 
                 if finish_reason and not _simple_stream_finalized:
                     _simple_stream_finalized = True
-                    for event in _finish_simple_stream_items():
+                    status = (
+                        "incomplete"
+                        if _get_finish_reason_type(finish_reason) == "length"
+                        else "completed"
+                    )
+                    for event in _finish_simple_stream_items(status=status):
                         yield event
                 continue
 
@@ -1733,18 +1794,28 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # Convert UsageInfo to ResponseUsage format
         if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
+            response_dict["usage"] = _convert_usage_info_to_response_usage(
+                response_dict["usage"]
+            )
+
+        finish_reason_type = _get_finish_reason_type(_simple_finish_reason)
+        if finish_reason_type == "length":
+            response_dict["status"] = "incomplete"
+            response_dict["incomplete_details"] = {"reason": "max_output_tokens"}
+            final_response.status = "incomplete"
+            final_response.incomplete_details = response_dict["incomplete_details"]
+            if request.store:
+                async with self.response_store_lock:
+                    self.response_store[final_response.id] = final_response
+
+            yield _send_event(
+                openai_responses_types.ResponseIncompleteEvent(
+                    type="response.incomplete",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
+            )
+            return
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
