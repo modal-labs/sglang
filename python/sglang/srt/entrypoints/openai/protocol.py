@@ -1192,7 +1192,18 @@ class ResponseBuiltinTool(BaseModel):
 ResponseTool = Union[ResponseFunctionTool, ResponseBuiltinTool]
 
 
+class ResponseMessageInputItem(BaseModel):
+    """Responses message input item accepted before chat conversion."""
+
+    type: Optional[Literal["message"]] = None
+    role: Literal["user", "assistant", "system", "developer"]
+    content: Any
+    id: Optional[str] = None
+    status: Optional[str] = None
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    ResponseMessageInputItem,
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,

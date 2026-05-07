@@ -816,11 +816,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         msg = (
             item
             if isinstance(item, dict)
-            else item.model_dump()
+            else item.model_dump(exclude_none=True)
             if hasattr(item, "model_dump")
             else dict(item)
         )
-        msg_type = msg.get("type", "message")
+        msg_type = msg.get("type") or "message"
 
         if msg_type == "function_call":
             arguments = msg.get("arguments", "")
@@ -866,6 +866,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "reasoning_content": reasoning_text,
                 "content": None,
             }
+
+        if msg_type == "message":
+            msg.pop("type", None)
+            msg.pop("id", None)
+            msg.pop("status", None)
 
         role = msg.get("role")
         content = msg.get("content")

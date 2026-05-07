@@ -309,16 +309,34 @@ class ServingResponsesStreamTestCase(unittest.TestCase):
         )
 
     def test_responses_assistant_output_text_content_converts_to_string(self):
-        converted = self.serving._convert_responses_input_item(
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "OK"}],
-            }
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "role": "user",
+                    "content": "Remember the code word CERULEAN. Reply only OK.",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_previous",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "OK"}],
+                },
+                {
+                    "role": "user",
+                    "content": "What code word did I ask you to remember?",
+                },
+            ],
         )
+
+        converted = self.serving._convert_responses_input_item(request.input[1])
 
         self.assertEqual(converted["role"], "assistant")
         self.assertEqual(converted["content"], "OK")
+        self.assertNotIn("type", converted)
+        self.assertNotIn("id", converted)
+        self.assertNotIn("status", converted)
 
 
 if __name__ == "__main__":
