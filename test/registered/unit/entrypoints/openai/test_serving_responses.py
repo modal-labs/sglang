@@ -12,6 +12,7 @@ from openai.types.responses.response_function_tool_call import ResponseFunctionT
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
+    PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
@@ -69,6 +70,9 @@ class ServingResponsesStreamTestCase(unittest.TestCase):
         self.serving = OpenAIServingResponses(
             _MockTokenizerManager(), _MockTemplateManager()
         )
+        self.fake_full_usage = UsageInfo(
+            prompt_tokens=1, completion_tokens=1, total_tokens=2
+        )
 
     async def _fake_full_generator(
         self,
@@ -97,7 +101,7 @@ class ServingResponsesStreamTestCase(unittest.TestCase):
                 )
             ],
             status="completed",
-            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            usage=self.fake_full_usage,
         )
 
     def test_simple_context_function_call_stream_emits_done_events_with_stable_ids(
@@ -197,6 +201,124 @@ class ServingResponsesStreamTestCase(unittest.TestCase):
         self.assertEqual(completed_item["id"], added_item["id"])
         self.assertEqual(completed_item["call_id"], added_item["call_id"])
         self.assertEqual(completed_item["arguments"], '{"text": "hello"}')
+
+    def test_simple_context_stream_preserves_cached_token_usage(self):
+        request = ResponsesRequest(
+            model="x",
+            input="Say hi.",
+            stream=True,
+            tool_choice="auto",
+            request_id="resp_cached",
+        )
+        context = SimpleContext()
+        self.fake_full_usage = UsageInfo(
+            prompt_tokens=10,
+            completion_tokens=2,
+            total_tokens=12,
+            prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=6),
+        )
+
+        async def result_generator():
+            context.append_output(
+                {
+                    "text": "hi",
+                    "meta_info": {"finish_reason": {"type": "stop"}},
+                }
+            )
+            yield context
+
+        self.serving.responses_full_generator = self._fake_full_generator
+        chunks = asyncio.run(
+            _collect_stream(
+                self.serving.responses_stream_generator(
+                    request,
+                    {},
+                    result_generator(),
+                    context,
+                    "x",
+                    Mock(),
+                    RequestResponseMetadata(request_id=request.request_id),
+                    created_time=123,
+                )
+            )
+        )
+
+        events = _decode_sse_chunks(chunks)
+        completed = next(
+            data for event_type, data in events if event_type == "response.completed"
+        )
+
+        self.assertEqual(
+            completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            6,
+        )
+
+    def test_simple_context_length_finish_emits_response_incomplete(self):
+        request = ResponsesRequest(
+            model="x",
+            input="Write a long answer.",
+            stream=True,
+            tool_choice="auto",
+            max_output_tokens=1,
+            request_id="resp_incomplete",
+        )
+        context = SimpleContext()
+
+        async def result_generator():
+            context.append_output(
+                {
+                    "text": "Partial",
+                    "meta_info": {"finish_reason": {"type": "length"}},
+                }
+            )
+            yield context
+
+        self.serving.responses_full_generator = self._fake_full_generator
+        chunks = asyncio.run(
+            _collect_stream(
+                self.serving.responses_stream_generator(
+                    request,
+                    {},
+                    result_generator(),
+                    context,
+                    "x",
+                    Mock(),
+                    RequestResponseMetadata(request_id=request.request_id),
+                    created_time=123,
+                )
+            )
+        )
+
+        events = _decode_sse_chunks(chunks)
+        event_types = [event_type for event_type, _ in events]
+        item_done = next(
+            data for event_type, data in events if event_type == "response.output_item.done"
+        )
+        incomplete = next(
+            data for event_type, data in events if event_type == "response.incomplete"
+        )
+
+        self.assertIn("response.incomplete", event_types)
+        self.assertNotIn("response.completed", event_types)
+        self.assertEqual(item_done["item"]["status"], "incomplete")
+        self.assertEqual(incomplete["response"]["status"], "incomplete")
+        self.assertEqual(incomplete["response"]["output"][0]["status"], "incomplete")
+        self.assertEqual(
+            incomplete["response"]["incomplete_details"],
+            {"reason": "max_output_tokens"},
+        )
+
+    def test_responses_assistant_output_text_content_converts_to_string(self):
+        converted = self.serving._convert_responses_input_item(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "OK"}],
+            }
+        )
+
+        self.assertEqual(converted["role"], "assistant")
+        self.assertEqual(converted["content"], "OK")
 
 
 if __name__ == "__main__":
