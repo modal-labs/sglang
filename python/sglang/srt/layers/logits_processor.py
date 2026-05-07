@@ -108,6 +108,9 @@ class LogitsProcessorOutput:
 
     # DFLASH draft-model verify-head metric. Shape: [batch_size].
     dflash_predicted_accept_lens: Optional[torch.Tensor] = None
+    # DFLASH per-proposal cumulative survival probabilities.
+    # Shape: [batch_size, block_size - 1].
+    dflash_accept_survival_probs: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass

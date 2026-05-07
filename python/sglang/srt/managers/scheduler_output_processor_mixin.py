@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+DFLASH_ACCEPT_DUMP_ENV = "SGLANG_DFLASH_ACCEPT_DUMP"
 
 
 class SchedulerOutputProcessorMixin:
@@ -346,6 +350,11 @@ class SchedulerOutputProcessorMixin:
             result.predicted_accept_length_per_req_cpu = [
                 float(x) for x in result.predicted_accept_lens.tolist()
             ]
+        if result.predicted_accept_survival_probs is not None:
+            result.predicted_accept_survival_probs_per_req_cpu = [
+                [float(x) for x in row]
+                for row in result.predicted_accept_survival_probs.tolist()
+            ]
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -362,6 +371,110 @@ class SchedulerOutputProcessorMixin:
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
+
+    def _get_dflash_accept_dump_fd(self: Scheduler) -> Optional[int]:
+        path = os.environ.get(DFLASH_ACCEPT_DUMP_ENV)
+        if not path:
+            return None
+
+        fd = getattr(self, "_dflash_accept_dump_fd", None)
+        cached_path = getattr(self, "_dflash_accept_dump_path", None)
+        if fd is not None and cached_path == path:
+            return fd
+
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        dump_dir = os.path.dirname(path)
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        self._dflash_accept_dump_fd = fd
+        self._dflash_accept_dump_path = path
+        if not getattr(self, "_dflash_accept_dump_logged", False):
+            logger.info("DFLASH accept-length dump enabled: %s", path)
+            self._dflash_accept_dump_logged = True
+        return fd
+
+    def _dump_dflash_accept_lengths(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Append one JSONL row per verified DFlash draft block.
+
+        This is intentionally heavyweight instrumentation. Enable it only by setting
+        SGLANG_DFLASH_ACCEPT_DUMP to a writable path.
+        """
+        predicted_accept_lens = result.predicted_accept_length_per_req_cpu
+        predicted_accept_survival_probs = (
+            result.predicted_accept_survival_probs_per_req_cpu
+        )
+        accepted_draft_lens = result.accept_length_per_req_cpu
+        if predicted_accept_lens is None or accepted_draft_lens is None:
+            return
+        if getattr(self, "tp_rank", 0) != 0:
+            return
+
+        fd = self._get_dflash_accept_dump_fd()
+        if fd is None:
+            return
+
+        now = time.time()
+        rows = []
+        for batch_index, req in enumerate(batch.reqs):
+            if batch_index >= len(accepted_draft_lens):
+                break
+            accepted_draft_tokens = int(accepted_draft_lens[batch_index])
+            accept_len = accepted_draft_tokens + 1
+            pred_accept_len = (
+                float(predicted_accept_lens[batch_index])
+                if batch_index < len(predicted_accept_lens)
+                else None
+            )
+            sampling_params = getattr(req, "sampling_params", None)
+            row = {
+                "time": now,
+                "rid": getattr(req, "rid", None),
+                "batch_index": batch_index,
+                "verify_index": int(getattr(req, "spec_verify_ct", 0)),
+                "tp_rank": getattr(self, "tp_rank", None),
+                "dp_rank": getattr(self, "dp_rank", None),
+                "accept_len": accept_len,
+                "accepted_draft_tokens": accepted_draft_tokens,
+                "pred_accept_len": pred_accept_len,
+                "pred_accept_len_expected": pred_accept_len,
+                "pred_accepted_draft_tokens": (
+                    pred_accept_len - 1.0 if pred_accept_len is not None else None
+                ),
+                "accept_len_error": (
+                    pred_accept_len - float(accept_len)
+                    if pred_accept_len is not None
+                    else None
+                ),
+                "output_len": len(getattr(req, "output_ids", [])),
+                "finished": bool(req.finished()),
+            }
+            if predicted_accept_survival_probs is not None and batch_index < len(
+                predicted_accept_survival_probs
+            ):
+                row["survival_probs"] = predicted_accept_survival_probs[batch_index]
+            if sampling_params is not None:
+                row.update(
+                    {
+                        "temperature": float(
+                            getattr(sampling_params, "temperature", 1.0)
+                        ),
+                        "top_p": float(getattr(sampling_params, "top_p", 1.0)),
+                        "top_k": int(getattr(sampling_params, "top_k", -1)),
+                        "min_p": float(getattr(sampling_params, "min_p", 0.0)),
+                    }
+                )
+            rows.append(json.dumps(row, separators=(",", ":")))
+
+        if rows:
+            os.write(fd, ("\n".join(rows) + "\n").encode("utf-8"))
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -434,6 +547,7 @@ class SchedulerOutputProcessorMixin:
                 result.num_accepted_tokens,
                 result.predicted_accept_length_per_req_cpu,
             )
+            self._dump_dflash_accept_lengths(batch, result)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph

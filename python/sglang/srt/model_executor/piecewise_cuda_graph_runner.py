@@ -795,6 +795,9 @@ class PiecewiseCudaGraphRunner:
                         dflash_predicted_accept_lens=(
                             output.dflash_predicted_accept_lens
                         ),
+                        dflash_accept_survival_probs=(
+                            output.dflash_accept_survival_probs
+                        ),
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output

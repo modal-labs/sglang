@@ -828,6 +828,11 @@ class CPUGraphRunner:
                 if output.dflash_predicted_accept_lens is not None
                 else None
             ),
+            dflash_accept_survival_probs=(
+                output.dflash_accept_survival_probs[: self.raw_bs]
+                if output.dflash_accept_survival_probs is not None
+                else None
+            ),
         )
 
     def get_spec_info(self, num_tokens: int):

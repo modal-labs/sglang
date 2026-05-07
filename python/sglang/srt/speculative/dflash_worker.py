@@ -673,6 +673,9 @@ class DFlashWorker:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
         predicted_accept_lens = draft_logits_output.dflash_predicted_accept_lens
+        predicted_accept_survival_probs = (
+            draft_logits_output.dflash_accept_survival_probs
+        )
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
@@ -704,6 +707,9 @@ class DFlashWorker:
         batch.spec_info = verify_input
         batch.return_hidden_states = False
         batch.spec_info.predicted_accept_lens = predicted_accept_lens
+        batch.spec_info.predicted_accept_survival_probs = (
+            predicted_accept_survival_probs
+        )
 
     @staticmethod
     def _predicted_accept_lens_to_cpu(
@@ -712,6 +718,17 @@ class DFlashWorker:
         if predicted_accept_lens is None:
             return None
         return [float(x) for x in predicted_accept_lens.detach().to("cpu").tolist()]
+
+    @staticmethod
+    def _predicted_accept_survival_probs_to_cpu(
+        predicted_accept_survival_probs: Optional[torch.Tensor],
+    ) -> Optional[list[list[float]]]:
+        if predicted_accept_survival_probs is None:
+            return None
+        return [
+            [float(x) for x in row]
+            for row in predicted_accept_survival_probs.detach().to("cpu").tolist()
+        ]
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1473,6 +1490,11 @@ class DFlashWorker:
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             predicted_accept_length_per_req_cpu=self._predicted_accept_lens_to_cpu(
                 getattr(verify_input, "predicted_accept_lens", None)
+            ),
+            predicted_accept_survival_probs_per_req_cpu=(
+                self._predicted_accept_survival_probs_to_cpu(
+                    getattr(verify_input, "predicted_accept_survival_probs", None)
+                )
             ),
             can_run_cuda_graph=can_run_cuda_graph,
         )

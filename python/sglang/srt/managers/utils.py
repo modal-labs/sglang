@@ -29,6 +29,7 @@ class GenerationBatchResult:
     num_accepted_tokens: int = 0
     accept_length_per_req_cpu: Optional[List[int]] = None
     predicted_accept_length_per_req_cpu: Optional[List[float]] = None
+    predicted_accept_survival_probs_per_req_cpu: Optional[List[List[float]]] = None
     can_run_cuda_graph: bool = False
 
     # For output processing
@@ -44,6 +45,7 @@ class GenerationBatchResult:
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
     predicted_accept_lens: Optional[torch.Tensor] = None
+    predicted_accept_survival_probs: Optional[torch.Tensor] = None
     prepared_kv_allocated_lens_cpu: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
@@ -92,6 +94,10 @@ class GenerationBatchResult:
         if self.predicted_accept_lens is not None:
             self.predicted_accept_lens = self.predicted_accept_lens.to(
                 "cpu", non_blocking=True
+            )
+        if self.predicted_accept_survival_probs is not None:
+            self.predicted_accept_survival_probs = (
+                self.predicted_accept_survival_probs.to("cpu", non_blocking=True)
             )
 
         if (x := self.expert_distribution_metrics) is not None:

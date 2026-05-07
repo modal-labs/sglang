@@ -279,7 +279,7 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashVerifyHead(nn.Module):
-    """Small readout head for dynamic DFlash verify-length bring-up metrics."""
+    """Small readout head that predicts DFlash emitted tokens before target verify."""
 
     def __init__(self, config, *, hidden_ratio: int) -> None:
         super().__init__()
@@ -357,9 +357,14 @@ class DFlashVerifyHead(nn.Module):
         x = self.mlp[1](x)
         return self.mlp[2](x).squeeze(-1)
 
-    def expected_accept_lens(self, proposal_hidden: torch.Tensor) -> torch.Tensor:
+    def survival_probs(self, proposal_hidden: torch.Tensor) -> torch.Tensor:
         hazard_logits = self(proposal_hidden)
-        survival_probs = torch.sigmoid(hazard_logits.float()).cumprod(dim=1)
+        return torch.sigmoid(hazard_logits.float()).cumprod(dim=1)
+
+    def expected_accept_lens(self, proposal_hidden: torch.Tensor) -> torch.Tensor:
+        survival_probs = self.survival_probs(proposal_hidden)
+        # DFlash gets the target/bonus token for free, so serving-side accept length
+        # is emitted-token count: accepted draft proposals plus one.
         return survival_probs.sum(dim=1) + 1.0
 
 
@@ -449,17 +454,17 @@ class DFlashDraftModel(nn.Module):
             )
         return self.verify_head(hidden_states, proposal_offsets)
 
-    def _compute_verify_head_predicted_accept_lens(
+    def _compute_verify_head_accept_predictions(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> Optional[torch.Tensor]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if self.verify_head is None or hidden_states.numel() == 0:
-            return None
+            return None, None
         bs = int(forward_batch.batch_size)
         block_size = int(self.block_size)
         if bs <= 0 or block_size <= 1:
-            return None
+            return None, None
         expected_tokens = bs * block_size
         if int(hidden_states.shape[0]) < expected_tokens:
             raise ValueError(
@@ -468,7 +473,9 @@ class DFlashDraftModel(nn.Module):
                 f"hidden_states.shape={tuple(hidden_states.shape)}."
             )
         block_hidden = hidden_states[:expected_tokens].view(bs, block_size, -1)
-        return self.verify_head.expected_accept_lens(block_hidden[:, 1:, :])
+        survival_probs = self.verify_head.survival_probs(block_hidden[:, 1:, :])
+        predicted_accept_lens = survival_probs.sum(dim=1) + 1.0
+        return predicted_accept_lens, survival_probs
 
     @torch.no_grad()
     def forward(
@@ -497,14 +504,15 @@ class DFlashDraftModel(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
-        predicted_accept_lens = self._compute_verify_head_predicted_accept_lens(
-            hidden_states, forward_batch
+        predicted_accept_lens, accept_survival_probs = (
+            self._compute_verify_head_accept_predictions(hidden_states, forward_batch)
         )
 
         return LogitsProcessorOutput(
             next_token_logits=None,
             hidden_states=hidden_states,
             dflash_predicted_accept_lens=predicted_accept_lens,
+            dflash_accept_survival_probs=accept_survival_probs,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

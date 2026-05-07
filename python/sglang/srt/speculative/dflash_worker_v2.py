@@ -431,6 +431,9 @@ class DFlashWorkerV2(DFlashWorker):
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
         predicted_accept_lens = draft_logits_output.dflash_predicted_accept_lens
+        predicted_accept_survival_probs = (
+            draft_logits_output.dflash_accept_survival_probs
+        )
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
@@ -624,6 +627,7 @@ class DFlashWorkerV2(DFlashWorker):
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
             predicted_accept_lens=predicted_accept_lens,
+            predicted_accept_survival_probs=predicted_accept_survival_probs,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             prepared_kv_allocated_lens_cpu=draft_input.reserved_seq_lens_cpu,
