@@ -1,0 +1,203 @@
+# ruff: noqa: E402
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+import asyncio
+import json
+import unittest
+from unittest.mock import Mock
+
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+
+from sglang.srt.entrypoints.context import SimpleContext
+from sglang.srt.entrypoints.openai.protocol import (
+    RequestResponseMetadata,
+    ResponsesRequest,
+    ResponsesResponse,
+    UsageInfo,
+)
+from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+
+
+class _MockTokenizerManager:
+    def __init__(self):
+        self.server_args = Mock(
+            tokenizer_metrics_allowed_custom_labels=None,
+            tool_call_parser="qwen3_coder",
+            reasoning_parser=None,
+        )
+
+        mock_hf_config = Mock()
+        mock_hf_config.model_type = "qwen3"
+
+        self.model_config = Mock()
+        self.model_config.hf_config = mock_hf_config
+        self.model_config.get_default_sampling_params.return_value = {}
+
+        self.tokenizer = Mock()
+
+
+class _MockTemplateManager:
+    pass
+
+
+def _decode_sse_chunks(chunks):
+    events = []
+    for chunk in chunks:
+        event_type = None
+        data = None
+        for line in chunk.splitlines():
+            if line.startswith("event:"):
+                event_type = line.removeprefix("event:").strip()
+            elif line.startswith("data:"):
+                data = json.loads(line.removeprefix("data:").strip())
+        if event_type is not None:
+            events.append((event_type, data))
+    return events
+
+
+async def _collect_stream(generator):
+    return [chunk async for chunk in generator]
+
+
+class ServingResponsesStreamTestCase(unittest.TestCase):
+    def setUp(self):
+        self.serving = OpenAIServingResponses(
+            _MockTokenizerManager(), _MockTemplateManager()
+        )
+
+    async def _fake_full_generator(
+        self,
+        request,
+        sampling_params,
+        result_generator,
+        context,
+        model_name,
+        tokenizer,
+        request_metadata,
+        created_time=None,
+    ):
+        return ResponsesResponse.from_request(
+            request,
+            sampling_params,
+            model_name=model_name,
+            created_time=created_time or 0,
+            output=[
+                ResponseFunctionToolCall(
+                    type="function_call",
+                    id="fc_wrong",
+                    call_id="call_wrong",
+                    name="echo",
+                    arguments="{}",
+                    status="completed",
+                )
+            ],
+            status="completed",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    def test_simple_context_function_call_stream_emits_done_events_with_stable_ids(
+        self,
+    ):
+        request = ResponsesRequest(
+            model="x",
+            input="Use echo.",
+            stream=True,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "echo",
+                    "description": "Echo text.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                }
+            ],
+            tool_choice="auto",
+            request_id="resp_test",
+        )
+        context = SimpleContext()
+
+        async def result_generator():
+            context.append_output(
+                {
+                    "text": (
+                        "<tool_call><function=echo>"
+                        "<parameter=text>hello</parameter>"
+                        "</function></tool_call>"
+                    ),
+                    "meta_info": {"finish_reason": {"type": "stop"}},
+                }
+            )
+            yield context
+
+        self.serving.responses_full_generator = self._fake_full_generator
+        chunks = asyncio.run(
+            _collect_stream(
+                self.serving.responses_stream_generator(
+                    request,
+                    {},
+                    result_generator(),
+                    context,
+                    "x",
+                    Mock(),
+                    RequestResponseMetadata(request_id=request.request_id),
+                    created_time=123,
+                )
+            )
+        )
+
+        events = _decode_sse_chunks(chunks)
+        event_types = [event_type for event_type, _ in events]
+
+        self.assertIn("response.function_call_arguments.done", event_types)
+        self.assertIn("response.output_item.done", event_types)
+        self.assertLess(
+            event_types.index("response.function_call_arguments.done"),
+            event_types.index("response.completed"),
+        )
+        self.assertLess(
+            event_types.index("response.output_item.done"),
+            event_types.index("response.completed"),
+        )
+
+        added = next(
+            data
+            for event_type, data in events
+            if event_type == "response.output_item.added"
+        )
+        args_done = next(
+            data
+            for event_type, data in events
+            if event_type == "response.function_call_arguments.done"
+        )
+        item_done = next(
+            data
+            for event_type, data in events
+            if event_type == "response.output_item.done"
+        )
+        completed = next(
+            data for event_type, data in events if event_type == "response.completed"
+        )
+
+        added_item = added["item"]
+        done_item = item_done["item"]
+        completed_item = completed["response"]["output"][0]
+
+        self.assertEqual(args_done["arguments"], '{"text": "hello"}')
+        self.assertEqual(args_done["item_id"], added_item["id"])
+        self.assertEqual(done_item["id"], added_item["id"])
+        self.assertEqual(done_item["call_id"], added_item["call_id"])
+        self.assertEqual(completed_item["id"], added_item["id"])
+        self.assertEqual(completed_item["call_id"], added_item["call_id"])
+        self.assertEqual(completed_item["arguments"], '{"text": "hello"}')
+
+
+if __name__ == "__main__":
+    unittest.main()

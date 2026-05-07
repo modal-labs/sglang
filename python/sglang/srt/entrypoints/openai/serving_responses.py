@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import time
+import uuid
 from contextlib import AsyncExitStack
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
@@ -1087,21 +1088,248 @@ class OpenAIServingResponses(OpenAIServingChat):
         # State for non-Harmony (SimpleContext) streaming
         _prev_text = ""
         _simple_stream_started = False
+        _simple_stream_finalized = False
+        _simple_text = ""
+        _simple_text_item_id = ""
+        _simple_text_output_index = -1
+        _simple_completed_output_items: dict[int, Any] = {}
+        _simple_tool_call_states: dict[int, dict[str, Any]] = {}
         _tool_parser = None
         function_tools = _normalize_function_tools_for_chat_parser(request.tools)
         if function_tools and self.tool_call_parser:
             _tool_parser = FunctionCallParser(function_tools, self.tool_call_parser)
 
-        async for ctx in result_generator:
+        def _make_simple_text_content(text: str):
+            return openai_responses_types.ResponseOutputText(
+                type="output_text",
+                text=text,
+                annotations=[],
+                logprobs=None,
+            )
 
+        def _start_simple_text_item():
+            nonlocal current_output_index
+            nonlocal _simple_stream_started, _simple_text_item_id
+            nonlocal _simple_text_output_index
+
+            if _simple_stream_started:
+                return []
+
+            _simple_stream_started = True
+            _simple_text_item_id = f"msg_{random_uuid()}"
+            _simple_text_output_index = current_output_index
+            current_output_index += 1
+
+            return [
+                _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=_simple_text_output_index,
+                        item=openai_responses_types.ResponseOutputMessage(
+                            id=_simple_text_item_id,
+                            type="message",
+                            role="assistant",
+                            content=[],
+                            status="in_progress",
+                        ),
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseContentPartAddedEvent(
+                        type="response.content_part.added",
+                        sequence_number=-1,
+                        output_index=_simple_text_output_index,
+                        item_id=_simple_text_item_id,
+                        content_index=current_content_index,
+                        part=_make_simple_text_content(""),
+                    )
+                ),
+            ]
+
+        def _finish_simple_text_item():
+            nonlocal _simple_text
+            nonlocal _simple_stream_started, _simple_text_item_id
+            nonlocal _simple_text_output_index
+
+            if not _simple_stream_started:
+                return []
+
+            text_content = _make_simple_text_content(_simple_text)
+            message = openai_responses_types.ResponseOutputMessage(
+                id=_simple_text_item_id,
+                type="message",
+                role="assistant",
+                content=[text_content],
+                status="completed",
+            )
+            _simple_completed_output_items[_simple_text_output_index] = message
+
+            events = [
+                _send_event(
+                    openai_responses_types.ResponseTextDoneEvent(
+                        type="response.output_text.done",
+                        sequence_number=-1,
+                        output_index=_simple_text_output_index,
+                        content_index=current_content_index,
+                        text=_simple_text,
+                        logprobs=[],
+                        item_id=_simple_text_item_id,
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseContentPartDoneEvent(
+                        type="response.content_part.done",
+                        sequence_number=-1,
+                        item_id=_simple_text_item_id,
+                        output_index=_simple_text_output_index,
+                        content_index=current_content_index,
+                        part=text_content,
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=_simple_text_output_index,
+                        item=message,
+                    )
+                ),
+            ]
+
+            _simple_stream_started = False
+            _simple_text = ""
+            _simple_text_item_id = ""
+            _simple_text_output_index = -1
+            return events
+
+        def _start_simple_tool_call(call_item):
+            nonlocal current_output_index
+
+            state = _simple_tool_call_states.get(call_item.tool_index)
+            if state is not None:
+                if call_item.name:
+                    state["name"] = call_item.name
+                return []
+
+            state = {
+                "id": f"fc_{random_uuid()}",
+                "call_id": f"call_{uuid.uuid4().hex[:24]}",
+                "name": call_item.name or "",
+                "arguments": "",
+                "output_index": current_output_index,
+                "done": False,
+            }
+            current_output_index += 1
+            _simple_tool_call_states[call_item.tool_index] = state
+
+            return [
+                _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=state["output_index"],
+                        item=ResponseFunctionToolCall(
+                            type="function_call",
+                            id=state["id"],
+                            call_id=state["call_id"],
+                            name=state["name"],
+                            arguments="",
+                            status="in_progress",
+                        ),
+                    )
+                )
+            ]
+
+        def _append_simple_tool_call_arguments(call_item):
+            if call_item.parameters is None or call_item.parameters == "":
+                return []
+
+            state = _simple_tool_call_states.get(call_item.tool_index)
+            if state is None:
+                events = _start_simple_tool_call(call_item)
+                state = _simple_tool_call_states[call_item.tool_index]
+            else:
+                events = []
+
+            state["arguments"] += call_item.parameters
+            events.append(
+                _send_event(
+                    openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                        type="response.function_call_arguments.delta",
+                        sequence_number=-1,
+                        item_id=state["id"],
+                        output_index=state["output_index"],
+                        delta=call_item.parameters,
+                    )
+                )
+            )
+            return events
+
+        def _finish_simple_tool_call_state(state: dict[str, Any]):
+            if state["done"]:
+                return []
+
+            state["done"] = True
+            item = ResponseFunctionToolCall(
+                type="function_call",
+                id=state["id"],
+                call_id=state["call_id"],
+                name=state["name"],
+                arguments=state["arguments"],
+                status="completed",
+            )
+            _simple_completed_output_items[state["output_index"]] = item
+
+            return [
+                _send_event(
+                    openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                        type="response.function_call_arguments.done",
+                        sequence_number=-1,
+                        item_id=state["id"],
+                        output_index=state["output_index"],
+                        arguments=state["arguments"],
+                        name=state["name"],
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=state["output_index"],
+                        item=item,
+                    )
+                ),
+            ]
+
+        def _finish_simple_tool_calls(exclude_tool_index: Optional[int] = None):
+            events = []
+            for tool_index, state in sorted(
+                _simple_tool_call_states.items(),
+                key=lambda item: item[1]["output_index"],
+            ):
+                if tool_index == exclude_tool_index:
+                    continue
+                events.extend(_finish_simple_tool_call_state(state))
+            return events
+
+        def _finish_simple_stream_items():
+            events = []
+            events.extend(_finish_simple_text_item())
+            events.extend(_finish_simple_tool_calls())
+            return events
+
+        async for ctx in result_generator:
             # Non-Harmony path: SimpleContext streams token-by-token
             if not hasattr(ctx, "is_expecting_start"):
                 if ctx.last_output is None:
                     continue
                 text = ctx.last_output.get("text", "")
-                delta = text[len(_prev_text):]
+                delta = text[len(_prev_text) :]
                 _prev_text = text
-                finish_reason = ctx.last_output.get("meta_info", {}).get("finish_reason")
+                finish_reason = ctx.last_output.get("meta_info", {}).get(
+                    "finish_reason"
+                )
 
                 if delta:
                     if _tool_parser:
@@ -1109,105 +1337,39 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         normal_text, calls = delta, []
 
-                    if normal_text and not _simple_stream_started:
-                        _simple_stream_started = True
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                item=openai_responses_types.ResponseOutputMessage(
-                                    id=current_item_id, type="message",
-                                    role="assistant", content=[], status="in_progress",
-                                ),
-                            )
-                        )
-                        yield _send_event(
-                            openai_responses_types.ResponseContentPartAddedEvent(
-                                type="response.content_part.added",
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                item_id=current_item_id,
-                                content_index=current_content_index,
-                                part=openai_responses_types.ResponseOutputText(
-                                    type="output_text", text="", annotations=[],
-                                ),
-                            )
-                        )
                     if normal_text:
+                        for event in _finish_simple_tool_calls():
+                            yield event
+                        for event in _start_simple_text_item():
+                            yield event
+                        _simple_text += normal_text
                         yield _send_event(
                             openai_responses_types.ResponseTextDeltaEvent(
                                 type="response.output_text.delta",
                                 sequence_number=-1,
                                 content_index=current_content_index,
-                                output_index=current_output_index,
-                                item_id=current_item_id,
+                                output_index=_simple_text_output_index,
+                                item_id=_simple_text_item_id,
                                 delta=normal_text,
                                 logprobs=[],
                             )
                         )
                     for call_item in calls:
                         if call_item.name:
-                            import uuid as _uuid
-                            _fc_id = f"fc_{random_uuid()}"
-                            _call_id = f"call_{_uuid.uuid4().hex[:24]}"
-                            # Close text output item if it was started
-                            if _simple_stream_started:
-                                yield _send_event(
-                                    openai_responses_types.ResponseOutputItemDoneEvent(
-                                        type="response.output_item.done",
-                                        sequence_number=-1,
-                                        output_index=current_output_index,
-                                        item=openai_responses_types.ResponseOutputMessage(
-                                            id=current_item_id, type="message",
-                                            role="assistant",
-                                            content=[openai_responses_types.ResponseOutputText(
-                                                type="output_text", text=_prev_text, annotations=[],
-                                            )],
-                                            status="completed",
-                                        ),
-                                    )
-                                )
-                                current_output_index += 1
-                                _simple_stream_started = False
-                            yield _send_event(
-                                openai_responses_types.ResponseOutputItemAddedEvent(
-                                    type="response.output_item.added",
-                                    sequence_number=-1,
-                                    output_index=current_output_index,
-                                    item=ResponseFunctionToolCall(
-                                        type="function_call", id=_fc_id,
-                                        call_id=_call_id, name=call_item.name,
-                                        arguments="", status="in_progress",
-                                    ),
-                                )
-                            )
-                        if call_item.parameters:
-                            yield _send_event(
-                                openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
-                                    type="response.function_call_arguments.delta",
-                                    sequence_number=-1,
-                                    item_id=_fc_id,
-                                    output_index=current_output_index,
-                                    delta=call_item.parameters,
-                                )
-                            )
+                            for event in _finish_simple_text_item():
+                                yield event
+                            if call_item.tool_index not in _simple_tool_call_states:
+                                for event in _finish_simple_tool_calls():
+                                    yield event
+                            for event in _start_simple_tool_call(call_item):
+                                yield event
+                        for event in _append_simple_tool_call_arguments(call_item):
+                            yield event
 
-                if finish_reason:
-                    # Flush any remaining tool call data
-                    if _tool_parser and hasattr(_tool_parser, 'detector') and hasattr(_tool_parser.detector, 'prev_tool_call_arr'):
-                        for tc in (_tool_parser.detector.prev_tool_call_arr or []):
-                            if hasattr(tc, 'arguments') and tc.arguments:
-                                yield _send_event(
-                                    openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
-                                        type="response.function_call_arguments.done",
-                                        sequence_number=-1,
-                                        item_id=_fc_id if '_fc_id' in dir() else current_item_id,
-                                        output_index=current_output_index,
-                                        arguments=tc.arguments,
-                                        name=tc.name or "",
-                                    )
-                                )
+                if finish_reason and not _simple_stream_finalized:
+                    _simple_stream_finalized = True
+                    for event in _finish_simple_stream_items():
+                        yield event
                 continue
 
             if ctx.is_expecting_start():
@@ -1558,6 +1720,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time=created_time,
         )
+        if _simple_completed_output_items:
+            final_response.output = [
+                item for _, item in sorted(_simple_completed_output_items.items())
+            ]
+            if request.store:
+                async with self.response_store_lock:
+                    self.response_store[final_response.id] = final_response
+
         # Convert final_response to the format expected by ResponseCompletedEvent
         response_dict = final_response.model_dump()
 
