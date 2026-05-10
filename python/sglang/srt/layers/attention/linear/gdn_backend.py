@@ -79,6 +79,12 @@ class GDNKernelDispatcher:
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
+        elif decode_backend.is_flash_kernels():
+            raise ValueError(
+                "flash-kernels backend only supports prefill, not decode. "
+                "Use --linear-attn-decode-backend triton (or flashinfer) "
+                "instead."
+            )
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -102,10 +108,20 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif prefill_backend.is_flash_kernels():
+            if not is_cuda():
+                raise ValueError("flash-kernels GDN backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.gdn_flash import (
+                FlashKernelsGDNKernel,
+            )
+
+            self.extend_kernel = FlashKernelsGDNKernel()
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer if either decode or prefill selected it
+        # Verify kernel: use FlashInfer if either decode or prefill selected
+        # it; flash-kernels never handles verify (prefill-only) so falls
+        # through to triton.
         if decode_backend.is_flashinfer() or prefill_backend.is_flashinfer():
             self.verify_kernel = flashinfer_kernel
         else:

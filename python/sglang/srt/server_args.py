@@ -237,7 +237,7 @@ MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flash-kernels"]
 
 
 # Allow external code to add more choices
