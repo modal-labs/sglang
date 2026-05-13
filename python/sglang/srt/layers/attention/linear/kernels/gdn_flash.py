@@ -1,17 +1,21 @@
 """flash-kernels TileLang wrapper for GDN prefill.
 
-`kernels.chunk_gated_delta_rule` is a hand-tuned TileLang kernel for
+`kernels.chunk_gated_delta_rule_fwd` is a hand-tuned TileLang kernel for
 the gated-delta-rule (GDN) linear-attention forward pass.  On NVIDIA
 B200 / GB200 (sm_100) it lowers to TCGEN5MMA — Blackwell's 5th-gen
 tensor-core instruction with TMEM accumulators — and outperforms the
 bundled FLA Triton chunk kernel by ~1.45x on Qwen3.5-style shapes.
 The package ships from modal-projects/flash-kernels and is imported as
-`from kernels import chunk_gated_delta_rule`.
+`from kernels import chunk_gated_delta_rule_fwd`.
 
 flash-kernels takes its running state in the same `(B, H_v, V, K)`
 layout as SGLang's `Mamba2StateShape.temporal = (num_v_heads,
 head_v_dim, state_size=head_k_dim)`, so this wrapper does *not* need to
 transpose between SGLang's pool layout and the kernel-internal layout.
+
+This wrapper enables prefix caching by returning per-chunk states via the
+`output_h=True` parameter, allowing SGLang to cache and reuse GDN state
+across requests with shared prefixes.
 
 Prefill-only.  Decode and target_verify raise NotImplementedError; the
 dispatcher in `linear/gdn_backend.py` should pair this backend with
@@ -36,9 +40,9 @@ def _get_kernel():
     shouldn't crash at module-import time."""
     global _chunk_gated_delta_rule_cache
     if _chunk_gated_delta_rule_cache is None:
-        from kernels import chunk_gated_delta_rule
+        from kernels import chunk_gated_delta_rule_fwd
 
-        _chunk_gated_delta_rule_cache = chunk_gated_delta_rule
+        _chunk_gated_delta_rule_cache = chunk_gated_delta_rule_fwd
     return _chunk_gated_delta_rule_cache
 
 
@@ -109,7 +113,14 @@ class FlashKernelsGDNKernel(LinearAttnKernelBase):
         # already contiguous.
         v = v.contiguous()
 
-        o, final_state = chunk_gated_delta_rule(
+        # Apply L2 normalization to q and k (required for correctness)
+        # The low-level function doesn't handle this internally, so we do it here
+        from kernels.utils import l2norm as kernels_l2norm
+        q = kernels_l2norm(q)
+        k = kernels_l2norm(k)
+
+        # Use low-level function to get per-chunk states for prefix caching
+        g, A, o, h, final_state = chunk_gated_delta_rule(
             q=q,
             k=k,
             v=v,
@@ -117,8 +128,8 @@ class FlashKernelsGDNKernel(LinearAttnKernelBase):
             beta=beta,
             initial_state=initial_state,
             output_final_state=True,
+            output_h=True,  # Enable per-chunk state output for prefix caching
             cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
         )
 
         # Scatter the final state back to the pool, matching the FLA
@@ -135,14 +146,10 @@ class FlashKernelsGDNKernel(LinearAttnKernelBase):
         # - core_attn_out: (1, T, H_v, V) prefill output
         # - last_recurrent_state=None: state was scattered above (mirrors
         #   the FLA Triton GPU path which is also None here)
-        # - h=None: per-chunk states aren't surfaced.  This disables
-        #   prefix caching of GDN state on this backend; SGLang's
-        #   `_track_mamba_state_extend` becomes a no-op.  TODO: thread
-        #   `output_h=True` through to enable it — would require calling
-        #   `kernels.chunk_gated_delta_rule_fwd` (the lower-level entry
-        #   point that exposes the per-chunk h tensor) instead of the
-        #   high-level wrapper.
-        return o, None, None
+        # - h: per-chunk states for prefix caching (enabled via output_h=True).
+        # This allows SGLang's `_track_mamba_state_extend` to cache and reuse
+        # GDN state across requests with shared prefixes.
+        return o, None, h
 
     def target_verify(
         self,
