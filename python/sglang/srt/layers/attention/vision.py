@@ -153,6 +153,30 @@ def resolve_seqlens(
     return resolved_seqlens
 
 
+def _normalize_max_seqlen(max_seqlen: int | torch.Tensor | None) -> Optional[int]:
+    if max_seqlen is None:
+        return None
+
+    if isinstance(max_seqlen, torch.Tensor):
+        if max_seqlen.numel() != 1:
+            max_seqlen = max_seqlen.max()
+        if max_seqlen.is_cuda:
+            max_seqlen = max_seqlen.detach().cpu()
+        return int(max_seqlen.item())
+
+    return int(max_seqlen)
+
+
+def _resolve_max_seqlen(
+    seq_lens: torch.Tensor,
+    max_seqlen: int | torch.Tensor | None,
+) -> int:
+    resolved_max_seqlen = _normalize_max_seqlen(max_seqlen)
+    if resolved_max_seqlen is not None:
+        return resolved_max_seqlen
+    return int(seq_lens.max().item())
+
+
 class VisionSdpaAttention(nn.Module):
     r"""
     Scaled Dot Product Attention inner product
@@ -362,7 +386,7 @@ class VisionTritonAttention(nn.Module):
             output = torch.empty_like(q)
 
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            max_seqlen = _resolve_max_seqlen(seq_lens, kwargs.get("max_seqlen"))
             context_attention_fwd(
                 q,
                 k,
@@ -421,7 +445,7 @@ class VisionFlash3Attention(nn.Module):
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            max_seqlen = _resolve_max_seqlen(seq_lens, kwargs.get("max_seqlen"))
 
             output = flash_attn_func(
                 q,
@@ -472,7 +496,7 @@ class VisionFlash4Attention(nn.Module):
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        max_seqlen = _resolve_max_seqlen(seq_lens, kwargs.get("max_seqlen"))
 
         output = flash_attn_func(
             q,
@@ -526,16 +550,11 @@ class VisionFlashInferAttention(nn.Module):
             )
 
         sequence_lengths = kwargs["sequence_lengths"]  # (B_padded,) or (B_padded,1,1,1)
-        max_seqlen = kwargs["max_seqlen"]
-
-        # max_seqlen must be python int
-        if isinstance(max_seqlen, torch.Tensor):
-            if max_seqlen.is_cuda:
-                max_seqlen = int(max_seqlen.detach().cpu().item())
-            else:
-                max_seqlen = int(max_seqlen.item())
-        else:
-            max_seqlen = int(max_seqlen)
+        max_seqlen = _normalize_max_seqlen(kwargs["max_seqlen"])
+        if max_seqlen is None:
+            raise RuntimeError(
+                "max_seqlen should be prepared for vision flashinfer_cudnn attention backend"
+            )
 
         # flatten if caller gives (b, s, h, d)
         is_reshaped = q.dim() == 4
@@ -641,7 +660,7 @@ class VisionAiterAttention(nn.Module):
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        max_seqlen = _resolve_max_seqlen(seq_lens, kwargs.get("max_seqlen"))
 
         return self.flash_attn_varlen_func(
             q=q,

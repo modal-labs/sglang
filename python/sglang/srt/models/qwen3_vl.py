@@ -759,15 +759,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         token_cu_seqlens = np.concatenate(
             [np.zeros(1, dtype=np.int32), token_cu_seqlens]
         )
+        real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
+        max_seqlen = int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
 
         flashinfer_max_seqlen = 0
         cu_seqlens = None
         if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
-            # real token lens (B,)
-            real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
-            flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(
-                int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
-            )
+            flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(max_seqlen)
 
             # (B_padded,) token lengths
             seq_lens_padded = self.compute_flashinfer_sequence_lengths_padded(
@@ -806,7 +804,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
             else:
                 cu_seqlens = cu_seqlens.to("cpu")
-            max_seqlen = None
 
         x = x.unsqueeze(1)
 
