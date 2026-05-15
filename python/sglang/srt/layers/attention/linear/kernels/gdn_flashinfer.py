@@ -111,7 +111,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self._mtp_fn is None:
             raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
 
-        if self.use_state_pool and mtp_bf16_fn is not None:
+        if self.is_sm100plus and mtp_bf16_fn is not None:
             # Adapt bf16 kernel to fp32 kernel interface so target_verify needs no branching.
             def _mtp_bf16_adapted(
                 q,
