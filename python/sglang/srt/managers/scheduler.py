@@ -1528,6 +1528,19 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
+        # TP-safe queue-full reject: filter on rank 0 BEFORE broadcast_pyobj
+        # so non-rank-0 ranks never see rejected requests. Without this, each
+        # rank ran _abort_on_queued_limit independently, which could decide
+        # differently once another path (wait/run timeout) had mutated the
+        # per-rank waiting_queue out of order.
+        if (
+            self.pp_rank == 0
+            and self.attn_tp_rank == 0
+            and self.attn_cp_rank == 0
+            and recv_reqs is not None
+        ):
+            recv_reqs = self._filter_recv_reqs_on_queue_limit(recv_reqs)
+
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
@@ -2050,6 +2063,88 @@ class Scheduler(
             self.send_to_tokenizer.send_output(abort_req, req)
             return False
         return True
+
+    def _filter_recv_reqs_on_queue_limit(
+        self,
+        recv_reqs,
+    ):
+        """Reject incoming requests that would overflow max_queued_requests, on rank 0 only.
+
+        TP-safe variant of `_abort_on_queued_limit`'s reject-incoming branch:
+        by filtering BEFORE `broadcast_pyobj`, rejected requests never reach
+        the waiting_queue on any TP rank, so a queue-overflow decision on one
+        rank can't desync the per-rank queues from another rank that already
+        had a different queue length (e.g. because `_abort_on_waiting_timeout`
+        fired on it but not on the others).
+
+        The priority-eviction branch of `_abort_on_queued_limit` is left in
+        place: eviction needs to pop an existing per-rank queue entry and
+        propagate the choice across ranks, which would require a separate
+        broadcast. That path is already symmetric across ranks because
+        `broadcast_pyobj` preserves insertion order, so
+        `max(enumerate(queue), key=(-prio, time))` selects the same idx on
+        every rank. The filter is therefore disabled when priority scheduling
+        is enabled.
+        """
+        if (
+            self.max_queued_requests is None
+            or self.disaggregation_mode != DisaggregationMode.NULL
+            or self.enable_priority_scheduling
+        ):
+            return recv_reqs
+
+        survivors = []
+        pending_admits = 0
+        current_queue_len = len(self.waiting_queue)
+
+        for item in recv_reqs:
+            if isinstance(item, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                if current_queue_len + pending_admits + 1 <= self.max_queued_requests:
+                    survivors.append(item)
+                    pending_admits += 1
+                else:
+                    self._reject_for_queue_full(item)
+            elif isinstance(
+                item,
+                (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+            ):
+                batch_size = len(item)
+                if (
+                    current_queue_len + pending_admits + batch_size
+                    <= self.max_queued_requests
+                ):
+                    survivors.append(item)
+                    pending_admits += batch_size
+                else:
+                    # Best-effort: reject the whole batch. Splitting a batch
+                    # partway would change the io_struct contract; keep that
+                    # as a follow-up if it becomes a real workload.
+                    for sub in item:
+                        self._reject_for_queue_full(sub)
+            else:
+                survivors.append(item)
+        return survivors
+
+    def _reject_for_queue_full(self, item) -> None:
+        """Emit AbortReq + warning for a queue-full-rejected request (rank 0 only)."""
+        rid = getattr(item, "rid", None)
+        self.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": "The request queue is full.",
+                },
+                rid=rid,
+            ),
+            item,
+        )
+        logging.warning(
+            "queue abort (rank 0 pre-broadcast) rid=%s waiting_queue_len=%d max_queued_requests=%s",
+            rid,
+            len(self.waiting_queue),
+            self.max_queued_requests,
+        )
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
