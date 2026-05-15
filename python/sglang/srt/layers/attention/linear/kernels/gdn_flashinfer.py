@@ -348,6 +348,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
         b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
 
+        if intermediate_states_buffer is not None:
+            intermediate_states_buffer = intermediate_states_buffer[:batch_size]
+
         output_fi, _ = self._mtp_fn(
             q=query_mtp,
             k=key_mtp,
