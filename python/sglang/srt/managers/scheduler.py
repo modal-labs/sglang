@@ -2206,33 +2206,73 @@ class Scheduler(
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
 
+        # TP-safe: with multiple ranks, each rank's `time.perf_counter()` reading
+        # and each rank's per-rank-stamped `wait_queue_entry_time` are
+        # independent. Without coordination, ranks can decide differently about
+        # which requests cross the deadline on a given scheduler iteration,
+        # which permanently desyncs their waiting_queues and eventually hangs a
+        # downstream collective op. Have rank 0 compute the rid set, broadcast
+        # it across the TP group, and have every rank pop the identical set.
+        if self.tp_size > 1:
+            if self.tp_rank == 0:
+                deadline = time.perf_counter() - timeout_s
+                rids_to_abort: Optional[List[str]] = [
+                    req.rid
+                    for req in self.waiting_queue
+                    if 0 < req.time_stats.wait_queue_entry_time < deadline
+                ]
+            else:
+                rids_to_abort = None
+            # TODO(harmya): when --enable-dp-attention is on, scope this
+            # broadcast to the dp group rather than full tp. For now matches
+            # Perplexity's evo-v3.5 shape (dp-attention off).
+            rids_to_abort = broadcast_pyobj(
+                rids_to_abort,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        else:
+            deadline = time.perf_counter() - timeout_s
+            rids_to_abort = [
+                req.rid
+                for req in self.waiting_queue
+                if 0 < req.time_stats.wait_queue_entry_time < deadline
+            ]
+
+        if not rids_to_abort:
+            return
+
+        rid_set = set(rids_to_abort)
         deleted_reqs = set()
-        deadline = time.perf_counter() - timeout_s
         for req in self.waiting_queue:
-            entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(req.rid)
-                self.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request waiting timeout reached.",
-                        },
-                        rid=req.rid,
-                    ),
-                    req,
-                )
-                logging.warning(
-                    "waiting timeout abort rid=%s waited_s=%.3f timeout_s=%.3f waiting_queue_len=%d",
-                    req.rid,
-                    time.perf_counter() - entry_time,
-                    timeout_s,
-                    len(self.waiting_queue),
-                )
-                deleted_reqs.add(req)
+            if req.rid not in rid_set:
+                continue
+            if self.enable_hicache_storage:
+                # Release prefetch events associated with the request
+                self.tree_cache.release_aborted_request(req.rid)
+            # On non-rank-0 schedulers send_to_tokenizer is a no-op wrapper,
+            # so only rank 0 actually notifies the client. Every rank still
+            # pops locally to keep waiting_queue in sync.
+            self.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "Request waiting timeout reached.",
+                    },
+                    rid=req.rid,
+                ),
+                req,
+            )
+            logging.warning(
+                "waiting timeout abort rid=%s waited_s=%.3f timeout_s=%.3f waiting_queue_len=%d",
+                req.rid,
+                time.perf_counter() - req.time_stats.wait_queue_entry_time,
+                timeout_s,
+                len(self.waiting_queue),
+            )
+            deleted_reqs.add(req)
 
         if deleted_reqs:
             self.waiting_queue = [
