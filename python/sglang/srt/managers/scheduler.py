@@ -1323,9 +1323,47 @@ class Scheduler(
         if self.running_batch.is_empty():
             return
 
-        deadline = time.perf_counter() - timeout_s
+        # TP-safe: each rank's `time.perf_counter()` reading and each rank's
+        # per-rank-stamped `forward_entry_time` are independent. Without
+        # coordination, ranks can mark different requests `to_finish` on a
+        # given iter, which then filters the running_batch differently across
+        # ranks — divergent req_pool_indices feeding the next forward pass
+        # cause an all_reduce hang. Rank 0 picks the rid set, broadcasts via
+        # broadcast_pyobj, every rank sets to_finish on the identical set.
+        if self.tp_size > 1:
+            if self.tp_rank == 0:
+                deadline = time.perf_counter() - timeout_s
+                rids_to_abort: Optional[List[str]] = [
+                    req.rid
+                    for req in self.running_batch.reqs
+                    if not req.finished()
+                    and 0 < req.time_stats.forward_entry_time < deadline
+                ]
+            else:
+                rids_to_abort = None
+            # TODO(harmya): scope to dp group when --enable-dp-attention is on.
+            # Perplexity evo-v3.5 has dp-attention off so full tp is fine.
+            rids_to_abort = broadcast_pyobj(
+                rids_to_abort,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        else:
+            deadline = time.perf_counter() - timeout_s
+            rids_to_abort = [
+                req.rid
+                for req in self.running_batch.reqs
+                if not req.finished()
+                and 0 < req.time_stats.forward_entry_time < deadline
+            ]
+
+        if not rids_to_abort:
+            return
+
+        rid_set = set(rids_to_abort)
         for req in self.running_batch.reqs:
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+            if req.rid in rid_set and not req.finished():
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
