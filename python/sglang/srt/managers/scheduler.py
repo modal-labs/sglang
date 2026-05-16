@@ -1695,6 +1695,15 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
+        # TP-safe queue-full reject on rank 0 before broadcast_pyobj.
+        if (
+            self.pp_rank == 0
+            and self.attn_tp_rank == 0
+            and self.attn_cp_rank == 0
+            and recv_reqs is not None
+        ):
+            recv_reqs = self._filter_recv_reqs_on_queue_limit(recv_reqs)
+
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
@@ -2249,8 +2258,86 @@ class Scheduler(
             return False
         return True
 
+    def _filter_recv_reqs_on_queue_limit(self, recv_reqs):
+        """Drop overflow on rank 0 before broadcast. Priority eviction stays in _abort_on_queued_limit."""
+        if (
+            self.max_queued_requests is None
+            or self.disaggregation_mode != DisaggregationMode.NULL
+            or self.enable_priority_scheduling
+        ):
+            return recv_reqs
+
+        survivors = []
+        pending_admits = 0
+        current_queue_len = len(self.waiting_queue)
+
+        def _can_admit() -> bool:
+            return current_queue_len + pending_admits + 1 <= self.max_queued_requests
+
+        for item in recv_reqs:
+            if isinstance(item, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                # Health checks don't enter waiting_queue; don't count them.
+                if is_health_check_generate_req(item):
+                    survivors.append(item)
+                elif _can_admit():
+                    survivors.append(item)
+                    pending_admits += 1
+                else:
+                    self._reject_for_queue_full(item)
+            elif isinstance(
+                item,
+                (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+            ):
+                admitted_subs = []
+                for sub in item:
+                    if is_health_check_generate_req(sub):
+                        admitted_subs.append(sub)
+                    elif _can_admit():
+                        admitted_subs.append(sub)
+                        pending_admits += 1
+                    else:
+                        self._reject_for_queue_full(sub)
+                if admitted_subs:
+                    item.batch = admitted_subs
+                    survivors.append(item)
+            else:
+                survivors.append(item)
+        return survivors
+
+    def _reject_for_queue_full(self, item) -> None:
+        """AbortReq + materialize shm (unlink /dev/shm) for a rank-0 reject."""
+        try:
+            unwrap_shm_features(item)
+        except Exception as _e:
+            logging.warning("unwrap_shm_features failed on rejected req: %r", _e)
+        rid = getattr(item, "rid", None)
+        self.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": "The request queue is full.",
+                },
+                rid=rid,
+            ),
+            item,
+        )
+        logging.warning(
+            "queue abort (rank 0 pre-broadcast) rid=%s waiting_queue_len=%d max_queued_requests=%s",
+            rid,
+            len(self.waiting_queue),
+            self.max_queued_requests,
+        )
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
+        # Rank 0 is the authoritative admission gate; non-primary ranks trust it.
+        if not (
+            self.pp_rank == 0
+            and self.attn_tp_rank == 0
+            and self.attn_cp_rank == 0
+        ):
+            return False
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
