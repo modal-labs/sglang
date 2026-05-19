@@ -580,6 +580,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # common, get by time.perf_counter()
     wait_queue_entry_time: float = 0.0
     forward_entry_time: float = 0.0
+    prefill_run_batch_start_time: float = 0.0
+    prefill_run_batch_end_time: float = 0.0
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
@@ -998,6 +1000,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         if self.bootstrap_done_time == 0.0:
             self.bootstrap_done_time = ts
+
+    def set_prefill_run_batch_start_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.prefill_run_batch_start_time = ts
+
+    def set_prefill_run_batch_end_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.prefill_run_batch_end_time = ts
 
     def set_decode_prebuilt_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
