@@ -586,6 +586,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # common, get by time.perf_counter()
     wait_queue_entry_time: float = 0.0
     forward_entry_time: float = 0.0
+    prefill_run_batch_start_time: float = 0.0
+    prefill_run_batch_end_time: float = 0.0
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
@@ -1050,16 +1052,23 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         return getattr(self, "request_process_latency_snapshot", None)
 
     def get_prefill_waiting_latency(self) -> Optional[float]:
-        if self.prefill_run_batch_start_time > 0.0:
-            return self.prefill_run_batch_start_time - self.forward_entry_time
+        prefill_run_batch_start_time = getattr(
+            self, "prefill_run_batch_start_time", 0.0
+        )
+        if prefill_run_batch_start_time > 0.0:
+            return prefill_run_batch_start_time - self.forward_entry_time
         return getattr(self, "prefill_waiting_latency_snapshot", None)
 
     def get_prefill_launch_latency(self) -> Optional[float]:
+        prefill_run_batch_start_time = getattr(
+            self, "prefill_run_batch_start_time", 0.0
+        )
+        prefill_run_batch_end_time = getattr(self, "prefill_run_batch_end_time", 0.0)
         if (
-            self.prefill_run_batch_start_time > 0.0
-            and self.prefill_run_batch_end_time > 0.0
+            prefill_run_batch_start_time > 0.0
+            and prefill_run_batch_end_time > 0.0
         ):
-            return self.prefill_run_batch_end_time - self.prefill_run_batch_start_time
+            return prefill_run_batch_end_time - prefill_run_batch_start_time
         return getattr(self, "prefill_launch_latency_snapshot", None)
 
     def get_prefill_forward_latency(self) -> Optional[float]:
