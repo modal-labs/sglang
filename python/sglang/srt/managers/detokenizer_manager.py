@@ -395,6 +395,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             dp_ranks=recv_obj.dp_ranks,
+            queue_times=recv_obj.queue_times,
+            request_process_latencies=recv_obj.request_process_latencies,
+            prefill_waiting_latencies=recv_obj.prefill_waiting_latencies,
+            prefill_launch_latencies=recv_obj.prefill_launch_latencies,
+            prefill_forward_latencies=recv_obj.prefill_forward_latencies,
             time_stats=recv_obj.time_stats,
         )
 

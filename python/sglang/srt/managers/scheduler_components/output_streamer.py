@@ -272,6 +272,11 @@ class _GenerationStreamAccumulator:
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
+    queue_times: list = field(default_factory=list)
+    request_process_latencies: list = field(default_factory=list)
+    prefill_waiting_latencies: list = field(default_factory=list)
+    prefill_launch_latencies: list = field(default_factory=list)
+    prefill_forward_latencies: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -376,6 +381,19 @@ class _GenerationStreamAccumulator:
         self.cached_tokens_details.append(self.get_cached_tokens_details(req))
 
         self.retraction_counts.append(req.retraction_count)
+        self.queue_times.append(req.time_stats.maybe_get_queueing_time())
+        self.request_process_latencies.append(
+            req.time_stats.get_request_process_latency()
+        )
+        self.prefill_waiting_latencies.append(
+            req.time_stats.get_prefill_waiting_latency()
+        )
+        self.prefill_launch_latencies.append(
+            req.time_stats.get_prefill_launch_latency()
+        )
+        self.prefill_forward_latencies.append(
+            req.time_stats.get_prefill_forward_latency()
+        )
 
         self.time_stats.append(req.time_stats)
 
@@ -524,4 +542,9 @@ class _GenerationStreamAccumulator:
             retraction_counts=self.retraction_counts,
             load=load,
             dp_ranks=dp_ranks,
+            queue_times=self.queue_times,
+            request_process_latencies=self.request_process_latencies,
+            prefill_waiting_latencies=self.prefill_waiting_latencies,
+            prefill_launch_latencies=self.prefill_launch_latencies,
+            prefill_forward_latencies=self.prefill_forward_latencies,
         )
