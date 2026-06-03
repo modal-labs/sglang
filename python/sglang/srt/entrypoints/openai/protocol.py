@@ -1273,15 +1273,37 @@ class ResponseReasoningParam(BaseModel):
     )
 
 
-class ResponseTool(BaseModel):
-    """Tool definition for responses."""
+class ResponseFunctionTool(BaseModel):
+    """Function tool definition for responses."""
+    type: Literal["function"] = "function"
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[dict] = None
+    strict: Optional[bool] = None
 
+
+class ResponseBuiltinTool(BaseModel):
+    """Built-in tool definition for responses."""
     type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
+        description="Type of built-in tool to enable"
     )
 
 
+ResponseTool = Union[ResponseFunctionTool, ResponseBuiltinTool]
+
+
+class ResponseMessageInputItem(BaseModel):
+    """Responses message input item accepted before chat conversion."""
+
+    type: Optional[Literal["message"]] = None
+    role: Literal["user", "assistant", "system", "developer"]
+    content: Any
+    id: Optional[str] = None
+    status: Optional[str] = None
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    ResponseMessageInputItem,
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
@@ -1326,6 +1348,7 @@ class ResponsesRequest(BaseModel):
     user: Optional[str] = None
 
     # Extra SGLang parameters
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
@@ -1420,7 +1443,9 @@ class ResponsesResponse(BaseModel):
     output: List[
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
-    status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    status: Literal[
+        "queued", "in_progress", "completed", "failed", "cancelled", "incomplete"
+    ]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
     tool_choice: str = "auto"
