@@ -1382,7 +1382,11 @@ class Scheduler(
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched,
         # as current spec-v1 still filters batch inside verify stage.
-        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        timeout_s = (
+            self.server_args.req_running_timeout
+            if self.server_args.req_running_timeout is not None
+            else envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        )
         if timeout_s <= 0:
             return
         if self.running_batch.is_empty():
@@ -1630,6 +1634,7 @@ class Scheduler(
             get_last_forward_mode=lambda: (
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
+            filter_recv_reqs_on_queue_limit=self._filter_recv_reqs_on_queue_limit,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2211,8 +2216,86 @@ class Scheduler(
             return False
         return True
 
+    def _filter_recv_reqs_on_queue_limit(self, recv_reqs):
+        """Drop overflow on rank 0 before broadcast. Priority eviction stays in _abort_on_queued_limit."""
+        if (
+            self.max_queued_requests is None
+            or self.disaggregation_mode != DisaggregationMode.NULL
+            or self.enable_priority_scheduling
+        ):
+            return recv_reqs
+
+        survivors = []
+        pending_admits = 0
+        current_queue_len = len(self.waiting_queue)
+
+        def _can_admit() -> bool:
+            return current_queue_len + pending_admits + 1 <= self.max_queued_requests
+
+        for item in recv_reqs:
+            if isinstance(item, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                # Health checks don't enter waiting_queue; don't count them.
+                if is_health_check_generate_req(item):
+                    survivors.append(item)
+                elif _can_admit():
+                    survivors.append(item)
+                    pending_admits += 1
+                else:
+                    self._reject_for_queue_full(item)
+            elif isinstance(
+                item,
+                (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+            ):
+                admitted_subs = []
+                for sub in item:
+                    if is_health_check_generate_req(sub):
+                        admitted_subs.append(sub)
+                    elif _can_admit():
+                        admitted_subs.append(sub)
+                        pending_admits += 1
+                    else:
+                        self._reject_for_queue_full(sub)
+                if admitted_subs:
+                    item.batch = admitted_subs
+                    survivors.append(item)
+            else:
+                survivors.append(item)
+        return survivors
+
+    def _reject_for_queue_full(self, item) -> None:
+        """AbortReq plus shm unlink for a rank-0 queue-full reject."""
+        try:
+            unwrap_shm_features(item)
+        except Exception as e:
+            logging.warning("unwrap_shm_features failed on rejected req: %r", e)
+        rid = getattr(item, "rid", None)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": "The request queue is full.",
+                },
+                rid=rid,
+            ),
+            item,
+        )
+        logging.warning(
+            "queue abort (rank 0 pre-broadcast) rid=%s waiting_queue_len=%d max_queued_requests=%s",
+            rid,
+            len(self.waiting_queue),
+            self.max_queued_requests,
+        )
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
+        # Rank 0 is the authoritative admission gate; non-primary ranks trust it.
+        if not (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            return False
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
@@ -2257,6 +2340,13 @@ class Scheduler(
             ),
             req_to_abort,
         )
+        logging.warning(
+            "queue abort rid=%s waiting_queue_len=%d max_queued_requests=%s message=%s",
+            req_to_abort.rid,
+            len(self.waiting_queue),
+            self.max_queued_requests,
+            message,
+        )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
@@ -2282,6 +2372,13 @@ class Scheduler(
                         rid=req.rid,
                     ),
                     req,
+                )
+                logging.warning(
+                    "waiting timeout abort rid=%s waited_s=%.3f timeout_s=%.3f waiting_queue_len=%d",
+                    req.rid,
+                    time.perf_counter() - entry_time,
+                    timeout_s,
+                    len(self.waiting_queue),
                 )
                 deleted_reqs.add(req)
 
@@ -3581,6 +3678,7 @@ class Scheduler(
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",
+                "req_running_timeout",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
             ]

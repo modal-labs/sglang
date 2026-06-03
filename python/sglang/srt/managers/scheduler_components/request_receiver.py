@@ -56,6 +56,7 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
+    filter_recv_reqs_on_queue_limit: Callable[[List], List]
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -75,6 +76,14 @@ class SchedulerRequestReceiver:
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
+
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+            and recv_reqs is not None
+        ):
+            recv_reqs = self.filter_recv_reqs_on_queue_limit(recv_reqs)
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
 

@@ -278,15 +278,67 @@ class SchedulerInvariantChecker:
 def create_scheduler_watchdog(
     scheduler: "Scheduler", watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
+    def _safe_len(value):
+        if value is None:
+            return 0
+        try:
+            return len(value)
+        except TypeError:
+            return None
+
+    def _summarize_req(req) -> str:
+        mm_inputs = getattr(req, "multimodal_inputs", None)
+        mm_items = getattr(mm_inputs, "mm_items", None) if mm_inputs else None
+        sampling_params = getattr(req, "sampling_params", None)
+        finished_reason = getattr(req, "finished_reason", None)
+        to_finish = getattr(req, "to_finish", None)
+
+        return (
+            "Req("
+            f"rid={getattr(req, 'rid', None)}, "
+            f"input_len={_safe_len(getattr(req, 'origin_input_ids', None))}, "
+            f"unpadded_input_len={_safe_len(getattr(req, 'origin_input_ids_unpadded', None))}, "
+            f"fill_len={_safe_len(getattr(req, 'fill_ids', None))}, "
+            f"output_len={_safe_len(getattr(req, 'output_ids', None))}, "
+            f"prefix_len={_safe_len(getattr(req, 'prefix_indices', None))}, "
+            f"extend_input_len={getattr(req, 'extend_input_len', None)}, "
+            f"cached_tokens={getattr(req, 'cached_tokens', None)}, "
+            f"mm_items={_safe_len(mm_items)}, "
+            f"stream={getattr(req, 'stream', None)}, "
+            f"req_pool_idx={getattr(req, 'req_pool_idx', None)}, "
+            f"kv_allocated_len={getattr(req, 'kv_allocated_len', None)}, "
+            f"kv_committed_len={getattr(req, 'kv_committed_len', None)}, "
+            f"finished_reason={type(finished_reason).__name__ if finished_reason else None}, "
+            f"to_finish={type(to_finish).__name__ if to_finish else None}, "
+            f"max_new_tokens={getattr(sampling_params, 'max_new_tokens', None)}"
+            ")"
+        )
+
     def dump_info() -> str:
         if scheduler.is_initializing:
             return ""
         _, messages = scheduler.invariant_checker._check_all_pools(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
+        cur_batch = scheduler.cur_batch
+        if cur_batch is None:
+            return "\n".join(messages)
+
+        reqs = getattr(cur_batch, "reqs", [])
+        req_summaries = ",\n  ".join(_summarize_req(req) for req in reqs)
+        input_ids = getattr(cur_batch, "input_ids", None)
+        input_ids_shape = tuple(input_ids.shape) if input_ids is not None else None
+        forward_mode = getattr(cur_batch, "forward_mode", None)
+        seq_lens_sum = getattr(cur_batch, "seq_lens_sum", None)
+        extend_num_tokens = getattr(cur_batch, "extend_num_tokens", None)
         return (
-            f"{scheduler.cur_batch.batch_size()=}\n"
-            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
+            f"scheduler.cur_batch.batch_size()={cur_batch.batch_size()}\n"
+            f"scheduler.cur_batch.forward_mode={forward_mode}\n"
+            f"scheduler.cur_batch.seq_lens_sum={seq_lens_sum}\n"
+            f"scheduler.cur_batch.extend_num_tokens={extend_num_tokens}\n"
+            f"scheduler.cur_batch.input_ids_shape={input_ids_shape}\n"
+            f"scheduler.cur_batch.reqs=[\n  {req_summaries}\n]\n"
+            + "\n".join(messages)
         )
 
     return WatchdogRaw(
