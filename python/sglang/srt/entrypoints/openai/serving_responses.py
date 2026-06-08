@@ -72,6 +72,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _should_emit_normal_text_as_message(
+    text: str, *, any_tool_call_in_progress: bool
+) -> bool:
+    """Pure predicate: should `text` open / extend a user-visible message item?
+
+    The qwen3-coder tool-call grammar emits `\\n` separators between adjacent
+    `<tool_call>...</tool_call>` blocks. The streaming detector cannot tell
+    those whitespace bytes apart from genuine message content, so the serving
+    layer applies a structural rule: while any tool call is still open,
+    whitespace-only `normal_text` fragments are inter-call separators and must
+    not open a message output item.
+    """
+    if not text:
+        return False
+    if any_tool_call_in_progress and not text.strip():
+        return False
+    return True
+
+
 def _normalize_function_tools_for_chat_parser(tools: list[Any] | None) -> list[Tool]:
     """Convert Responses function tools to chat-style Tool objects."""
     normalized_tools: list[Tool] = []
@@ -1344,6 +1363,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             if state is None:
                 events = _start_simple_tool_call(call_item)
                 state = _simple_tool_call_states[call_item.tool_index]
+            elif state["done"]:
+                # Defensive: a finalized tool-call state is closed for writes.
+                # The streaming loop is structured to drain argument fragments
+                # before finalizing, so this branch should be unreachable in
+                # practice; the guard prevents future ordering quirks from
+                # resurrecting a closed output_index with an orphan delta.
+                return []
             else:
                 events = []
 
@@ -1451,7 +1477,36 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         normal_text, calls = delta, []
 
-                    if normal_text:
+                    # Drain tool-call updates from this chunk BEFORE handling
+                    # normal_text. The detector returns (calls, normal_text) as
+                    # a flat pair, losing source-order information across the
+                    # two buckets; on a `</function>\n</tool_call>\n` boundary
+                    # the trailing `}` for the previous tool lands in calls[]
+                    # while the inter-call `\n` lands in normal_text. Handling
+                    # normal_text first would finalize the previous tool with
+                    # truncated arguments and emit a late args.delta against an
+                    # already-closed output_index.
+                    for call_item in calls:
+                        if call_item.name:
+                            for event in _finish_simple_text_item():
+                                yield event
+                            if call_item.tool_index not in _simple_tool_call_states:
+                                for event in _finish_simple_tool_calls(
+                                    exclude_tool_index=call_item.tool_index
+                                ):
+                                    yield event
+                            for event in _start_simple_tool_call(call_item):
+                                yield event
+                        for event in _append_simple_tool_call_arguments(call_item):
+                            yield event
+
+                    if _should_emit_normal_text_as_message(
+                        normal_text,
+                        any_tool_call_in_progress=any(
+                            not s["done"]
+                            for s in _simple_tool_call_states.values()
+                        ),
+                    ):
                         for event in _finish_simple_tool_calls():
                             yield event
                         for event in _start_simple_text_item():
@@ -1468,17 +1523,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 logprobs=[],
                             )
                         )
-                    for call_item in calls:
-                        if call_item.name:
-                            for event in _finish_simple_text_item():
-                                yield event
-                            if call_item.tool_index not in _simple_tool_call_states:
-                                for event in _finish_simple_tool_calls():
-                                    yield event
-                            for event in _start_simple_tool_call(call_item):
-                                yield event
-                        for event in _append_simple_tool_call_arguments(call_item):
-                            yield event
 
                 if finish_reason and not _simple_stream_finalized:
                     _simple_stream_finalized = True
