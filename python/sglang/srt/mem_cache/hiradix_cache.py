@@ -48,6 +48,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.mla_host_dedup import (
+    is_mla_dedup_dummy_rank,
+    maybe_prebuild_mla_host_dedup,
+)
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -83,6 +87,18 @@ class HiRadixCache(RadixCache):
 
         allocator_type = get_allocator_type(server_args)
 
+        # Rendezvous the dedup process groups BEFORE the slow host KV alloc;
+        # otherwise rank 0's multi-minute pin races the dummy ranks into the
+        # 600s NCCL watchdog (see maybe_prebuild_mla_host_dedup).
+        self._mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
+            self.kv_cache,
+            params.tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            server_args.hicache_storage_backend,
+            server_args.enable_mla_hicache_host_dedup,
+        )
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
@@ -111,6 +127,12 @@ class HiRadixCache(RadixCache):
                 allocator_type=allocator_type,
                 dcp_size=(_parallel.attn_dcp_size if _parallel.dcp_enabled else 1),
                 dcp_rank=(_parallel.attn_dcp_rank if _parallel.dcp_enabled else 0),
+                # Allocator-only on non-src dedup ranks (see mla_host_dedup).
+                is_dummy=is_mla_dedup_dummy_rank(
+                    self.kv_cache,
+                    server_args.hicache_storage_backend,
+                    server_args.enable_mla_hicache_host_dedup,
+                ),
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
@@ -148,6 +170,7 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
+                mla_dedup_prebuild=self._mla_dedup_prebuild,
             )
         elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -180,6 +203,10 @@ class HiRadixCache(RadixCache):
                 model_name=server_args.served_model_name,
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=self.enable_storage_metrics,
+                mla_dedup_prebuild=self._mla_dedup_prebuild,
+                enable_mla_hicache_host_dedup=(
+                    server_args.enable_mla_hicache_host_dedup
+                ),
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -314,6 +341,10 @@ class HiRadixCache(RadixCache):
                 self.detach_storage_backend()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+        try:
+            self.cache_controller._destroy_mla_broadcast_group()
+        except Exception:
+            logger.exception("Failed to destroy MLA broadcast group.")
 
     def _apply_storage_runtime_config(
         self,
