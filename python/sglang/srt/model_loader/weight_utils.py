@@ -1036,7 +1036,11 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
+        # GDS/cuFile needs the nvidia-fs driver, absent under gVisor — the default path then
+        # fails at open ("Error opening file"). nogds reads via O_DIRECT + a host bounce
+        # buffer instead. Env-gated so the GDS default is preserved off-sandbox.
+        nogds = os.environ.get("SGLANG_FASTSAFETENSORS_NOGDS", "0") == "1"
+        loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:

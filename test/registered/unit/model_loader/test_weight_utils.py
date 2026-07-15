@@ -4,7 +4,9 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
+from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.weight_utils import filter_duplicate_safetensors_files
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,6 +84,72 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
             index_file=INDEX_NAME,
         )
         self.assertEqual(result, [single])
+
+
+class TestFastsafetensorsNoGDS(CustomTestCase):
+    def test_nogds_is_enabled_only_by_exact_env_value(self):
+        loader_calls = []
+
+        class FakeProcessGroup:
+            def rank(self):
+                return 0
+
+            def size(self):
+                return 1
+
+        class FakeFileBuffer:
+            def __init__(self):
+                self.key_to_rank_lidx = {}
+
+        class FakeLoader:
+            def __init__(self, process_group, device, *, nogds):
+                loader_calls.append(nogds)
+
+            def add_filenames(self, rank_file_map):
+                pass
+
+            def copy_files_to_device(self):
+                return FakeFileBuffer()
+
+            def close(self):
+                pass
+
+        def run_with_env(value):
+            if value is None:
+                os.environ.pop("SGLANG_FASTSAFETENSORS_NOGDS", None)
+            else:
+                os.environ["SGLANG_FASTSAFETENSORS_NOGDS"] = value
+
+            with (
+                mock.patch.object(weight_utils, "SafeTensorsFileLoader", FakeLoader),
+                mock.patch.object(
+                    weight_utils, "SingleGroup", return_value=FakeProcessGroup()
+                ),
+                mock.patch.object(
+                    weight_utils.torch.distributed,
+                    "is_initialized",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    weight_utils,
+                    "tqdm",
+                    side_effect=lambda iterable, **_: iterable,
+                ),
+            ):
+                list(
+                    weight_utils.fastsafetensors_weights_iterator(["model.safetensors"])
+                )
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for value, expected in (
+                (None, False),
+                ("0", False),
+                ("true", False),
+                ("1", True),
+            ):
+                with self.subTest(value=value):
+                    run_with_env(value)
+                    self.assertEqual(loader_calls[-1], expected)
 
 
 if __name__ == "__main__":
