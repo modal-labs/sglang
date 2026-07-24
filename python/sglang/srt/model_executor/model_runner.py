@@ -1187,14 +1187,24 @@ class ModelRunner:
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
+        is_draft_worker = getattr(self, "is_draft_worker", False)
+        draft_kv_cache_dtype = getattr(
+            self.server_args, "speculative_draft_kv_cache_dtype", None
+        )
+        using_draft_kv_override = is_draft_worker and draft_kv_cache_dtype is not None
+        requested_kv_cache_dtype = kv_cache_dtype.select_kv_cache_dtype(
+            target_kv_cache_dtype=self.server_args.kv_cache_dtype,
+            draft_kv_cache_dtype=draft_kv_cache_dtype,
+            is_draft_worker=is_draft_worker,
+        )
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 # RAW user intent = resolver INPUT; server_args stays pristine
                 # so read it here -- not the resolved get_model() bag.
-                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
+                server_args_kv_cache_dtype=requested_kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
-                is_draft_worker=getattr(self, "is_draft_worker", False),
+                is_draft_worker=is_draft_worker,
                 is_dflash=(
                     spec_algorithm.is_dflash_family()
                     if spec_algorithm is not None
@@ -1212,9 +1222,9 @@ class ModelRunner:
         self.kv_cache_dtype_str = (
             resolved_kv_cache_dtype
             if resolved_kv_cache_dtype is not None
-            else self.server_args.kv_cache_dtype
+            else requested_kv_cache_dtype
         )
-        if resolved_kv_cache_dtype is not None:
+        if resolved_kv_cache_dtype is not None and not using_draft_kv_override:
             self._record_kv_cache_dtype(resolved_kv_cache_dtype)
 
     def _get_attention_backend(self, init_new_workspace: bool = False):

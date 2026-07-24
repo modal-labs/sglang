@@ -19,6 +19,18 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 }
 
 
+def select_kv_cache_dtype(
+    *,
+    target_kv_cache_dtype: str,
+    draft_kv_cache_dtype: Optional[str],
+    is_draft_worker: bool,
+) -> str:
+    """Select the target or explicit draft-pool storage dtype."""
+    if is_draft_worker and draft_kv_cache_dtype is not None:
+        return draft_kv_cache_dtype
+    return target_kv_cache_dtype
+
+
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,
