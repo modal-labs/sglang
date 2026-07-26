@@ -521,6 +521,22 @@ class Scheduler(
             page_size=self.page_size,
         )
 
+        # Slot-keyed DFLASH draft ring: cached draft context cannot be reused
+        # across prefix-cache resumes, so radix matches are capped by a
+        # ring-sized tail (match_prefix_for_req) -- the re-prefilled tail's
+        # captured hidden states rebuild the drafter's window through the
+        # ordinary extend path. Without this, resumed requests draft blind
+        # until `window` fresh tokens accumulate.
+        if getattr(self.draft_worker, "use_draft_ring", False):
+            self.tree_cache.dflash_draft_ring_reprefill_tail_tokens = int(
+                self.draft_worker.draft_ring_tokens
+            )
+            logger.info(
+                "DFLASH draft ring: capping prefix-cache matches by %s tail "
+                "tokens (cache-hit resumes re-prefill the drafter window).",
+                self.draft_worker.draft_ring_tokens,
+            )
+
         # Init running status
         self.init_running_status()
 

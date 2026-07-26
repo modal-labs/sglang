@@ -2164,6 +2164,11 @@ class ServerArgs:
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
         NS("spec"),
     ] = None
+    speculative_dflash_draft_ring: A[
+        bool,
+        "EXPERIMENTAL, DFLASH only, requires --speculative-draft-window-size. Keep the draft model's KV in a fixed per-request ring sized to the draft window (own small allocation with a static request->slot map) instead of sharing the target's global KV index space. Frees pool-sized draft KV back to the target; costs a ring-sized tail re-prefill on every prefix-cache-hit resume (the ring is slot-keyed, so cached draft context cannot be reused). Prefer for memory-tight or long-context deployments with low prefix-hit traffic; the default shared-index compact cache remains better for cache-heavy multi-turn serving.",
+        NS("spec"),
+    ] = False
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(
@@ -3613,6 +3618,7 @@ class ServerArgs:
 
         # Needs the draft-token count derived just above.
         self._validate_linear_replayssm_spec_ring()
+        self._validate_dflash_draft_ring()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -6156,6 +6162,35 @@ class ServerArgs:
                 "--linear-replayssm-cache-len must be >= 2 * the maximum "
                 "speculative draft-token count for the spec-verify ring "
                 f"(early-flush margin), got {ring_len} < {2 * max_drafts}."
+            )
+
+    def _validate_dflash_draft_ring(self):
+        """--speculative-dflash-draft-ring preconditions.
+
+        The ring is sized from the draft window plus the draft block width, so
+        both must be known here; DFLASH is the only drafter with the ring's
+        write pattern (monotone prefix, block writes at the tail). Runs after
+        handle_speculative_decoding() so the draft-token count is final.
+        """
+        if not self.speculative_dflash_draft_ring:
+            return
+        algo = (self.speculative_algorithm or "").upper()
+        if algo != "DFLASH":
+            raise ValueError(
+                "--speculative-dflash-draft-ring is DFLASH-only, got "
+                f"speculative_algorithm={self.speculative_algorithm!r}."
+            )
+        if not self.speculative_draft_window_size:
+            raise ValueError(
+                "--speculative-dflash-draft-ring requires "
+                "--speculative-draft-window-size (the ring is sized to the "
+                "draft window; full-history drafters cannot ride a ring)."
+            )
+        if not self.speculative_num_draft_tokens:
+            raise ValueError(
+                "--speculative-dflash-draft-ring requires a resolved "
+                "--speculative-num-draft-tokens (ring capacity covers "
+                "window + draft block)."
             )
 
     def _handle_legacy_cp_arguments(self):

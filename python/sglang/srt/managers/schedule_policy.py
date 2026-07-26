@@ -105,6 +105,14 @@ def match_prefix_for_req(
     # the match by the trailing sliding window so it gets re-prefilled, rewriting
     # this request's SWA ring. No-op for other layouts.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    # Same contract for the slot-keyed DFLASH draft ring (set by the scheduler
+    # when --speculative-dflash-draft-ring is on): the ring cannot reuse cached
+    # draft context, so hold back a ring-sized tail for re-prefill.
+    ring_tail = int(
+        getattr(tree_cache, "dflash_draft_ring_reprefill_tail_tokens", 0) or 0
+    )
+    if ring_tail > reprefill_tail:
+        reprefill_tail = ring_tail
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
 
     match_result = tree_cache.match_prefix(

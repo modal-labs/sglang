@@ -807,3 +807,40 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
     return None
+
+
+def compute_dflash_draft_ring_geometry(
+    *,
+    draft_window_size: int,
+    block_size: int,
+    page_size: int,
+) -> Tuple[int, int]:
+    """Ring geometry for --speculative-dflash-draft-ring.
+
+    Returns (ring_tokens, ctx_keep_tokens).
+
+    Live ring span per request at any instant: `draft_window_size` readable
+    ctx tokens, up to one page of left-alignment slack (paged backends keep
+    the window start page-aligned), plus one draft block written past the
+    prefix at verify. ring_tokens is page-aligned so the static
+    position -> ring-slot map (slot = pos % ring_tokens) preserves local
+    page structure.
+
+    ctx_keep_tokens caps each request's ctx-KV write to the chunk's last
+    window+page positions: ctx writes are a parallel scatter, so positions p
+    and p + ring_tokens would race for one slot; keep + block <= ring_tokens
+    makes every batch collision-free while every future read window is still
+    fully covered.
+    """
+    if draft_window_size <= 0:
+        raise ValueError(
+            f"draft ring needs a positive draft window, got {draft_window_size}."
+        )
+    if block_size <= 0:
+        raise ValueError(f"draft ring needs a positive block size, got {block_size}.")
+    page = max(int(page_size), 1)
+    keep = int(draft_window_size) + page
+    need = keep + int(block_size)
+    ring_tokens = -(-need // page) * page
+    assert keep + int(block_size) <= ring_tokens
+    return ring_tokens, keep
