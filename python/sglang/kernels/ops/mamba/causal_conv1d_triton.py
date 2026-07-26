@@ -15,7 +15,7 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 PAD_SLOT_ID = -1
 
 
-@triton.jit(do_not_specialize=["seqlen"])
+@triton.jit(do_not_specialize=["seqlen", "stride_o_token"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -41,7 +41,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_istate_token: tl.constexpr,
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
-    stride_o_token: tl.constexpr,
+    # A one-token view sliced from K3's fused [q, k, v, g] projection is
+    # considered dense, so ``empty_like`` preserves the parent row pitch.
+    # Multi-token views get a compact output instead.  Keep this stride
+    # runtime-valued so those two layouts share one precompiled kernel.
+    stride_o_token,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters

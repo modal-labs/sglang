@@ -31,7 +31,10 @@ def _jit_does_not_specialize(kernel, arg_name: str) -> bool:
         ),
         (memory_common.get_last_loc_kernel, ("num_tokens",)),
         (memory_common._get_last_loc_safe_kernel, ("num_tokens",)),
-        (causal_conv1d_triton._causal_conv1d_fwd_kernel, ("seqlen",)),
+        (
+            causal_conv1d_triton._causal_conv1d_fwd_kernel,
+            ("seqlen", "stride_o_token"),
+        ),
         (
             fused_kv_materialize._fused_norm_rope_kernel_stacked,
             ("total_ctx", "k_out_stride_layer", "v_out_stride_layer"),
@@ -41,6 +44,40 @@ def _jit_does_not_specialize(kernel, arg_name: str) -> bool:
 )
 def test_k3_runtime_shape_scalars_do_not_create_jit_variants(kernel, arg_names):
     assert all(_jit_does_not_specialize(kernel, name) for name in arg_names)
+
+
+def test_fused_kv_precompile_uses_compile_only_live_geometry(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        fused_kv_materialize._fused_norm_rope_kernel_stacked,
+        "warmup",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    helper = object.__new__(fused_kv_materialize.FusedKVMaterializeHelper)
+    helper.n_layers = 6
+    helper.num_kv_heads = 8
+    helper.head_dim = 128
+    helper.kv_size = 1024
+    helper.layer_out_dim = 2048
+    helper.rotary_dim = 128
+    helper.device = torch.device("cpu")
+    helper.max_position_hint = 0
+    helper._reserved_rope_cache_len = 1
+    helper.flat_kv_weight_t = torch.empty((1, 6 * 2048), dtype=torch.bfloat16)
+    helper.k_norm_weights = torch.empty((6, 128), dtype=torch.bfloat16)
+    helper.eps_values = torch.empty((6,), dtype=torch.float32)
+    helper.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty((1, 128)))
+
+    helper.precompile()
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0].shape == (1, 6, 2048)
+    assert args[5].shape == (6, 1, 8, 128)
+    assert args[7:9] == (12288, 2048)
+    assert args[11:14] == (1024, 1024, 128)
+    assert kwargs["grid"] == (1, 8, 6)
 
 
 def test_paged_allocator_uses_one_config_derived_batch_bound():

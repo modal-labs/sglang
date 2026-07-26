@@ -107,6 +107,41 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _precompile_fused_kv_helper_tp(helper, tp_rank: int, tp_group) -> None:
+    """Populate on rank zero, load on peers, and fail every rank together."""
+
+    rank_zero_error = None
+    if tp_rank == 0:
+        try:
+            helper.precompile()
+        except Exception as exc:
+            rank_zero_error = f"{type(exc).__name__}: {exc}"
+    if tp_group.world_size > 1:
+        rank_zero_error = tp_group.broadcast_object(rank_zero_error, src=0)
+    if rank_zero_error is not None:
+        raise RuntimeError(
+            "DFLASH fused KV Triton precompile failed on TP rank 0: "
+            f"{rank_zero_error}"
+        )
+
+    peer_error = None
+    if tp_rank != 0:
+        try:
+            helper.precompile()
+        except Exception as exc:
+            peer_error = f"rank={tp_rank} {type(exc).__name__}: {exc}"
+    peer_errors = (
+        tp_group.all_gather_object(peer_error)
+        if tp_group.world_size > 1
+        else [peer_error]
+    )
+    peer_errors = [error for error in peer_errors if error is not None]
+    if peer_errors:
+        raise RuntimeError(
+            "DFLASH fused KV Triton artifact load failed: " + "; ".join(peer_errors)
+        )
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -636,14 +671,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_position_hint=self.target_worker.model_runner.model_config.context_len
                 + int(self.block_size),
             )
-            if self.ps.tp_rank == 0:
-                logger.info(
-                    "DFLASH fused KV materialization enabled. "
-                    "n_layers=%d, num_kv_heads=%d, head_dim=%d",
-                    len(layers),
-                    first_attn.num_kv_heads,
-                    first_attn.head_dim,
-                )
         except Exception as e:
             logger.warning(
                 "DFLASH fused KV initialization failed, falling back to sequential path: %s",
@@ -651,6 +678,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
+            return
+
+        # Compilation is deliberately outside the eligibility/fallback catch:
+        # readiness must fail closed if this serving-path kernel cannot be
+        # compiled.  Rank zero reports its result before peers try to load the
+        # shared artifact, avoiding a peer hanging at a barrier on rank-zero
+        # failure.
+        _precompile_fused_kv_helper_tp(
+            self._fused_kv_helper,
+            self.ps.tp_rank,
+            get_tp_group(),
+        )
+
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DFLASH fused KV materialization enabled. "
+                "n_layers=%d, num_kv_heads=%d, head_dim=%d; "
+                "fused_norm_rope_triton=ready",
+                len(layers),
+                first_attn.num_kv_heads,
+                first_attn.head_dim,
+            )
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
@@ -1427,17 +1476,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.mamba_track_indices is not None:
             mamba_track_interval = self.server_args.mamba_track_interval
-            seq_lens_post_verify = (
-                seq_lens_pre_verify + commit_lens.to(seq_lens_pre_verify.dtype)
+            seq_lens_post_verify = seq_lens_pre_verify + commit_lens.to(
+                seq_lens_pre_verify.dtype
             )
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
             )
             tracking_point = (
-                seq_lens_post_verify
-                // mamba_track_interval
-                * mamba_track_interval
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             can_track_mask = to_track_mask & (

@@ -10,11 +10,48 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+from sglang.srt.speculative.dflash_worker_v2 import (
+    DFlashWorkerV2,
+    _precompile_fused_kv_helper_tp,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestDFlashFusedKVPrecompile(unittest.TestCase):
+    @staticmethod
+    def _group(*, broadcast_result=None, gathered=None):
+        return SimpleNamespace(
+            world_size=8,
+            broadcast_object=Mock(return_value=broadcast_result),
+            all_gather_object=Mock(
+                side_effect=lambda value: gathered or [None] * 7 + [value]
+            ),
+        )
+
+    def test_rank_zero_compile_failure_is_broadcast_and_raised(self):
+        helper = SimpleNamespace(precompile=Mock(side_effect=ValueError("compile")))
+        group = self._group(broadcast_result="ValueError: compile")
+
+        with self.assertRaisesRegex(RuntimeError, "failed on TP rank 0"):
+            _precompile_fused_kv_helper_tp(helper, 0, group)
+
+        group.broadcast_object.assert_called_once_with("ValueError: compile", src=0)
+        group.all_gather_object.assert_not_called()
+
+    def test_peer_artifact_load_failure_is_raised(self):
+        helper = SimpleNamespace(precompile=Mock(side_effect=ValueError("load")))
+        group = self._group(
+            broadcast_result=None,
+            gathered=[None, "rank=1 ValueError: load"] + [None] * 6,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "artifact load failed"):
+            _precompile_fused_kv_helper_tp(helper, 1, group)
+
+        helper.precompile.assert_called_once()
 
 
 class TestDFlashMambaLazyValidation(CustomTestCase):

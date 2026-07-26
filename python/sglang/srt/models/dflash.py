@@ -408,6 +408,17 @@ class DFlashDraftModel(nn.Module):
 
         self.block_size = draft_config.resolve_block_size(default=16)
 
+    def precompile_runtime_kernels(self, model_runner) -> None:
+        """Compile DFlash request-table kernels against the draft pool pitch."""
+        from sglang.srt.model_executor.k3_runtime_kernel_precompile import (
+            precompile_k3_runtime_kernels,
+        )
+
+        precompile_k3_runtime_kernels(
+            model_runner,
+            include_kimi_hybrid=False,
+        )
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
 

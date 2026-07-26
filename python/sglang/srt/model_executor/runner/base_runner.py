@@ -223,6 +223,10 @@ class BaseRunner(ABC):
         if mr.device != "cuda":
             return
 
+        precompile_runtime = getattr(mr.model, "precompile_runtime_kernels", None)
+        if precompile_runtime is not None:
+            precompile_runtime(mr)
+
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
 

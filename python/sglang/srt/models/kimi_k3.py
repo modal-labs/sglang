@@ -3552,6 +3552,17 @@ class KimiK3LinearForCausalLM(nn.Module):
                 f"elapsed={time.perf_counter() - tic:.2f}s."
             )
 
+    def precompile_runtime_kernels(self, model_runner) -> None:
+        """Compile request-path kernels once the live KV/state pools exist."""
+        from sglang.srt.model_executor.k3_runtime_kernel_precompile import (
+            precompile_k3_runtime_kernels,
+        )
+
+        precompile_k3_runtime_kernels(
+            model_runner,
+            include_kimi_hybrid=True,
+        )
+
 
 # ---------------------------------------------------------------------------
 # KimiK3ForConditionalGeneration — multimodal wrapper
@@ -3626,6 +3637,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Prepared Kimi-K3 vision attention kernels "
                 "(persistent Triton autotune at 448x448; FA4 when available)"
             )
+
+    def precompile_runtime_kernels(self, model_runner) -> None:
+        if self.language_model is not None:
+            self.language_model.precompile_runtime_kernels(model_runner)
 
     def get_input_embeddings(self):
         if self.language_model is None:

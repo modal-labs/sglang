@@ -392,6 +392,63 @@ class FusedKVMaterializeHelper:
         self._workspace_capacity = new_capacity
         self._workspace_dtype = dtype
 
+    def precompile(self) -> None:
+        """Compile the fused normalization/RoPE kernel without executing it.
+
+        All pointer dtypes and strides come from the helper's stacked live
+        weights and model geometry.  A one-element positions tensor is the
+        only temporary allocation; no serving request or context-size bucket
+        is manufactured.
+        """
+
+        total_ctx = 1
+        flat = self.flat_kv_weight_t.reshape(-1)
+        kv_numel = self.n_layers * self.layer_out_dim
+        kv = flat[:kv_numel].view(total_ctx, self.n_layers, self.layer_out_dim)
+        out_numel = self.n_layers * self.num_kv_heads * self.head_dim
+        k_out = flat[:out_numel].view(
+            self.n_layers,
+            total_ctx,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        v_out = k_out
+        positions = torch.empty((total_ctx,), dtype=torch.int64, device=self.device)
+        cos_sin_cache = self._ensure_rope_cache(
+            self.max_position_hint if self.max_position_hint is not None else 0
+        )
+
+        half_rotary_dim = self.rotary_dim // 2
+        block_hd = triton.next_power_of_2(self.head_dim)
+        _fused_norm_rope_kernel_stacked.warmup(
+            kv,
+            self.k_norm_weights,
+            self.eps_values,
+            cos_sin_cache,
+            positions,
+            k_out,
+            v_out,
+            kv.stride(0),
+            kv.stride(1),
+            self.k_norm_weights.stride(0),
+            cos_sin_cache.stride(0),
+            k_out.stride(0),
+            k_out.stride(1),
+            k_out.stride(2),
+            v_out.stride(0),
+            v_out.stride(1),
+            v_out.stride(2),
+            total_ctx,
+            self.n_layers,
+            self.num_kv_heads,
+            self.head_dim,
+            self.kv_size,
+            self.rotary_dim,
+            half_rotary_dim,
+            block_hd,
+            grid=(total_ctx, self.num_kv_heads, self.n_layers),
+        )
+
     def materialize(
         self,
         ctx_hidden: torch.Tensor,
