@@ -10,6 +10,9 @@ from sglang.kernels.ops.attention.fla import (
 )
 from sglang.kernels.ops.attention.fla import kda as kda_ops
 from sglang.srt.models import kimi_k3
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _unwrap_autotuner(kernel):

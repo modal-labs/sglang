@@ -39,7 +39,7 @@ from sglang.srt.mem_cache.allocator.paged import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
-from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
+from sglang.srt.utils.common import get_num_new_pages
 
 logger = logging.getLogger(__name__)
 
@@ -891,7 +891,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     self.free_virtual_ids,
                     out_indices,
-                    next_power_of_2(bs),
+                    self.triton_batch_size_upper_bound(bs),
                     self.page_size,
                 )
 
@@ -950,7 +950,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     self.free_virtual_ids,
                     out_indices,
-                    next_power_of_2(bs),
+                    self.triton_batch_size_upper_bound(bs),
                     self.page_size,
                 )
 

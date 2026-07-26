@@ -411,6 +411,17 @@ class KVCacheConfigurator:
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        # alloc_extend/alloc_decode use a constexpr reduction width. Pin it to
+        # the configured request-pool capacity so BS1/4/16 do not each produce
+        # another Triton artifact. Composite allocators propagate this to the
+        # child that owns the paged allocation kernels.
+        set_batch_bound = getattr(
+            token_to_kv_pool_allocator,
+            "set_triton_batch_size_upper_bound",
+            None,
+        )
+        if set_batch_bound is not None:
+            set_batch_bound(sizes.max_running_requests)
 
         # Defensive check: the explicit validation above should reject known
         # unsupported pool families before allocation. Keep this guard here so

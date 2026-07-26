@@ -23,7 +23,13 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "total_ctx",
+        "k_out_stride_layer",
+        "v_out_stride_layer",
+    ]
+)
 def _fused_norm_rope_kernel_stacked(
     kv_ptr,  # [total_ctx, n_layers, kv_size * 2]
     k_norm_weight_ptr,  # [n_layers, head_dim]

@@ -56,7 +56,7 @@ def write_req_to_token_pool_triton(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _get_last_loc_safe_kernel(
     req_to_token,
     req_pool_indices_tensor,
@@ -117,7 +117,7 @@ def get_last_loc_triton_safe(
     return result_i32.to(prefix_lens_tensor.dtype)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def get_last_loc_kernel(
     req_to_token,
     req_pool_indices_tensor,

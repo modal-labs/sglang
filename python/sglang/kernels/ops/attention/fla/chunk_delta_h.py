@@ -51,7 +51,7 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
     key=["H", "K", "V", "BT", "USE_GK"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "stride_init_state"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
     v,
@@ -325,9 +325,9 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert not (use_exp2 and g is not None), (
-        "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
-    )
+    assert not (
+        use_exp2 and g is not None
+    ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE

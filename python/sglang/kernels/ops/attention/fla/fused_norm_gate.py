@@ -22,7 +22,7 @@ _use_cpu = is_cpu() and cpu_has_amx_support()
 MAX_ROWS_PER_BLOCK = 4
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def layer_norm_gated_fwd_kernel(
     x,  # pointer to the input
     g,  # pointer to the gate

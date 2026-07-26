@@ -46,6 +46,60 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        # Paged allocation kernels need a compile-time width for their prefix
+        # reductions.  Once the request pool has been sized, the configurator
+        # installs one capacity-derived width here so different serving batch
+        # sizes do not create distinct Triton artifacts.
+        self._triton_batch_size_upper_bound = None
+
+    def set_triton_batch_size_upper_bound(self, max_batch_size: int) -> None:
+        """Use one config-derived Triton reduction width for this allocator.
+
+        Composite allocators delegate alloc_extend/alloc_decode to child
+        allocators, so propagate the bound through the small set of allocator
+        child surfaces as well. This is a compile-shape bound only; the runtime
+        grid remains the actual batch size.
+        """
+        max_batch_size = int(max_batch_size)
+        if max_batch_size <= 0:
+            raise ValueError(f"max_batch_size must be positive, got {max_batch_size}")
+        new_bound = 1 << (max_batch_size - 1).bit_length()
+        # A draft worker may share the target allocator and configure it later.
+        # Never shrink a bound that another runner in the process already owns.
+        self._triton_batch_size_upper_bound = max(
+            self._triton_batch_size_upper_bound or 0,
+            new_bound,
+        )
+
+        for child_name in (
+            "full_attn_allocator",
+            "swa_attn_allocator",
+            "mamba_allocator",
+            "logical_attn_allocator",
+            "hisparse_attn_allocator",
+        ):
+            child = getattr(self, child_name, None)
+            if (
+                child is not None
+                and child is not self
+                and hasattr(child, "set_triton_batch_size_upper_bound")
+            ):
+                child.set_triton_batch_size_upper_bound(max_batch_size)
+
+    def triton_batch_size_upper_bound(self, batch_size: int) -> int:
+        """Return the stable configured width, or preserve legacy fallback."""
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        bound = self._triton_batch_size_upper_bound
+        if bound is None:
+            return 1 << (batch_size - 1).bit_length()
+        if batch_size > bound:
+            raise RuntimeError(
+                "runtime batch exceeds the configured Triton allocation bound: "
+                f"batch_size={batch_size}, bound={bound}"
+            )
+        return bound
 
     @property
     def size_full(self):

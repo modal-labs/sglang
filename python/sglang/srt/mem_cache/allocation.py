@@ -646,6 +646,16 @@ def assign_req_to_token_pool_func(
             req_to_token.shape[1],
         )
         return
+    # ReqToTokenPool reserves one padding row in addition to its configured
+    # request capacity. Use that capacity as the single compile-time reduction
+    # width, rather than specializing once per observed serving batch size.
+    max_batch_size = req_to_token.shape[0] - 1
+    if batch_size > max_batch_size:
+        raise RuntimeError(
+            "assignment batch exceeds req-to-token pool capacity: "
+            f"batch_size={batch_size}, capacity={max_batch_size}"
+        )
+    batch_size_upper_bound = next_power_of_2(max_batch_size)
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,
@@ -653,7 +663,7 @@ def assign_req_to_token_pool_func(
         end_offset,
         out_cache_loc,
         req_to_token.shape[1],
-        next_power_of_2(batch_size),
+        batch_size_upper_bound,
     )
 
 

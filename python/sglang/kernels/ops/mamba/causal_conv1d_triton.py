@@ -15,7 +15,7 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 PAD_SLOT_ID = -1
 
 
-@triton.jit()
+@triton.jit(do_not_specialize=["seqlen"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
