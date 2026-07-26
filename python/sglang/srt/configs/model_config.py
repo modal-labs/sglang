@@ -258,6 +258,7 @@ class ModelConfig:
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
+        draft_fp8_activation_scheme: str = "dynamic",
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -265,6 +266,7 @@ class ModelConfig:
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.speculative_algorithm = speculative_algorithm
+        self.draft_fp8_activation_scheme = draft_fp8_activation_scheme
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -558,6 +560,9 @@ class ModelConfig:
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
             speculative_algorithm=server_args.speculative_algorithm,
+            draft_fp8_activation_scheme=(
+                server_args.speculative_draft_fp8_activation_scheme
+            ),
             **kwargs,
         )
 

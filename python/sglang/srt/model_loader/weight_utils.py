@@ -319,6 +319,11 @@ def get_quant_config(
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+        if model_config.quantization == "fp8" and model_config.is_draft_model:
+            return Fp8Config(
+                activation_scheme=model_config.draft_fp8_activation_scheme,
+                use_online_weight_staging_pool=True,
+            )
         if model_config.quantization == "quark_mxfp4":
             return quant_cls(
                 online_scheme=model_config.quantization,

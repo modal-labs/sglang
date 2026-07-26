@@ -4,14 +4,13 @@
 
 from __future__ import annotations
 
+import gc
 import logging
+import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
-from torch.nn import Module
-from torch.nn.parameter import Parameter
-
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
@@ -100,6 +99,8 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
+from torch.nn import Module
+from torch.nn.parameter import Parameter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
@@ -121,6 +122,205 @@ _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+
+_DRAFT_FP8_MEMORY_DIAGNOSTICS_ENV = "SGLANG_DRAFT_FP8_MEMORY_DIAGNOSTICS"
+
+
+def _cuda_memory_snapshot() -> Dict[str, int]:
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    stats = torch.cuda.memory_stats()
+    return {
+        "free_bytes": int(free_bytes),
+        "total_bytes": int(total_bytes),
+        "allocated_bytes": int(stats.get("allocated_bytes.all.current", 0)),
+        "reserved_bytes": int(stats.get("reserved_bytes.all.current", 0)),
+    }
+
+
+class _OnlineFp8WeightStaging:
+    """Own the transient BF16 source pool for online draft FP8 conversion.
+
+    The manager is deliberately separate from ``Fp8Config`` so shallow copies
+    of a quantization config share one owner. Only source-weight allocations
+    enter this pool. Quantized destinations, scales, and conversion scratch use
+    the normal CUDA pool.
+    """
+
+    def __init__(self, *, enabled: bool, diagnostics_enabled: bool) -> None:
+        self.enabled = enabled
+        self.diagnostics_enabled = diagnostics_enabled
+        self.pool = None
+        self.device: Optional[int] = None
+        self.source_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+        self.before: Optional[Dict[str, int]] = None
+        self.source_bytes = 0
+        self.destination_bytes = 0
+        self.scale_bytes = 0
+        self.layers = 0
+        self.started = False
+
+    def begin(self) -> None:
+        if not self.enabled or not _is_cuda:
+            return
+        if self.started:
+            raise RuntimeError("Online FP8 weight staging was started twice.")
+        self.started = True
+        self.source_refs.clear()
+        self.source_bytes = 0
+        self.destination_bytes = 0
+        self.scale_bytes = 0
+        self.layers = 0
+        self.before = None
+
+    def _ensure_pool(self):
+        if self.pool is not None:
+            if torch.cuda.current_device() != self.device:
+                raise RuntimeError(
+                    "Online FP8 source weights must be allocated on one CUDA device."
+                )
+            return self.pool
+
+        if not self.started:
+            raise RuntimeError(
+                "Online FP8 source allocation escaped its loader staging scope."
+            )
+        torch.cuda.init()
+        allocator_backend = torch.cuda.get_allocator_backend()
+        if allocator_backend != "native":
+            raise RuntimeError(
+                "Online FP8 weight staging requires PyTorch's native CUDA "
+                f"allocator, but the active backend is {allocator_backend!r}."
+            )
+        self.device = torch.cuda.current_device()
+        # The target model is already loaded when the speculative draft starts.
+        # Release only inactive default-pool blocks before creating the isolated
+        # source pool, so cached target-loader scratch cannot cause a false OOM.
+        # This does not change the active allocator or affect live allocations.
+        gc.collect()
+        torch.cuda.empty_cache()
+        if self.diagnostics_enabled:
+            self.before = _cuda_memory_snapshot()
+        self.pool = torch.cuda.MemPool(use_on_oom=False, no_split=False)
+        return self.pool
+
+    def allocate(
+        self,
+        output_size: int,
+        input_size: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not self.enabled or not _is_cuda:
+            return torch.empty(output_size, input_size, dtype=dtype)
+        pool = self._ensure_pool()
+        with torch.cuda.use_mem_pool(pool, device=self.device):
+            return torch.empty(output_size, input_size, dtype=dtype)
+
+    def track_source(self, parameter: torch.Tensor) -> None:
+        if self.enabled and _is_cuda:
+            self.source_refs.append(weakref.ref(parameter))
+
+    def record_conversion(
+        self,
+        *,
+        source_bytes: int,
+        destination: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        if not self.enabled:
+            return
+        self.source_bytes += source_bytes
+        self.destination_bytes += destination.numel() * destination.element_size()
+        self.scale_bytes += scale.numel() * scale.element_size()
+        self.layers += 1
+
+    @staticmethod
+    def _pool_bytes(snapshot: list[dict]) -> tuple[int, int, int]:
+        reserved = sum(int(segment.get("total_size", 0)) for segment in snapshot)
+        allocated = sum(int(segment.get("allocated_size", 0)) for segment in snapshot)
+        active = sum(int(segment.get("active_size", 0)) for segment in snapshot)
+        return reserved, allocated, active
+
+    def finish(self) -> None:
+        if not self.enabled or not _is_cuda:
+            return
+        if not self.started:
+            raise RuntimeError("Online FP8 weight staging was not started.")
+        self.started = False
+
+        pool = self.pool
+        if pool is None:
+            self.before = None
+            return
+        assert self.device is not None
+
+        gc.collect()
+        with torch.cuda.device(self.device):
+            torch.cuda.synchronize()
+            live_sources = sum(ref() is not None for ref in self.source_refs)
+            snapshot = pool.snapshot(include_traces=False)
+            pool_reserved, pool_allocated, pool_active = self._pool_bytes(snapshot)
+            pool_use_count = pool.use_count()
+            expandable_segments = sum(
+                bool(segment.get("is_expandable", False)) for segment in snapshot
+            )
+            # allocated_size is the live-tensor invariant. active_size may
+            # temporarily include pending-free blocks until the allocator next
+            # processes stream events; the pool destructor handles those after
+            # the device synchronization above.
+            if (
+                live_sources
+                or pool_allocated
+                or pool_use_count != 1
+                or expandable_segments
+            ):
+                raise RuntimeError(
+                    "Online FP8 BF16 staging pool still owns live sources before "
+                    "teardown: "
+                    f"{live_sources=}, {pool_allocated=}, {pool_active=}, "
+                    f"{pool_use_count=}, {expandable_segments=}."
+                )
+
+            before_release = _cuda_memory_snapshot()
+            self.pool = None
+            self.device = None
+            self.source_refs.clear()
+            del pool
+            gc.collect()
+            torch.cuda.synchronize()
+            after_release = _cuda_memory_snapshot()
+
+        if self.diagnostics_enabled:
+            before = self.before or before_release
+            log_info_on_rank0(
+                logger,
+                (
+                    "Draft FP8 source-pool memory proof: "
+                    f"layers={self.layers}, source_bytes={self.source_bytes}, "
+                    f"fp8_destination_bytes={self.destination_bytes}, "
+                    f"scale_bytes={self.scale_bytes}, "
+                    f"pool_reserved_bytes={pool_reserved}, "
+                    "pool_allocated_bytes_before_destroy="
+                    f"{pool_allocated}, pool_active_bytes_before_destroy="
+                    f"{pool_active}, pool_use_count_before_destroy="
+                    f"{pool_use_count}, cuda_free_before_staging="
+                    f"{before['free_bytes']}, cuda_free_before_destroy="
+                    f"{before_release['free_bytes']}, cuda_free_after_destroy="
+                    f"{after_release['free_bytes']}, pool_free_recovered="
+                    f"{after_release['free_bytes'] - before_release['free_bytes']:+d}"
+                ),
+            )
+        self.before = None
+
+    def abort(self) -> None:
+        """Best-effort release that never masks the loader's original error."""
+        pool = self.pool
+        self.pool = None
+        self.device = None
+        self.source_refs.clear()
+        self.before = None
+        self.started = False
+        if pool is not None:
+            del pool
 
 
 def _require_fp4_dtype():
@@ -229,6 +429,7 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        use_online_weight_staging_pool: bool = False,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -252,6 +453,19 @@ class Fp8Config(QuantizationConfig):
             )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
+        if use_online_weight_staging_pool and is_checkpoint_fp8_serialized:
+            raise ValueError(
+                "FP8 source-pool staging is only valid for online "
+                "quantization of non-serialized weights."
+            )
+        self.use_online_weight_staging_pool = use_online_weight_staging_pool
+        self._online_weight_staging = _OnlineFp8WeightStaging(
+            enabled=use_online_weight_staging_pool,
+            diagnostics_enabled=(
+                use_online_weight_staging_pool
+                and get_bool_env_var(_DRAFT_FP8_MEMORY_DIAGNOSTICS_ENV)
+            ),
+        )
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -271,6 +485,39 @@ class Fp8Config(QuantizationConfig):
             elif weight_block_size != [1, 32]:
                 raise ValueError("MXFP8 requires weight_block_size=[1, 32].")
         self.weight_block_size = weight_block_size
+
+    def begin_online_weight_staging(self) -> None:
+        self._online_weight_staging.begin()
+
+    def allocate_online_source_weight(
+        self,
+        output_size: int,
+        input_size: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return self._online_weight_staging.allocate(output_size, input_size, dtype)
+
+    def track_online_source_weight(self, parameter: torch.Tensor) -> None:
+        self._online_weight_staging.track_source(parameter)
+
+    def record_online_quantization(
+        self,
+        *,
+        source_bytes: int,
+        destination: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        self._online_weight_staging.record_conversion(
+            source_bytes=source_bytes,
+            destination=destination,
+            scale=scale,
+        )
+
+    def finish_online_weight_staging(self) -> None:
+        self._online_weight_staging.finish()
+
+    def abort_online_weight_staging(self) -> None:
+        self._online_weight_staging.abort()
 
     def get_name(self) -> str:
         return "mxfp8" if self.use_mxfp8 else "fp8"
@@ -434,6 +681,14 @@ class Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.online_static = (
+            not self.quant_config.is_checkpoint_fp8_serialized
+            and getattr(self.quant_config, "activation_scheme", "dynamic") == "static"
+        )
+        # Static unit activation scales need the per-tensor W8A8 path. The
+        # CUTLASS online path selects per-channel weights and per-token scales.
+        if self.online_static:
+            self.cutlass_fp8_supported = False
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
@@ -457,6 +712,9 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
+        )
+        self.use_online_weight_staging_pool = getattr(
+            self.quant_config, "use_online_weight_staging_pool", False
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
@@ -546,15 +804,33 @@ class Fp8LinearMethod(LinearMethodBase):
         weight_dtype = (
             torch.float8_e4m3fn if is_checkpoint_fp8_serialized else params_dtype
         )
+        allocate_online_source = getattr(
+            quant_config, "allocate_online_source_weight", None
+        )
+        if allocate_online_source is not None and not is_checkpoint_fp8_serialized:
+            weight_data = allocate_online_source(
+                output_size_per_partition,
+                input_size_per_partition,
+                weight_dtype,
+            )
+        else:
+            weight_data = torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=weight_dtype,
+            )
         weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
-            ),
+            data=weight_data,
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
+        if (
+            getattr(quant_config, "use_online_weight_staging_pool", False)
+            and not is_checkpoint_fp8_serialized
+        ):
+            quant_config.track_online_source_weight(weight)
 
         if is_checkpoint_fp8_serialized:
             if block_quant:
@@ -818,10 +1094,20 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
         else:
-            layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            if (
+                self.use_online_weight_staging_pool
+                and not self.is_checkpoint_fp8_serialized
+            ):
+                # Preserve the tracked source Parameter until it is replaced by
+                # the final FP8 Parameter below.
+                layer.weight.requires_grad_(False)
+            else:
+                layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.is_checkpoint_fp8_serialized:
+                source_weight = layer.weight
+                source_bytes = source_weight.numel() * source_weight.element_size()
                 if (
                     self.cutlass_fp8_supported
                     or self.use_marlin
@@ -830,7 +1116,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
-                        layer.weight, layer.weight.shape[-1]
+                        source_weight, source_weight.shape[-1]
                     )
                     weight_scale = weight_scale.t().contiguous()
                     if _use_aiter and self.use_aiter_fp8_per_token:
@@ -838,12 +1124,39 @@ class Fp8LinearMethod(LinearMethodBase):
                         qweight = shuffle_weight(qweight.contiguous(), (16, 16))
                 else:
                     # per-tensor quantization
-                    qweight, weight_scale = input_to_float8(layer.weight)
+                    if self.use_online_weight_staging_pool and _is_cuda:
+                        # This kernel preallocates only the FP8 output and
+                        # scalar scale. Unlike input_to_float8, it does not
+                        # materialize a full-size FP32 scratch tensor.
+                        qweight, weight_scale = scaled_fp8_quant(source_weight)
+                    else:
+                        qweight, weight_scale = input_to_float8(source_weight)
 
                 # Update the layer with the new values.
                 layer.weight = Parameter(qweight.t(), requires_grad=False)
+                # No BF16 sidecar is retained. This drops the final source
+                # Parameter reference; its storage becomes inactive in the
+                # transient source pool.
+                del source_weight
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                layer.input_scale = None
+                layer.input_scale = (
+                    Parameter(
+                        torch.ones(
+                            1,
+                            device=layer.weight.device,
+                            dtype=torch.float32,
+                        ),
+                        requires_grad=False,
+                    )
+                    if self.online_static
+                    else None
+                )
+                if self.use_online_weight_staging_pool:
+                    self.quant_config.record_online_quantization(
+                        source_bytes=source_bytes,
+                        destination=qweight,
+                        scale=weight_scale,
+                    )
 
             # If checkpoint is fp8, handle that there are N scales for N
             # shards in a fused module

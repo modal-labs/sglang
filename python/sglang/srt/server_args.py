@@ -2190,6 +2190,19 @@ class ServerArgs:
         ),
         NS("spec"),
     ] = None
+    speculative_draft_fp8_activation_scheme: A[
+        Literal["dynamic", "static"],
+        Arg(
+            help=(
+                "Activation scaling for online FP8 speculative-draft "
+                "quantization. 'dynamic' preserves the default per-request "
+                "scaling; 'static' fixes every draft linear activation scale "
+                "to 1.0. This does not override serialized checkpoint scales."
+            ),
+            choices=("dynamic", "static"),
+        ),
+        NS("spec"),
+    ] = "dynamic"
     speculative_skip_dp_mlp_sync: A[
         bool,
         "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",

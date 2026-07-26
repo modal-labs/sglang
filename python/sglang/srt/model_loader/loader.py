@@ -333,6 +333,41 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+@contextmanager
+def _online_quantization_staging(quant_config):
+    begin = getattr(quant_config, "begin_online_weight_staging", None)
+    finish = getattr(quant_config, "finish_online_weight_staging", None)
+    abort = getattr(quant_config, "abort_online_weight_staging", None)
+    if begin is not None:
+        begin()
+    try:
+        yield
+    except BaseException:
+        if abort is not None:
+            try:
+                abort()
+            except BaseException:
+                logger.exception(
+                    "Failed to abort online FP8 weight staging; preserving "
+                    "the original model-loader error."
+                )
+        raise
+    else:
+        if finish is not None:
+            try:
+                finish()
+            except BaseException:
+                if abort is not None:
+                    try:
+                        abort()
+                    except BaseException:
+                        logger.exception(
+                            "Failed to abort online FP8 weight staging after "
+                            "a teardown invariant failed."
+                        )
+                raise
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -788,17 +823,18 @@ class DefaultModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    quant_config,
-                )
+        with _online_quantization_staging(quant_config):
+            with set_default_torch_dtype(model_config.dtype):
+                with target_device:
+                    model = _initialize_model(
+                        model_config,
+                        self.load_config,
+                        quant_config,
+                    )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
-            )
+                self.load_weights_and_postprocess(
+                    model, self._get_all_weights(model_config, model), target_device
+                )
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
@@ -1427,30 +1463,31 @@ class DummyModelLoader(BaseModelLoader):
 
         quant_config = _get_quantization_config(model_config, self.load_config)
 
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    quant_config,
-                )
+        with _online_quantization_staging(quant_config):
+            with set_default_torch_dtype(model_config.dtype):
+                with torch.device(device_config.device):
+                    model = _initialize_model(
+                        model_config,
+                        self.load_config,
+                        quant_config,
+                    )
 
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
+                # NOTE(woosuk): For accurate performance evaluation, we assign
+                # random values to the weights.
+                initialize_dummy_weights(model)
 
-            _post_load_weights(model)
+                _post_load_weights(model)
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
-                    if (
-                        hasattr(module, "is_weights_quantized")
-                        and module.is_weights_quantized()
-                    ):
-                        continue
-                    quant_method.process_weights_after_loading(module)
+                for _, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        # Skip FusedMoE layers already quantized during init (FP8 or FP4)
+                        if (
+                            hasattr(module, "is_weights_quantized")
+                            and module.is_weights_quantized()
+                        ):
+                            continue
+                        quant_method.process_weights_after_loading(module)
 
         return model.eval()
 
