@@ -34,11 +34,13 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
     # `restore_value=["initial_state"]` works for unit tests but OOMs on
     # production-scale models (e.g. Kimi-Linear-48B at default mem_fraction)
     # because cloning the cache pool for each benchmark exceeds available memory.
-    # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
-    # future per-bucket configs once the kernel is refactored to write final
-    # state to a separate output buffer). The env knobs keep this single-config
-    # property while allowing model/hardware-local validation of the selected
-    # tile without corrupting the state pool through multi-config autotune.
+    # Do not specialize on the number of chunks: the selected config is static,
+    # and NT is not used in the kernel body. Keeping a token-count bucket in the
+    # key would create three identical JIT variants and let a long first request
+    # compile after readiness for no performance benefit. The env knobs keep
+    # this single-config property while allowing model/hardware-local validation
+    # of the selected tile without corrupting the state pool through multi-config
+    # autotune.
     configs=[
         triton.Config(
             {"BV": GDN_CHUNK_H_BV},
@@ -46,7 +48,7 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
             num_stages=GDN_CHUNK_H_NUM_STAGES,
         )
     ],
-    key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
+    key=["H", "K", "V", "BT", "USE_GK"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -76,15 +78,15 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
@@ -323,9 +325,9 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert not (
-        use_exp2 and g is not None
-    ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    assert not (use_exp2 and g is not None), (
+        "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -377,7 +379,6 @@ def chunk_gated_delta_rule_fwd_h(
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
     )
     return h, v_new

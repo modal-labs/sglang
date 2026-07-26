@@ -7,6 +7,7 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import time
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -1417,8 +1418,7 @@ class KimiK3MoE(nn.Module):
         else:
             if prequantized_hidden_states is not None:
                 raise RuntimeError(
-                    "K3 MoE prequantized front input requires the fused "
-                    "plain-TP front."
+                    "K3 MoE prequantized front input requires the fused plain-TP front."
                 )
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         if use_dp:
@@ -1886,8 +1886,7 @@ class KimiK3DeltaAttention(nn.Module):
             return self._qkvg_fp8(hidden_states), None
         if prequantized_hidden_states is not None:
             raise RuntimeError(
-                "K3 KDA received a prequantized qkvg input without an FP8 "
-                "qkvg linear."
+                "K3 KDA received a prequantized qkvg input without an FP8 qkvg linear."
             )
         return self.fused_qkvg_proj(hidden_states)
 
@@ -3476,22 +3475,82 @@ class KimiK3LinearForCausalLM(nn.Module):
         # sizing so the returned HBM contributes to serving capacity.
         self.model.target_fp8.finalize()
 
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer) or not isinstance(
-                layer.self_attn, KimiK3DeltaAttention
-            ):
-                continue
-            from sglang.kernels.ops.attention.fla.kda import (
-                precompile_k3_recompute_w_u_kernel,
-            )
+    def precompile_kernels_after_loading(self) -> None:
+        """Finish Triton KDA prefill autotuning before graph capture/readiness."""
+        server_args = get_server_args()
+        prefill_backend = (
+            server_args.linear_attn_prefill_backend or server_args.linear_attn_backend
+        )
+        if prefill_backend != "triton":
+            return
 
-            if precompile_k3_recompute_w_u_kernel(
-                num_heads=layer.self_attn.local_num_heads,
-                dtype=layer.self_attn.o_proj.weight.dtype,
-                device=layer.self_attn.dt_bias.device,
-            ):
-                rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
-            break
+        kda_layer = next(
+            (
+                layer.self_attn
+                for layer in self.model.layers
+                if not isinstance(layer, PPMissingLayer)
+                and isinstance(layer.self_attn, KimiK3DeltaAttention)
+            ),
+            None,
+        )
+        if kda_layer is None:
+            return
+
+        from sglang.kernels.ops.attention.fla.kda import (
+            _k3_prefill_autotune_chunk_counts,
+            precompile_k3_triton_prefill_kernels,
+        )
+        from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+
+        # Match the state-pool resolver exactly (server args are projected to
+        # its environment before loading; config/default remain valid when the
+        # explicit CLI value is absent).
+        state_dtype = mamba2_state_dtype(self.config).temporal
+        activation_dtype = kda_layer.config.dtype
+        if not isinstance(activation_dtype, torch.dtype):
+            activation_dtype = getattr(torch, activation_dtype)
+        kwargs = dict(
+            num_heads=kda_layer.local_num_heads,
+            head_dim=kda_layer.head_k_dim,
+            value_dim=kda_layer.head_v_dim,
+            activation_dtype=activation_dtype,
+            state_dtype=state_dtype,
+            a_log_dtype=kda_layer.A_log.dtype,
+            dt_bias_dtype=kda_layer.dt_bias.dtype,
+            lower_bound=kda_layer.attn.lower_bound,
+            device=kda_layer.dt_bias.device,
+        )
+
+        # All TP ranks use identical KDA geometry on identical GPUs and share
+        # Triton's on-disk cache. Let one rank benchmark, then have the other
+        # ranks invoke the same direct kernel path and load the persisted
+        # winners. The second barrier makes completion a strict pre-ready
+        # invariant on every rank.
+        parallel = get_parallel()
+        tp_group = get_tp_group()
+        tic = time.perf_counter()
+        benchmarked = None
+        if parallel.tp_rank == 0:
+            benchmarked = precompile_k3_triton_prefill_kernels(**kwargs)
+        if parallel.tp_size > 1:
+            tp_group.barrier()
+        if parallel.tp_rank != 0:
+            precompile_k3_triton_prefill_kernels(**kwargs)
+        if parallel.tp_size > 1:
+            tp_group.barrier()
+
+        if benchmarked is not None:
+            chunk_counts = _k3_prefill_autotune_chunk_counts(kda_layer.local_num_heads)
+            source = (
+                "persistent-cache"
+                if not benchmarked
+                else f"autotuned={','.join(benchmarked)}"
+            )
+            rank0_log(
+                "K3_KDA_TRITON_PREFILL_READY "
+                f"chunk_regimes={chunk_counts}, {source}, "
+                f"elapsed={time.perf_counter() - tic:.2f}s."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3556,6 +3615,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
             self.language_model.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:
+        if self.language_model is not None:
+            self.language_model.precompile_kernels_after_loading()
         if self.config.language_only:
             return
         if self.vision_tower.precompile_fused_rope():

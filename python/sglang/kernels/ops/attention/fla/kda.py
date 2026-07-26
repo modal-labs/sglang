@@ -39,6 +39,8 @@ if is_intel:
 
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+KDA_CHUNK_SIZE = 64
+KDA_FUSED_INTRA_MAX_CTAS = 256
 
 # Convert natural-log gates to log2 space before the exp2-based chunk kernels.
 # log2(e) rounded to fp32, matching flash-linear-attention.
@@ -1048,18 +1050,18 @@ def kda_gate_chunk_cumsum(
         Cumulative-summed gated tensor of shape [B, T, H, K].
     """
     if cu_seqlens is not None:
-        assert (
-            g.shape[0] == 1
-        ), "Only batch size 1 is supported when cu_seqlens are provided"
+        assert g.shape[0] == 1, (
+            "Only batch size 1 is supported when cu_seqlens are provided"
+        )
     assert len(g.shape) == 4
     B, T, H, S = g.shape
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2 ** (
-        chunk_size.bit_length() - 1
-    ), "chunk_size must be a power of 2"
+    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
+        "chunk_size must be a power of 2"
+    )
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
@@ -1098,7 +1100,7 @@ def chunk_kda_fwd(
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
 ):
-    chunk_size = 64
+    chunk_size = KDA_CHUNK_SIZE
     # Pre-compute chunk indices once and thread through all downstream kernels.
     # Without this, each of the 4 callees would recompute independently.
     chunk_indices = (
@@ -1146,7 +1148,7 @@ def chunk_kda_fwd(
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]
-    _small_grid = _B * _NT_pr * _H_pr <= 256
+    _small_grid = _B * _NT_pr * _H_pr <= KDA_FUSED_INTRA_MAX_CTAS
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -1236,4 +1238,141 @@ def chunk_kda(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
         output_intermediate_states=output_intermediate_states,
+    )
+
+
+def _k3_prefill_autotune_chunk_counts(num_heads: int) -> tuple[int, ...]:
+    """Return one synthetic chunk count for every KDA intra-fusion regime.
+
+    Triton's relevant autotune keys do not contain the request length. The
+    only length-dependent dispatch choice is whether the intra pipeline has
+    at most ``KDA_FUSED_INTRA_MAX_CTAS`` CTAs. Deriving the two sides of that
+    exact branch avoids request/token buckets while covering every kernel
+    variant that serving can select.
+    """
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}")
+
+    chunk_counts = []
+    if num_heads <= KDA_FUSED_INTRA_MAX_CTAS:
+        chunk_counts.append(1)
+    chunk_counts.append(KDA_FUSED_INTRA_MAX_CTAS // num_heads + 1)
+    return tuple(dict.fromkeys(chunk_counts))
+
+
+@torch.inference_mode()
+def precompile_k3_triton_prefill_kernels(
+    *,
+    num_heads: int,
+    head_dim: int,
+    value_dim: int,
+    activation_dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    a_log_dtype: torch.dtype,
+    dt_bias_dtype: torch.dtype,
+    lower_bound: Optional[float],
+    device: torch.device,
+) -> Optional[tuple[str, ...]]:
+    """Autotune all Triton KDA-prefill regimes before the server is ready.
+
+    This invokes ``chunk_kda`` directly with synthetic tensors. It does not
+    construct a model request and does not encode serving token buckets. The
+    tensor geometry/dtypes come from the loaded KDA layer, while sequence
+    lengths are computed solely to cross the kernel's small/large CTA branch.
+
+    Returns ``None`` when the CUDA/NVIDIA path is unavailable. Otherwise,
+    returns the names of autotuners that benchmarked instead of reading a
+    persistent result; an empty tuple therefore means a warm cache hit.
+    """
+    device = torch.device(device)
+    if not is_nvidia or device.type != "cuda":
+        return None
+    if min(num_heads, head_dim, value_dim) <= 0:
+        raise ValueError(
+            "K3 KDA precompile dimensions must be positive, got "
+            f"H={num_heads}, K={head_dim}, V={value_dim}"
+        )
+
+    # Track whether Triton actually benchmarked a configuration. Disk-cache
+    # hits populate Autotuner.cache without setting bench_time.
+    from sglang.kernels.ops.attention.fla import (
+        chunk_intra,
+        chunk_intra_token_parallel,
+    )
+
+    kernels = {
+        "kda_gate_chunk_cumsum_vector_kernel": kda_gate_chunk_cumsum_vector_kernel,
+        "chunk_kda_fwd_kernel_inter_solve_fused": (
+            chunk_intra.chunk_kda_fwd_kernel_inter_solve_fused
+        ),
+        "chunk_kda_fwd_kernel_intra_token_parallel": (
+            chunk_intra_token_parallel.chunk_kda_fwd_kernel_intra_token_parallel
+        ),
+        "chunk_gla_fwd_kernel_o": chunk_gla_fwd_kernel_o,
+    }
+
+    def unwrap_autotuner(kernel):
+        while not hasattr(kernel, "configs") and hasattr(kernel, "fn"):
+            kernel = kernel.fn
+        return kernel
+
+    autotuners = {name: unwrap_autotuner(kernel) for name, kernel in kernels.items()}
+    bench_time_before = {
+        name: getattr(autotuner, "bench_time", None)
+        for name, autotuner in autotuners.items()
+    }
+
+    with torch.cuda.device(device):
+        for num_chunks in _k3_prefill_autotune_chunk_counts(num_heads):
+            num_tokens = num_chunks * KDA_CHUNK_SIZE
+            qkv_shape = (1, num_tokens, num_heads, head_dim)
+            # Nonzero Q/K avoid depending on l2norm's zero-vector behavior.
+            q = torch.ones(qkv_shape, dtype=activation_dtype, device=device)
+            k = torch.zeros_like(q)
+            k.fill_(1)
+            v = torch.zeros(
+                (1, num_tokens, num_heads, value_dim),
+                dtype=activation_dtype,
+                device=device,
+            )
+            raw_gate = torch.zeros_like(q)
+            # Kimi-K3 applies sigmoid in fp32 before entering chunk_kda.
+            beta = torch.zeros(
+                (1, num_tokens, num_heads), dtype=torch.float32, device=device
+            )
+            initial_state = torch.zeros(
+                (1, num_heads, value_dim, head_dim),
+                dtype=state_dtype,
+                device=device,
+            )
+            initial_state_indices = torch.zeros(1, dtype=torch.int32, device=device)
+            cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+            A_log = torch.zeros(num_heads, dtype=a_log_dtype, device=device)
+            dt_bias = torch.zeros(
+                num_heads * head_dim, dtype=dt_bias_dtype, device=device
+            )
+
+            output = chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=raw_gate,
+                beta=beta,
+                initial_state=initial_state,
+                initial_state_indices=initial_state_indices,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                output_intermediate_states=True,
+            )
+            del output
+
+        torch.cuda.synchronize(device)
+
+    return tuple(
+        name
+        for name, autotuner in autotuners.items()
+        if getattr(autotuner, "bench_time", None) != bench_time_before[name]
     )
