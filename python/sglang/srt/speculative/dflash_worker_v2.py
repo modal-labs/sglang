@@ -529,9 +529,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.use_draft_ring:
             assert memory_pool_config is not None and req_to_token_pool is not None
             rows = int(req_to_token_pool.size)
+            # The draft's own ReqToTokenPool allocates padding rows beyond the
+            # target's request count (observed: +1), and the ring map must
+            # cover every row of the table it actually gets. Fund a couple of
+            # spare rows (a few MB); _install_draft_ring_map asserts the real
+            # table fits.
             ring_cfg = replace(
                 memory_pool_config,
-                max_total_num_tokens=rows * int(self.draft_ring_tokens),
+                max_total_num_tokens=(rows + 2) * int(self.draft_ring_tokens),
             )
             self._draft_worker.alloc_memory_pool(
                 memory_pool_config=ring_cfg,
