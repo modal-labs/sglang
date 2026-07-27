@@ -80,6 +80,124 @@ _OBJECT_KEYWORDS = {
     "required",
 }
 
+_STRING_LENGTH_TOKEN_RATIO = 4
+_TOOL_GRAMMAR_TOKEN_RESERVE = 256
+_SCHEMA_MAP_KEYS = (
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+)
+_SCHEMA_SINGLE_KEYS = (
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "contentSchema",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+)
+_SCHEMA_LIST_KEYS = ("allOf", "anyOf", "oneOf", "prefixItems")
+
+
+def limit_kimik3_tool_schema_max_lengths(
+    tools: List[Tool], max_output_tokens: Optional[int]
+) -> List[Tool]:
+    """Conservatively bound explicit, oversized string lengths for one request.
+
+    K3 emits string arguments as raw XTML text. An extreme ``maxLength`` lets
+    the model keep emitting a grammar-valid string until ``max_output_tokens``
+    is exhausted, leaving the enclosing tool call incomplete. This request-
+    local schema copy bounds only limits larger than the entire output budget;
+    ordinary limits and unbounded strings are unchanged.
+    """
+    if (
+        not isinstance(max_output_tokens, int)
+        or isinstance(max_output_tokens, bool)
+        or max_output_tokens <= _TOOL_GRAMMAR_TOKEN_RESERVE
+    ):
+        return tools
+
+    max_string_length = (
+        max_output_tokens - _TOOL_GRAMMAR_TOKEN_RESERVE
+    ) // _STRING_LENGTH_TOKEN_RATIO
+
+    def limit_schema(schema: Any) -> Any:
+        if not isinstance(schema, dict):
+            return schema
+
+        result = schema
+        max_length = schema.get("maxLength")
+        min_length = schema.get("minLength", 0)
+        if (
+            isinstance(max_length, int)
+            and not isinstance(max_length, bool)
+            and max_length > max_output_tokens
+            and isinstance(min_length, int)
+            and not isinstance(min_length, bool)
+            and min_length <= max_string_length
+        ):
+            result = dict(result)
+            result["maxLength"] = max_string_length
+
+        for key in _SCHEMA_MAP_KEYS:
+            children = result.get(key)
+            if not isinstance(children, dict):
+                continue
+            limited = {name: limit_schema(child) for name, child in children.items()}
+            if limited != children:
+                if result is schema:
+                    result = dict(result)
+                result[key] = limited
+
+        for key in _SCHEMA_SINGLE_KEYS:
+            child = result.get(key)
+            if not isinstance(child, (bool, dict, list)):
+                continue
+            if isinstance(child, list):
+                limited_child = [limit_schema(item) for item in child]
+            else:
+                limited_child = limit_schema(child)
+            if limited_child != child:
+                if result is schema:
+                    result = dict(result)
+                result[key] = limited_child
+
+        for key in _SCHEMA_LIST_KEYS:
+            children = result.get(key)
+            if not isinstance(children, list):
+                continue
+            limited = [limit_schema(child) for child in children]
+            if limited != children:
+                if result is schema:
+                    result = dict(result)
+                result[key] = limited
+        return result
+
+    limited_tools = []
+    for tool in tools:
+        parameters = tool.function.parameters
+        limited_parameters = limit_schema(parameters)
+        if limited_parameters is parameters:
+            limited_tools.append(tool)
+            continue
+        limited_tools.append(
+            tool.model_copy(
+                update={
+                    "function": tool.function.model_copy(
+                        update={"parameters": limited_parameters}
+                    )
+                }
+            )
+        )
+    return limited_tools
+
 
 def _escape_attr(value: str) -> str:
     return value.replace("&", "&amp;").replace('"', "&quot;")

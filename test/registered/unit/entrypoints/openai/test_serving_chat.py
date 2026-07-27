@@ -261,6 +261,48 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
+    def test_kimi_k3_limits_oversized_schema_for_request_grammar_only(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use the tool."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "submit",
+                        "strict": True,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "value": {
+                                    "type": "string",
+                                    "maxLength": 5_000_000,
+                                }
+                            },
+                            "required": ["value"],
+                        },
+                    },
+                }
+            ],
+            tool_choice="required",
+            max_tokens=2048,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as parser_cls:
+            self.chat._process_messages(request, is_multimodal=False)
+
+        constraint_tools = parser_cls.call_args.args[0]
+        limited_value = constraint_tools[0].function.parameters["properties"]["value"]
+        original_value = request.tools[0].function.parameters["properties"]["value"]
+        self.assertEqual(limited_value["maxLength"], 448)
+        self.assertEqual(original_value["maxLength"], 5_000_000)
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [

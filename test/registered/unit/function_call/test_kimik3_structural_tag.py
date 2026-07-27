@@ -25,6 +25,7 @@ from sglang.srt.function_call.kimik3_format import (
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
     get_kimik3_structural_tag,
+    limit_kimik3_tool_schema_max_lengths,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -82,6 +83,72 @@ def _argument(key, argument_type, value):
     return (
         f'<|open|>argument key="{key}" type="{argument_type}"<|sep|>'
         f"{value}{ARGUMENT_CLOSE}"
+    )
+
+
+def test_request_budget_limits_only_oversized_string_schemas():
+    parameters = {
+        "type": "object",
+        "properties": {
+            "huge": {"type": "string", "maxLength": 5_000_000},
+            "ordinary": {"type": "string", "maxLength": 512},
+            "unbounded": {"type": "string"},
+            "nested": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "maxLength": 6_700_000}
+                    },
+                },
+            },
+        },
+    }
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters=parameters,
+        ),
+    )
+
+    limited = limit_kimik3_tool_schema_max_lengths([tool], 2048)
+    limited_properties = limited[0].function.parameters["properties"]
+
+    assert limited_properties["huge"]["maxLength"] == 448
+    assert limited_properties["ordinary"]["maxLength"] == 512
+    assert "maxLength" not in limited_properties["unbounded"]
+    assert (
+        limited_properties["nested"]["items"]["properties"]["content"]["maxLength"]
+        == 448
+    )
+    assert parameters["properties"]["huge"]["maxLength"] == 5_000_000
+
+
+def test_request_budget_does_not_make_min_length_unsatisfiable():
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "string",
+                        "minLength": 500,
+                        "maxLength": 5_000_000,
+                    }
+                },
+            },
+        ),
+    )
+
+    limited = limit_kimik3_tool_schema_max_lengths([tool], 2048)
+
+    assert (
+        limited[0].function.parameters["properties"]["value"]["maxLength"] == 5_000_000
     )
 
 
@@ -411,16 +478,12 @@ def test_strict_schema_handles_one_sided_negative_integer_minimum():
     for value in ("-1000000", "-999999", "-1", "0", "1000001"):
         assert _accepts(
             grammar,
-            _tools_section(
-                _call("submit", 1, _argument("value", "number", value))
-            ),
+            _tools_section(_call("submit", 1, _argument("value", "number", value))),
         )
     for value in ("-", "-1000001", "1.5"):
         assert not _accepts(
             grammar,
-            _tools_section(
-                _call("submit", 1, _argument("value", "number", value))
-            ),
+            _tools_section(_call("submit", 1, _argument("value", "number", value))),
         )
 
 

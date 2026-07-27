@@ -64,6 +64,9 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_structural_tag import (
+    limit_kimik3_tool_schema_max_lengths,
+)
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -896,8 +899,14 @@ class OpenAIServingChat(OpenAIServingBase):
             elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
+                constraint_tools = all_tools
+                if self.chat_encoding_spec == "kimi_k3":
+                    constraint_tools = limit_kimik3_tool_schema_max_lengths(
+                        all_tools,
+                        request.max_completion_tokens or request.max_tokens,
+                    )
                 parser = FunctionCallParser(
-                    all_tools,
+                    constraint_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
