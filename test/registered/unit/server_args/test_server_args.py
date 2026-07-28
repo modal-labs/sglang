@@ -317,6 +317,85 @@ class TestLinearAttentionBackendStateDtype(unittest.TestCase):
             server_args._handle_linear_attn_backend()
 
 
+class TestLinearAttentionReplaySSMSpecBackend(unittest.TestCase):
+    def _flashinfer_replayssm_args(self, **overrides):
+        values = {
+            "model_path": "dummy",
+            "mamba_ssm_dtype": "bfloat16",
+            "linear_attn_decode_backend": "flashinfer",
+            "linear_attn_verify_backend": "nv_cutedsl",
+            "enable_linear_replayssm_spec": True,
+            "linear_replayssm_cache_len": 16,
+            "speculative_algorithm": "DFLASH",
+            "speculative_eagle_topk": 1,
+            "mamba_radix_cache_strategy": "extra_buffer",
+        }
+        values.update(overrides)
+        return ServerArgs(**values)
+
+    @patch("torch.cuda.get_device_capability", return_value=(10, 0))
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_allows_flashinfer_decode_for_kda_cutedsl_replayssm(
+        self, _mock_sm100, _mock_is_cuda, _mock_capability
+    ):
+        server_args = self._flashinfer_replayssm_args()
+
+        server_args._handle_linear_attn_backend()
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "flashinfer")
+        self.assertEqual(server_args.linear_attn_verify_backend, "nv_cutedsl")
+        self.assertEqual(server_args.mamba_ssm_dtype, "bfloat16")
+
+    @patch("torch.cuda.get_device_capability", return_value=(10, 0))
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_rejects_flashinfer_target_verify_for_replayssm(
+        self, _mock_sm100, _mock_is_cuda, _mock_capability
+    ):
+        server_args = self._flashinfer_replayssm_args(
+            linear_attn_verify_backend="flashinfer"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "requires a ring-writing target-verify backend"
+        ):
+            server_args._handle_linear_attn_backend()
+
+    @patch("torch.cuda.get_device_capability", return_value=(10, 0))
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_rejects_flashinfer_decode_for_non_kda_spec_algorithm(
+        self, _mock_sm100, _mock_is_cuda, _mock_capability
+    ):
+        server_args = self._flashinfer_replayssm_args(
+            speculative_algorithm="EAGLE"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "KDA DSPARK/DFLASH may use FlashInfer decode"
+        ):
+            server_args._handle_linear_attn_backend()
+
+    @patch("torch.cuda.get_device_capability", return_value=(10, 0))
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_rejects_flashinfer_verify_even_with_triton_decode(
+        self, _mock_sm100, _mock_is_cuda, _mock_capability
+    ):
+        server_args = self._flashinfer_replayssm_args(
+            linear_attn_decode_backend="triton",
+            linear_attn_verify_backend="flashinfer",
+            speculative_algorithm="EAGLE",
+            mamba_radix_cache_strategy="no_buffer",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "requires a ring-writing target-verify backend"
+        ):
+            server_args._handle_linear_attn_backend()
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)

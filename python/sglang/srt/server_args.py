@@ -6012,17 +6012,15 @@ class ServerArgs:
                     f"{self.linear_replayssm_cache_len}."
                 )
 
-        # ReplaySSM spec-verify (Part B of #28511): GDN-only, linear-chain target
-        # verify. Reuses the `linear_replayssm` ring (replayssm_d/k/g + write_pos)
-        # plus two extra per-slot cursors (cache_base, is_flush) and the chunked
-        # (I+A)^-1 reconstruction verify kernel. The intra-window interaction uses a
-        # strictly-lower causal mask, so it is valid ONLY for a linear draft chain
-        # (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP); EAGLE tree verify
-        # (topk > 1) must fall back to the recurrent verify. GDN-only is enforced at
-        # runtime (KDA routes through kda_backend, which never enters this path; the
-        # pool gate also checks `not cache_params.is_kda`). The ring length reuses
-        # --linear-replayssm-cache-len (no separate flag).
+        # ReplaySSM spec-verify (Part B of #28511): linear-chain target verify.
+        # GDN uses the chunked reconstruction path; KDA DSpARK/DFlash writes its
+        # raw-input ring from the Triton or nv_cutedsl verify kernel and folds the
+        # accepted prefix into the committed state after every verify. Because
+        # that KDA protocol is verify-side, ordinary single-token decode may use
+        # FlashInfer as long as target verify remains on the ring-writing CuTe
+        # path. FlashInfer target verify itself does not write the ring.
         if self.enable_linear_replayssm_spec:
+            _algo = (self.speculative_algorithm or "").upper()
             if self.speculative_eagle_topk not in (None, 1):
                 raise ValueError(
                     "--enable-linear-replayssm-spec requires a linear draft chain "
@@ -6031,13 +6029,28 @@ class ServerArgs:
                     "EAGLE tree verify. Got "
                     f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
                 )
-            if decode != "triton":
+            if verify not in (
+                None,
+                "triton",
+                "nv_cutedsl",
+            ):
+                raise ValueError(
+                    "--enable-linear-replayssm-spec requires a ring-writing "
+                    "target-verify backend (triton or "
+                    f"nv_cutedsl), got {verify!r}."
+                )
+            flashinfer_decode_with_kda_cutedsl_verify = (
+                decode == "flashinfer"
+                and verify == "nv_cutedsl"
+                and _algo in ("DSPARK", "DFLASH")
+            )
+            if decode != "triton" and not flashinfer_decode_with_kda_cutedsl_verify:
                 raise ValueError(
                     "--enable-linear-replayssm-spec requires the Triton linear-attn "
-                    "decode backend, got "
-                    f"--linear-attn-decode-backend={decode!r}."
+                    "decode backend, except KDA DSPARK/DFLASH may use FlashInfer "
+                    "decode with --linear-attn-verify-backend=nv_cutedsl; got "
+                    f"decode={decode!r}, verify={verify!r}, algorithm={_algo!r}."
                 )
-            _algo = (self.speculative_algorithm or "").upper()
             if self.enable_mamba_extra_buffer() and _algo not in ("DSPARK", "DFLASH"):
                 # KDA fold-every-commit (DSPARK/DFLASH) keeps `temporal` current
                 # and snapshots the crossing state in the same replay, so it works
