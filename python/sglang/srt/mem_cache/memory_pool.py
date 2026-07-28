@@ -929,6 +929,16 @@ class MambaPool:
             t = self.mamba_cache.temporal
             t[:, indices] = 0
 
+    def reset_replayssm_cursors(self, indices: torch.Tensor) -> None:
+        """Mark slots as having no pending ReplaySSM ring state."""
+        for cursor in (
+            self.replayssm_write_pos,
+            self.replayssm_cache_base,
+            self.replayssm_is_flush,
+        ):
+            if cursor is not None:
+                cursor[indices] = 0
+
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
 
@@ -969,14 +979,7 @@ class MambaPool:
             self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
                 :, src_indices
             ]
-        if self.replayssm_write_pos is not None:
-            self.replayssm_write_pos[dst_indices] = 0
-        # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring
-        # entries, so its rolling origin + flush flag reset alongside write_pos.
-        if self.replayssm_cache_base is not None:
-            self.replayssm_cache_base[dst_indices] = 0
-        if self.replayssm_is_flush is not None:
-            self.replayssm_is_flush[dst_indices] = 0
+        self.reset_replayssm_cursors(dst_indices)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -1302,14 +1305,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 # ring. write_pos=0 means "ring empty", so the decode kernel
                 # ignores ring contents and reads only the checkpoint state
                 # (the post-prefill state that prefill wrote into this slot).
-                if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.mamba_pool_idx] = 0
-                # ReplaySSM spec-verify ring: an empty ring also resets the
-                # circular origin + flush flag so the first verify step on this
-                # freshly-prefilled slot reconstructs from the checkpoint alone.
-                if self.mamba_pool.replayssm_cache_base is not None:
-                    self.mamba_pool.replayssm_cache_base[req.mamba_pool_idx] = 0
-                    self.mamba_pool.replayssm_is_flush[req.mamba_pool_idx] = 0
+                self.mamba_pool.reset_replayssm_cursors(req.mamba_pool_idx)
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:

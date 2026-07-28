@@ -651,6 +651,13 @@ class MambaComponent(TreeComponent):
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:
                 return
+            # HiCache stores only the flushed conv/temporal checkpoint. Reused
+            # tree and request slots must not expose stale ReplaySSM cursors
+            # left by their previous owners.
+            mamba_pool = self.cache.req_to_token_pool.mamba_pool
+            for item in transfers:
+                if item.device_indices is not None:
+                    mamba_pool.reset_replayssm_cursors(item.device_indices)
             transfer = transfers[0]
             if transfer.device_indices is not None:
                 cd = node.component_data[ct]

@@ -14,8 +14,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridLoadReservation,
     HybridWriteReservation,
 )
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.unified_cache_components import (
     BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
     ComponentType,
     MambaComponent,
     PrepareLoadBackResult,
@@ -927,6 +929,72 @@ class TestUnifiedLoadConsensus(unittest.TestCase):
         cache.dec_lock_ref.assert_called_once()
         cache.dec_host_lock_ref.assert_not_called()
         self.assertIn(node.id, cache.ongoing_load_back)
+
+
+class TestMambaLoadCommit(unittest.TestCase):
+    def test_resets_replayssm_cursors_for_tree_and_request_slots(self):
+        mamba_pool = SimpleNamespace(
+            replayssm_write_pos=torch.full((10,), 11, dtype=torch.int32),
+            replayssm_cache_base=torch.full((10,), 12, dtype=torch.int32),
+            replayssm_is_flush=torch.ones((10,), dtype=torch.int8),
+        )
+        mamba_pool.reset_replayssm_cursors = MethodType(
+            MambaPool.reset_replayssm_cursors, mamba_pool
+        )
+        host_lru = SimpleNamespace(
+            in_list=mock.Mock(return_value=True),
+            remove_node=mock.Mock(),
+        )
+        device_lru = SimpleNamespace(insert_mru=mock.Mock())
+        cache = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(mamba_pool=mamba_pool),
+            host_lru_lists={ComponentType.MAMBA: host_lru},
+            lru_lists={ComponentType.MAMBA: device_lru},
+            component_evictable_size_={ComponentType.MAMBA: 0},
+        )
+        component = SimpleNamespace(
+            component_type=ComponentType.MAMBA,
+            cache=cache,
+        )
+        component_data = SimpleNamespace(value=None)
+        node = SimpleNamespace(
+            component_data={ComponentType.MAMBA: component_data},
+        )
+        tree_indices = _indices(3, 1)
+        request_indices = _indices(7, 1)
+
+        MambaComponent.commit_hicache_transfer(
+            component,
+            node,
+            CacheTransferPhase.LOAD_BACK,
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    device_indices=tree_indices,
+                ),
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    device_indices=request_indices,
+                ),
+            ],
+        )
+
+        for cursor in (
+            mamba_pool.replayssm_write_pos,
+            mamba_pool.replayssm_cache_base,
+            mamba_pool.replayssm_is_flush,
+        ):
+            torch.testing.assert_close(
+                cursor[tree_indices], torch.zeros_like(cursor[tree_indices])
+            )
+            torch.testing.assert_close(
+                cursor[request_indices], torch.zeros_like(cursor[request_indices])
+            )
+            self.assertNotEqual(cursor[0].item(), 0)
+        torch.testing.assert_close(component_data.value, tree_indices)
+        host_lru.remove_node.assert_called_once_with(node)
+        device_lru.insert_mru.assert_called_once_with(node)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.MAMBA], 1)
 
 
 if __name__ == "__main__":
