@@ -22,7 +22,8 @@ import jinja2
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import Draft7Validator, Draft202012Validator, SchemaError
+from jsonschema.validators import validator_for
 
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
@@ -690,7 +691,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                self._validate_tool_schema(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
@@ -717,6 +718,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    def _validate_tool_schema(self, schema: object) -> None:
+        """Validate K3 tool schemas without rejecting legacy Draft 7 IDs."""
+        if self.chat_encoding_spec != "kimi_k3":
+            Draft202012Validator.check_schema(schema)
+            return
+
+        validator = (
+            validator_for(schema, default=Draft202012Validator)
+            if isinstance(schema, (dict, bool))
+            else Draft202012Validator
+        )
+        try:
+            validator.check_schema(schema)
+        except SchemaError:
+            if not isinstance(schema, dict) or "$schema" in schema:
+                raise
+            Draft7Validator.check_schema(schema)
 
     def _convert_to_internal_request(
         self,

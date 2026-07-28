@@ -381,6 +381,62 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(enabled_kwargs["thinking_effort"], "low")
         self.assertTrue(enabled_kwargs["preserve_thinking"])
 
+    def test_kimi_k3_accepts_draft7_tool_schema_id_fragments(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+
+        def request_for(schema):
+            return ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Use the tool."}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "test_tool",
+                            "parameters": schema,
+                        },
+                    }
+                ],
+            )
+
+        for schema_id in (
+            "#user",
+            "https://example.com/schemas/user#/definitions/name",
+            "https://example.com/schemas/user#/$defs/name",
+        ):
+            with self.subTest(schema_id=schema_id):
+                self.assertIsNone(
+                    self.chat._validate_request(
+                        request_for({"$id": schema_id, "type": "object"})
+                    )
+                )
+
+        self.assertIsNone(
+            self.chat._validate_request(
+                request_for(
+                    {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "$id": "#user",
+                        "type": "object",
+                    }
+                )
+            )
+        )
+        error = self.chat._validate_request(
+            request_for(
+                {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "$id": "#user",
+                    "type": "object",
+                }
+            )
+        )
+        self.assertIn("$id", error)
+        self.assertIn(
+            "invalid 'parameters'",
+            self.chat._validate_request(request_for({"type": "geometry"})),
+        )
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [
