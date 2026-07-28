@@ -46,6 +46,14 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.k3_target_fp8 import (
+    K3TargetFP8Linear,
+    K3TargetFP8SourceGroup,
+    K3TargetFP8State,
+    kda_qkvg_role,
+    moe_front_role,
+    rebind_weight_aliases,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -178,7 +186,10 @@ def _k3_bf16_gemm(
 
 
 def _merge_weights_as_views(
-    mods: list, pad_rows_to: int = 1
+    mods: list,
+    pad_rows_to: int = 1,
+    *,
+    allocation_context=None,
 ) -> tuple[torch.Tensor, list[int]]:
     """Cat module weights along dim 0; re-point each module's weight to a view
     of the merged buffer so the original storage is freed (net extra memory ~0).
@@ -189,14 +200,89 @@ def _merge_weights_as_views(
     ws = [m.weight.data for m in mods]
     sizes = [w.shape[0] for w in ws]
     pad = (-sum(sizes)) % pad_rows_to
-    if pad:
-        ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
-    merged = torch.cat(ws, dim=0).contiguous()
+    if allocation_context is None:
+        if pad:
+            ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
+        merged = torch.cat(ws, dim=0).contiguous()
+    else:
+        # The K3 target FP8 path places this final BF16 source in a private
+        # MemPool. Do not use torch.cat here: its destination allocator is
+        # implicit and a padding temporary could escape the source pool.
+        with allocation_context:
+            merged = torch.empty(
+                (sum(sizes) + pad, ws[0].shape[1]),
+                dtype=ws[0].dtype,
+                device=ws[0].device,
+            )
+        dst = 0
+        for weight in ws:
+            rows = weight.shape[0]
+            merged[dst : dst + rows].copy_(weight)
+            dst += rows
+        if pad:
+            merged[dst:].zero_()
     off = 0
     for m, n in zip(mods, sizes):
         m.weight.data = merged[off : off + n]
         off += n
     return merged, sizes
+
+
+def _validate_target_fp8_sources(
+    group: K3TargetFP8SourceGroup,
+    modules: list[nn.Module],
+    *,
+    label: str,
+) -> list[torch.Tensor]:
+    """Preflight one private-pool conversion unit without changing storage."""
+    weights: list[torch.Tensor] = []
+    for module in modules:
+        group.validate_staged_linear_weight(module)
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, nn.Parameter):
+            raise TypeError(
+                f"K3 target FP8 {label} component has no weight Parameter."
+            )
+        weights.append(weight)
+
+    if any(not weight.is_cuda for weight in weights):
+        raise RuntimeError(
+            f"K3 target FP8 {label} does not support CPU/offloaded weights."
+        )
+    dtypes = {weight.dtype for weight in weights}
+    if len(dtypes) != 1 or next(iter(dtypes)) not in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        raise RuntimeError(
+            f"K3 target FP8 {label} requires one BF16/FP16 dtype, got "
+            f"{[weight.dtype for weight in weights]}."
+        )
+    devices = {weight.device for weight in weights}
+    if len(devices) != 1:
+        raise RuntimeError(
+            f"K3 target FP8 {label} components span devices "
+            f"{sorted(str(device) for device in devices)}."
+        )
+    if any(weight.ndim != 2 or not weight.is_contiguous() for weight in weights):
+        raise RuntimeError(
+            f"K3 target FP8 {label} requires contiguous 2D components, got "
+            f"{[(tuple(weight.shape), weight.is_contiguous()) for weight in weights]}."
+        )
+    input_widths = {weight.shape[1] for weight in weights}
+    if len(input_widths) != 1:
+        raise RuntimeError(
+            f"K3 target FP8 {label} components have mismatched input widths "
+            f"{sorted(input_widths)}."
+        )
+    output_width = sum(weight.shape[0] for weight in weights)
+    input_width = next(iter(input_widths))
+    if output_width % 16 or input_width % 16:
+        raise RuntimeError(
+            f"K3 target FP8 {label} merged shape must be 16-aligned, got "
+            f"({output_width}, {input_width})."
+        )
+    return weights
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +348,7 @@ class KimiK3MLP(nn.Module):
         activation_situ_linear_beta: float | None = None,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        target_fp8_gate_up_group: Optional[K3TargetFP8SourceGroup] = None,
     ) -> None:
         super().__init__()
         _tp_kwargs = (
@@ -275,6 +362,8 @@ class KimiK3MLP(nn.Module):
             prefix=f"{prefix}.gate_up_proj",
             **_tp_kwargs,
         )
+        if target_fp8_gate_up_group is not None:
+            target_fp8_gate_up_group.stage_linear_weight(self.gate_up_proj)
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -373,6 +462,7 @@ class KimiK3MoE(nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        target_fp8: Optional[K3TargetFP8State] = None,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -384,6 +474,24 @@ class KimiK3MoE(nn.Module):
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
+        self._target_fp8 = target_fp8
+        self._target_fp8_front_role = moe_front_role()
+        self._target_fp8_front_group = (
+            target_fp8.new_source_group(
+                self._target_fp8_front_role,
+                layer_idx,
+            )
+            if target_fp8 is not None
+            else None
+        )
+        if (
+            self._target_fp8_front_group is not None
+            and not get_moe_a2a_backend().is_none()
+        ):
+            raise RuntimeError(
+                "K3 target FP8 front replacement currently requires plain "
+                "TP (no MoE a2a/EP)."
+            )
 
         # Latent MoE
         self.use_latent_moe = config.routed_expert_hidden_size is not None
@@ -394,6 +502,7 @@ class KimiK3MoE(nn.Module):
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
+        self._front_fp8: Optional[K3TargetFP8Linear] = None
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -401,6 +510,8 @@ class KimiK3MoE(nn.Module):
         # Gate — fp32 output so routing (sigmoid, bias add, top-k) runs in
         # full precision (matches GateLinear in mke). codespell:ignore mke
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
+        if self._target_fp8_front_group is not None:
+            self._target_fp8_front_group.stage_linear_weight(self.gate)
 
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
         # so FusedMoE's weight_loader uses the MXFP4 fast path
@@ -527,6 +638,7 @@ class KimiK3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
+                target_fp8_gate_up_group=self._target_fp8_front_group,
                 **(dict(tp_rank=0, tp_size=1) if self._shared_experts_tp1 else {}),
             )
         else:
@@ -560,6 +672,10 @@ class KimiK3MoE(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
+            if self._target_fp8_front_group is not None:
+                self._target_fp8_front_group.stage_linear_weight(
+                    self.routed_expert_down_proj
+                )
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
                 if config.latent_moe_use_norm
@@ -604,6 +720,44 @@ class KimiK3MoE(nn.Module):
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
 
+    def _validate_target_fp8_front_source(self) -> None:
+        """Fail before converting any layer if the selected front is ineligible."""
+        if self._target_fp8_front_group is None or self._front_fp8 is not None:
+            return
+        if not (self.use_latent_moe and self.shared_experts is not None):
+            raise RuntimeError(
+                "K3 target FP8 front requires latent MoE with shared experts."
+            )
+        if not get_moe_a2a_backend().is_none():
+            raise RuntimeError(
+                "K3 target FP8 front requires plain TP (no MoE a2a/EP)."
+            )
+        _validate_target_fp8_sources(
+            self._target_fp8_front_group,
+            [
+                self.shared_experts.gate_up_proj,
+                self.gate,
+                self.routed_expert_down_proj,
+            ],
+            label=f"MoE front layer {self.layer_idx}",
+        )
+        shared_down = self.shared_experts.down_proj.weight
+        if (
+            not isinstance(shared_down, nn.Parameter)
+            or not shared_down.is_cuda
+            or shared_down.dtype not in (torch.bfloat16, torch.float16)
+            or shared_down.ndim != 2
+            or not shared_down.is_contiguous()
+        ):
+            raise RuntimeError(
+                "K3 target FP8 front requires its unconverted shared-down "
+                "runtime dependency to remain a contiguous CUDA BF16/FP16 "
+                f"weight at layer {self.layer_idx}; got "
+                f"shape={getattr(shared_down, 'shape', None)}, "
+                f"dtype={getattr(shared_down, 'dtype', None)}, "
+                f"device={getattr(shared_down, 'device', None)}."
+            )
+
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
 
@@ -616,6 +770,8 @@ class KimiK3MoE(nn.Module):
         cuda graph capture); only plain bf16/fp16 dense weights are merged —
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
+        if self._front_fp8 is not None:
+            return
         if not self.use_latent_moe:
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
@@ -636,8 +792,46 @@ class KimiK3MoE(nn.Module):
             return
         dtypes = {m.weight.dtype for m in mods}
         if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
+            if self._target_fp8_front_group is not None:
+                raise RuntimeError(
+                    "K3 target FP8 staged a MoE front whose component "
+                    f"dtypes cannot be merged: {[m.weight.dtype for m in mods]}."
+                )
             return
-        self._front_w, self._front_sizes = _merge_weights_as_views(mods)
+        convert_to_fp8 = self._target_fp8_front_group is not None
+        allocation_context = (
+            self._target_fp8_front_group.allocation()
+            if convert_to_fp8
+            else None
+        )
+        self._front_w, self._front_sizes = _merge_weights_as_views(
+            mods, allocation_context=allocation_context
+        )
+        del allocation_context
+        if convert_to_fp8:
+            if self._target_fp8 is None:
+                raise RuntimeError("K3 target FP8 front lost its owner state.")
+            source = self._front_w
+            converted = self._target_fp8.convert(
+                source,
+                self._target_fp8_front_role,
+                self.layer_idx,
+                component_names=("shared_gate_up", "router", "latent_down"),
+                component_rows=self._front_sizes,
+            )
+            # Remove every BF16 alias before the source pool is destroyed.
+            # These component parameters are retained only so model
+            # introspection remains structurally stable; the fused front is
+            # the sole runtime consumer in this plain-TP configuration.
+            rebind_weight_aliases(
+                mods,
+                self._front_sizes,
+                converted.logical_weight,
+            )
+            self._front_w = None
+            self._front_fp8 = converted
+            del source
+            self._target_fp8_front_group.release()
         self._front_is_ep_pair = len(mods) == 2
         # NOTE: invalidate the cached properties
         for prop in (
@@ -661,7 +855,7 @@ class KimiK3MoE(nn.Module):
         return (
             self.use_latent_moe
             and self.shared_experts is not None
-            and self._front_w is not None
+            and (self._front_w is not None or self._front_fp8 is not None)
             and not self._front_is_ep_pair
             and get_moe_a2a_backend().is_none()
             and self.shared_experts.down_proj.weight.dtype
@@ -902,6 +1096,11 @@ class KimiK3MoE(nn.Module):
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
+        if self._front_fp8 is not None:
+            raise RuntimeError(
+                "K3 FP8 front replacement has no BF16 component fallback; "
+                "this configuration must remain on the fused plain-TP front."
+            )
         # Shared experts on original hidden_states. Under SBO they go to the
         # side stream and are joined at the tail (see _sbo_shared_overlap).
         #
@@ -1031,7 +1230,7 @@ class KimiK3MoE(nn.Module):
         allreduce path; same trick as RowParallelLinear)."""
         if TYPE_CHECKING:  # NOTE: precondition for this case
             assert (
-                self._front_w is not None
+                (self._front_w is not None or self._front_fp8 is not None)
                 and self._front_sizes is not None
                 and self.moe_hidden_size is not None
                 and self.shared_experts is not None
@@ -1040,7 +1239,11 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(hidden_states, self._front_w)
+        fused = (
+            self._front_fp8(hidden_states)
+            if self._front_fp8 is not None
+            else _k3_bf16_gemm(hidden_states, self._front_w)
+        )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
@@ -1179,7 +1382,9 @@ class KimiK3MoE(nn.Module):
             hidden_states = get_global_dp_buffer(get_tp_group())
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             dp_prefix_sum, prefix_sum = prefix_sum, None
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+        if hidden_states.shape[0] == 0:
+            out = hidden_states
+        elif self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
@@ -1208,6 +1413,7 @@ class KimiK3DeltaAttention(nn.Module):
         prefix: str = "",
         all_reduce_fusion: bool = False,
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
+        target_fp8: Optional[K3TargetFP8State] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1239,6 +1445,10 @@ class KimiK3DeltaAttention(nn.Module):
         self.head_v_dim = config.v_head_dim
         self.layer_idx = layer_idx
         self.prefix = prefix
+        self._target_fp8 = target_fp8
+        self._target_fp8_qkvg_role = kda_qkvg_role()
+        self._target_fp8_qkvg_group: Optional[K3TargetFP8SourceGroup] = None
+        self._qkvg_fp8: Optional[K3TargetFP8Linear] = None
         assert self.num_heads % self.attn_tp_size == 0
         self.local_num_heads = divide(self.num_heads, self.attn_tp_size)
 
@@ -1276,6 +1486,15 @@ class KimiK3DeltaAttention(nn.Module):
                 tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
+            if target_fp8 is not None:
+                self._target_fp8_qkvg_group = target_fp8.new_source_group(
+                    self._target_fp8_qkvg_role,
+                    layer_idx,
+                )
+            if self._target_fp8_qkvg_group is not None:
+                self._target_fp8_qkvg_group.stage_linear_weight(
+                    self.fused_qkvg_proj
+                )
             self.split_sizes = [
                 3 * projection_size // self.tp_size,
                 projection_size // self.tp_size,
@@ -1533,6 +1752,100 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._bfa_fa_size, self._bfa_b_size = sizes
 
+    def _validate_target_fp8_qkvg_source(self) -> None:
+        """Fail before converting any layer if wide qkvg is not the TP path."""
+        if self._target_fp8_qkvg_group is None or self._qkvg_fp8 is not None:
+            return
+        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
+            raise RuntimeError(
+                "K3 target FP8 wide scope requires the full-rank fused qkvg "
+                f"path at KDA layer {self.layer_idx}."
+            )
+        weights = _validate_target_fp8_sources(
+            self._target_fp8_qkvg_group,
+            [self.fused_qkvg_proj],
+            label=f"KDA qkvg layer {self.layer_idx}",
+        )
+        if self.fused_qkvg_proj.bias is not None:
+            raise RuntimeError("K3 target FP8 qkvg does not support a bias.")
+        if self.fused_qkvg_proj.gather_output:
+            raise RuntimeError(
+                "K3 target FP8 qkvg requires a TP-local (non-gathered) output."
+            )
+        if len(self.fused_qkvg_proj.output_sizes) != 4:
+            raise RuntimeError(
+                "K3 target FP8 wide scope requires four merged qkvg shards."
+            )
+        component_rows = [
+            output_size // self.fused_qkvg_proj.tp_size
+            for output_size in self.fused_qkvg_proj.output_sizes
+        ]
+        if len(set(component_rows)) != 1 or sum(component_rows) != weights[0].shape[0]:
+            raise RuntimeError(
+                "K3 target FP8 wide scope requires equal TP-local q/k/v/g "
+                f"rows covering the source, got rows={component_rows}, "
+                f"shape={tuple(weights[0].shape)}."
+            )
+
+    def _convert_qkvg_to_target_fp8(self) -> None:
+        """Replace the already-merged TP-local q/k/v/g projection after load."""
+        if self._target_fp8_qkvg_group is None or self._qkvg_fp8 is not None:
+            return
+        if self._target_fp8 is None:
+            raise RuntimeError("K3 target FP8 qkvg lost its owner state.")
+        source = self.fused_qkvg_proj.weight.data
+        if (
+            source.dtype not in (torch.bfloat16, torch.float16)
+            or source.ndim != 2
+            or not source.is_contiguous()
+        ):
+            raise RuntimeError(
+                "K3 target FP8 staged a KDA qkvg projection with an "
+                f"unsupported source: shape={tuple(source.shape)}, "
+                f"dtype={source.dtype}, contiguous={source.is_contiguous()}."
+            )
+        if len(self.fused_qkvg_proj.output_sizes) != 4:
+            raise RuntimeError(
+                "K3 target FP8 wide scope requires four merged qkvg shards."
+            )
+        component_rows = [
+            output_size // self.fused_qkvg_proj.tp_size
+            for output_size in self.fused_qkvg_proj.output_sizes
+        ]
+        if sum(component_rows) != source.shape[0]:
+            raise RuntimeError(
+                "K3 target FP8 qkvg component rows do not cover its source: "
+                f"rows={component_rows}, shape={tuple(source.shape)}."
+            )
+
+        converted = self._target_fp8.convert(
+            source,
+            self._target_fp8_qkvg_role,
+            self.layer_idx,
+            component_names=("q", "k", "v", "g"),
+            component_rows=component_rows,
+        )
+        # Keep the original Parameter object alive and rebind its storage.
+        # load_weights() retains a params_dict referencing this Parameter until
+        # post_load_weights returns, so replacing only the module would pin the
+        # private BF16 pool and make release correctly fail.
+        rebind_weight_aliases(
+            [self.fused_qkvg_proj],
+            [source.shape[0]],
+            converted.logical_weight,
+        )
+        self._qkvg_fp8 = converted
+        del source
+        self._target_fp8_qkvg_group.release()
+
+    def _project_qkvg(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self._qkvg_fp8 is not None:
+            return self._qkvg_fp8(hidden_states), None
+        return self.fused_qkvg_proj(hidden_states)
+
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
         (kernels/ops/attention/kda_fused_decode): per-segment transposed fp32 conv
@@ -1609,21 +1922,25 @@ class KimiK3DeltaAttention(nn.Module):
                         bfa = gemm(hidden_states, w)
                         forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                         beta = bfa[..., n_fa : n_fa + n_b]
-                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    fused_states, _ = self._project_qkvg(hidden_states)
                     qkv, g_proj_states = torch.split(
                         fused_states, self.split_sizes, dim=-1
                     )
                     cur.wait_stream(alt)
                     return qkv, beta, forget_gate, g_proj_states
 
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+                fused_states, _ = self._project_qkvg(hidden_states)
+                qkv, g_proj_states = torch.split(
+                    fused_states, self.split_sizes, dim=-1
+                )
                 bfa = gemm(hidden_states, w)
                 forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+                fused_states, _ = self._project_qkvg(hidden_states)
+                qkv, g_proj_states = torch.split(
+                    fused_states, self.split_sizes, dim=-1
+                )
                 beta = self.b_proj(hidden_states)[0]
                 forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         else:
@@ -1884,6 +2201,7 @@ class KimiK3DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        target_fp8: Optional[K3TargetFP8State] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1954,7 +2272,10 @@ class KimiK3DecoderLayer(nn.Module):
                 all_reduce_fusion=self.all_reduce_fusion,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
-                bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
+                bfa_alt_stream=(
+                    alt_streams[2] if alt_streams is not None else None
+                ),
+                target_fp8=target_fp8,
             )
         else:
             self.self_attn = KimiK3MLAAttention(
@@ -1979,6 +2300,7 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
+                target_fp8=target_fp8,
             )
         else:
             self.mlp = KimiK3MLP(
@@ -2360,6 +2682,7 @@ class KimiK3LinearModel(nn.Module):
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync(get_server_args())
+        self.target_fp8 = K3TargetFP8State.from_env()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -2391,10 +2714,29 @@ class KimiK3LinearModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_streams=self.alt_streams,
+                target_fp8=self.target_fp8,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
+        )
+
+        local_front_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer)
+            if not isinstance(self.layers[layer_idx], PPMissingLayer)
+            and isinstance(self.layers[layer_idx].mlp, KimiK3MoE)
+        ]
+        local_kda_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer)
+            if config.is_kda_layer(layer_idx)
+        ]
+        configured_kda_ids = list(config.linear_layer_ids)
+        self.target_fp8.configure_expected_layer_ids(
+            local_front_ids=local_front_ids,
+            local_kda_ids=local_kda_ids,
+            configured_kda_count=len(configured_kda_ids),
         )
 
         if self.pp_group.is_last_rank:
@@ -2703,6 +3045,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        self.model.target_fp8.begin_checkpoint_load()
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
         )
@@ -2826,6 +3169,21 @@ class KimiK3LinearForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                if param_name == ".fused_qkvg_proj":
+                    self.model.target_fp8.mark_checkpoint_component(
+                        kda_qkvg_role(),
+                        layer_id,
+                        ("q", "k", "v", "g")[shard_id],
+                    )
+                elif (
+                    param_name == ".gate_up_proj"
+                    and ".shared_experts." in name
+                ):
+                    self.model.target_fp8.mark_checkpoint_component(
+                        moe_front_role(),
+                        layer_id,
+                        ("shared_gate", "shared_up")[shard_id],
+                    )
                 break
             else:
                 for idx, (param_name, weight_name, expert_id, shard_id) in enumerate(
@@ -2866,8 +3224,46 @@ class KimiK3LinearForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, **kwargs)
+                    if layer_id is not None:
+                        if name.endswith(".mlp.gate.weight"):
+                            self.model.target_fp8.mark_checkpoint_component(
+                                moe_front_role(),
+                                layer_id,
+                                "router",
+                            )
+                        elif name.endswith(
+                            ".mlp.routed_expert_down_proj.weight"
+                        ):
+                            self.model.target_fp8.mark_checkpoint_component(
+                                moe_front_role(),
+                                layer_id,
+                                "latent_down",
+                            )
+                        elif name.endswith(
+                            ".mlp.shared_experts.gate_up_proj.weight"
+                        ):
+                            self.model.target_fp8.mark_checkpoint_component(
+                                moe_front_role(),
+                                layer_id,
+                                "shared_gate",
+                            )
+                            self.model.target_fp8.mark_checkpoint_component(
+                                moe_front_role(),
+                                layer_id,
+                                "shared_up",
+                            )
+                        elif name.endswith(
+                            ".self_attn.fused_qkvg_proj.weight"
+                        ):
+                            for component in ("q", "k", "v", "g"):
+                                self.model.target_fp8.mark_checkpoint_component(
+                                    kda_qkvg_role(),
+                                    layer_id,
+                                    component,
+                                )
             loaded_params.add(name)
 
+        self.model.target_fp8.finish_checkpoint_load()
         self.post_load_weights()
 
     def post_load_weights(self):
@@ -2912,6 +3308,18 @@ class KimiK3LinearForCausalLM(nn.Module):
         # weights are re-pointed to views of the merged buffers (net extra
         # memory ~0), so this must run after all weights are loaded and
         # before cuda graph capture.
+        # Validate every selected source before changing any layer, so a
+        # topology/offload/loader mismatch cannot leave a partially converted
+        # model behind.
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if isinstance(layer.mlp, KimiK3MoE):
+                layer.mlp._validate_target_fp8_front_source()
+            if isinstance(layer.self_attn, KimiK3DeltaAttention):
+                layer.self_attn._validate_target_fp8_qkvg_source()
+
+        self.model.target_fp8.begin_conversion()
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
@@ -2925,8 +3333,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
+                layer.self_attn._convert_qkvg_to_target_fp8()
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+
+        # Every selected BF16 source alias has now been rebound to its FP8
+        # destination. Destroy the private source-only pool before graph/KV
+        # sizing so the returned HBM contributes to serving capacity.
+        self.model.target_fp8.finalize()
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

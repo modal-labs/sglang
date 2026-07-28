@@ -770,6 +770,16 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Online static-E4M3 replacement for selected Kimi-K3 target BF16 dense
+    # weights. "front" converts the post-merge MoE front; "wide" additionally
+    # converts the already-merged KDA qkvg projection. Routed experts remain
+    # checkpoint MXFP4, so this stays separate from --quantization.
+    SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
+    # tensor_static is the faster one-scale representation; channel_static is
+    # the per-output-channel range-robust correctness fallback.
+    SGLANG_K3_TARGET_DENSE_FP8_REPRESENTATION = EnvStr("tensor_static")
+    SGLANG_K3_TARGET_DENSE_FP8_MEMORY_DIAGNOSTICS = EnvBool(False)
+    SGLANG_K3_TARGET_DENSE_FP8_RANGE_DIAGNOSTICS = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
