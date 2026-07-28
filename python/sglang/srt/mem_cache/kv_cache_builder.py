@@ -82,6 +82,12 @@ def maybe_register_hicache_draft(
     """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
     if not enable_hierarchical_cache:
         return
+    if getattr(draft_worker, "use_draft_ring", False):
+        # The private DFlash ring uses request-row/modulo locations, not the
+        # target's global KV indices. Its cache-hit context is rebuilt by the
+        # scheduler's ring-tail re-prefill instead of HiCache mirroring.
+        logger.info("HiCache draft KV mirroring disabled for the DFlash ring")
+        return
 
     draft_kv_pool = get_draft_kv_pool(
         draft_worker=draft_worker,
