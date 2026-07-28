@@ -49,6 +49,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     field_serializer,
     field_validator,
     model_serializer,
@@ -215,7 +216,9 @@ class JsonSchemaResponseFormat(BaseModel):
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = None
+    # The OpenAI wire contract accepts JSON booleans, not truthy strings or
+    # integers. Keep the false default used by the compatibility path.
+    strict: Optional[StrictBool] = False
 
 
 class ResponseFormat(BaseModel):
