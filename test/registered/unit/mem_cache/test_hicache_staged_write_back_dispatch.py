@@ -316,6 +316,8 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.device_pool = device_pool
         host.layout = "page_first"
         host.page_size = 1
+        host.dcp_size = 1
+        host.dcp_rank = 0
         host.layer_num = layer_num
         host.kv_cache_dim = kv_cache_dim
         host.token_stride_size = kv_cache_dim
