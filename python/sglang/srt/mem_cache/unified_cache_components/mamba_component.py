@@ -518,6 +518,7 @@ class MambaComponent(TreeComponent):
         node: UnifiedTreeNode,
         *,
         req: Optional[Req] = None,
+        allow_evict: bool = True,
     ) -> PrepareLoadBackResult:
         cd = node.component_data[self.component_type]
         # skip unless the node needs a load-back (device value absent), like build_hicache_transfers
@@ -529,10 +530,11 @@ class MambaComponent(TreeComponent):
         ):
             return PrepareLoadBackResult()
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-        if dst is None:
+        if dst is None and allow_evict:
             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert dst is not None, "Cannot alloc mamba for load_back"
+        if dst is None:
+            return PrepareLoadBackResult(succeeded=False)
         req.mamba_pool_idx = dst[0]
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 

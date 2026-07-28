@@ -3506,9 +3506,11 @@ class UnifiedRadixCacheSuite:
         req.mamba_pool_idx = None
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
-        # cache_controller.load() failing (device alloc / transfer resolution)
+        # A failed controller reservation (device alloc / transfer resolution)
         # must also return the slot this call allocated.
-        with mock.patch.object(cache.cache_controller, "load", return_value=None):
+        with mock.patch.object(
+            cache.cache_controller, "reserve_load", return_value=None
+        ):
             loaded = cache.load_back(leaf, req=req)
 
         self.assertFalse(loaded)

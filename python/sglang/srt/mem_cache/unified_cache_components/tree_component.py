@@ -81,6 +81,7 @@ class PrepareLoadBackResult:
 
     # Freshly allocated device mamba slot, recovered on failure.
     allocated_mamba_slot: Optional[torch.Tensor] = None
+    succeeded: bool = True
 
 
 class CacheTransferPhase(str, Enum):
@@ -393,6 +394,7 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         *,
         req: Optional[Req] = None,
+        allow_evict: bool = True,
     ) -> PrepareLoadBackResult:
         """Cache-level pre-allocation before a load-back builds its transfers."""
         return PrepareLoadBackResult()

@@ -426,6 +426,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
 
+    def _all_ranks_succeeded(self, local_success: bool) -> bool:
+        if self.tp_world_size == 1 and self.pp_size == 1:
+            return local_success
+        succeeded = torch.tensor(
+            int(local_success),
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(succeeded, torch.distributed.ReduceOp.MIN)
+        if self.pp_size > 1:
+            assert self.pp_group is not None
+            torch.distributed.all_reduce(
+                succeeded,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.pp_group,
+            )
+        return succeeded.item() == 1
+
     def _pp_sync(self, data: torch.Tensor) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
@@ -504,6 +522,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             attach_hybrid_pool_to_unified_cache,
         )
+
+        if server_args.hicache_write_policy == "write_back" and (
+            self.tp_world_size > 1 or self.pp_size > 1
+        ):
+            raise ValueError(
+                "Unified HiCache write_back is not TP/PP safe; use a "
+                "write_through policy"
+            )
 
         # Direct IO layout fixup (must happen before pool creation)
         if server_args.hicache_io_backend == "direct":
@@ -1689,24 +1715,58 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-        # Pre-evict host if insufficient
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
-            needed = kv_tokens - host_avail
-            evicted = self.evict_host(needed)
-            if evicted < needed:
-                return 0
-
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        host_indices = self.cache_controller.write(
-            device_value, node_id=node.id, extra_pools=aux_xfers or None
-        )
-        if host_indices is None:
+        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
+        if write_back and multi_rank:
+            raise RuntimeError(
+                "Unified HiCache write_back cannot run independently on TP/PP ranks"
+            )
+        coordinated = multi_rank
+        # Coordinated backups fail closed under pressure. Safe victim eviction
+        # needs its own cross-rank reservation protocol.
+        if not coordinated:
+            host_avail = self.cache_controller.mem_pool_host.available_size()
+            if host_avail < kv_tokens:
+                needed = kv_tokens - host_avail
+                evicted = self.evict_host(needed)
+                if evicted < needed:
+                    return 0
+
+        try:
+            reservation = self.cache_controller.reserve_write(
+                device_value,
+                node_id=node.id,
+                extra_pools=aux_xfers or None,
+                allow_evict=not coordinated,
+            )
+        except Exception:
+            if not coordinated:
+                raise
+            logger.exception("HiCache write reservation failed on this rank")
+            reservation = None
+        try:
+            group_succeeded = (
+                self._all_ranks_succeeded(reservation is not None)
+                if coordinated
+                else reservation is not None
+            )
+        except Exception:
+            if reservation is not None:
+                try:
+                    self.cache_controller.abort_write(reservation)
+                except Exception:
+                    logger.exception("Failed to abort HiCache write reservation")
+            raise
+        if not group_succeeded:
+            if reservation is not None:
+                self.cache_controller.abort_write(reservation)
+            return 0
+        if reservation is None:
             return 0
 
-        # Commit
+        host_indices = self.cache_controller.commit_write(reservation)
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
@@ -1792,37 +1852,69 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None:
             return False
 
-        host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
-        # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
             best_match_node, CacheTransferPhase.LOAD_BACK
         )[0]
 
-        # Lock path & pre-evict if device pool is insufficient
-        result = self.inc_lock_ref(best_match_node)
-        ancestor_lock_params = result.to_dec_params()
+        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
+        ancestor_lock_result = None
+        ancestor_lock_params = None
+        host_anchor_params = None
+        if not multi_rank:
+            # Preserve the single-rank eviction invariant: the load path and
+            # its host anchor must stay alive while local eviction makes room.
+            host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
+            ancestor_lock_result = self.inc_lock_ref(best_match_node)
+            ancestor_lock_params = ancestor_lock_result.to_dec_params()
 
-        # Let each component pre-allocate per-request state for the load-back;
-        # the finally below lets components recover it unless the load succeeds.
-        preps: dict[ComponentType, PrepareLoadBackResult] = {
-            comp.component_type: comp.prepare_load_back(best_match_node, req=req)
-            for comp in self._components_tuple
-        }
+        # Let each component reserve per-request state for the load-back. The
+        # finally below returns those reservations unless every rank commits.
+        preps: dict[ComponentType, PrepareLoadBackResult] = {}
+        local_prepare_ok = True
         success = False
         try:
+            for comp in self._components_tuple:
+                try:
+                    prep = comp.prepare_load_back(
+                        best_match_node,
+                        req=req,
+                        allow_evict=not multi_rank,
+                    )
+                except Exception:
+                    if not multi_rank:
+                        raise
+                    logger.exception(
+                        "HiCache %s load reservation failed on this rank",
+                        comp.component_type,
+                    )
+                    prep = PrepareLoadBackResult(succeeded=False)
+                preps[comp.component_type] = prep
+                local_prepare_ok = local_prepare_ok and prep.succeeded
             success = self._load_back_transfers(
                 best_match_node=best_match_node,
                 mem_quota=mem_quota,
                 req=req,
                 kv_xfer=kv_xfer,
-                result=result,
+                local_prepare_ok=local_prepare_ok,
+                lock_delta=(
+                    ancestor_lock_result.delta or 0
+                    if ancestor_lock_result is not None
+                    else None
+                ),
                 ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
             )
             return success
         finally:
-            for comp in self._components_tuple:
-                comp.finalize_load_back(req, preps[comp.component_type], success)
+            try:
+                if not success and ancestor_lock_result is not None:
+                    self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                    self.dec_host_lock_ref(best_match_node, host_anchor_params)
+            finally:
+                for comp in self._components_tuple:
+                    prep = preps.get(comp.component_type)
+                    if prep is not None:
+                        comp.finalize_load_back(req, prep, success)
 
     def _load_back_transfers(
         self,
@@ -1831,21 +1923,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         mem_quota: Optional[int],
         req,
         kv_xfer: PoolTransfer,
-        result: IncLockRefResult,
+        local_prepare_ok: bool,
+        lock_delta: Optional[int],
         ancestor_lock_params: Optional[DecLockRefParams],
         host_anchor_params: Optional[DecLockRefParams],
     ) -> bool:
         kv_tokens = len(kv_xfer.host_indices)
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
-        for comp in self._components_tuple:
-            if comp.component_type == BASE_COMPONENT_TYPE:
-                continue
-            t = comp.build_hicache_transfers(
-                best_match_node, CacheTransferPhase.LOAD_BACK, req=req
-            )
-            if t:
-                comp_xfers[comp.component_type] = t
+        if local_prepare_ok:
+            for comp in self._components_tuple:
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                t = comp.build_hicache_transfers(
+                    best_match_node, CacheTransferPhase.LOAD_BACK, req=req
+                )
+                if t:
+                    comp_xfers[comp.component_type] = t
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
@@ -1853,40 +1947,65 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
-        ):
-            self.dec_lock_ref(best_match_node, ancestor_lock_params)
-            self.dec_host_lock_ref(best_match_node, host_anchor_params)
-            return False
+        if lock_delta is None:
+            lock_delta = (
+                self._estimate_load_back_lock_delta(best_match_node)
+                if mem_quota is not None
+                else 0
+            )
+        local_ok = local_prepare_ok and not (
+            (kv_tokens < self.load_back_threshold and not comp_xfers)
+            or (mem_quota is not None and kv_tokens > mem_quota + lock_delta)
+        )
+        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
+        if local_ok and not multi_rank:
+            if self.supports_swa():
+                avail = self.token_to_kv_pool_allocator.full_available_size()
+            else:
+                avail = self.token_to_kv_pool_allocator.available_size()
+            if avail < kv_tokens:
+                needed = kv_tokens - avail
+                result = self.evict(EvictParams(num_tokens=needed))
+                local_ok = result.num_tokens_evicted >= needed
 
-        if self.supports_swa():
-            avail = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = self.token_to_kv_pool_allocator.available_size()
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
-                self.dec_lock_ref(best_match_node, ancestor_lock_params)
-                self.dec_host_lock_ref(best_match_node, host_anchor_params)
-                return False
-
-        # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        device_indices = self.cache_controller.load(
-            host_indices=kv_xfer.host_indices,
-            node_id=best_match_node.id,
-            extra_pools=aux_xfers or None,
-        )
+        reservation = None
+        if local_ok:
+            # Multi-rank promotion deliberately does not evict. Coordinated
+            # victim selection is a separate transaction.
+            try:
+                reservation = self.cache_controller.reserve_load(
+                    host_indices=kv_xfer.host_indices,
+                    node_id=best_match_node.id,
+                    extra_pools=aux_xfers or None,
+                    allow_evict=not multi_rank,
+                )
+            except Exception:
+                if not multi_rank:
+                    raise
+                logger.exception("HiCache load reservation failed on this rank")
+            local_ok = reservation is not None
 
-        self.dec_lock_ref(best_match_node, ancestor_lock_params)
-        if device_indices is None:
-            self.dec_host_lock_ref(best_match_node, host_anchor_params)
+        try:
+            group_succeeded = self._all_ranks_succeeded(local_ok)
+        except Exception:
+            if reservation is not None:
+                try:
+                    self.cache_controller.abort_load(reservation)
+                except Exception:
+                    logger.exception("Failed to abort HiCache load reservation")
+            raise
+        if not group_succeeded:
+            if reservation is not None:
+                self.cache_controller.abort_load(reservation)
             return False
+        assert reservation is not None
 
-        # Commit: each component gets only its own transfers
+        # Queueing and tree mutation happen only after every rank can commit.
+        if host_anchor_params is None:
+            host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
+        device_indices = self.cache_controller.commit_load(reservation)
         kv_xfer.device_indices = device_indices
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             best_match_node,
@@ -1903,13 +2022,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self._update_evictable_leaf_sets(best_match_node)
+        ongoing_lock_params = self.inc_lock_ref(best_match_node).to_dec_params()
+        if ancestor_lock_params is not None:
+            # The pre-eviction lock skipped tombstones. Acquire the complete
+            # restored path first, then release only what the old lock owned.
+            self.dec_lock_ref(best_match_node, ancestor_lock_params)
         self.ongoing_load_back[best_match_node.id] = _OngoingLoadBack(
             best_match_node,
-            self.inc_lock_ref(best_match_node).to_dec_params(),
+            ongoing_lock_params,
             host_anchor_params,
         )
 
         return True
+
+    def _estimate_load_back_lock_delta(self, node: UnifiedTreeNode) -> int:
+        """Pure estimate of FULL tokens newly protected by load-back locking."""
+        cur = node
+        while (
+            cur is not self.root_node
+            and cur.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            cur = cur.parent
+
+        delta = 0
+        while cur is not self.root_node:
+            component = cur.component_data[BASE_COMPONENT_TYPE]
+            if component.lock_ref == 0:
+                delta += len(component.value)
+            cur = cur.parent
+        return delta
 
     def _build_sidecar_transfers(
         self,

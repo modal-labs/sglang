@@ -412,13 +412,17 @@ class HybridCacheController(BaseHiCacheController):
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
-        pool_reservation = self._reserve_pool_transfers(
-            extra_pools,
-            alloc_host=True,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
-            allow_evict=allow_evict,
-        )
+        try:
+            pool_reservation = self._reserve_pool_transfers(
+                extra_pools,
+                alloc_host=True,
+                kv_device_indices=device_indices,
+                kv_host_indices=host_indices,
+                allow_evict=allow_evict,
+            )
+        except Exception:
+            self.mem_pool_host.free(host_indices)
+            raise
         if pool_reservation is None:
             self.mem_pool_host.free(host_indices)
             return None
@@ -444,8 +448,10 @@ class HybridCacheController(BaseHiCacheController):
         return reservation.host_indices
 
     def abort_write(self, reservation: HybridWriteReservation) -> None:
-        self._rollback_pool_reservation(reservation.pool_reservation)
-        self.mem_pool_host.free(reservation.host_indices)
+        try:
+            self._rollback_pool_reservation(reservation.pool_reservation)
+        finally:
+            self.mem_pool_host.free(reservation.host_indices)
 
     def write(
         self,
@@ -536,13 +542,18 @@ class HybridCacheController(BaseHiCacheController):
                 return None
             primary_free_fn = full_allocator.free
 
-        pool_reservation = self._reserve_pool_transfers(
-            extra_pools,
-            alloc_host=False,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
-            allow_evict=allow_evict,
-        )
+        try:
+            pool_reservation = self._reserve_pool_transfers(
+                extra_pools,
+                alloc_host=False,
+                kv_device_indices=device_indices,
+                kv_host_indices=host_indices,
+                allow_evict=allow_evict,
+            )
+        except Exception:
+            if primary_free_fn is not None:
+                primary_free_fn(device_indices)
+            raise
         if pool_reservation is None:
             if primary_free_fn is not None:
                 primary_free_fn(device_indices)
@@ -569,9 +580,11 @@ class HybridCacheController(BaseHiCacheController):
         return reservation.device_indices
 
     def abort_load(self, reservation: HybridLoadReservation) -> None:
-        self._rollback_pool_reservation(reservation.pool_reservation)
-        if reservation.primary_free_fn is not None:
-            reservation.primary_free_fn(reservation.device_indices)
+        try:
+            self._rollback_pool_reservation(reservation.pool_reservation)
+        finally:
+            if reservation.primary_free_fn is not None:
+                reservation.primary_free_fn(reservation.device_indices)
 
     def load(
         self,
@@ -885,15 +898,23 @@ class HybridCacheController(BaseHiCacheController):
     def _rollback_pool_reservation(
         reservation: _PoolTransferReservation,
     ) -> None:
+        first_error = None
         for reserved in reversed(reservation.reserved_indices):
-            if reserved.free_fn is not None:
-                assert reserved.indices is not None
-                reserved.free_fn(reserved.indices)
-            setattr(
-                reserved.transfer,
-                reserved.attribute,
-                reserved.previous_indices,
-            )
+            try:
+                if reserved.free_fn is not None:
+                    assert reserved.indices is not None
+                    reserved.free_fn(reserved.indices)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            finally:
+                setattr(
+                    reserved.transfer,
+                    reserved.attribute,
+                    reserved.previous_indices,
+                )
+        if first_error is not None:
+            raise first_error
 
     def _reserve_pool_transfers(
         self,
@@ -911,82 +932,47 @@ class HybridCacheController(BaseHiCacheController):
         derived_transfers: list[PoolTransfer] = []
 
         def rollback_allocated() -> None:
+            rollback_indices = tuple(reserved_indices)
+            reserved_indices.clear()
             self._rollback_pool_reservation(
                 _PoolTransferReservation(
                     transfers=extra_pools,
-                    reserved_indices=tuple(reserved_indices),
+                    reserved_indices=rollback_indices,
                 )
             )
 
-        for pool in extra_pools:
-            if pool.indices_from_pool is not None:
-                derived_transfers.append(pool)
-                continue
-            entry = self.mem_pool_host.entry_map.get(pool.name)
-            if entry is None:
-                continue
-            if alloc_host:
-                if pool.host_indices is not None or pool.device_indices is None:
-                    continue
-                alloc_fn = entry.host_pool.alloc
-                free_fn = entry.host_pool.free
-                evict_fn = entry.host_evict_fn
-                size = len(pool.device_indices)
-            else:
-                if pool.device_indices is not None or pool.host_indices is None:
-                    continue
-                # device_alloc_fn / device_free_fn override entry.device_pool's
-                # methods for pools whose device_pool is a raw KV pool (layout)
-                # rather than an allocator (e.g. SWA).
-                alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
-                free_fn = entry.device_free_fn or entry.device_pool.free
-                evict_fn = entry.device_evict_fn
-                size = len(pool.host_indices)
-            indices = alloc_fn(size)
-            if indices is None and allow_evict and evict_fn:
-                evict_fn(size)
-                indices = alloc_fn(size)
-            if indices is None:
-                rollback_allocated()
-                return None
-            attribute = "host_indices" if alloc_host else "device_indices"
-            previous_indices = getattr(pool, attribute)
-            setattr(pool, attribute, indices)
-            reserved_indices.append(
-                _ReservedPoolIndices(
-                    transfer=pool,
-                    attribute=attribute,
-                    previous_indices=previous_indices,
-                    indices=indices,
-                    free_fn=free_fn,
-                )
-            )
-
-        # Assign indices to deferred pools from their source.
-        for pool in derived_transfers:
-            if pool.indices_from_pool == PoolName.KV:
-                source_indices = (
-                    ("host_indices", kv_host_indices),
-                    ("device_indices", kv_device_indices),
-                )
-            else:
-                source = next(
-                    (
-                        transfer
-                        for transfer in extra_pools
-                        if transfer.indices_from_pool is None
-                        and transfer.name == pool.indices_from_pool
-                    ),
-                    None,
-                )
-                if source is None:
+        try:
+            for pool in extra_pools:
+                entry = self.mem_pool_host.entry_map.get(pool.name)
+                if entry is None:
                     rollback_allocated()
                     return None
-                source_indices = (
-                    ("host_indices", source.host_indices),
-                    ("device_indices", source.device_indices),
-                )
-            for attribute, indices in source_indices:
+                if pool.indices_from_pool is not None:
+                    derived_transfers.append(pool)
+                    continue
+                if alloc_host:
+                    if pool.host_indices is not None or pool.device_indices is None:
+                        continue
+                    alloc_fn = entry.host_pool.alloc
+                    free_fn = entry.host_pool.free
+                    evict_fn = entry.host_evict_fn
+                    size = len(pool.device_indices)
+                else:
+                    if pool.device_indices is not None or pool.host_indices is None:
+                        continue
+                    # Overrides support raw device pools such as SWA.
+                    alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
+                    free_fn = entry.device_free_fn or entry.device_pool.free
+                    evict_fn = entry.device_evict_fn
+                    size = len(pool.host_indices)
+                indices = alloc_fn(size)
+                if indices is None and allow_evict and evict_fn:
+                    evict_fn(size)
+                    indices = alloc_fn(size)
+                if indices is None:
+                    rollback_allocated()
+                    return None
+                attribute = "host_indices" if alloc_host else "device_indices"
                 previous_indices = getattr(pool, attribute)
                 setattr(pool, attribute, indices)
                 reserved_indices.append(
@@ -995,8 +981,52 @@ class HybridCacheController(BaseHiCacheController):
                         attribute=attribute,
                         previous_indices=previous_indices,
                         indices=indices,
+                        free_fn=free_fn,
                     )
                 )
+
+            # Assign indices to deferred pools from their source.
+            for pool in derived_transfers:
+                if pool.indices_from_pool == PoolName.KV:
+                    source_indices = (
+                        ("host_indices", kv_host_indices),
+                        ("device_indices", kv_device_indices),
+                    )
+                else:
+                    source = next(
+                        (
+                            transfer
+                            for transfer in extra_pools
+                            if transfer.indices_from_pool is None
+                            and transfer.name == pool.indices_from_pool
+                        ),
+                        None,
+                    )
+                    if source is None:
+                        rollback_allocated()
+                        return None
+                    source_indices = (
+                        ("host_indices", source.host_indices),
+                        ("device_indices", source.device_indices),
+                    )
+                for attribute, indices in source_indices:
+                    previous_indices = getattr(pool, attribute)
+                    setattr(pool, attribute, indices)
+                    reserved_indices.append(
+                        _ReservedPoolIndices(
+                            transfer=pool,
+                            attribute=attribute,
+                            previous_indices=previous_indices,
+                            indices=indices,
+                        )
+                    )
+        except Exception:
+            try:
+                rollback_allocated()
+            except Exception:
+                logger.exception("Failed to fully roll back pool reservation")
+            raise
+
         return _PoolTransferReservation(
             transfers=extra_pools,
             reserved_indices=tuple(reserved_indices),
