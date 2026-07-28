@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from utils import make_serving  # noqa: F401 — bootstrap import
@@ -122,8 +123,141 @@ class ResponsesSamplingParamsTestCase(unittest.TestCase):
         )
         self.assertEqual(params["structural_tag"], '{"type": "structural_tag"}')
 
+    def test_text_format_maps_to_json_schema_constraint(self):
+        schema = {"type": "object", "properties": {"age": {"type": "integer"}}}
+        for response_format, expected in (
+            ({"type": "json_schema", "name": "p", "schema": schema}, schema),
+            ({"type": "json_object"}, {"type": "object"}),
+        ):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                store=False,
+                text={"format": response_format},
+            )
+            params = request.to_sampling_params(128, {})
+            self.assertEqual(json.loads(params["json_schema"]), expected)
+
+        plain = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            text={"format": {"type": "text"}},
+        ).to_sampling_params(128, {})
+        self.assertNotIn("json_schema", plain)
+
+    def test_text_format_conflicts_with_tool_constraint(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "p",
+                    "schema": {"type": "object"},
+                }
+            },
+        )
+        with self.assertRaises(ValueError):
+            request.to_sampling_params(
+                128,
+                {},
+                tool_call_constraint=("json_schema", {"type": "object"}),
+            )
+
+    def test_deferred_prompt_budget_is_not_replaced_by_model_default(self):
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        params = request.to_sampling_params(
+            default_max_tokens=None,
+            default_params={"max_new_tokens": 128},
+        )
+        self.assertIsNone(params["max_new_tokens"])
+
+
+class IncludeOutputLogprobsTestCase(unittest.TestCase):
+    def test_detected_only_for_logprobs_include(self):
+        def enabled(include):
+            return ResponsesRequest(
+                model="x", input="hi", store=False, include=include
+            ).is_include_output_logprobs()
+
+        self.assertTrue(enabled(["message.output_text.logprobs"]))
+        self.assertFalse(enabled(None))
+        self.assertFalse(enabled(["reasoning.encrypted_content"]))
+
+
+class ThinkingControlTestCase(unittest.TestCase):
+    def test_effort_none_disables_thinking(self):
+        kwargs = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            reasoning={"effort": "none"},
+        ).chat_template_kwargs
+        self.assertEqual(
+            (kwargs["enable_thinking"], kwargs["thinking"]), (False, False)
+        )
+
+    def test_other_requests_leave_thinking_unspecified(self):
+        for kwargs in (
+            {"reasoning": {"effort": "medium"}},
+            {
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "p",
+                        "schema": {"type": "object"},
+                    }
+                }
+            },
+            {"tool_choice": "required"},
+            {"tool_choice": {"type": "function", "name": "f"}},
+            {},
+        ):
+            request = ResponsesRequest(model="x", input="hi", store=False, **kwargs)
+            self.assertIsNone(request.chat_template_kwargs)
+
+    def test_explicit_chat_template_kwargs_win(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            reasoning={"effort": "none"},
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        self.assertTrue(request.chat_template_kwargs["enable_thinking"])
+        self.assertFalse(request.chat_template_kwargs["thinking"])
+
 
 class ResponsesResponseFromRequestTestCase(unittest.TestCase):
+    def test_requested_text_format_is_echoed(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "p",
+                    "schema": schema,
+                }
+            },
+        )
+        response = ResponsesResponse.from_request(
+            request,
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+        self.assertEqual(response.text["format"]["type"], "json_schema")
+
     def test_parallel_tool_calls_false_preserved(self):
         from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
 
@@ -140,6 +274,118 @@ class ResponsesResponseFromRequestTestCase(unittest.TestCase):
             usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
         )
         self.assertFalse(response.parallel_tool_calls)
+
+    def test_incomplete_status_sets_incomplete_details(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        response = ResponsesResponse.from_request(
+            request,
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="incomplete",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+        self.assertEqual(response.incomplete_details, {"reason": "max_output_tokens"})
+
+    def test_usage_serialized_in_responses_shape(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            PromptTokensDetails,
+            ResponsesResponse,
+        )
+
+        response = ResponsesResponse.from_request(
+            ResponsesRequest(model="x", input="hi", store=False),
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=UsageInfo(
+                prompt_tokens=11,
+                completion_tokens=102,
+                total_tokens=113,
+                reasoning_tokens=7,
+                prompt_tokens_details=PromptTokensDetails(cached_tokens=3),
+            ),
+        )
+        usage = response.model_dump()["usage"]
+        self.assertEqual(
+            usage,
+            {
+                "input_tokens": 11,
+                "input_tokens_details": {
+                    "cached_tokens": 3,
+                    "cache_write_tokens": 0,
+                },
+                "output_tokens": 102,
+                "output_tokens_details": {"reasoning_tokens": 7},
+                "total_tokens": 113,
+            },
+        )
+
+    def test_effort_none_not_echoed_in_response(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            reasoning={"effort": "none"},
+        )
+        response = ResponsesResponse.from_request(
+            request,
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="in_progress",
+            usage=None,
+        )
+        self.assertIsNone(response.reasoning["effort"])
+
+
+class InputItemStringIdTestCase(unittest.TestCase):
+    def test_replayed_content_item_drops_id_only(self):
+        normalize = ResponsesRequest._normalize_input_item_for_validation
+        content_item = normalize(
+            {
+                "id": "msg_x",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}],
+            }
+        )
+        self.assertNotIn("id", content_item)
+        self.assertTrue(content_item["content"])
+
+        reference = {"type": "item_reference", "id": "msg_ref"}
+        self.assertEqual(normalize(reference), reference)
+
+    def test_request_accepts_replayed_output_item(self):
+        ResponsesRequest(
+            model="x",
+            store=False,
+            input=[
+                {
+                    "id": "msg_x",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}],
+                }
+            ],
+        )
+
+
+class ToolChoiceObjectFormTestCase(unittest.TestCase):
+    def test_named_function_object_accepted(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            tool_choice={"type": "function", "name": "get_weather"},
+        )
+        self.assertEqual(request.tool_choice["name"], "get_weather")
 
 
 if __name__ == "__main__":

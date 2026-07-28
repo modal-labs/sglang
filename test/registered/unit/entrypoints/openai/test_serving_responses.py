@@ -8,7 +8,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import make_serving
+from utils import collect_stream_events, event_payloads, event_types, make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
@@ -16,8 +16,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     RequestResponseMetadata,
     ResponsesRequest,
 )
-from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.entrypoints.openai.serving_responses import (
+    OpenAIServingResponses,
+    _build_output_text_logprobs,
+    _should_emit_normal_text_as_message,
+)
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -254,6 +260,38 @@ class InputItemNormalizationTestCase(unittest.TestCase):
             {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
         )
 
+    def test_function_call_output_preserves_image_content_parts(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "generated image"},
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.com/result.png",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "tool",
+                "tool_call_id": "call_abc",
+                "content": [
+                    {"type": "text", "text": "generated image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://example.com/result.png",
+                            "detail": "auto",
+                        },
+                    },
+                ],
+            },
+        )
+
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):
             OpenAIServingResponses._normalize_response_message_for_chat(
@@ -370,6 +408,32 @@ class MultimodalRequestTestCase(unittest.TestCase):
             captured["adapted_request"].image_data, ["http://example.com/cat.png"]
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
+        self.assertTrue(captured["adapted_request"].adjust_max_new_tokens_for_prompt)
+        self.assertIsNone(captured["adapted_request"].sampling_params["max_new_tokens"])
+
+    def test_completion_budget_uses_expanded_multimodal_input_length(self):
+        manager = object.__new__(TokenizerManager)
+        manager.context_len = 32
+        manager.num_reserved_tokens = 4
+        manager.validate_total_tokens = True
+        manager.allow_auto_truncate = False
+        manager.model_config = Mock(vocab_size=100)
+        manager.server_args = Mock(
+            enable_return_hidden_states=False,
+            enable_custom_logit_processor=False,
+        )
+        request = GenerateReqInput(
+            text="rendered prompt",
+            image_data=["image"],
+            sampling_params={"max_new_tokens": None},
+            adjust_max_new_tokens_for_prompt=True,
+        )
+
+        # The multimodal processor has expanded the short rendered prompt to
+        # twenty actual input IDs before validation.
+        manager._validate_one_request(request, [1] * 20)
+
+        self.assertEqual(request.sampling_params["max_new_tokens"], 6)
 
 
 class OutputItemsTestCase(unittest.TestCase):
@@ -523,6 +587,192 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         ]
         msg = get_developer_message(instructions="be helpful", tools=tools)
         self.assertIsNotNone(msg)
+
+
+class StatusFromFinishReasonTestCase(unittest.TestCase):
+    def test_only_length_maps_to_incomplete(self):
+        status = OpenAIServingResponses._status_from_finish_reason
+        self.assertEqual(status({"type": "length"}), "incomplete")
+        self.assertEqual(status("length"), "incomplete")
+        for other in ({"type": "stop"}, {"type": "tool_calls"}, "stop", None):
+            self.assertEqual(status(other), "completed")
+
+
+class BuildOutputTextLogprobsTestCase(unittest.TestCase):
+    def test_tokens_and_top_logprobs_are_converted(self):
+        output = _build_output_text_logprobs(
+            {
+                "output_token_logprobs": [
+                    (-0.1, 10, "Hello"),
+                    (-0.2, 11, " world"),
+                ],
+                "output_top_logprobs": [
+                    [(-0.1, 10, "Hello"), (-2.0, 12, "Hi")],
+                    [(-0.2, 11, " world"), (-3.0, 13, " earth")],
+                ],
+            }
+        )
+        self.assertEqual(len(output), 2)
+        self.assertEqual(output[0].token, "Hello")
+        self.assertEqual(output[0].logprob, -0.1)
+        self.assertEqual(output[0].bytes, list(b"Hello"))
+        self.assertEqual(output[0].top_logprobs[0].token, "Hello")
+        self.assertEqual(output[1].token, " world")
+
+    def test_missing_top_logprobs_yields_empty_lists(self):
+        output = _build_output_text_logprobs(
+            {
+                "output_token_logprobs": [(-0.5, 7, "hi")],
+                "output_top_logprobs": None,
+            }
+        )
+        self.assertEqual(output[0].top_logprobs, [])
+
+
+class ChatToolChoiceConversionTestCase(unittest.TestCase):
+    def test_conversion(self):
+        convert = OpenAIServingResponses._chat_tool_choice
+        for value in ("auto", "required", "none"):
+            self.assertEqual(convert(value), value)
+        self.assertEqual(
+            convert({"type": "function", "name": "get_weather"}),
+            {"type": "function", "function": {"name": "get_weather"}},
+        )
+        self.assertEqual(convert({"type": "web_search"}), "auto")
+
+
+class ShouldEmitNormalTextTestCase(unittest.TestCase):
+    def test_whitespace_suppressed_only_while_tool_is_open(self):
+        emit = _should_emit_normal_text_as_message
+        self.assertFalse(emit("", any_tool_call_in_progress=False))
+        self.assertFalse(emit("\n", any_tool_call_in_progress=True))
+        self.assertTrue(emit("\n", any_tool_call_in_progress=False))
+        self.assertTrue(emit("hello", any_tool_call_in_progress=True))
+
+
+class CancelIdempotencyTestCase(unittest.TestCase):
+    def test_cancel_terminal_response_returns_it(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        serving = make_serving()
+        response = ResponsesResponse.from_request(
+            ResponsesRequest(model="x", input="hi", store=False),
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="cancelled",
+            usage=None,
+        )
+        serving.response_store[response.id] = response
+
+        output = asyncio.run(serving.cancel_responses(response.id))
+
+        self.assertIs(output, response)
+        self.assertEqual(output.status, "cancelled")
+
+
+class StreamingLogprobsRejectionTestCase(unittest.TestCase):
+    def test_stream_with_logprobs_include_rejected(self):
+        import orjson
+
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            stream=True,
+            include=["message.output_text.logprobs"],
+        )
+
+        result = asyncio.run(serving.create_responses(request))
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("streaming mode", orjson.loads(result.body)["error"]["message"])
+
+
+class MultiToolCallStreamingOrderTestCase(unittest.TestCase):
+    def test_prior_tool_call_done_before_next_added(self):
+        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
+        serving = make_serving()
+        serving.tool_call_parser = "qwen3_coder"
+        serving.reasoning_parser = None
+
+        detector = Qwen3CoderDetector()
+        start, end = detector.tool_call_start_token, detector.tool_call_end_token
+        function_prefix = detector.tool_call_prefix
+        function_end = detector.function_end_token
+        parameter_prefix = detector.parameter_prefix
+        parameter_end = detector.parameter_end_token
+        tool_1 = (
+            f"{start}{function_prefix}get_weather>"
+            f"{parameter_prefix}city>Beijing{parameter_end}{function_end}{end}"
+        )
+        tool_2 = (
+            f"{start}{function_prefix}get_time>"
+            f"{parameter_prefix}tz>UTC{parameter_end}{function_end}{end}"
+        )
+        full_output = tool_1 + "\n" + tool_2
+
+        async def fake_generator():
+            yield {"text": tool_1, "meta_info": {}}
+            yield {"text": tool_1 + "\n", "meta_info": {}}
+            yield {"text": full_output, "meta_info": {}}
+            yield {
+                "text": full_output,
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                    "prompt_tokens": 5,
+                    "completion_tokens": 10,
+                },
+            }
+
+        request = ResponsesRequest(
+            model="x",
+            input="weather and time",
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "type": "function",
+                    "name": "get_time",
+                    "parameters": {"type": "object"},
+                },
+            ],
+        )
+
+        async def run():
+            stream = serving.responses_stream_generator_non_harmony(
+                request,
+                {},
+                fake_generator(),
+                "x",
+                Mock(),
+                RequestResponseMetadata(request_id="r"),
+            )
+            return await collect_stream_events(stream)
+
+        events = asyncio.run(run())
+        sequence = list(zip(event_types(events), event_payloads(events)))
+
+        first_done = next(
+            index
+            for index, (event_type, payload) in enumerate(sequence)
+            if event_type == "response.output_item.done"
+            and payload["output_index"] == 0
+        )
+        second_added = next(
+            index
+            for index, (event_type, payload) in enumerate(sequence)
+            if event_type == "response.output_item.added"
+            and payload["output_index"] == 1
+        )
+        self.assertLess(first_done, second_added)
 
 
 if __name__ == "__main__":

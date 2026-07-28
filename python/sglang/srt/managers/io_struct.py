@@ -262,6 +262,8 @@ class GenerateReqInput:
 
     # For background responses (OpenAI responses API)
     background: bool = False
+    # Resolve the Responses API completion budget after multimodal expansion.
+    adjust_max_new_tokens_for_prompt: bool = False
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
 
@@ -766,6 +768,9 @@ class GenerateReqInput:
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
+            background=self.background,
+            adjust_max_new_tokens_for_prompt=self.adjust_max_new_tokens_for_prompt,
+            require_reasoning=self.require_reasoning,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,

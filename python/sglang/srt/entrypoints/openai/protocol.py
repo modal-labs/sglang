@@ -41,6 +41,7 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseReasoningItem,
+    ResponseTextConfig,
 )
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
@@ -48,6 +49,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_serializer,
     field_validator,
     model_serializer,
     model_validator,
@@ -1498,7 +1500,8 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    text: Optional[ResponseTextConfig] = None
+    tool_choice: Union[Literal["auto", "required", "none"], Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
@@ -1506,6 +1509,7 @@ class ResponsesRequest(BaseModel):
     user: Optional[str] = None
 
     # Extra SGLang parameters
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
@@ -1539,6 +1543,29 @@ class ResponsesRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def normalize_reasoning_to_thinking(cls, values):
+        """Map ``reasoning.effort=none`` to model-family thinking toggles."""
+        if not isinstance(values, dict):
+            return values
+
+        reasoning = values.get("reasoning")
+        if isinstance(reasoning, dict):
+            effort = reasoning.get("effort") or reasoning.get("reasoning_effort")
+        else:
+            effort = getattr(reasoning, "effort", None)
+
+        if effort == "none":
+            existing = values.get("chat_template_kwargs")
+            existing = existing if isinstance(existing, dict) else {}
+            values["chat_template_kwargs"] = {
+                "thinking": False,
+                "enable_thinking": False,
+                **existing,
+            }
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
     def normalize_responses_input(cls, values):
         if not isinstance(values, dict):
             return values
@@ -1557,6 +1584,11 @@ class ResponsesRequest(BaseModel):
     def _normalize_input_item_for_validation(item):
         if not isinstance(item, dict):
             return item
+
+        # Replayed output items carry string IDs. They are content items, not
+        # server-side item references, so retain the content and discard the ID.
+        if isinstance(item.get("id"), str) and item.get("content") is not None:
+            item = {key: value for key, value in item.items() if key != "id"}
 
         content = item.get("content")
         if not isinstance(content, list):
@@ -1582,9 +1614,25 @@ class ResponsesRequest(BaseModel):
         part["detail"] = "auto"
         return part
 
+    @staticmethod
+    def _json_schema_from_text_format(
+        text: Optional[ResponseTextConfig],
+    ) -> Optional[str]:
+        response_format = getattr(text, "format", None)
+        format_type = getattr(response_format, "type", None)
+        if format_type == "json_object":
+            return '{"type": "object"}'
+        if format_type != "json_schema":
+            return None
+        schema = getattr(response_format, "schema_", None)
+        return convert_json_schema_to_str(schema) if schema is not None else None
+
+    def is_include_output_logprobs(self) -> bool:
+        return bool(self.include and "message.output_text.logprobs" in self.include)
+
     def to_sampling_params(
         self,
-        default_max_tokens: int,
+        default_max_tokens: Optional[int],
         default_params: Optional[Dict] = None,
         stop: Optional[Union[str, List[str]]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
@@ -1595,12 +1643,17 @@ class ResponsesRequest(BaseModel):
 
         # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
-            max_tokens = min(self.max_output_tokens, default_max_tokens)
+            max_tokens = (
+                min(self.max_output_tokens, default_max_tokens)
+                if default_max_tokens is not None
+                else self.max_output_tokens
+            )
         else:
             max_tokens = default_max_tokens
 
         # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        max_tokens -= 2
+        if max_tokens is not None:
+            max_tokens -= 2
 
         temperature = self.temperature
         if temperature is None:
@@ -1631,8 +1684,14 @@ class ResponsesRequest(BaseModel):
 
         # Apply any additional default parameters
         for key, value in default_params.items():
+            if key == "max_new_tokens" and default_max_tokens is None:
+                continue
             if key not in params or params[key] is None:
                 params[key] = value
+
+        json_schema = self._json_schema_from_text_format(self.text)
+        if json_schema is not None:
+            params["json_schema"] = json_schema
 
         has_existing_constraints = (
             params.get("regex")
@@ -1677,10 +1736,12 @@ class ResponsesResponse(BaseModel):
     output: List[
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
-    status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    status: Literal[
+        "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
+    ]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Union[str, Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.
@@ -1702,6 +1763,26 @@ class ResponsesResponse(BaseModel):
     truncation: Optional[str] = None
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+    @field_serializer("usage")
+    def _serialize_usage(self, usage: Optional[UsageInfo], _info):
+        if usage is None:
+            return None
+        cached_tokens = (
+            usage.prompt_tokens_details.cached_tokens
+            if usage.prompt_tokens_details
+            else 0
+        )
+        return {
+            "input_tokens": usage.prompt_tokens,
+            "input_tokens_details": {
+                "cached_tokens": cached_tokens,
+                "cache_write_tokens": 0,
+            },
+            "output_tokens": usage.completion_tokens or 0,
+            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+            "total_tokens": usage.total_tokens,
+        }
 
     @classmethod
     def from_request(
@@ -1750,7 +1831,12 @@ class ResponsesResponse(BaseModel):
                     return False
             return True
 
-        text_format = {"format": {"type": "text"}} if _is_text_only(output) else None
+        if request.text is not None:
+            text_format = request.text.model_dump(by_alias=True, exclude_none=True)
+        else:
+            text_format = (
+                {"format": {"type": "text"}} if _is_text_only(output) else None
+            )
 
         return cls(
             id=request.request_id,
@@ -1768,12 +1854,20 @@ class ResponsesResponse(BaseModel):
             tools=request.tools,
             # fields for parity with v1/responses
             error=None,
-            incomplete_details=None,
+            incomplete_details=(
+                {"reason": "max_output_tokens"} if status == "incomplete" else None
+            ),
             instructions=request.instructions,
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
-                "effort": request.reasoning.effort if request.reasoning else None,
+                # ``none`` is an SGLang request extension that the OpenAI
+                # response schema does not accept on the wire.
+                "effort": (
+                    request.reasoning.effort
+                    if request.reasoning and request.reasoning.effort != "none"
+                    else None
+                ),
                 "summary": None,  # unused
             },
             store=request.store,
@@ -1819,6 +1913,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    skip_special_tokens: bool = True
 
 
 class ToolCallProcessingResult(NamedTuple):

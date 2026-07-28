@@ -1036,6 +1036,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
+        # Responses requests without an explicit prompt budget arrive here
+        # before max_new_tokens is resolved. Do it after multimodal processing,
+        # when input_ids includes the expanded image/audio/video tokens.
+        if isinstance(obj, GenerateReqInput) and obj.adjust_max_new_tokens_for_prompt:
+            available_tokens = max(0, _max_req_len - input_token_num - 2)
+            requested_tokens = obj.sampling_params.get("max_new_tokens")
+            obj.sampling_params["max_new_tokens"] = (
+                available_tokens
+                if requested_tokens is None
+                else min(requested_tokens, available_tokens)
+            )
+
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
