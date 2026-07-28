@@ -37,20 +37,9 @@ NUM_STATE_STAGES = 2
 BLOCK_THREADS_NARROW = 256
 BLOCK_THREADS_WIDE = 512
 
-# Recurrence lane split: K spans P2_LANES_K lanes instead of all 32, so
-# 32 // P2_LANES_K v-rows reduce concurrently and each butterfly is
-# log2(P2_LANES_K) steps rather than 5. Row stride is padded so the
-# concurrent rows land on disjoint banks (see SMEM_STATE_PAD_BYTES).
-P2_LANES_K = 8
-# TILE_K rows are 512B in FP32 and 256B in BF16, both multiples of the 32-bank
-# period. Add eight 4B banks regardless of dtype: row group r shifts by eight
-# banks and the four concurrent row groups tile banks 0..31.
-SMEM_STATE_PAD_BYTES = P2_LANES_K * 4
-P2_ROWS_LANE = WARP_SIZE // P2_LANES_K
-P2_VEC = TILE_K // P2_LANES_K
-# XOR offsets strictly below P2_LANES_K never cross a group boundary, so the
-# full-warp mask still confines each butterfly to its own group.
-P2_BFLY = [1 << s for s in reversed(range(P2_LANES_K.bit_length() - 1))]
+# Recurrence K lanes are specialized by verify shape. The T16/N1 split-value
+# path benefits from 16 lanes; all other paths keep the measured 8-lane
+# specialization. Row padding is derived from that compile-time lane count.
 
 HEAD_DIM = TILE_K
 VEC_SIZE = HEAD_DIM // WARP_SIZE
@@ -65,13 +54,14 @@ def _issue_state_tile(
     thr_state_copy,
     gStateTiles: cute.Tensor,
     sState: cute.Tensor,
-    i_v: int,
+    source_tile: int,
+    state_stage: int,
 ) -> None:
-    """cp.async state tile ``i_v`` into the stage it maps to, and commit it."""
+    """cp.async one recurrent-state tile into its selected SMEM stage."""
     cute.copy(
         state_g2s_copy,
-        thr_state_copy.partition_S(gStateTiles[(None, None, i_v)]),
-        thr_state_copy.partition_D(sState[(None, None, i_v % NUM_STATE_STAGES)]),
+        thr_state_copy.partition_S(gStateTiles[(None, None, source_tile)]),
+        thr_state_copy.partition_D(sState[(None, None, state_stage)]),
     )
     cute.arch.cp_async_commit_group()
 
@@ -112,6 +102,8 @@ def kda_decode_mtp_kernel(
     scale: cutlass.Constexpr[float],
     NUM_SPEC: cutlass.Constexpr[int],
     BLOCK_THREADS: cutlass.Constexpr[int],
+    P2_LANES_K: cutlass.Constexpr[int],
+    SPLIT_V: cutlass.Constexpr[bool],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
@@ -120,23 +112,31 @@ def kda_decode_mtp_kernel(
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
-    One block owns all 128 value rows, so APPLY_ONORM can reduce the RMS
-    denominator without cross-block synchronization.
+    SPLIT_V distributes the two independent 64-channel value tiles over
+    separate grid-z blocks. APPLY_ONORM is only valid when one block owns all
+    128 value rows.
     """
     tidx, _, _ = cute.arch.thread_idx()
     in_warp_tid = tidx % WARP_SIZE
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
-    i_hv, i_n, _ = cute.arch.block_idx()
+    i_hv, i_n, i_z = cute.arch.block_idx()
     head_off = i_hv * HEAD_DIM
     T_LOOP = 1 + NUM_SPEC
+    ACTIVE_V_TILES = 1 if cutlass.const_expr(SPLIT_V) else NUM_V_TILES
     # Conv-precompute warp budget: q/k/g each get P1_JOB_WARPS warps and split
     # the token dimension across them; the rest carry the v-conv.
     NUM_WARPS = BLOCK_THREADS // WARP_SIZE
     P1_V_WARPS = max(1, NUM_WARPS // P1_V_WARP_DIVISOR)
     P1_JOB_WARPS = (NUM_WARPS - P1_V_WARPS) // P1_NUM_JOBS
     P1_QKG_WARPS = P1_NUM_JOBS * P1_JOB_WARPS
-    V_CH_PER_THREAD = TILE_K // (P1_V_WARPS * WARP_SIZE)
+    P1_V_CHANNELS = TILE_V if cutlass.const_expr(SPLIT_V) else HEAD_DIM
+    V_CH_PER_THREAD = max(1, P1_V_CHANNELS // (P1_V_WARPS * WARP_SIZE))
+    # XOR offsets strictly below P2_LANES_K never cross a group boundary, so
+    # the full-warp mask confines each butterfly to its own recurrence group.
+    P2_ROWS_LANE = WARP_SIZE // P2_LANES_K
+    P2_VEC = TILE_K // P2_LANES_K
+    P2_BFLY = [1 << s for s in reversed(range(P2_LANES_K.bit_length() - 1))]
     NUM_V_ROWS = TILE_V // NUM_WARPS
     P2_BATCHES = NUM_V_ROWS // P2_ROWS_LANE
     smem = cutlass.utils.SmemAllocator()
@@ -176,10 +176,11 @@ def kda_decode_mtp_kernel(
     r_bk = cute.make_rmem_tensor(
         cute.make_layout((P2_VEC,), stride=(1,)), cutlass.Float32
     )
-    # Sized for whichever is larger: both v-tiles of recurrent state (phase 2)
-    # or the two conv windows (phase 1). The phases never overlap.
+    # Sized for whichever is larger: active recurrent-state tiles (phase 2) or
+    # the two conv windows (phase 1). The phases never overlap.
     R_STATE_ELEMS = max(
-        NUM_V_TILES * P2_BATCHES * P2_VEC, 2 * (KERNEL_WIDTH - 1) * VEC_SIZE
+        ACTIVE_V_TILES * P2_BATCHES * P2_VEC,
+        2 * (KERNEL_WIDTH - 1) * VEC_SIZE,
     )
     r_state = cute.make_rmem_tensor(
         cute.make_layout((R_STATE_ELEMS,), stride=(1,)), cutlass.Float32
@@ -200,8 +201,14 @@ def kda_decode_mtp_kernel(
         cute.arch.griddepcontrol_wait()
         pad_bos = cu_seqlens[i_n]
         for i_t in cutlass.range_constexpr(T_LOOP):
-            if tidx < HEAD_DIM:
-                o[0, pad_bos + i_t, i_hv, tidx] = cutlass.BFloat16(0.0)
+            if cutlass.const_expr(SPLIT_V):
+                if tidx < TILE_V:
+                    o[0, pad_bos + i_t, i_hv, i_z * TILE_V + tidx] = cutlass.BFloat16(
+                        0.0
+                    )
+            else:
+                if tidx < HEAD_DIM:
+                    o[0, pad_bos + i_t, i_hv, tidx] = cutlass.BFloat16(0.0)
         cute.arch.griddepcontrol_launch_dependents()
         # nvvm.exit, not `return`: the DSL rejects an early return out of a
         # staged if (UNSUP_EARLY_EXIT).
@@ -211,18 +218,19 @@ def kda_decode_mtp_kernel(
         k_idx = i * 32 + in_warp_tid
         for w in range(KERNEL_WIDTH - 1):
             r_state[w * VEC_SIZE + i] = cutlass.Float32(cs_q[slot, head_off + k_idx, w])
-            r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i] = (
-                cutlass.Float32(cs_k[slot, head_off + k_idx, w])
+            r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i] = cutlass.Float32(
+                cs_k[slot, head_off + k_idx, w]
             )
 
     if tidx < HEAD_DIM:
         cute.autovec_copy(w_k[(head_off + tidx, None)], r_w4)
         for w in range(KERNEL_WIDTH):
             sConvW[w * HEAD_DIM + tidx] = r_w4[w]
-    if tidx < HEAD_DIM:
-        cute.autovec_copy(w_v[(head_off + tidx, None)], r_w4)
+    if tidx < P1_V_CHANNELS:
+        v_idx = i_z * TILE_V + tidx if cutlass.const_expr(SPLIT_V) else tidx
+        cute.autovec_copy(w_v[(head_off + v_idx, None)], r_w4)
         for w in range(KERNEL_WIDTH):
-            sConvW[V_WEIGHT_BASE + w * HEAD_DIM + tidx] = r_w4[w]
+            sConvW[V_WEIGHT_BASE + w * HEAD_DIM + v_idx] = r_w4[w]
     if warp_idx < P1_QKG_WARPS and warp_idx % P1_NUM_JOBS == 0:
         for i in range(VEC_SIZE):
             cute.autovec_copy(w_q[(head_off + i * 32 + in_warp_tid, None)], r_w4)
@@ -234,8 +242,23 @@ def kda_decode_mtp_kernel(
     gStateTiles = cute.local_tile(gState, (TILE_V, TILE_K), (None, 0))
     thr_state_copy = state_g2s_copy.get_slice(tidx)
 
-    for i_v in cutlass.range_constexpr(min(NUM_STATE_STAGES, NUM_V_TILES)):
-        _issue_state_tile(state_g2s_copy, thr_state_copy, gStateTiles, sState, i_v)
+    if cutlass.const_expr(SPLIT_V):
+        cute.copy(
+            state_g2s_copy,
+            thr_state_copy.partition_S(gStateTiles[(None, None, i_z)]),
+            thr_state_copy.partition_D(sState[(None, None, 0)]),
+        )
+        cute.arch.cp_async_commit_group()
+    else:
+        for i_v in cutlass.range_constexpr(min(NUM_STATE_STAGES, NUM_V_TILES)):
+            _issue_state_tile(
+                state_g2s_copy,
+                thr_state_copy,
+                gStateTiles,
+                sState,
+                i_v,
+                i_v % NUM_STATE_STAGES,
+            )
 
     cute.arch.griddepcontrol_wait()
 
@@ -340,16 +363,15 @@ def kda_decode_mtp_kernel(
                     r_xk = cutlass.Float32(x_k[0, token, i_hv, k_idx])
                     r_conv += (
                         r_xk
-                        * sConvW[
-                            (KERNEL_WIDTH - 1) * HEAD_DIM + i * 32 + in_warp_tid
-                        ]
+                        * sConvW[(KERNEL_WIDTH - 1) * HEAD_DIM + i * 32 + in_warp_tid]
                     )
                     r_conv = r_conv * cute.arch.rcp_approx(
                         cutlass.Float32(1.0) + cute.math.exp(-r_conv, fastmath=True)
                     )
                     r_k[i] = r_conv
                     if cutlass.const_expr(CACHE_RING):
-                        ring_rawk[slot, i_hv, i_t, k_idx] = cutlass.BFloat16(r_conv)
+                        if cutlass.const_expr(not SPLIT_V) or i_z == 0:
+                            ring_rawk[slot, i_hv, i_t, k_idx] = cutlass.BFloat16(r_conv)
                     r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = r_state[
                         (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
                     ]
@@ -375,7 +397,8 @@ def kda_decode_mtp_kernel(
                         cutlass.Float32(1.0) + cute.math.exp(-r_b_raw, fastmath=True)
                     )
                     if cutlass.const_expr(CACHE_RING):
-                        ring_beta[slot, i_hv, i_t] = sBeta[i_t]
+                        if cutlass.const_expr(not SPLIT_V) or i_z == 0:
+                            ring_beta[slot, i_hv, i_t] = sBeta[i_t]
             else:
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
@@ -390,25 +413,28 @@ def kda_decode_mtp_kernel(
                     r_gk = lower_bound * sigmoid_val
                     sG[i_t, k_idx] = cute.math.exp(r_gk, fastmath=True)
                     if cutlass.const_expr(CACHE_RING):
-                        ring_g[slot, i_hv, i_t, k_idx] = r_gk
+                        if cutlass.const_expr(not SPLIT_V) or i_z == 0:
+                            ring_g[slot, i_hv, i_t, k_idx] = r_gk
             if p1_job == 0:
-                for i in range(VEC_SIZE):
-                    k_idx = i * 32 + in_warp_tid
-                    for w in range(KERNEL_WIDTH - 1):
-                        intermediate_conv_q[scratch_row, i_t, head_off + k_idx, w] = (
-                            cutlass.BFloat16(r_state[w * VEC_SIZE + i])
-                        )
+                if cutlass.const_expr(not SPLIT_V) or i_z == 0:
+                    for i in range(VEC_SIZE):
+                        k_idx = i * 32 + in_warp_tid
+                        for w in range(KERNEL_WIDTH - 1):
+                            intermediate_conv_q[
+                                scratch_row, i_t, head_off + k_idx, w
+                            ] = cutlass.BFloat16(r_state[w * VEC_SIZE + i])
             elif p1_job == 1:
-                for i in range(VEC_SIZE):
-                    k_idx = i * 32 + in_warp_tid
-                    for w in range(KERNEL_WIDTH - 1):
-                        intermediate_conv_k[scratch_row, i_t, head_off + k_idx, w] = (
-                            cutlass.BFloat16(
+                if cutlass.const_expr(not SPLIT_V) or i_z == 0:
+                    for i in range(VEC_SIZE):
+                        k_idx = i * 32 + in_warp_tid
+                        for w in range(KERNEL_WIDTH - 1):
+                            intermediate_conv_k[
+                                scratch_row, i_t, head_off + k_idx, w
+                            ] = cutlass.BFloat16(
                                 r_state[
                                     (KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i
                                 ]
                             )
-                        )
             # Reach token i_t + P1_JOB_WARPS. The conv body already
             # advanced one step; clamp the rest so the final iteration's
             # unread advance stays in bounds at the last request.
@@ -433,46 +459,53 @@ def kda_decode_mtp_kernel(
                         )
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i] = _xn
     else:
-        for _c in range(V_CH_PER_THREAD):
-            _v_idx = (tidx - P1_QKG_WARPS * 32) + _c * (HEAD_DIM // V_CH_PER_THREAD)
-            _csv0 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 0])
-            _csv1 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 1])
-            _csv2 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 2])
-            _wv = [
-                sConvW[V_WEIGHT_BASE + w * HEAD_DIM + _v_idx]
-                for w in range(KERNEL_WIDTH)
-            ]
-            # Sliding conv window, oldest -> newest.
-            _win = [_csv0, _csv1, _csv2]
-            for _t in cutlass.range_constexpr(T_LOOP):
-                _win.append(
-                    cutlass.Float32(
-                        x_v[0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx]
-                    )
+        # A split CTA computes and checkpoints only its disjoint value tile.
+        # The non-split specialization compiles the bounds guard away.
+        v_thread = tidx - P1_QKG_WARPS * WARP_SIZE
+        if cutlass.const_expr(not SPLIT_V) or v_thread < P1_V_CHANNELS:
+            for _c in range(V_CH_PER_THREAD):
+                local_v = v_thread + _c * (P1_V_CHANNELS // V_CH_PER_THREAD)
+                _v_idx = (
+                    i_z * TILE_V + local_v if cutlass.const_expr(SPLIT_V) else local_v
                 )
-            for _t in cutlass.range_constexpr(T_LOOP):
-                _vconv = _win[_t] * _wv[0]
-                for _w in cutlass.range_constexpr(1, KERNEL_WIDTH):
-                    _vconv += _win[_t + _w] * _wv[_w]
-                _vconv = _vconv * cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-_vconv, fastmath=True)
-                )
-                sVall[_t * HEAD_DIM + _v_idx] = _vconv
-                if cutlass.const_expr(CACHE_RING):
-                    ring_rawv[slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
-                for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
-                    intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
-                        cutlass.BFloat16(_win[_t + 1 + _w])
+                _csv0 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 0])
+                _csv1 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 1])
+                _csv2 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 2])
+                _wv = [
+                    sConvW[V_WEIGHT_BASE + w * HEAD_DIM + _v_idx]
+                    for w in range(KERNEL_WIDTH)
+                ]
+                # Sliding conv window, oldest -> newest.
+                _win = [_csv0, _csv1, _csv2]
+                for _t in cutlass.range_constexpr(T_LOOP):
+                    _win.append(
+                        cutlass.Float32(
+                            x_v[0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx]
+                        )
                     )
+                for _t in cutlass.range_constexpr(T_LOOP):
+                    _vconv = _win[_t] * _wv[0]
+                    for _w in cutlass.range_constexpr(1, KERNEL_WIDTH):
+                        _vconv += _win[_t + _w] * _wv[_w]
+                    _vconv = _vconv * cute.arch.rcp_approx(
+                        cutlass.Float32(1.0) + cute.math.exp(-_vconv, fastmath=True)
+                    )
+                    sVall[_t * HEAD_DIM + _v_idx] = _vconv
+                    if cutlass.const_expr(CACHE_RING):
+                        ring_rawv[slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
+                    for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
+                        intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
+                            cutlass.BFloat16(_win[_t + 1 + _w])
+                        )
 
     k_grp = in_warp_tid % P2_LANES_K
     row_grp = in_warp_tid // P2_LANES_K
 
-    staged = cutlass.const_expr(NUM_STATE_STAGES < NUM_V_TILES)
+    staged = cutlass.const_expr(not SPLIT_V and NUM_STATE_STAGES < NUM_V_TILES)
     if cutlass.const_expr(not staged):
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
-    for i_v in cutlass.range_constexpr(NUM_V_TILES):
+    for i_v in cutlass.range_constexpr(ACTIVE_V_TILES):
         if cutlass.const_expr(staged):
             cute.arch.cp_async_wait_group(
                 min(NUM_STATE_STAGES + i_v, NUM_V_TILES) - 1 - i_v
@@ -484,7 +517,7 @@ def kda_decode_mtp_kernel(
                     sState[
                         warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp,
                         j * P2_LANES_K + k_grp,
-                        i_v % NUM_STATE_STAGES,
+                        0 if cutlass.const_expr(SPLIT_V) else i_v % NUM_STATE_STAGES,
                     ]
                 )
         if cutlass.const_expr(staged) and i_v + NUM_STATE_STAGES < NUM_V_TILES:
@@ -495,6 +528,7 @@ def kda_decode_mtp_kernel(
                 gStateTiles,
                 sState,
                 i_v + NUM_STATE_STAGES,
+                (i_v + NUM_STATE_STAGES) % NUM_STATE_STAGES,
             )
 
     cute.arch.griddepcontrol_launch_dependents()
@@ -518,8 +552,9 @@ def kda_decode_mtp_kernel(
             r_k[j0], r_k[j1] = cute.arch.mul_packed_f32x2(
                 (r_decay[j0], r_decay[j1]), (_k0, _k1)
             )
-        for i_v in range(NUM_V_TILES):
-            v_base = i_v * TILE_V
+        for i_v in range(ACTIVE_V_TILES):
+            global_v_tile = i_z if cutlass.const_expr(SPLIT_V) else i_v
+            v_base = global_v_tile * TILE_V
             for b in range(P2_BATCHES):
                 _st = (i_v * P2_BATCHES + b) * P2_VEC
                 v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
@@ -570,7 +605,8 @@ def kda_decode_mtp_kernel(
                     else:
                         o[0, bos + i_t, i_hv, v_base + v_row] = cutlass.BFloat16(shq)
         if cutlass.const_expr(not CACHE_RING):
-            for i_v in range(NUM_V_TILES):
+            for i_v in range(ACTIVE_V_TILES):
+                global_v_tile = i_z if cutlass.const_expr(SPLIT_V) else i_v
                 for b in range(P2_BATCHES):
                     _st = (i_v * P2_BATCHES + b) * P2_VEC
                     v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
@@ -580,7 +616,7 @@ def kda_decode_mtp_kernel(
                                 scratch_row,
                                 i_t,
                                 i_hv,
-                                i_v * TILE_V + v_row,
+                                global_v_tile * TILE_V + v_row,
                                 j * P2_LANES_K + k_grp,
                             ] = cutlass.BFloat16(r_state[_st + j])
                         else:
@@ -588,7 +624,7 @@ def kda_decode_mtp_kernel(
                                 scratch_row,
                                 i_t,
                                 i_hv,
-                                i_v * TILE_V + v_row,
+                                global_v_tile * TILE_V + v_row,
                                 j * P2_LANES_K + k_grp,
                             ] = r_state[_st + j]
 
@@ -655,6 +691,8 @@ def _run_kda_decode_mtp_dspark(
     N: cutlass.Constexpr[int],
     NUM_SPEC: cutlass.Constexpr[int],
     BLOCK_THREADS: cutlass.Constexpr[int],
+    P2_LANES_K: cutlass.Constexpr[int],
+    SPLIT_V: cutlass.Constexpr[bool],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
@@ -667,11 +705,13 @@ def _run_kda_decode_mtp_dspark(
     state_item_bits = h0.element_type.width
     state_item_bytes = state_item_bits // 8
     state_copy_elems = 128 // state_item_bits
-    state_smem_stride = TILE_K + SMEM_STATE_PAD_BYTES // state_item_bytes
-    # Pad by 32 bytes so the P2_ROWS_LANE v-rows read concurrently by one warp
-    # land on disjoint banks for either FP32 or BF16 state. This is 8 FP32
-    # elements or 16 BF16 elements.
-    state_stages = min(NUM_STATE_STAGES, TILE_K // TILE_V)
+    # TILE_K rows are a whole number of 32-bank periods for FP32 and BF16.
+    # Pad by one four-byte bank per recurrence lane so concurrent row groups
+    # land on disjoint banks for either state dtype.
+    state_smem_stride = TILE_K + (P2_LANES_K * 4) // state_item_bytes
+    state_stages = (
+        1 if cutlass.const_expr(SPLIT_V) else min(NUM_STATE_STAGES, TILE_K // TILE_V)
+    )
     smem_state_layout = cute.make_layout(
         (TILE_V, TILE_K, state_stages),
         stride=(state_smem_stride, 1, TILE_V * state_smem_stride),
@@ -732,13 +772,15 @@ def _run_kda_decode_mtp_dspark(
         scale,
         NUM_SPEC,
         BLOCK_THREADS,
+        P2_LANES_K,
+        SPLIT_V,
         lower_bound,
         CACHE_RING,
         APPLY_ONORM,
         STATE_IS_BF16,
         onorm_eps,
     ).launch(
-        grid=(H, N, 1),
+        grid=(H, N, NUM_V_TILES if cutlass.const_expr(SPLIT_V) else 1),
         block=[BLOCK_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -764,6 +806,11 @@ def _block_threads(*, H: int, N: int) -> int:
         torch.cuda.current_device()
     ).multi_processor_count
     return BLOCK_THREADS_WIDE if H * N <= num_sms else BLOCK_THREADS_NARROW
+
+
+def _p2_lanes_k(*, N: int, num_spec: int) -> int:
+    """Select recurrence reduction lanes for one compiled verify shape."""
+    return 16 if N == 1 and 1 + num_spec == 16 else 8
 
 
 _DSPARK_COMPILED = {}
@@ -828,6 +875,7 @@ def fused_kda_decode_mtp_dspark(
     cu_seqlens,
     lower_bound,
     scale=None,
+    split_v=False,
     replayssm_rawv=None,
     replayssm_rawk=None,
     replayssm_g=None,
@@ -850,6 +898,11 @@ def fused_kda_decode_mtp_dspark(
     intermediate_ssm state snapshots are skipped, so intermediate_ssm may be
     None.
 
+    ``split_v`` distributes the two 64-channel value tiles over separate CTAs.
+    It is restricted to the single-request 16-token specialization and cannot
+    fuse output normalization. Under ReplaySSM, z=0 owns shared raw-k/g/beta
+    rows while each CTA writes its disjoint raw-v slice.
+
     Passing all three onorm_* arguments fuses gated RMSNorm into the recurrence
     kernel.
     """
@@ -871,6 +924,8 @@ def fused_kda_decode_mtp_dspark(
             f"request; got T={T}, N={N}"
         )
     num_spec = T // N - 1
+    if split_v and (N != 1 or 1 + num_spec != 16):
+        raise ValueError("split_v requires exactly N=1 and 16 tokens")
     if recurrent_state.shape[1:] != (H, TILE_K, TILE_K):
         raise ValueError("expected recurrent state layout [pool, H, V=128, K=128]")
     supported_state_dtypes = (torch.float32, torch.bfloat16)
@@ -941,7 +996,10 @@ def fused_kda_decode_mtp_dspark(
             raise ValueError(f"expected output-norm weight shape {(TILE_K,)}")
         if onorm_gate.dtype != torch.bfloat16 or onorm_weight.dtype != torch.float32:
             raise ValueError("expected output-norm gate=bf16 and weight=fp32")
+    if apply_onorm and split_v:
+        raise ValueError("fused output norm requires split_v=False")
     block_threads = _block_threads(H=H, N=N)
+    p2_lanes_k = _p2_lanes_k(N=N, num_spec=num_spec)
     out = torch.empty_like(x_v)
     args = (
         recurrent_state,
@@ -979,6 +1037,8 @@ def fused_kda_decode_mtp_dspark(
         N,
         num_spec,
         block_threads,
+        p2_lanes_k,
+        split_v,
         cache_ring,
         apply_onorm,
         state_is_bf16,
@@ -999,6 +1059,8 @@ def fused_kda_decode_mtp_dspark(
             N=N,
             NUM_SPEC=num_spec,
             BLOCK_THREADS=block_threads,
+            P2_LANES_K=p2_lanes_k,
+            SPLIT_V=split_v,
             lower_bound=float(lower_bound),
             CACHE_RING=cache_ring,
             APPLY_ONORM=apply_onorm,

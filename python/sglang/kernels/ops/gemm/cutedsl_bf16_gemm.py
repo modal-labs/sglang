@@ -1299,7 +1299,9 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
 # fails k < 2048), but TGV wins 1.04-2.43x on every one of them on GB300
 # (L2-defeating weight rotation + CUDA-graph timing; serving A/B confirmed
 # e2e with GSM8K parity). kv_a (n=576) loses (0.84x) and stays out. Gated to
-# small decode batches; larger m stays on the measured heuristic below.
+# small decode/verify batches (m <= 16 remeasured on B300 at m=8/12/16:
+# TGV 0.82-0.94x cuBLAS on every shape); larger m stays on the measured
+# heuristic below.
 _K3_TGV_WIN_SHAPES = frozenset(
     {
         (6144, 7168),  # KDA fused qkvg
@@ -1325,7 +1327,7 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
-    if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+    if m <= 16 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False

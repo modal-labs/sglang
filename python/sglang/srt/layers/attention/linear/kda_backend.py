@@ -321,6 +321,14 @@ def ragged_verify_dense_scatter_indices(
     ).clamp_(max=batch_size * draft_token_num)
 
 
+def _supports_cutedsl_mtp_width(draft_token_num: int) -> bool:
+    return 2 <= draft_token_num <= 8 or draft_token_num == 16
+
+
+def _split_cutedsl_mtp_value_tiles(*, draft_token_num: int, batch_size: int) -> bool:
+    return draft_token_num == 16 and batch_size == 1
+
+
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
@@ -737,6 +745,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
+                draft_token_num=draft_token_num,
                 conv_states=conv_states,
                 ssm_states=ssm_states,
                 intermediate_state_cache=intermediate_state_cache,
@@ -875,9 +884,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
-        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
-        # specialized per block size and capped at 8 by shared-memory growth.
-        if not 2 <= draft_token_num <= 8:
+        # The CuTe kernel is specialized per verify width. Width 16 uses a
+        # split-value path; ordinary widths retain the faster single-CTA path.
+        if not _supports_cutedsl_mtp_width(draft_token_num):
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
@@ -946,6 +955,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
+        draft_token_num: int,
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         intermediate_state_cache: torch.Tensor,
@@ -983,11 +993,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ic_q, ic_k, ic_v = intermediate_conv_window_cache.split(
             [layer.q_dim, layer.k_dim, layer.v_dim], dim=-2
         )
-        # The kernel owns all 128 output channels and can fold gated RMSNorm
-        # into the recurrence.
+        batch_size = query_start_loc.shape[0] - 1
+        split_v = _split_cutedsl_mtp_value_tiles(
+            draft_token_num=draft_token_num,
+            batch_size=batch_size,
+        )
+        # A split CTA owns only 64 output channels, so leave the handoff
+        # unconsumed and let the model apply its existing full-width o_norm.
         onorm_gate = getattr(layer, "_k3_onorm_gate", None)
         fused_static = getattr(layer, "_k3_fused_decode_args", None)
-        apply_onorm = onorm_gate is not None and fused_static is not None
+        apply_onorm = (
+            onorm_gate is not None and fused_static is not None and not split_v
+        )
         if apply_onorm:
             onorm_weight = fused_static[5]
             onorm_eps = fused_static[6]
@@ -1021,6 +1038,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cu_seqlens=query_start_loc.to(torch.int32),
             lower_bound=float(layer.lower_bound),
             scale=layer.head_q_dim**-0.5,
+            split_v=split_v,
             replayssm_rawv=replayssm_rawv,
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,

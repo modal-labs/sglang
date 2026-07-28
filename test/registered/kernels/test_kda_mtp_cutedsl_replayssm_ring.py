@@ -54,6 +54,7 @@ def _run(
     state_dtype=torch.float32,
     onorm=False,
     pad_last=False,
+    split_v=False,
 ):
     torch.manual_seed(seed)
     T = N * (1 + num_spec)
@@ -115,6 +116,7 @@ def _run(
         ssm_state_indices=slots,
         cu_seqlens=cu_seqlens,
         lower_bound=-5.0,
+        split_v=split_v,
     )
     norm = {}
     if onorm:
@@ -148,16 +150,17 @@ def _run(
 
 
 @pytest.mark.parametrize(
-    "N,H,num_spec,state_dtype",
+    "N,H,num_spec,state_dtype,split_v",
     [
-        (4, 2, 4, torch.float32),
-        (1, 12, 5, torch.float32),
-        (1, 12, 7, torch.bfloat16),
-        (16, 2, 8, torch.float32),
+        (4, 2, 4, torch.float32, False),
+        (1, 12, 5, torch.float32, False),
+        (1, 12, 7, torch.bfloat16, False),
+        (16, 2, 8, torch.float32, False),
+        (1, 12, 15, torch.bfloat16, True),
     ],
-    ids=["small", "k3ish", "k3-block8-bf16", "wide"],
+    ids=["small", "k3ish", "k3-block8-bf16", "wide", "k3-block16-split-bf16"],
 )
-def test_cutedsl_ring_fold_parity(N, H, num_spec, state_dtype):
+def test_cutedsl_ring_fold_parity(N, H, num_spec, state_dtype, split_v):
     seed = 0
     out_base, base = _run(
         "baseline",
@@ -166,9 +169,16 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec, state_dtype):
         num_spec=num_spec,
         seed=seed,
         state_dtype=state_dtype,
+        split_v=split_v,
     )
     out_ring, ring = _run(
-        "ring", N=N, H=H, num_spec=num_spec, seed=seed, state_dtype=state_dtype
+        "ring",
+        N=N,
+        H=H,
+        num_spec=num_spec,
+        seed=seed,
+        state_dtype=state_dtype,
+        split_v=split_v,
     )
 
     torch.testing.assert_close(out_ring, out_base, rtol=0, atol=0)
@@ -197,6 +207,20 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec, state_dtype):
             / base_state.float().abs().max().clamp_min(1e-6)
         ).item()
         assert rel < 2e-2, f"req={j}: rel={rel:.3e}"
+
+
+def test_cutedsl_block16_split_matches_single_cta():
+    args = dict(N=1, H=2, num_spec=15, seed=29, state_dtype=torch.bfloat16)
+    single, single_state = _run("baseline", split_v=False, **args)
+    split, split_state = _run("baseline", split_v=True, **args)
+
+    torch.testing.assert_close(split, single, rtol=0, atol=0)
+    torch.testing.assert_close(
+        split_state["inter"],
+        single_state["inter"],
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_cutedsl_bf16_state_matches_fp32_register_math_block8():
