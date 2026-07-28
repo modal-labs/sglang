@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.models import dflash
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -368,9 +368,7 @@ class TestLinearAttentionReplaySSMSpecBackend(unittest.TestCase):
     def test_rejects_flashinfer_decode_for_non_kda_spec_algorithm(
         self, _mock_sm100, _mock_is_cuda, _mock_capability
     ):
-        server_args = self._flashinfer_replayssm_args(
-            speculative_algorithm="EAGLE"
-        )
+        server_args = self._flashinfer_replayssm_args(speculative_algorithm="EAGLE")
 
         with self.assertRaisesRegex(
             ValueError, "KDA DSPARK/DFLASH may use FlashInfer decode"

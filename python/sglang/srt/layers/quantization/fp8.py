@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
+from torch.nn import Module
+from torch.nn.parameter import Parameter
+
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
@@ -99,8 +102,6 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
-from torch.nn import Module
-from torch.nn.parameter import Parameter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo

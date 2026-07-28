@@ -255,9 +255,7 @@ def _validate_target_fp8_sources(
         group.validate_staged_linear_weight(module)
         weight = getattr(module, "weight", None)
         if not isinstance(weight, nn.Parameter):
-            raise TypeError(
-                f"K3 target FP8 {label} component has no weight Parameter."
-            )
+            raise TypeError(f"K3 target FP8 {label} component has no weight Parameter.")
         weights.append(weight)
 
     if any(not weight.is_cuda for weight in weights):
@@ -744,9 +742,7 @@ class KimiK3MoE(nn.Module):
                 "K3 target FP8 front requires latent MoE with shared experts."
             )
         if not get_moe_a2a_backend().is_none():
-            raise RuntimeError(
-                "K3 target FP8 front requires plain TP (no MoE a2a/EP)."
-            )
+            raise RuntimeError("K3 target FP8 front requires plain TP (no MoE a2a/EP).")
         _validate_target_fp8_sources(
             self._target_fp8_front_group,
             [
@@ -815,9 +811,7 @@ class KimiK3MoE(nn.Module):
             return
         convert_to_fp8 = self._target_fp8_front_group is not None
         allocation_context = (
-            self._target_fp8_front_group.allocation()
-            if convert_to_fp8
-            else None
+            self._target_fp8_front_group.allocation() if convert_to_fp8 else None
         )
         self._front_w, self._front_sizes = _merge_weights_as_views(
             mods, allocation_context=allocation_context
@@ -1531,9 +1525,7 @@ class KimiK3DeltaAttention(nn.Module):
                     layer_idx,
                 )
             if self._target_fp8_qkvg_group is not None:
-                self._target_fp8_qkvg_group.stage_linear_weight(
-                    self.fused_qkvg_proj
-                )
+                self._target_fp8_qkvg_group.stage_linear_weight(self.fused_qkvg_proj)
             self.split_sizes = [
                 3 * projection_size // self.tp_size,
                 projection_size // self.tp_size,
@@ -2338,9 +2330,7 @@ class KimiK3DecoderLayer(nn.Module):
                 all_reduce_fusion=self.all_reduce_fusion,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
-                bfa_alt_stream=(
-                    alt_streams[2] if alt_streams is not None else None
-                ),
+                bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
                 target_fp8=target_fp8,
             )
         else:
@@ -3291,10 +3281,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                         layer_id,
                         ("q", "k", "v", "g")[shard_id],
                     )
-                elif (
-                    param_name == ".gate_up_proj"
-                    and ".shared_experts." in name
-                ):
+                elif param_name == ".gate_up_proj" and ".shared_experts." in name:
                     self.model.target_fp8.mark_checkpoint_component(
                         moe_front_role(),
                         layer_id,
@@ -3347,17 +3334,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                                 layer_id,
                                 "router",
                             )
-                        elif name.endswith(
-                            ".mlp.routed_expert_down_proj.weight"
-                        ):
+                        elif name.endswith(".mlp.routed_expert_down_proj.weight"):
                             self.model.target_fp8.mark_checkpoint_component(
                                 moe_front_role(),
                                 layer_id,
                                 "latent_down",
                             )
-                        elif name.endswith(
-                            ".mlp.shared_experts.gate_up_proj.weight"
-                        ):
+                        elif name.endswith(".mlp.shared_experts.gate_up_proj.weight"):
                             self.model.target_fp8.mark_checkpoint_component(
                                 moe_front_role(),
                                 layer_id,
@@ -3368,9 +3351,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                                 layer_id,
                                 "shared_up",
                             )
-                        elif name.endswith(
-                            ".self_attn.fused_qkvg_proj.weight"
-                        ):
+                        elif name.endswith(".self_attn.fused_qkvg_proj.weight"):
                             for component in ("q", "k", "v", "g"):
                                 self.model.target_fp8.mark_checkpoint_component(
                                     kda_qkvg_role(),

@@ -581,9 +581,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         cols = torch.arange(width, dtype=table.dtype, device=table.device)
         cols = cols.remainder(ring)
-        base = (
-            torch.arange(rows, dtype=table.dtype, device=table.device) * ring + page
-        )
+        base = torch.arange(rows, dtype=table.dtype, device=table.device) * ring + page
         table.copy_(base.unsqueeze(1) + cols.unsqueeze(0))
         self._ring_page_offset = page
         if self.ps.tp_rank == 0:
@@ -1785,9 +1783,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     ctx_lens.to(torch.int64),
                 )
                 positions = positions.to(torch.int64)
-                keep_mask = positions >= (
-                    ends_flat - int(self._ring_ctx_keep_tokens)
-                )
+                keep_mask = positions >= (ends_flat - int(self._ring_ctx_keep_tokens))
                 if not bool(keep_mask.all()):
                     positions = positions[keep_mask]
                     rows_flat = rows_flat[keep_mask]

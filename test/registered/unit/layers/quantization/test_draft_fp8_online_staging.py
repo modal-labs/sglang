@@ -9,10 +9,11 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from torch.nn import Parameter
+
 from sglang.srt.layers.quantization import fp8
 from sglang.srt.model_loader import loader, weight_utils
 from sglang.test.ci.ci_register import register_cpu_ci
-from torch.nn import Parameter
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
