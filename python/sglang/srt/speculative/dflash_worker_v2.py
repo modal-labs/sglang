@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import math
 from dataclasses import replace
@@ -60,6 +61,178 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+
+def _get_dflash_sampling_tp_group():
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+
+
+def _sync_dflash_sampling_results(
+    accept_len: torch.Tensor,
+    bonus: torch.Tensor,
+    *,
+    tp_group=None,
+    outcome_buffer: Optional[torch.Tensor] = None,
+    local_outcome_buffer: Optional[torch.Tensor] = None,
+    gathered_outcome_buffer: Optional[torch.Tensor] = None,
+    assert_consensus: bool = False,
+) -> None:
+    """Broadcast rank 0's stochastic decision before any serving state mutates.
+
+    ``accept_len`` and ``bonus`` have different dtypes, so they are packed into
+    one int64 tensor and synchronized with one collective. Optional debug
+    buffers retain and gather every rank's pre-broadcast decision; all ranks
+    then fail together with the first divergent row.
+    """
+    if tp_group is None:
+        tp_group = _get_dflash_sampling_tp_group()
+    world_size = int(tp_group.world_size)
+    if world_size <= 1:
+        return
+
+    bs = int(accept_len.numel())
+    if bonus.numel() != bs:
+        raise ValueError("DFlash accept_len and bonus must have the same length")
+    if outcome_buffer is None:
+        outcome_buffer = torch.empty((bs, 2), dtype=torch.int64, device=bonus.device)
+    outcome = outcome_buffer[:bs]
+    if outcome.dtype != torch.int64 or tuple(outcome.shape) != (bs, 2):
+        raise ValueError("DFlash TP outcome buffer must be int64 with shape [bs, 2]")
+
+    outcome[:, 0].copy_(accept_len)
+    outcome[:, 1].copy_(bonus)
+
+    local_outcome = None
+    if assert_consensus:
+        if local_outcome_buffer is None:
+            local_outcome_buffer = torch.empty_like(outcome)
+        local_outcome = local_outcome_buffer[:bs]
+        local_outcome.copy_(outcome)
+
+    tp_group.broadcast(outcome, src=0)
+
+    if assert_consensus:
+        if gathered_outcome_buffer is None:
+            gathered_outcome_buffer = torch.empty(
+                (world_size * bs, 2),
+                dtype=torch.int64,
+                device=outcome.device,
+            )
+        gathered = gathered_outcome_buffer[: world_size * bs]
+        if tuple(gathered.shape) != (world_size * bs, 2):
+            raise ValueError(
+                "DFlash TP gathered outcome buffer must have shape [tp * bs, 2]"
+            )
+        assert local_outcome is not None
+        tp_group.all_gather_into_tensor(gathered, local_outcome.contiguous())
+        by_rank = gathered.view(world_size, bs, 2)
+        canonical = outcome.view(1, bs, 2)
+        mismatch = by_rank.ne(canonical).any(dim=-1)
+        if bool(mismatch.any().item()):
+            first = mismatch.nonzero()[0]
+            rank = int(first[0].item())
+            row = int(first[1].item())
+            raise RuntimeError(
+                "DFlash stochastic TP divergence before state mutation: "
+                f"rank={rank}, row={row}, "
+                f"local={by_rank[rank, row].tolist()}, "
+                f"rank0={outcome[row].tolist()}"
+            )
+
+    accept_len.copy_(outcome[:, 0])
+    bonus.copy_(outcome[:, 1])
+
+
+def _assert_dflash_tp_tensor_consensus(
+    tensor: torch.Tensor,
+    *,
+    label: str,
+    tp_group,
+) -> None:
+    """Debug-only exact comparison of a small tensor across every TP rank."""
+    world_size = int(tp_group.world_size)
+    if world_size <= 1 or tensor.numel() == 0:
+        return
+    local = tensor.contiguous().view(-1)
+    gathered = torch.empty(
+        (world_size * local.numel(),),
+        dtype=local.dtype,
+        device=local.device,
+    )
+    tp_group.all_gather_into_tensor(gathered, local)
+    by_rank = gathered.view(world_size, local.numel())
+    mismatch = by_rank.ne(by_rank[0:1])
+    if bool(mismatch.any().item()):
+        first = mismatch.nonzero()[0]
+        rank = int(first[0].item())
+        index = int(first[1].item())
+        raise RuntimeError(
+            f"DFlash TP {label} divergence before state mutation: "
+            f"rank={rank}, flat_index={index}, "
+            f"local={int(by_rank[rank, index].item())}, "
+            f"rank0={int(by_rank[0, index].item())}"
+        )
+
+
+def _digest_ints(digest, values) -> None:
+    for value in values:
+        digest.update(int(value).to_bytes(8, "little", signed=True))
+
+
+def _stable_dflash_state_hash(req) -> tuple[int, int]:
+    """Hash output-token and grammar state without rescanning a long prompt."""
+
+    token_digest = hashlib.blake2b(digest_size=8)
+    token_digest.update(str(req.rid).encode())
+    token_digest.update(len(req.origin_input_ids).to_bytes(8, "little"))
+    _digest_ints(token_digest, req.origin_input_ids[-8:])
+    _digest_ints(token_digest, req.output_ids)
+
+    grammar_digest = hashlib.blake2b(digest_size=8)
+    grammar = req.grammar
+
+    def add_grammar_state(obj) -> None:
+        if obj is None:
+            grammar_digest.update(b"none")
+            return
+        grammar_digest.update(
+            f"{type(obj).__module__}.{type(obj).__qualname__}".encode()
+        )
+        for name in (
+            "_finished",
+            "current_token",
+            "state",
+            "tokens_in_think",
+            "tokens_after_end",
+            "think_end_match_len",
+        ):
+            value = getattr(obj, name, None)
+            grammar_digest.update(name.encode())
+            grammar_digest.update(repr(value).encode())
+        accepted_tokens = getattr(obj, "accepted_tokens", ())
+        grammar_digest.update(len(accepted_tokens).to_bytes(8, "little"))
+        _digest_ints(grammar_digest, accepted_tokens)
+        match_history = getattr(obj, "_match_len_history", ())
+        grammar_digest.update(len(match_history).to_bytes(8, "little"))
+        _digest_ints(grammar_digest, match_history)
+        add_grammar_state(getattr(obj, "grammar", None))
+
+    add_grammar_state(grammar)
+    return (
+        int.from_bytes(token_digest.digest(), "little", signed=True),
+        int.from_bytes(grammar_digest.digest(), "little", signed=True),
+    )
+
+
+def _dflash_request_state_hashes(reqs, *, device) -> torch.Tensor:
+    return torch.tensor(
+        [_stable_dflash_state_hash(req) for req in reqs],
+        dtype=torch.int64,
+        device=device,
+    )
 
 
 def _get_fused_kv_materialize_helper():
@@ -286,6 +459,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._sampling_outcome_buf: Optional[torch.Tensor] = None
+        self._sampling_local_outcome_buf: Optional[torch.Tensor] = None
+        self._sampling_gathered_outcome_buf: Optional[torch.Tensor] = None
+        self._sampling_gathered_tp_size: int = 0
 
     @property
     def draft_worker(self):
@@ -1314,7 +1491,41 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._new_seq_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
         ]
+        self._sampling_outcome_buf = torch.empty(
+            (new_cap, 2), dtype=torch.int64, device=device
+        )
+        self._sampling_local_outcome_buf = None
+        self._sampling_gathered_outcome_buf = None
+        self._sampling_gathered_tp_size = 0
         self._accept_bonus_buffer_cap = new_cap
+
+    def _sampling_sync_buffers(
+        self, *, bs: int, tp_size: int, assert_consensus: bool
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        self._ensure_accept_bonus_buffers(bs)
+        assert self._sampling_outcome_buf is not None
+        if not assert_consensus:
+            return self._sampling_outcome_buf[:bs], None, None
+
+        if self._sampling_local_outcome_buf is None:
+            self._sampling_local_outcome_buf = torch.empty_like(
+                self._sampling_outcome_buf
+            )
+        if (
+            self._sampling_gathered_outcome_buf is None
+            or self._sampling_gathered_tp_size != int(tp_size)
+        ):
+            self._sampling_gathered_outcome_buf = torch.empty(
+                (int(tp_size) * self._accept_bonus_buffer_cap, 2),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._sampling_gathered_tp_size = int(tp_size)
+        return (
+            self._sampling_outcome_buf[:bs],
+            self._sampling_local_outcome_buf[:bs],
+            self._sampling_gathered_outcome_buf[: int(tp_size) * bs],
+        )
 
     def _next_accept_bonus_buffers(self, bs: int) -> tuple[
         torch.Tensor,
@@ -1723,12 +1934,44 @@ class DFlashWorkerV2(BaseSpecWorker):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
+            tp_group = _get_dflash_sampling_tp_group()
+            assert_tp_state = envs.SGLANG_DFLASH_TP_ASSERT_STATE.get()
+            if assert_tp_state:
+                _assert_dflash_tp_tensor_consensus(
+                    candidates,
+                    label="candidate-token",
+                    tp_group=tp_group,
+                )
+                _assert_dflash_tp_tensor_consensus(
+                    _dflash_request_state_hashes(batch.reqs, device=device),
+                    label="request-token/grammar-state",
+                    tp_group=tp_group,
+                )
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+            # Tiny TP-local numerical differences in target sampling can select
+            # different accepted lengths or bonus tokens. One divergence is
+            # enough to poison per-rank Mamba, draft-KV, output, and radix state.
+            # Canonicalize rank 0's decision before deriving or committing any
+            # of those values.
+            outcome, local_outcome, gathered_outcomes = self._sampling_sync_buffers(
+                bs=bs,
+                tp_size=int(tp_group.world_size),
+                assert_consensus=assert_tp_state,
+            )
+            _sync_dflash_sampling_results(
+                accept_len,
+                bonus,
+                tp_group=tp_group,
+                outcome_buffer=outcome,
+                local_outcome_buffer=local_outcome,
+                gathered_outcome_buffer=gathered_outcomes,
+                assert_consensus=assert_tp_state,
             )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
@@ -1738,6 +1981,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
             out_tokens[:, int(self.block_size) - 1].fill_(0)
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            if assert_tp_state:
+                _assert_dflash_tp_tensor_consensus(
+                    out_tokens,
+                    label="derived-output-token",
+                    tp_group=tp_group,
+                )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)

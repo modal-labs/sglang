@@ -833,6 +833,9 @@ class Envs:
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Debug-only: compare stochastic DFlash decisions and derived state across
+    # TP ranks, failing all ranks together on the first divergence.
+    SGLANG_DFLASH_TP_ASSERT_STATE = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
