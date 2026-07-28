@@ -120,32 +120,35 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self._matcher.next_token(self.think_end_match_len)
 
     def transfer_state(self, token: int) -> None:
-        self._match_len_history.append(self.think_end_match_len)
         if self._is_thinking():
-            matched = self._matcher.advance(self.think_end_match_len, token)
+            previous_match = self.think_end_match_len
+            self._match_len_history.append(previous_match)
+            matched = self._matcher.advance(previous_match, token)
             if matched == len(self._matcher):
                 self.think_end_match_len = 0
                 self.tokens_after_end = 0
                 return
             self.think_end_match_len = matched
-            self.tokens_in_think += 1
+            # A matching delimiter prefix is provisional, not reasoning. If a
+            # later token mismatches, the matcher exposes the portion that has
+            # become ordinary reasoning and it is committed here.
+            self.tokens_in_think += previous_match + 1 - matched
         elif self._is_generation():
             self.tokens_after_end += 1
 
     def rollback_state(self):
-        # Restore the match length recorded before the token being undone; the
-        # counters below cannot express a partial marker match.
-        restored = self._match_len_history.pop() if self._match_len_history else None
         if self._is_thinking():
-            if self.tokens_in_think > 0:
-                self.tokens_in_think -= 1
+            if self._match_len_history:
+                previous_match = self._match_len_history.pop()
+                self.tokens_in_think -= previous_match + 1 - self.think_end_match_len
+                self.think_end_match_len = previous_match
         elif self._is_generation():
             if self.tokens_after_end == 0:
-                self.tokens_after_end = -1
+                if self._match_len_history:
+                    self.tokens_after_end = -1
+                    self.think_end_match_len = self._match_len_history.pop()
             elif self.tokens_after_end > 0:
                 self.tokens_after_end -= 1
-        if restored is not None:
-            self.think_end_match_len = restored
 
     def accept_token(self, token: int):
         # Track the last accepted token on the wrapper itself (mirroring
@@ -161,7 +164,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.transfer_state(token)
 
     def is_terminated(self):
-        if self.grammar is not None:
+        if self._is_generation() and self.grammar is not None:
             return self.grammar.is_terminated()
         return False
 
@@ -174,7 +177,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.rollback_state()
 
     def _can_think_more(self):
-        return self.max_think_tokens < 0 or self.tokens_in_think < self.max_think_tokens
+        return (
+            self.max_think_tokens < 0
+            or self.tokens_in_think + self.think_end_match_len < self.max_think_tokens
+        )
 
     def _do_token_filter(self, vocab_mask, token_ids, idx, is_allowed=True):
         if self.token_filter_fn is not None:
@@ -184,10 +190,18 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self._is_thinking():
             if not self.enable_token_filter:
                 return
-            if self._can_think_more():
+            if self.think_end_match_len:
                 self._do_token_filter(
-                    vocab_mask, self.think_excluded_token_ids, idx, is_allowed=False
+                    vocab_mask, [self._next_think_end_token()], idx, is_allowed=True
                 )
+            elif self._can_think_more():
+                if self.think_excluded_token_ids is not None:
+                    self._do_token_filter(
+                        vocab_mask,
+                        self.think_excluded_token_ids,
+                        idx,
+                        is_allowed=False,
+                    )
             else:
                 # Budget exhausted: allow only the token that advances the
                 # think_end marker, walking a multi-token marker one step per
@@ -237,6 +251,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         new_obj._match_len_history = deque(
             self._match_len_history, maxlen=_MATCH_HISTORY_LIMIT
         )
+        new_obj.current_token = self.current_token
         new_obj._finished = self._finished
         return new_obj
 
@@ -254,20 +269,21 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self._finished = finished
 
     def try_jump_forward(self, tokenizer):
-        if self.grammar is not None:
+        if self._is_generation() and self.grammar is not None:
             return self.grammar.try_jump_forward(tokenizer)
         return None
 
     def jump_forward_str_state(self, helper):
-        if self.grammar is not None:
+        if self._is_generation() and self.grammar is not None:
             return self.grammar.jump_forward_str_state(helper)
         return None
 
     def jump_and_retokenize(self, old_output_ids, new_output_ids, next_state):
-        if self.grammar is not None:
+        if self._is_generation() and self.grammar is not None:
             return self.grammar.jump_and_retokenize(
                 old_output_ids, new_output_ids, next_state
             )
+        return None
 
 
 class ReasonerGrammarBackend(BaseGrammarBackend):
@@ -294,9 +310,11 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             reasoning_parser, tokenizer
         )
         self.max_think_tokens = envs.SGLANG_MAX_THINK_TOKENS.get()
+        self.enable_token_filter = self.enable_strict_thinking and (
+            self.think_excluded_token_ids is not None or self.max_think_tokens >= 0
+        )
         if (
-            self.enable_strict_thinking
-            and self.think_excluded_token_ids is not None
+            self.enable_token_filter
             and not self.grammar_backend.is_support_token_filter
         ):
             raise ValueError(
@@ -304,11 +322,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 "support token filtering. Use a grammar backend that supports token "
                 "filtering (e.g., xgrammar) or disable strict reasoning mode."
             )
-        self.enable_token_filter = (
-            self.enable_strict_thinking
-            and self.think_excluded_token_ids is not None
-            and self.grammar_backend.is_support_token_filter
-        )
         self._token_filter_fn = (
             self.grammar_backend.set_token_filter if self.enable_token_filter else None
         )

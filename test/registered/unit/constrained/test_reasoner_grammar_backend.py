@@ -164,6 +164,25 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertEqual(obj.max_think_tokens, 2)
         self.assertEqual(obj.think_excluded_token_ids, [3, 4])
 
+    def test_strict_budget_works_without_excluded_tokens(self):
+        os.environ["SGLANG_MAX_THINK_TOKENS"] = "0"
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        parser = self._make_parser()
+        parser.detector.think_excluded_tokens = None
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            parser,
+            self._make_tokenizer(),
+            enable_strict_thinking=True,
+        )
+
+        obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertTrue(reasoner.enable_token_filter)
+        self.assertEqual(_allowed_token_ids(mask, [1, 2, 3]), [2])
+
     def test_init_strict_reasoning_grammar_none_when_strict_disabled(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
         reasoner = ReasonerGrammarBackend(
@@ -228,11 +247,14 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         obj = ReasonerGrammarObject(grammar=None, think_end_ids=[2, 3])
         obj.maybe_init_reasoning(True)
 
+        obj.accept_token(10)
         obj.accept_token(2)
         self.assertTrue(obj._is_thinking())
+        self.assertEqual(obj.tokens_in_think, 1)
 
         obj.accept_token(3)
         self.assertTrue(obj._is_generation())
+        self.assertEqual(obj.tokens_in_think, 1)
 
     def test_multi_token_marker_survives_accept_then_rollback(self):
         """Speculative decoding explores a draft tree on the live grammar.
@@ -284,6 +306,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
             obj.accept_token(token)
 
         self.assertTrue(obj._is_generation())
+        self.assertEqual(obj.tokens_in_think, 1)
 
     def test_rejects_unencodable_excluded_token(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
@@ -319,12 +342,12 @@ class TestReasonerGrammarBackend(unittest.TestCase):
 class TestReasonerGrammarObjectRollback(unittest.TestCase):
     """Tests for rollback correctness at the THINKING→GENERATION boundary."""
 
-    def _make_object_with_mock_grammar(self):
+    def _make_object_with_mock_grammar(self, think_end_ids=None):
         inner_grammar = MagicMock()
         inner_grammar.is_terminated.return_value = False
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_ids=[7],
+            think_end_ids=think_end_ids or [7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
             enable_token_filter=True,
@@ -425,6 +448,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         self.assertEqual(copy.tokens_after_end, 1)
         self.assertTrue(copy._is_generation())
         self.assertIsNotNone(copy.grammar)
+        self.assertEqual(copy.current_token, 20)
         inner_grammar.copy.assert_called_once()
 
     def test_copy_preserves_thinking_state(self):
@@ -438,6 +462,30 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         self.assertEqual(copy.tokens_in_think, 2)
         self.assertEqual(copy.tokens_after_end, -1)
         self.assertTrue(copy._is_thinking())
+
+    def test_inner_grammar_operations_wait_for_complete_marker(self):
+        obj, inner_grammar = self._make_object_with_mock_grammar([7, 8])
+        inner_grammar.is_terminated.return_value = True
+        inner_grammar.try_jump_forward.return_value = ([], "jump")
+        obj.maybe_init_reasoning(True)
+
+        obj.accept_token(7)
+        self.assertFalse(obj.is_terminated())
+        self.assertIsNone(obj.try_jump_forward(None))
+        self.assertIsNone(obj.jump_forward_str_state(([], "jump")))
+        self.assertIsNone(obj.jump_and_retokenize([], [], -1))
+        inner_grammar.is_terminated.assert_not_called()
+        inner_grammar.try_jump_forward.assert_not_called()
+        inner_grammar.jump_forward_str_state.assert_not_called()
+        inner_grammar.jump_and_retokenize.assert_not_called()
+
+        obj.accept_token(8)
+        self.assertTrue(obj.is_terminated())
+        self.assertEqual(obj.try_jump_forward(None), ([], "jump"))
+        obj.jump_forward_str_state(([], "jump"))
+        obj.jump_and_retokenize([], [], -1)
+        inner_grammar.jump_forward_str_state.assert_called_once()
+        inner_grammar.jump_and_retokenize.assert_called_once()
 
 
 class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
@@ -499,6 +547,27 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         obj.fill_vocab_mask(mask, 0)
 
         inner_grammar.fill_vocab_mask.assert_called_once_with(mask, 0)
+
+    def test_partial_marker_forces_its_next_token(self):
+        obj = ReasonerGrammarObject(
+            grammar=None,
+            think_end_ids=[7, 8, 9],
+            think_excluded_token_ids=[3, 5],
+            max_think_tokens=5,
+            enable_token_filter=True,
+            token_filter_fn=set_token_filter_torch,
+            allocate_vocab_mask_fn=lambda vs, bs, d: torch.zeros(
+                (bs, (vs + 31) // 32), dtype=torch.int32
+            ),
+        )
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+        obj.accept_token(7)
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(_allowed_token_ids(mask, list(range(12))), [8])
 
     def test_non_strict_thinking_is_noop(self):
         inner_grammar = MagicMock()
