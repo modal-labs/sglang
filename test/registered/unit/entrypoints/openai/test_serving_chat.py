@@ -340,19 +340,124 @@ class ServingChatTestCase(unittest.TestCase):
 
         call = self.tm.tokenizer.apply_chat_template.call_args
         encoded_messages = call.args[0]
-        self.assertIsNone(encoded_messages[0]["tools"])
+        self.assertNotIn("tools", encoded_messages[0])
         self.assertEqual(encoded_messages[1]["role"], "system")
         self.assertEqual(
             encoded_messages[1]["tools"][0]["function"]["name"], "dynamic_tool"
         )
+        self.assertNotIn("strict", encoded_messages[1]["tools"][0]["function"])
+        self.assertNotIn("defer_loading", encoded_messages[1]["tools"][0])
         self.assertEqual(
             [tool["function"]["name"] for tool in call.kwargs["tools"]],
             ["global_tool"],
         )
+        self.assertNotIn("strict", call.kwargs["tools"][0]["function"])
+        self.assertNotIn("defer_loading", call.kwargs["tools"][0])
+        self.assertEqual(call.kwargs["tool_choice"], "required")
         self.assertEqual(
             [tool.function.name for tool in parser_cls.call_args.args[0]],
             ["global_tool", "dynamic_tool"],
         )
+
+    def test_kimi_k3_preserves_native_template_request_shape(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = None
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Use the tool."},
+                {
+                    "role": "assistant",
+                    "content": "partial",
+                    "reasoning_content": "reasoning",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "global_tool",
+                                "arguments": '{"broken":',
+                            },
+                        }
+                    ],
+                },
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "global_tool",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="required",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                },
+            },
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        encoded_assistant = call.args[0][-1]
+        self.assertEqual(encoded_assistant["role"], "assistant")
+        self.assertEqual(encoded_assistant["reasoning_content"], "reasoning")
+        self.assertEqual(
+            encoded_assistant["tool_calls"][0]["function"]["arguments"],
+            '{"broken":',
+        )
+        self.assertEqual(call.kwargs["tool_choice"], "required")
+        self.assertEqual(
+            call.kwargs["response_format"]["json_schema"]["schema"],
+            {"type": "object"},
+        )
+        self.assertNotIn("strict", call.kwargs["response_format"]["json_schema"])
+
+    def test_kimi_k3_tool_choice_none_keeps_declarations(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Do not use tools."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "global_tool"},
+                }
+            ],
+            tool_choice="none",
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(
+            [tool["function"]["name"] for tool in call.kwargs["tools"]],
+            ["global_tool"],
+        )
+        self.assertEqual(call.kwargs["tool_choice"], "none")
+
+    def test_kimi_k3_implicit_none_omits_tool_choice_directive(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello."}],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertNotIn("tool_choice", call.kwargs)
 
     def test_kimi_k3_applies_moonshot_thinking_controls(self):
         self.chat.chat_encoding_spec = "kimi_k3"

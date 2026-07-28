@@ -85,6 +85,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def dump_kimi_k3_template_value(value: Any) -> Any:
+    """Serialize a K3 template value without materializing omitted defaults."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_unset=True, by_alias=True)
+    return value
+
+
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
 
@@ -286,7 +293,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Extract content and remove the assistant message
                     assistant_prefix = last_content
                     messages = messages[:-1]
-                else:
+                elif self.chat_encoding_spec != "kimi_k3":
                     # Convert the last assistant message to user message
                     messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
@@ -939,16 +946,29 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         required_parsed_natively = False
         all_tools = self._collect_tools(request)
+        if self.chat_encoding_spec == "kimi_k3" and request.tools:
+            tools = [dump_kimi_k3_template_value(tool) for tool in request.tools]
         if all_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
-                    item.model_dump()
+                    (
+                        dump_kimi_k3_template_value(item)
+                        if self.chat_encoding_spec == "kimi_k3"
+                        else item.model_dump()
+                    )
                     for item in request.tools or []
                     if item.function.name == request.tool_choice.function.name
                 ] or None
             elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
+                tools = [
+                    (
+                        dump_kimi_k3_template_value(item)
+                        if self.chat_encoding_spec == "kimi_k3"
+                        else item.model_dump()
+                    )
+                    for item in request.tools
+                ]
             if self.tool_call_parser:
                 constraint_tools = all_tools
                 if self.chat_encoding_spec == "kimi_k3":
@@ -1028,9 +1048,14 @@ class OpenAIServingChat(OpenAIServingBase):
         thinking_mode = (
             ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
         )
-        messages = [msg.model_dump() for msg in request.messages]
-        for message in messages:
-            normalize_assistant_tool_call_arguments(message)
+        if self.chat_encoding_spec == "kimi_k3":
+            messages = [
+                dump_kimi_k3_template_value(message) for message in request.messages
+            ]
+        else:
+            messages = [message.model_dump() for message in request.messages]
+            for message in messages:
+                normalize_assistant_tool_call_arguments(message)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
@@ -1099,12 +1124,16 @@ class OpenAIServingChat(OpenAIServingBase):
                         request.reasoning_effort,
                     )
 
-            if isinstance(request.tool_choice, str):
-                template_kwargs.setdefault("tool_choice", request.tool_choice)
+            if isinstance(request.tool_choice, str) and (
+                request.tool_choice == "required"
+                or (
+                    request.tool_choice == "none" and bool(self._collect_tools(request))
+                )
+            ):
+                template_kwargs["tool_choice"] = request.tool_choice
             if request.response_format is not None:
-                template_kwargs.setdefault(
-                    "response_format",
-                    request.response_format.model_dump(by_alias=True),
+                template_kwargs["response_format"] = dump_kimi_k3_template_value(
+                    request.response_format
                 )
 
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
