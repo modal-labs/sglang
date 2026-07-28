@@ -2639,6 +2639,14 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Use K3's exact post-layer stream taps for a DFlash draft.
+
+        K3 DFlash checkpoints use the tap ids they were trained with, so these
+        ids must not receive the generic Qwen DFlash one-layer shift.
+        """
+        self.set_dspark_layers_to_capture(layer_ids)
+
     @torch.no_grad()
     def forward(
         self,
@@ -3026,6 +3034,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "DFLASH layer capture is not available in encoder-only mode"
+            )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device

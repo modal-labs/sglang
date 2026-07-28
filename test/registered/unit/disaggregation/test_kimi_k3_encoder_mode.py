@@ -6,7 +6,7 @@ import time
 from array import array
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -27,7 +27,10 @@ from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
-from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.models.kimi_k3 import (
+    KimiK3ForConditionalGeneration,
+    KimiK3LinearForCausalLM,
+)
 from sglang.srt.server_args import resolve_encoder_transfer_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -220,6 +223,20 @@ def test_kimi_k3_encoder_only_wrapper_guards_language_tower_hooks():
         KimiK3ForConditionalGeneration.lm_head.fget(model)
     with pytest.raises(AttributeError, match="DSPARK"):
         KimiK3ForConditionalGeneration.set_dspark_layers_to_capture(model, [0])
+    with pytest.raises(AttributeError, match="DFLASH"):
+        KimiK3ForConditionalGeneration.set_dflash_layers_to_capture(model, [0])
+
+
+def test_kimi_k3_dflash_preserves_exact_tap_ids():
+    layer_ids = [7, 23, 51, 67, 83]
+    linear_model = SimpleNamespace(set_dspark_layers_to_capture=Mock())
+    KimiK3LinearForCausalLM.set_dflash_layers_to_capture(linear_model, layer_ids)
+    linear_model.set_dspark_layers_to_capture.assert_called_once_with(layer_ids)
+
+    language_model = SimpleNamespace(set_dflash_layers_to_capture=Mock())
+    model = SimpleNamespace(language_model=language_model)
+    KimiK3ForConditionalGeneration.set_dflash_layers_to_capture(model, layer_ids)
+    language_model.set_dflash_layers_to_capture.assert_called_once_with(layer_ids)
 
 
 def test_kimi_k3_declares_encoder_only_weight_prefixes():

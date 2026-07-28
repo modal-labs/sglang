@@ -22,9 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# trtllm_mha: decode-only dense-MQA drafts (dspark). DFLASH excludes it
-# earlier, at arg resolution (speculative_hook.py) -- its draft path needs
-# per-layer DFlash attention -- so it never reaches this gate with it.
+# trtllm_mha supports dense DSpark drafts and causal/all-SWA DFlash drafts.
+# The DFlash resolver validates the checkpoint before this shared builder.
 _SUPPORTED_DRAFT_BACKENDS = (
     "flashinfer",
     "fa3",
