@@ -303,6 +303,84 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(limited_value["maxLength"], 448)
         self.assertEqual(original_value["maxLength"], 5_000_000)
 
+    def test_kimi_k3_preserves_dynamic_tools_at_message_position(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "global_tool"},
+                }
+            ],
+            messages=[
+                {"role": "system", "content": "Instructions."},
+                {
+                    "role": "developer",
+                    "content": "",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "dynamic_tool"},
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Use a tool."},
+            ],
+            tool_choice="required",
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as parser_cls:
+            self.chat._process_messages(request, is_multimodal=False)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        encoded_messages = call.args[0]
+        self.assertIsNone(encoded_messages[0]["tools"])
+        self.assertEqual(encoded_messages[1]["role"], "system")
+        self.assertEqual(
+            encoded_messages[1]["tools"][0]["function"]["name"], "dynamic_tool"
+        )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in call.kwargs["tools"]],
+            ["global_tool"],
+        )
+        self.assertEqual(
+            [tool.function.name for tool in parser_cls.call_args.args[0]],
+            ["global_tool", "dynamic_tool"],
+        )
+
+    def test_kimi_k3_applies_moonshot_thinking_controls(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+
+        disabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Answer."}],
+            thinking={"type": "disabled"},
+        )
+        self.chat._process_messages(disabled, is_multimodal=False)
+        disabled_kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertFalse(disabled_kwargs["thinking"])
+        self.assertNotIn("thinking_effort", disabled_kwargs)
+
+        enabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Think."}],
+            thinking={"type": "enabled", "keep": "all", "effort": "low"},
+            reasoning_effort="max",
+        )
+        self.chat._process_messages(enabled, is_multimodal=False)
+        enabled_kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertTrue(enabled_kwargs["thinking"])
+        self.assertEqual(enabled_kwargs["thinking_effort"], "low")
+        self.assertTrue(enabled_kwargs["preserve_thinking"])
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [

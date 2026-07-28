@@ -24,6 +24,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionResponseChoice,
     ChatMessage,
     CompletionRequest,
+    DynamicTool,
     Function,
     ModelCard,
     ModelList,
@@ -196,6 +197,159 @@ class TestChatCompletionRequest(unittest.TestCase):
             model="test-model", messages=messages, tools=tools
         )
         self.assertEqual(request2.tool_choice, "auto")
+
+    def test_chat_completion_dynamic_tools_are_typed(self):
+        dynamic_tool = {
+            "type": "function",
+            "function": {
+                "name": "dynamic_tool",
+                "parameters": {"type": "object"},
+            },
+        }
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "system", "content": "Instructions."},
+                {"role": "developer", "content": "", "tools": [dynamic_tool]},
+                {"role": "user", "content": "Use a tool."},
+            ],
+        )
+
+        self.assertEqual(request.tool_choice, "auto")
+        self.assertIsInstance(request.messages[1].tools[0], DynamicTool)
+        self.assertEqual(
+            request.messages[1].model_dump()["tools"][0]["function"]["name"],
+            "dynamic_tool",
+        )
+
+    def test_chat_completion_rejects_invalid_dynamic_tools(self):
+        valid_tool = {
+            "type": "function",
+            "function": {"name": "valid_tool"},
+        }
+        invalid_messages = (
+            [{"role": "user", "content": "x", "tools": [valid_tool]}],
+            [{"role": "assistant", "content": "", "tools": [valid_tool]}],
+            [{"role": "system", "content": "x", "tools": [valid_tool]}],
+            [{"role": "system", "content": "", "tools": valid_tool}],
+            [{"role": "system", "content": "", "tools": [None]}],
+            [
+                {
+                    "role": "system",
+                    "content": "",
+                    "tools": [{"function": {"name": "x"}}],
+                }
+            ],
+            [
+                {
+                    "role": "system",
+                    "content": "",
+                    "tools": [{"type": "bogus", "function": {"name": "x"}}],
+                }
+            ],
+        )
+        for messages in invalid_messages:
+            with self.subTest(messages=messages), self.assertRaises(ValidationError):
+                ChatCompletionRequest(model="test-model", messages=messages)
+
+        for name in ("1bad_name", "bad@name", "", "a" * 257):
+            with self.subTest(name=name), self.assertRaises(ValidationError):
+                ChatCompletionRequest(
+                    model="test-model",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "function": {"name": name},
+                                }
+                            ],
+                        }
+                    ],
+                )
+
+    def test_chat_completion_rejects_duplicate_tool_names(self):
+        def tool(name):
+            return {"type": "function", "function": {"name": name}}
+
+        for request_kwargs in (
+            {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "",
+                        "tools": [tool("dup"), tool("dup")],
+                    }
+                ]
+            },
+            {
+                "tools": [tool("dup")],
+                "messages": [
+                    {
+                        "role": "developer",
+                        "content": "",
+                        "tools": [tool("dup")],
+                    }
+                ],
+            },
+        ):
+            with self.subTest(request_kwargs=request_kwargs), self.assertRaises(
+                ValidationError
+            ):
+                ChatCompletionRequest(model="test-model", **request_kwargs)
+
+    def test_chat_completion_tool_message_requires_tool_call_id(self):
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "tool", "content": "result"}],
+            )
+
+    def test_chat_completion_normalizes_moonshot_thinking(self):
+        base = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        disabled = ChatCompletionRequest(
+            **base,
+            thinking={"type": "disabled", "effort": "ignored"},
+            chat_template_kwargs={
+                "thinking_effort": "high",
+                "preserve_thinking": True,
+            },
+        )
+        self.assertEqual(disabled.reasoning_effort, "none")
+        self.assertFalse(disabled.chat_template_kwargs["thinking"])
+        self.assertFalse(disabled.chat_template_kwargs["enable_thinking"])
+        self.assertNotIn("thinking_effort", disabled.chat_template_kwargs)
+        self.assertNotIn("preserve_thinking", disabled.chat_template_kwargs)
+
+        enabled = ChatCompletionRequest(
+            **base,
+            thinking={"type": "enabled", "keep": "all", "effort": "low"},
+            reasoning_effort="max",
+        )
+        self.assertEqual(enabled.reasoning_effort, "low")
+        self.assertEqual(enabled.chat_template_kwargs["thinking_effort"], "low")
+        self.assertTrue(enabled.chat_template_kwargs["preserve_thinking"])
+        self.assertTrue(enabled.chat_template_kwargs["thinking"])
+
+        defaulted = ChatCompletionRequest(
+            **base,
+            thinking={"keep": "all"},
+        )
+        self.assertEqual(defaulted.reasoning_effort, "max")
+        self.assertEqual(defaulted.chat_template_kwargs["thinking_effort"], "max")
+
+        for thinking in (
+            "enabled",
+            {"type": "enabled", "keep": "some"},
+            {"type": "enabled", "effort": "medium"},
+        ):
+            with self.subTest(thinking=thinking), self.assertRaises(ValidationError):
+                ChatCompletionRequest(**base, thinking=thinking)
 
     def test_chat_completion_sglang_extensions(self):
         """Test chat completion with SGLang extensions"""

@@ -633,6 +633,23 @@ class Tool(BaseModel):
         return self
 
 
+class DynamicFunction(Function):
+    """Kimi K3 message-level function description."""
+
+    name: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_-]*$",
+    )
+
+
+class DynamicTool(Tool):
+    """Kimi K3 message-level tool declaration."""
+
+    type: Literal["function"]
+    function: DynamicFunction
+
+
 _GenericMessageRole = Literal[
     "system", "assistant", "tool", "function", "developer", "latest_reminder"
 ]
@@ -648,7 +665,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tools: Optional[List[DynamicTool]] = Field(default=None, examples=[None])
 
     @field_validator("role", mode="before")
     @classmethod
@@ -662,13 +679,23 @@ class ChatCompletionMessageGenericParam(BaseModel):
         raise ValueError("'role' must be a string")
 
     @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
+    def validate_message_fields(self):
         if self.role != "assistant" and isinstance(self.content, list):
             for part in self.content:
                 if isinstance(part, ChatCompletionMessageContentThinkingPart):
                     raise ValueError(
                         "thinking content parts are only valid in assistant messages"
                     )
+        if self.tools is not None:
+            if self.role not in ("system", "developer"):
+                raise ValueError(
+                    "Message-level tools are only valid in system or developer "
+                    "messages."
+                )
+            if self.content not in (None, ""):
+                raise ValueError("A message declaring tools must have empty content.")
+        if self.role == "tool" and not self.tool_call_id:
+            raise ValueError("Tool messages must include tool_call_id.")
         return self
 
 
@@ -720,6 +747,27 @@ ReasoningEffortType = Optional[
         Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
     ]
 ]
+
+
+class ChatCompletionThinking(BaseModel):
+    """Moonshot Chat Completions thinking controls."""
+
+    type: Literal["enabled", "disabled"] = "enabled"
+    keep: Optional[str] = None
+    effort: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_enabled_options(self) -> ChatCompletionThinking:
+        if self.type == "enabled":
+            if self.keep is not None and self.keep != "all":
+                raise ValueError(
+                    "thinking.keep must be 'all' when thinking is enabled."
+                )
+            if self.effort is not None and self.effort not in ("low", "high", "max"):
+                raise ValueError(
+                    "thinking.effort must be one of 'low', 'high', or 'max'."
+                )
+        return self
 
 
 def _has_message_level_tools(messages: Any) -> bool:
@@ -790,6 +838,11 @@ class ChatCompletionRequest(BaseModel):
         "'max' is an sglang extension to the OpenAI schema for "
         "models that expose a maximum-effort tier above 'high'; models that don't "
         "support it treat it the same as 'high'.",
+    )
+    thinking: Optional[ChatCompletionThinking] = Field(
+        default=None,
+        description="Moonshot thinking controls. thinking.effort takes precedence "
+        "over reasoning_effort when both are supplied.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -884,6 +937,26 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "auto"
         return values
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_dynamic_tool_locations(cls, values):
+        if not isinstance(values, dict):
+            return values
+        for index, message in enumerate(values.get("messages", [])):
+            if not isinstance(message, dict) or message.get("tools") is None:
+                continue
+            role = message.get("role")
+            if not isinstance(role, str) or role.lower() not in ("system", "developer"):
+                raise ValueError(
+                    f"messages[{index}].tools is only valid for the system or "
+                    "developer role."
+                )
+            if message.get("content") not in (None, ""):
+                raise ValueError(
+                    f"messages[{index}] must have empty content when declaring tools."
+                )
+        return values
+
     @field_validator("reasoning_effort", mode="before")
     @classmethod
     def validate_reasoning_effort_type(cls, value):
@@ -933,6 +1006,34 @@ class ChatCompletionRequest(BaseModel):
             if enabled:
                 thinking = True
 
+        moonshot_thinking = values.get("thinking")
+        if moonshot_thinking is not None:
+            if not isinstance(moonshot_thinking, dict):
+                raise ValueError("thinking must be an object.")
+            thinking_type = moonshot_thinking.get("type", "enabled")
+            ctk = values.get("chat_template_kwargs")
+            ctk = dict(ctk) if isinstance(ctk, dict) else {}
+            if thinking_type == "disabled":
+                values["reasoning_effort"] = "none"
+                thinking = False
+                ctk["thinking"] = False
+                ctk["enable_thinking"] = False
+                ctk.pop("thinking_effort", None)
+                ctk.pop("preserve_thinking", None)
+            else:
+                thinking = True
+                thinking_effort = moonshot_thinking.get("effort")
+                if thinking_effort is None:
+                    thinking_effort = values.get("reasoning_effort", "max")
+                values["reasoning_effort"] = thinking_effort
+                ctk["thinking"] = True
+                ctk["enable_thinking"] = True
+                if thinking_effort in ("low", "high", "max"):
+                    ctk["thinking_effort"] = thinking_effort
+                if moonshot_thinking.get("keep", "all") == "all":
+                    ctk["preserve_thinking"] = True
+            values["chat_template_kwargs"] = ctk
+
         effort = values.get("reasoning_effort")
         if effort is not None:
             thinking = effort != "none"
@@ -949,6 +1050,28 @@ class ChatCompletionRequest(BaseModel):
             values["chat_template_kwargs"] = ctk
 
         return values
+
+    @model_validator(mode="after")
+    def validate_dynamic_tool_names(self) -> ChatCompletionRequest:
+        seen: Dict[str, str] = {}
+        for index, tool in enumerate(self.tools or []):
+            name = tool.function.name
+            if name in seen:
+                raise ValueError(
+                    f"Duplicate tool name {name!r} in request-level tools."
+                )
+            seen[name] = f"tools[{index}]"
+
+        for message_index, message in enumerate(self.messages):
+            for tool_index, tool in enumerate(getattr(message, "tools", None) or []):
+                name = tool.function.name
+                if name in seen:
+                    raise ValueError(
+                        f"Duplicate tool name {name!r} in {seen[name]} and "
+                        f"messages[{message_index}].tools[{tool_index}]."
+                    )
+                seen[name] = f"messages[{message_index}].tools[{tool_index}]"
+        return self
 
     @model_validator(mode="before")
     @classmethod
