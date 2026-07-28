@@ -222,6 +222,11 @@ class K3TargetFP8Linear(nn.Module):
             for parameter in (self.weight_scale, self.input_scale)
         )
 
+    @property
+    def supports_prequantized_static_input(self) -> bool:
+        """Whether the linear can consume the AttnRes unit-scale FP8 output."""
+        return self.representation == "tensor_static"
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
             return x.new_empty((*x.shape[:-1], self.weight.shape[1]))
@@ -234,6 +239,60 @@ class K3TargetFP8Linear(nn.Module):
             cutlass_fp8_supported=use_channel_cutlass,
             pad_output=False,
         )
+
+    def forward_prequantized(
+        self,
+        qinput: torch.Tensor,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Run tensor-static GEMM from a unit-scale E4M3 activation.
+
+        ``qinput`` must be the exact result of rounding the logical activation
+        to ``output_dtype`` and then applying static E4M3 quantization with
+        scale 1.0. The K3 AttnRes dual-output epilogue provides that contract.
+        Channel-static weights retain the established ``forward`` path because
+        their CUTLASS runner requires a repeated per-row activation scale.
+        """
+        if not self.supports_prequantized_static_input:
+            raise RuntimeError(
+                "K3 prequantized activation handoff requires tensor_static "
+                f"weights, got {self.representation!r}."
+            )
+        if qinput.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "K3 prequantized activation must be float8_e4m3fn, "
+                f"got {qinput.dtype}."
+            )
+        if qinput.ndim < 2 or qinput.shape[-1] != self.weight.shape[0]:
+            raise ValueError(
+                "K3 prequantized activation has incompatible shape: "
+                f"input={tuple(qinput.shape)}, weight={tuple(self.weight.shape)}."
+            )
+        if not qinput.is_contiguous():
+            raise ValueError("K3 prequantized activation must be contiguous.")
+        if output_dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(
+                "K3 prequantized output dtype must be BF16/FP16, "
+                f"got {output_dtype}."
+            )
+        output_shape = (*qinput.shape[:-1], self.weight.shape[1])
+        if qinput.numel() == 0:
+            return qinput.new_empty(output_shape, dtype=output_dtype)
+
+        qinput_2d = qinput.view(-1, qinput.shape[-1])
+        output = torch._scaled_mm(
+            qinput_2d,
+            self.weight,
+            scale_a=self.input_scale,
+            scale_b=self.weight_scale,
+            out_dtype=output_dtype,
+        )
+        # Accommodate PyTorch builds whose scaled_mm binding retains the
+        # historical (output, amax) return without changing the hot path.
+        if isinstance(output, tuple):
+            output = output[0]
+        return output.view(*output_shape)
 
     def _save_to_state_dict(self, *args, **kwargs) -> None:
         raise RuntimeError(

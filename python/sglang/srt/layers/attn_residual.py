@@ -14,7 +14,7 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import triton
@@ -27,6 +27,7 @@ _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
 _FAST_SUPPORTED = None
+NormalizedOutput = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 
 
 def _use_fast(hidden_size: int) -> bool:
@@ -70,7 +71,8 @@ def _aggregate_fast(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
-) -> torch.Tensor:
+    emit_static_fp8: bool = False,
+) -> NormalizedOutput:
     """Warp-specialized TMA kernel: online softmax over row chunks with the
     output RMSNorm fused, one persistent CTA per SM, per-nvb tuned launch
     config (GB300 benchmark winner across nvb). With write_bank_row the kernel
@@ -83,6 +85,11 @@ def _aggregate_fast(
 
     cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
     out = torch.empty_like(prefix_sum)
+    out_fp8 = (
+        torch.empty_like(prefix_sum, dtype=torch.float8_e4m3fn)
+        if emit_static_fp8
+        else None
+    )
     attn_res_fused_tma(
         prefix_sum,
         bank,
@@ -92,8 +99,9 @@ def _aggregate_fast(
         nvb,
         score_norm.variance_epsilon,
         write_prefix=write_bank_row,
+        out_fp8=out_fp8,
     )
-    return out
+    return (out, out_fp8) if out_fp8 is not None else out
 
 
 # ---- Kernel 1: per-row scoring (2D grid [T, NVB+1]) -------------------------
@@ -311,7 +319,8 @@ def _aggregate_fused_add(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    emit_static_fp8: bool = False,
+) -> tuple[NormalizedOutput, torch.Tensor]:
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
     write_bank_row rides _aggregate (fast path only)."""
@@ -325,6 +334,7 @@ def _aggregate_fused_add(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            emit_static_fp8=emit_static_fp8,
         ),
         prefix,
     )
@@ -341,7 +351,8 @@ def _aggregate(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
-) -> torch.Tensor:
+    emit_static_fp8: bool = False,
+) -> NormalizedOutput:
     """Single aggregation point: score → softmax → mix → norm.
 
     Caller handles nvb == 0 (layer 0 attn side: just out_norm(prefix_sum)).
@@ -358,7 +369,11 @@ def _aggregate(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            emit_static_fp8=emit_static_fp8,
         )
+    # The dual-output epilogue is K3/SM100-specific. Other devices and
+    # unsupported hidden sizes keep the established BF16 path; the selected
+    # FP8 linear will perform its normal standalone quantization.
     assert not write_bank_row, "fused bank write is fast-path only"
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
 
@@ -409,7 +424,8 @@ class AttnResidual:
         out_norm: RMSNorm,
         rows: Optional[slice] = None,
         write: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        emit_static_fp8: bool = False,
+    ) -> tuple[NormalizedOutput, torch.Tensor]:
         """Aggregate; with write=True also snapshot the aggregated prefix
         (the second return value) into the next bank row — fused into the
         fast kernel (the row streams through its score pass anyway), a
@@ -441,6 +457,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                emit_static_fp8=emit_static_fp8,
             )
             prefix = hidden_states
         else:
@@ -454,6 +471,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                emit_static_fp8=emit_static_fp8,
             )
         if fused_write:
             self.num_valid_blocks += 1  # row nvb written in-kernel

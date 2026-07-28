@@ -780,6 +780,11 @@ class Envs:
     SGLANG_K3_TARGET_DENSE_FP8_REPRESENTATION = EnvStr("tensor_static")
     SGLANG_K3_TARGET_DENSE_FP8_MEMORY_DIAGNOSTICS = EnvBool(False)
     SGLANG_K3_TARGET_DENSE_FP8_RANGE_DIAGNOSTICS = EnvBool(False)
+    # Emit the tensor-static activation directly from the K3 AttnRes
+    # RMSNorm epilogue during decode/target verify. Keep library-default off
+    # until a serving lane opts in after real-weight/mixed-batch soak; setting
+    # 0 remains the same-build standalone static-quant fallback.
+    SGLANG_K3_ATTN_RES_FP8_FUSION = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

@@ -145,6 +145,63 @@ class TestK3TargetFP8Linear(unittest.TestCase):
             representation="channel_static",
         )
         self.assertEqual(linear.resident_scale_bytes, 28)
+        self.assertFalse(linear.supports_prequantized_static_input)
+        with self.assertRaisesRegex(RuntimeError, "requires tensor_static"):
+            linear.forward_prequantized(
+                torch.empty((2, 4), dtype=torch.float8_e4m3fn),
+                output_dtype=torch.bfloat16,
+            )
+
+    @patch("sglang.srt.layers.k3_target_fp8.torch._scaled_mm")
+    def test_tensor_static_prequantized_input_bypasses_quant(self, scaled_mm):
+        runtime_weight = torch.empty((4, 6), dtype=torch.float8_e4m3fn)
+        weight_scale = torch.full((1,), 0.25, dtype=torch.float32)
+        linear = K3TargetFP8Linear(
+            runtime_weight,
+            weight_scale,
+            representation="tensor_static",
+        )
+        qinput = torch.empty((2, 3, 4), dtype=torch.float8_e4m3fn)
+        scaled_mm.return_value = torch.empty((6, 6), dtype=torch.bfloat16)
+
+        output = linear.forward_prequantized(
+            qinput,
+            output_dtype=torch.bfloat16,
+        )
+
+        self.assertTrue(linear.supports_prequantized_static_input)
+        self.assertEqual(tuple(output.shape), (2, 3, 6))
+        self.assertEqual(output.dtype, torch.bfloat16)
+        scaled_mm.assert_called_once()
+        args, kwargs = scaled_mm.call_args
+        self.assertEqual(tuple(args[0].shape), (6, 4))
+        self.assertEqual(args[0].data_ptr(), qinput.data_ptr())
+        self.assertIs(args[1], linear.weight)
+        self.assertIs(kwargs["scale_a"], linear.input_scale)
+        self.assertIs(kwargs["scale_b"], linear.weight_scale)
+        self.assertIs(kwargs["out_dtype"], torch.bfloat16)
+
+    def test_prequantized_input_contract_fails_closed(self):
+        linear = K3TargetFP8Linear(
+            torch.empty((4, 6), dtype=torch.float8_e4m3fn),
+            torch.ones(1, dtype=torch.float32),
+            representation="tensor_static",
+        )
+        with self.assertRaisesRegex(TypeError, "must be float8_e4m3fn"):
+            linear.forward_prequantized(
+                torch.empty((2, 4), dtype=torch.bfloat16),
+                output_dtype=torch.bfloat16,
+            )
+        with self.assertRaisesRegex(ValueError, "incompatible shape"):
+            linear.forward_prequantized(
+                torch.empty((2, 8), dtype=torch.float8_e4m3fn),
+                output_dtype=torch.bfloat16,
+            )
+        with self.assertRaisesRegex(TypeError, "must be BF16/FP16"):
+            linear.forward_prequantized(
+                torch.empty((2, 4), dtype=torch.float8_e4m3fn),
+                output_dtype=torch.float32,
+            )
 
 
 class TestK3TargetFP8Scope(unittest.TestCase):

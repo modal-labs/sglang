@@ -29,7 +29,10 @@ def _make_name(*args):
 
 @cache_once
 def _jit_fused_tma_module(
-    chunk_rows: int, occupancy: int, consumer_regs: int
+    chunk_rows: int,
+    occupancy: int,
+    consumer_regs: int,
+    emit_static_fp8: bool,
 ) -> Module:
     """Compile and cache the warp-specialized TMA aggregation kernel (per-row
     bulk copies into chunk slots; chunk_rows / occupancy / consumer_regs are
@@ -46,17 +49,25 @@ def _jit_fused_tma_module(
         chunk_rows,
         occupancy,
         consumer_regs,
+        emit_static_fp8,
     )
+    cuda_wrappers = [("run", f"AttnResFusedTmaKernel<{args}>::run")]
+    if not emit_static_fp8:
+        # The fused SP collectives only produce BF16. Keeping them out of the
+        # dual-output module also avoids instantiating unreachable FP8/SP
+        # combinations.
+        cuda_wrappers.extend(
+            [
+                ("run_pull_rs", f"AttnResFusedTmaKernel<{args}>::run_pull_rs"),
+                ("run_direct_ag", f"AttnResFusedTmaKernel<{args}>::run_direct_ag"),
+            ]
+        )
     with override_jit_cuda_arch(major, minor, suffix="a"):
         return load_jit(
             _make_name("fused_tma"),
             *args,
             cuda_files=["kimi_k3/attn_res/fused_tma.cuh"],
-            cuda_wrappers=[
-                ("run", f"AttnResFusedTmaKernel<{args}>::run"),
-                ("run_pull_rs", f"AttnResFusedTmaKernel<{args}>::run_pull_rs"),
-                ("run_direct_ag", f"AttnResFusedTmaKernel<{args}>::run_direct_ag"),
-            ],
+            cuda_wrappers=cuda_wrappers,
             extra_cuda_cflags=["-O3", "--use_fast_math"],
         )
 
@@ -124,7 +135,7 @@ def _attn_res_fused_pull_rs_op(
     occupancy: int,
     consumer_regs: int,
 ) -> None:
-    _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_pull_rs(
+    _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs, False).run_pull_rs(
         _COMM_MAP[world_size],
         input,
         residual,
@@ -151,6 +162,7 @@ def attn_res_fused_tma(
     eps: float,
     *,
     write_prefix: bool = False,
+    out_fp8: torch.Tensor | None = None,
 ) -> None:
     """Warp-specialized TMA aggregation (score -> online softmax -> weighted
     combine -> fused output RMSNorm), one persistent CTA per SM: a producer
@@ -162,6 +174,11 @@ def attn_res_fused_tma(
     Restrictions: H == 7168, nvb in [1, 8], SM100a+. The launch config comes
     from _TMA_BEST_CONFIG via _tuning() (each combination compiles its own
     module).
+
+    When ``out_fp8`` is provided, the normalized value is rounded to BF16
+    exactly as for ``out`` and then converted to static-scale-1.0 E4M3 in the
+    same epilogue. This preserves the standalone ``BF16 -> static_quant_fp8``
+    double rounding while avoiding its extra read and launch.
 
     Parameters
     ----------
@@ -175,9 +192,31 @@ def attn_res_fused_tma(
     write_prefix : also snapshot the prefix row into bank[:, nvb, :]
                  (bit-exact copy, fused into the score pass which already
                  has the row in registers); requires NB > nvb
+    out_fp8    : optional [T, H] float8_e4m3fn dual output with unit scale
     """
-    _jit_fused_tma_module(*_tuning(nvb, prefix_sum.shape[0])).run(
-        prefix_sum, bank, cw, ow, out, nvb, eps, write_prefix
+    if out_fp8 is not None:
+        if out_fp8.shape != out.shape:
+            raise ValueError(
+                "attn_res_fused_tma: out_fp8 must match out shape, "
+                f"got out_fp8={tuple(out_fp8.shape)} out={tuple(out.shape)}"
+            )
+        if out_fp8.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "attn_res_fused_tma: out_fp8 must be float8_e4m3fn, "
+                f"got {out_fp8.dtype}"
+            )
+        if not out_fp8.is_contiguous():
+            raise ValueError("attn_res_fused_tma: out_fp8 must be contiguous")
+    _jit_fused_tma_module(*_tuning(nvb, prefix_sum.shape[0]), out_fp8 is not None).run(
+        prefix_sum,
+        bank,
+        cw,
+        ow,
+        out,
+        out_fp8,
+        nvb,
+        eps,
+        write_prefix,
     )
 
 
@@ -198,7 +237,7 @@ def _attn_res_fused_direct_ag_op(
     occupancy: int,
     consumer_regs: int,
 ) -> None:
-    _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_direct_ag(
+    _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs, False).run_direct_ag(
         _COMM_MAP[world_size],
         prefix_sum,
         bank,

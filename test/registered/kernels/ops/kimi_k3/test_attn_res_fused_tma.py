@@ -35,6 +35,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.kimi_k3.attn_res import attn_res_fused_tma
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -131,6 +132,182 @@ class TestAttnResFusedTma(CustomTestCase):
                     self.assertTrue(
                         torch.equal(bank[:, nvb + 1 :], bank_ref[:, nvb + 1 :])
                     )
+
+    def test_dual_static_fp8_matches_standalone_double_rounding(self):
+        """The dual epilogue must preserve both the BF16 output and the exact
+        bytes produced by standalone unit-scale static quantization."""
+        unit_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        for nvb in range(1, 9):
+            # T=64/128 are request batch 8/16 at DFlash verify width 8.
+            for T in (1, 8, 32, 64, 128):
+                with self.subTest(nvb=nvb, T=T):
+                    prefix, bank, cw, ow = _make_inputs(
+                        T, seed=1000 + 8 * T + nvb, num_bank_slots=9
+                    )
+                    # Exercise E4M3 saturation as well as ordinary RMSNorm
+                    # values without changing the BF16 reference contract.
+                    if T == 32:
+                        ow.mul_(512)
+                    out_ref = torch.empty_like(prefix)
+                    out_dual = torch.empty_like(prefix)
+                    out_fp8 = torch.empty_like(prefix, dtype=torch.float8_e4m3fn)
+
+                    attn_res_fused_tma(prefix, bank, cw, ow, out_ref, nvb, _EPS)
+                    attn_res_fused_tma(
+                        prefix,
+                        bank,
+                        cw,
+                        ow,
+                        out_dual,
+                        nvb,
+                        _EPS,
+                        out_fp8=out_fp8,
+                    )
+                    expected_fp8, _ = static_quant_fp8(
+                        out_dual, unit_scale, repeat_scale=False
+                    )
+
+                    self.assertTrue(torch.equal(out_dual, out_ref))
+                    self.assertTrue(torch.equal(out_fp8, expected_fp8))
+
+    def test_dual_output_graph_replay_and_prefix_write(self):
+        """Late PDL release must make both dual outputs safe for graph replay
+        while retaining the fused bank snapshot."""
+        T, nvb = 8, 5
+        prefix, bank, cw, ow = _make_inputs(T, seed=2026, num_bank_slots=9)
+        bank_initial = bank.clone()
+        out = torch.empty_like(prefix)
+        out_fp8 = torch.empty_like(prefix, dtype=torch.float8_e4m3fn)
+
+        def chain():
+            bank[:, nvb].zero_()
+            attn_res_fused_tma(
+                prefix,
+                bank,
+                cw,
+                ow,
+                out,
+                nvb,
+                _EPS,
+                write_prefix=True,
+                out_fp8=out_fp8,
+            )
+
+        chain()
+        out_eager = out.clone()
+        out_fp8_eager = out_fp8.clone()
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                chain()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                chain()
+        torch.cuda.synchronize()
+        out.zero_()
+        out_fp8.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.equal(out, out_eager))
+        self.assertTrue(torch.equal(out_fp8, out_fp8_eager))
+        self.assertTrue(torch.equal(bank[:, nvb], prefix))
+        self.assertTrue(torch.equal(bank[:, :nvb], bank_initial[:, :nvb]))
+        self.assertTrue(torch.equal(bank[:, nvb + 1 :], bank_initial[:, nvb + 1 :]))
+
+    def test_dual_output_pdl_scaled_mm_consumer(self):
+        """A PDL-started production consumer must never observe partial FP8
+        stores from the dual epilogue under repeated graph replay."""
+        unit_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        nvb, output_size = 5, 16
+
+        def scaled_mm(qinput, weight):
+            result = torch._scaled_mm(
+                qinput,
+                weight,
+                scale_a=unit_scale,
+                scale_b=unit_scale,
+                out_dtype=torch.bfloat16,
+            )
+            return result[0] if isinstance(result, tuple) else result
+
+        def capture(call):
+            for _ in range(3):
+                result = call()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = call()
+            graph.replay()
+            torch.cuda.synchronize()
+            return graph, result
+
+        for T in (8, 128):
+            with self.subTest(T=T):
+                gen = torch.Generator(device="cuda").manual_seed(3000 + T)
+                a = torch.randn(
+                    T, _H, generator=gen, device="cuda", dtype=torch.bfloat16
+                )
+                b = torch.randn(
+                    T, _H, generator=gen, device="cuda", dtype=torch.bfloat16
+                )
+                _, bank, cw, ow = _make_inputs(T, seed=4000 + T)
+                weight = torch.randn(
+                    _H,
+                    output_size,
+                    generator=gen,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                ).to(torch.float8_e4m3fn)
+                prefix_baseline = torch.empty_like(a)
+                prefix_fused = torch.empty_like(a)
+                out_baseline = torch.empty_like(a)
+                out_fused = torch.empty_like(a)
+                out_fp8 = torch.empty_like(a, dtype=torch.float8_e4m3fn)
+
+                def baseline():
+                    torch.add(a, b, out=prefix_baseline)
+                    attn_res_fused_tma(
+                        prefix_baseline,
+                        bank,
+                        cw,
+                        ow,
+                        out_baseline,
+                        nvb,
+                        _EPS,
+                    )
+                    quantized, _ = static_quant_fp8(
+                        out_baseline, unit_scale, repeat_scale=False
+                    )
+                    return scaled_mm(quantized, weight)
+
+                def fused():
+                    torch.add(a, b, out=prefix_fused)
+                    attn_res_fused_tma(
+                        prefix_fused,
+                        bank,
+                        cw,
+                        ow,
+                        out_fused,
+                        nvb,
+                        _EPS,
+                        out_fp8=out_fp8,
+                    )
+                    return scaled_mm(out_fp8, weight)
+
+                baseline_graph, baseline_result = capture(baseline)
+                fused_graph, fused_result = capture(fused)
+                baseline_graph.replay()
+                torch.cuda.synchronize()
+                expected = baseline_result.clone()
+                self.assertTrue(torch.equal(fused_result, expected))
+
+                for _ in range(100):
+                    fused_graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(fused_result, expected))
+                self.assertTrue(torch.equal(out_fused, out_baseline))
 
     def test_pdl_chain_under_cuda_graph(self):
         """A preceding kernel writes prefix_sum; capture + replay (where the

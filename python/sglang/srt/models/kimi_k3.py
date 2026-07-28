@@ -137,6 +137,21 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def _split_static_fp8_output(
+    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if isinstance(output, tuple):
+        return output
+    return output, None
+
+
+def _is_decode_or_target_verify(forward_batch: ForwardBatch) -> bool:
+    mode = forward_batch.forward_mode
+    return envs.SGLANG_K3_ATTN_RES_FP8_FUSION.get() and (
+        mode.is_decode() or mode.is_target_verify()
+    )
+
+
 # MegaMoE SiTU sentinel: the patched deep_gemm mega kernel selects the K3 SiTU
 # activation when activation_clamp == 0.03125 (2^-5: exactly representable and
 # unused by any legitimate swiglu clamp; the host asserts clamp >= 0 so a
@@ -874,7 +889,6 @@ class KimiK3MoE(nn.Module):
 
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
-        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
@@ -1219,7 +1233,11 @@ class KimiK3MoE(nn.Module):
         return norm.weight, norm.variance_epsilon
 
     def _forward_fused(
-        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor],
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
         [H, gate_up + E + latent] weight, then land both TP-partial sums in
@@ -1239,11 +1257,22 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = (
-            self._front_fp8(hidden_states)
-            if self._front_fp8 is not None
-            else _k3_bf16_gemm(hidden_states, self._front_w)
-        )
+        if prequantized_hidden_states is not None:
+            if self._front_fp8 is None:
+                raise RuntimeError(
+                    "K3 MoE received a prequantized front input without an "
+                    "FP8 front linear."
+                )
+            fused = self._front_fp8.forward_prequantized(
+                prequantized_hidden_states,
+                output_dtype=hidden_states.dtype,
+            )
+        else:
+            fused = (
+                self._front_fp8(hidden_states)
+                if self._front_fp8 is not None
+                else _k3_bf16_gemm(hidden_states, self._front_w)
+            )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
@@ -1359,6 +1388,7 @@ class KimiK3MoE(nn.Module):
         *,
         prefix_sum: Optional[torch.Tensor] = None,
         forward_batch: Optional[ForwardBatch] = None,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """A pending prefix_sum is always consumed here: folded into the
         3-way JIT tail add when covered, plain adds otherwise (bit-identical
@@ -1385,8 +1415,17 @@ class KimiK3MoE(nn.Module):
         if hidden_states.shape[0] == 0:
             out = hidden_states
         elif self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_fused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                prequantized_hidden_states=prequantized_hidden_states,
+            )
         else:
+            if prequantized_hidden_states is not None:
+                raise RuntimeError(
+                    "K3 MoE prequantized front input requires the fused "
+                    "plain-TP front."
+                )
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         if use_dp:
             global_out = out
@@ -1841,9 +1880,23 @@ class KimiK3DeltaAttention(nn.Module):
     def _project_qkvg(
         self,
         hidden_states: torch.Tensor,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self._qkvg_fp8 is not None:
+            if prequantized_hidden_states is not None:
+                return (
+                    self._qkvg_fp8.forward_prequantized(
+                        prequantized_hidden_states,
+                        output_dtype=hidden_states.dtype,
+                    ),
+                    None,
+                )
             return self._qkvg_fp8(hidden_states), None
+        if prequantized_hidden_states is not None:
+            raise RuntimeError(
+                "K3 KDA received a prequantized qkvg input without an FP8 "
+                "qkvg linear."
+            )
         return self.fused_qkvg_proj(hidden_states)
 
     def _prepare_fused_decode(self) -> None:
@@ -1899,7 +1952,11 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
-    def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
+    def forward_qkvbfg_fused(
+        self,
+        hidden_states: torch.Tensor,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
+    ):
         if self.use_full_rank_gate:
             if self._bfa_w is not None:
                 w = self._bfa_w
@@ -1922,25 +1979,27 @@ class KimiK3DeltaAttention(nn.Module):
                         bfa = gemm(hidden_states, w)
                         forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                         beta = bfa[..., n_fa : n_fa + n_b]
-                    fused_states, _ = self._project_qkvg(hidden_states)
+                    fused_states, _ = self._project_qkvg(
+                        hidden_states, prequantized_hidden_states
+                    )
                     qkv, g_proj_states = torch.split(
                         fused_states, self.split_sizes, dim=-1
                     )
                     cur.wait_stream(alt)
                     return qkv, beta, forget_gate, g_proj_states
 
-                fused_states, _ = self._project_qkvg(hidden_states)
-                qkv, g_proj_states = torch.split(
-                    fused_states, self.split_sizes, dim=-1
+                fused_states, _ = self._project_qkvg(
+                    hidden_states, prequantized_hidden_states
                 )
+                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 bfa = gemm(hidden_states, w)
                 forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
-                fused_states, _ = self._project_qkvg(hidden_states)
-                qkv, g_proj_states = torch.split(
-                    fused_states, self.split_sizes, dim=-1
+                fused_states, _ = self._project_qkvg(
+                    hidden_states, prequantized_hidden_states
                 )
+                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 beta = self.b_proj(hidden_states)[0]
                 forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         else:
@@ -1957,12 +2016,19 @@ class KimiK3DeltaAttention(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
-                hidden_states
+                hidden_states,
+                prequantized_hidden_states,
             )
         else:
+            if prequantized_hidden_states is not None:
+                raise RuntimeError(
+                    "K3 KDA prequantized qkvg input requires the fused qkvg "
+                    "projection path."
+                )
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
                 hidden_states
             )
@@ -2408,6 +2474,7 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
@@ -2437,6 +2504,11 @@ class KimiK3DecoderLayer(nn.Module):
                     positions[:num_real],
                     forward_batch,
                     zero_allocator,
+                    (
+                        prequantized_hidden_states[:num_real]
+                        if prequantized_hidden_states is not None
+                        else None
+                    ),
                 )
             padded_o_proj = k3_sp_collective.finish_padded_o_proj_output(
                 attn_out, num_padded
@@ -2447,7 +2519,11 @@ class KimiK3DecoderLayer(nn.Module):
             out[:num_real] = attn_out
             return out
         return self._run_self_attn_inner(
-            hidden_states, positions, forward_batch, zero_allocator
+            hidden_states,
+            positions,
+            forward_batch,
+            zero_allocator,
+            prequantized_hidden_states,
         )
 
     def _run_self_attn_inner(
@@ -2456,6 +2532,7 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # For MLA layers with q_lora_rank, set up communicator attn_inputs
         # before the forward call (normally done by LayerCommunicator).
@@ -2469,12 +2546,15 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        result = self.self_attn(
+        attention_kwargs = dict(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        if prequantized_hidden_states is not None:
+            attention_kwargs["prequantized_hidden_states"] = prequantized_hidden_states
+        result = self.self_attn(**attention_kwargs)
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
@@ -2543,6 +2623,14 @@ class KimiK3DecoderLayer(nn.Module):
         # ---- Aggregation 1: attention side. Write layers snapshot the
         # pre-attention prefix into the bank in the same call (fused into
         # the fast kernel; standalone copy on other paths). ----
+        # A prequantized token tensor cannot follow the BF16-only SP or DP
+        # collectives. Those modes retain the standalone quantization path.
+        allow_fp8_handoff = (
+            not self._sp_moe
+            and not self._dp_attention
+            and _is_decode_or_target_verify(forward_batch)
+        )
+        prequantized_attn = None
         if input_sharded:
             assert self._sp_moe
             input_rows = _sp_local_rows(hidden_states)
@@ -2571,20 +2659,32 @@ class KimiK3DecoderLayer(nn.Module):
                 # gather the normalized tensor consumed by attention.
                 hidden_states = _sp_all_gather_rows(hidden_states)
         else:
-            hidden_states, prefix_sum = attn_res.forward(
+            qkvg_fp8 = getattr(self.self_attn, "_qkvg_fp8", None)
+            emit_attn_fp8 = (
+                allow_fp8_handoff
+                and qkvg_fp8 is not None
+                and qkvg_fp8.supports_prequantized_static_input
+            )
+            normalized, prefix_sum = attn_res.forward(
                 hidden_states,
                 prefix_sum,
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
                 self.input_layernorm,
                 write=self.is_block_write_layer,
+                emit_static_fp8=emit_attn_fp8,
             )
+            hidden_states, prequantized_attn = _split_static_fp8_output(normalized)
         if self.is_block_write_layer:
             prefix_sum = None
 
         # ---- Attention ----
         hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
+            hidden_states,
+            positions,
+            forward_batch,
+            zero_allocator,
+            prequantized_attn,
         )
 
         # ---- Complete o_proj's deferred reduction ----
@@ -2642,20 +2742,36 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
+        prequantized_mlp = None
         if not agg2_fused:
-            hidden_states, prefix_sum = attn_res.forward(
+            front_fp8 = getattr(self.mlp, "_front_fp8", None)
+            emit_mlp_fp8 = (
+                allow_fp8_handoff
+                and front_fp8 is not None
+                and front_fp8.supports_prequantized_static_input
+            )
+            normalized, prefix_sum = attn_res.forward(
                 hidden_states,
                 prefix_sum,
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
                 rows=rows,
+                emit_static_fp8=emit_mlp_fp8,
             )
+            hidden_states, prequantized_mlp = _split_static_fp8_output(normalized)
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
+        mlp_kwargs = dict(
+            prefix_sum=prefix_sum,
+            forward_batch=forward_batch,
+        )
+        if prequantized_mlp is not None:
+            mlp_kwargs["prequantized_hidden_states"] = prequantized_mlp
         out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            hidden_states,
+            **mlp_kwargs,
         )
         if shard_lo >= 0:
             if keep_sharded:
