@@ -381,6 +381,82 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(enabled_kwargs["thinking_effort"], "low")
         self.assertTrue(enabled_kwargs["preserve_thinking"])
 
+    def test_kimi_k3_validates_sampling_envelope(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        base = {
+            "model": "x",
+            "messages": [{"role": "user", "content": "Answer."}],
+        }
+
+        for thinking in (False, True):
+            thinking_config = {"type": "enabled" if thinking else "disabled"}
+            omitted = ChatCompletionRequest(**base, thinking=thinking_config)
+            with self.subTest(thinking=thinking, case="omitted"):
+                self.assertIsNone(self.chat._validate_request(omitted))
+
+        for thinking, field, value in (
+            (True, "temperature", 0.0),
+            (True, "temperature", 0.6),
+            (True, "temperature", 1.0),
+            (True, "top_p", 0.95),
+            (True, "top_p", 1.0),
+            (False, "temperature", 0.0),
+            (False, "temperature", 0.6),
+            (False, "temperature", 1.0),
+            (False, "top_p", 0.95),
+            (False, "top_p", 1.0),
+        ):
+            request = ChatCompletionRequest(
+                **base,
+                thinking={"type": "enabled" if thinking else "disabled"},
+                **{field: value},
+            )
+            with self.subTest(thinking=thinking, field=field, value=value):
+                self.assertIsNone(self.chat._validate_request(request))
+
+        for thinking, field, value in (
+            (True, "temperature", -0.1),
+            (True, "temperature", 1.1),
+            (True, "top_p", 0.8),
+            (False, "temperature", -0.1),
+            (False, "temperature", 1.1),
+            (False, "top_p", 0.8),
+        ):
+            request = ChatCompletionRequest(
+                **base,
+                thinking={"type": "enabled" if thinking else "disabled"},
+                **{field: value},
+            )
+            with self.subTest(thinking=thinking, field=field, value=value):
+                self.assertIn(field, self.chat._validate_request(request))
+
+        for field, value in (
+            ("presence_penalty", 0.5),
+            ("frequency_penalty", 0.5),
+            ("n", 2),
+        ):
+            request = ChatCompletionRequest(
+                **base,
+                thinking={"type": "enabled"},
+                **{field: value},
+            )
+            with self.subTest(field=field):
+                self.assertIn(field, self.chat._validate_request(request))
+
+    def test_kimi_k3_rejects_disabled_thinking_controls(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        base = {
+            "model": "x",
+            "messages": [{"role": "user", "content": "Answer."}],
+        }
+        for kwargs, expected_error in (
+            ({"thinking": False, "preserve_thinking": True}, "preserve_thinking"),
+            ({"thinking": False, "thinking_effort": "max"}, "thinking_effort"),
+        ):
+            request = ChatCompletionRequest(**base, chat_template_kwargs=kwargs)
+            with self.subTest(kwargs=kwargs):
+                self.assertIn(expected_error, self.chat._validate_request(request))
+
     def test_kimi_k3_accepts_draft7_tool_schema_id_fragments(self):
         self.chat.chat_encoding_spec = "kimi_k3"
 

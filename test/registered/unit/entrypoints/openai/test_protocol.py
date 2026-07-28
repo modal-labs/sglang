@@ -314,17 +314,11 @@ class TestChatCompletionRequest(unittest.TestCase):
         }
         disabled = ChatCompletionRequest(
             **base,
-            thinking={"type": "disabled", "effort": "ignored"},
-            chat_template_kwargs={
-                "thinking_effort": "high",
-                "preserve_thinking": True,
-            },
+            thinking={"type": "disabled"},
         )
         self.assertEqual(disabled.reasoning_effort, "none")
         self.assertFalse(disabled.chat_template_kwargs["thinking"])
         self.assertFalse(disabled.chat_template_kwargs["enable_thinking"])
-        self.assertNotIn("thinking_effort", disabled.chat_template_kwargs)
-        self.assertNotIn("preserve_thinking", disabled.chat_template_kwargs)
 
         enabled = ChatCompletionRequest(
             **base,
@@ -347,6 +341,8 @@ class TestChatCompletionRequest(unittest.TestCase):
             "enabled",
             {"type": "enabled", "keep": "some"},
             {"type": "enabled", "effort": "medium"},
+            {"type": "disabled", "keep": "all"},
+            {"type": "disabled", "effort": "max"},
         ):
             with self.subTest(thinking=thinking), self.assertRaises(ValidationError):
                 ChatCompletionRequest(**base, thinking=thinking)

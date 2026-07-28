@@ -664,6 +664,11 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if self.chat_encoding_spec == "kimi_k3":
+            validation_error = self._validate_kimi_k3_sampling_params(request)
+            if validation_error:
+                return validation_error
+
         all_tools = self._collect_tools(request) or []
 
         if (
@@ -717,6 +722,33 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        return None
+
+    def _validate_kimi_k3_sampling_params(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        """Validate the K3 sampling envelope used by target-only verification."""
+        thinking = (request.chat_template_kwargs or {}).get("thinking")
+        if thinking is None:
+            thinking = self._get_reasoning_from_request(request)
+
+        template_kwargs = request.chat_template_kwargs or {}
+        if not thinking:
+            if template_kwargs.get("preserve_thinking") is True:
+                return "Kimi K3 preserve_thinking=true is invalid when thinking=false."
+            if template_kwargs.get("thinking_effort") is not None:
+                return "Kimi K3 thinking_effort must be omitted when thinking=false."
+
+        if request.temperature is not None and not (0.0 <= request.temperature <= 1.0):
+            return "Kimi K3 temperature must be within [0.0, 1.0]."
+        if request.top_p is not None and not (0.95 <= request.top_p <= 1.0):
+            return "Kimi K3 top_p must be within [0.95, 1.0]."
+        if request.presence_penalty != 0:
+            return "Kimi K3 presence_penalty must be 0."
+        if request.frequency_penalty != 0:
+            return "Kimi K3 frequency_penalty must be 0."
+        if request.n != 1:
+            return "Kimi K3 n must be 1."
         return None
 
     def _validate_tool_schema(self, schema: object) -> None:

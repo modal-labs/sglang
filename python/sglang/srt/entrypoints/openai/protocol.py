@@ -758,15 +758,17 @@ class ChatCompletionThinking(BaseModel):
 
     @model_validator(mode="after")
     def validate_enabled_options(self) -> ChatCompletionThinking:
-        if self.type == "enabled":
-            if self.keep is not None and self.keep != "all":
+        if self.type == "disabled":
+            if self.keep is not None or self.effort is not None:
                 raise ValueError(
-                    "thinking.keep must be 'all' when thinking is enabled."
+                    "thinking.keep and thinking.effort must be omitted when "
+                    "thinking is disabled."
                 )
-            if self.effort is not None and self.effort not in ("low", "high", "max"):
-                raise ValueError(
-                    "thinking.effort must be one of 'low', 'high', or 'max'."
-                )
+            return self
+        if self.keep is not None and self.keep != "all":
+            raise ValueError("thinking.keep must be 'all' when thinking is enabled.")
+        if self.effort is not None and self.effort not in ("low", "high", "max"):
+            raise ValueError("thinking.effort must be one of 'low', 'high', or 'max'.")
         return self
 
 
