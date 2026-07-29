@@ -15,6 +15,8 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync
 
+from sglang.kernels.jit.cute_aot_cache import compile_with_cute_aot_cache
+
 WARP_SIZE = 32
 TILE_K = 128
 TILE_V = 64
@@ -817,7 +819,13 @@ _DSPARK_COMPILED = {}
 
 
 def _tensor_layout_key(tensor):
-    return (tensor.device, tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()))
+    return (
+        tensor.device,
+        tensor.dtype,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        _fits_32bit_stride(tensor),
+    )
 
 
 def _fits_32bit_stride(tensor):
@@ -1051,22 +1059,32 @@ def fused_kda_decode_mtp_dspark(
     compiled = _DSPARK_COMPILED.get(key)
     if compiled is None:
         cute_args = tuple(_cute_tensor(tensor, dynamic=False) for tensor in args)
-        compiled = cute.compile(
-            _run_kda_decode_mtp_dspark,
-            *cute_args,
-            scale=float(scale),
-            H=H,
-            N=N,
-            NUM_SPEC=num_spec,
-            BLOCK_THREADS=block_threads,
-            P2_LANES_K=p2_lanes_k,
-            SPLIT_V=split_v,
-            lower_bound=float(lower_bound),
-            CACHE_RING=cache_ring,
-            APPLY_ONORM=apply_onorm,
-            STATE_IS_BF16=state_is_bf16,
-            onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
-            stream=stream,
+        compiled = compile_with_cute_aot_cache(
+            kind="kimi_k3_kda_mtp_verify",
+            config={
+                "compile_key": key,
+                "assumed_align": 16,
+                "dynamic_tensors": False,
+            },
+            source_paths=(__file__,),
+            enable_tvm_ffi=False,
+            compile_fn=lambda: cute.compile(
+                _run_kda_decode_mtp_dspark,
+                *cute_args,
+                scale=float(scale),
+                H=H,
+                N=N,
+                NUM_SPEC=num_spec,
+                BLOCK_THREADS=block_threads,
+                P2_LANES_K=p2_lanes_k,
+                SPLIT_V=split_v,
+                lower_bound=float(lower_bound),
+                CACHE_RING=cache_ring,
+                APPLY_ONORM=apply_onorm,
+                STATE_IS_BF16=state_is_bf16,
+                onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
+                stream=stream,
+            ),
         )
         _DSPARK_COMPILED[key] = compiled
     compiled(

@@ -35,6 +35,9 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
+from sglang.kernels.jit.cute_aot_cache import (
+    install_flashinfer_mla_decode_aot_cache,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
@@ -78,6 +81,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
+        # FlashInfer's monolithic MLA path calls cute.compile directly, so its
+        # ordinary CuTe cache is bypassed. Install the optional object cache
+        # before the parent can first enter that path.
+        install_flashinfer_mla_decode_aot_cache()
         super().__init__(
             model_runner,
             skip_prefill,
