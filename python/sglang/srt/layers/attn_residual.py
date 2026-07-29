@@ -208,8 +208,9 @@ def _mix_fused(
     nvb: int,
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Triton score + combine pair: returns the pre-norm mixture."""
+    """Triton score + combine pair: writes/returns the pre-norm mixture."""
     T, H = prefix_sum.shape
     cw = get_cw(score_proj, score_norm)
     n_h_blocks = H // _BLOCK_H
@@ -233,7 +234,8 @@ def _mix_fused(
     )
 
     # Step 2: softmax + weighted sum (2D grid, full H-parallelism)
-    out = torch.empty_like(prefix_sum)
+    if out is None:
+        out = torch.empty_like(prefix_sum)
     _combine_kernel[(T, n_h_blocks)](
         prefix_sum,
         bank,
@@ -273,10 +275,14 @@ def aggregate_stream_torch(
     nvb: int,
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Eager reference for aggregate_stream (materializes [T, R, H])."""
     if nvb == 0:
-        return prefix_sum
+        if out is None:
+            return prefix_sum
+        out.copy_(prefix_sum)
+        return out
     T, H = prefix_sum.shape
     # rows = [bank[0..nvb-1], prefix_sum]  shape [T, nvb+1, H]
     rows = torch.cat([bank[:, :nvb, :], prefix_sum.unsqueeze(1)], dim=1)
@@ -287,7 +293,11 @@ def aggregate_stream_torch(
     # softmax + weighted sum of original rows
     probs = torch.softmax(scores.float(), dim=-1)
     mixed = (probs.unsqueeze(-1) * rows.float()).sum(dim=1)
-    return mixed.to(prefix_sum.dtype)
+    mixed = mixed.to(prefix_sum.dtype)
+    if out is None:
+        return mixed
+    out.copy_(mixed)
+    return out
 
 
 def aggregate_stream(
@@ -296,15 +306,22 @@ def aggregate_stream(
     nvb: int,
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pre-norm aggregated stream value (softmax mixture, no output norm):
     the K3 analogue of the residual stream, for dspark aux capture -- the
-    raw wire only carries the current block's running prefix."""
+    raw wire only carries the current block's running prefix. ``out`` may be
+    a row-strided view into a packed auxiliary-hidden-state buffer."""
     if nvb == 0:
-        return prefix_sum
+        if out is None:
+            return prefix_sum
+        out.copy_(prefix_sum)
+        return out
     if prefix_sum.shape[1] % _BLOCK_H != 0:
-        return aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
-    return _mix_fused(prefix_sum, bank, nvb, score_proj, score_norm)
+        return aggregate_stream_torch(
+            prefix_sum, bank, nvb, score_proj, score_norm, out=out
+        )
+    return _mix_fused(prefix_sum, bank, nvb, score_proj, score_norm, out=out)
 
 
 # ---- Residual-add + aggregation ----------------------------------------------

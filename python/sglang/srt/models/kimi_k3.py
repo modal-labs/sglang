@@ -2928,7 +2928,8 @@ class KimiK3LinearModel(nn.Module):
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
-        aux_hidden_states = []
+        aux_hidden_states: Optional[torch.Tensor] = None
+        aux_tap_idx = 0
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -2948,9 +2949,25 @@ class KimiK3LinearModel(nn.Module):
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                if aux_hidden_states is None:
+                    aux_hidden_states = hidden_states.new_empty(
+                        (
+                            hidden_states.shape[0],
+                            len(self.dspark_layers_to_capture) * hidden_states.shape[1],
+                        )
+                    )
+                hidden_size = hidden_states.shape[1]
+                aux_slot = aux_hidden_states[
+                    :, aux_tap_idx * hidden_size : (aux_tap_idx + 1) * hidden_size
+                ]
+                self._dspark_capture_stream(
+                    i,
+                    hidden_states,
+                    residual,
+                    attn_res,
+                    out=aux_slot,
                 )
+                aux_tap_idx += 1
 
         if not self.pp_group.is_last_rank:
             assert not sp_sharded
@@ -3004,6 +3021,14 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.dspark_layers_to_capture is not None:
+            if aux_hidden_states is None or aux_tap_idx != len(
+                self.dspark_layers_to_capture
+            ):
+                raise RuntimeError(
+                    "Kimi K3 auxiliary hidden capture count mismatch: "
+                    f"configured taps={self.dspark_layers_to_capture}, "
+                    f"captured={aux_tap_idx}."
+                )
             return hidden_states, aux_hidden_states
         return hidden_states
 
@@ -3013,12 +3038,19 @@ class KimiK3LinearModel(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         attn_res: Optional[AttnResidual],
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Stream value after `layer_idx`: the pre-norm mixture its next
         consumer would compute (next layer's attention side; output side
         for the last layer)."""
         if attn_res is None:
-            return hidden_states if residual is None else hidden_states + residual
+            if out is None:
+                return hidden_states if residual is None else hidden_states + residual
+            if residual is None:
+                out.copy_(hidden_states)
+            else:
+                torch.add(hidden_states, residual, out=out)
+            return out
         if residual is not None:
             # Materialize a delayed MLP add (mirrors the PP-wire fold).
             hidden_states = residual + hidden_states
@@ -3033,7 +3065,12 @@ class KimiK3LinearModel(nn.Module):
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
         return aggregate_stream(
-            hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
+            hidden_states,
+            attn_res.block_residual,
+            nvb,
+            score_proj,
+            score_norm,
+            out=out,
         )
 
 

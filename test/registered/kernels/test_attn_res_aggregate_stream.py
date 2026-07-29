@@ -4,6 +4,8 @@ Pins:
 - triton mix pair (aggregate_stream) vs the eager reference
   (aggregate_stream_torch) across nvb 1..8, small/large T, and a bank with
   NB > nvb rows (runtime-stride addressing);
+- direct writes into a row-strided packed-buffer slice are byte-identical to
+  the allocating path;
 - nvb == 0 passthrough (same tensor object);
 - _aggregate_fused == out_norm(mixture) -- guards the _mix_fused split that
   the serving "fused" mode now routes through;
@@ -86,10 +88,46 @@ class TestAggregateStream(CustomTestCase):
         ref = aggregate_stream_torch(prefix, bank, 5, self.proj, self.norm)
         torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=4e-2)
 
+    def test_row_strided_out_is_bit_exact(self):
+        for nvb in (1, 5, 8):
+            for T in (1, 5, 257):
+                with self.subTest(nvb=nvb, T=T):
+                    prefix, bank = _make_inputs(T, seed=31 * T + nvb)
+                    expected = _mix_fused(prefix, bank, nvb, self.proj, self.norm)
+                    packed = torch.empty(
+                        (T, 3 * _H), dtype=prefix.dtype, device=prefix.device
+                    )
+                    slot = packed[:, _H : 2 * _H]
+
+                    actual = _mix_fused(
+                        prefix,
+                        bank,
+                        nvb,
+                        self.proj,
+                        self.norm,
+                        out=slot,
+                    )
+
+                    self.assertIs(actual, slot)
+                    self.assertFalse(slot.is_contiguous())
+                    self.assertTrue(torch.equal(actual, expected))
+
     def test_nvb0_passthrough(self):
         prefix, bank = _make_inputs(3, seed=2)
         out = aggregate_stream(prefix, bank, 0, self.proj, self.norm)
         self.assertIs(out, prefix)
+
+    def test_nvb0_writes_packed_out(self):
+        prefix, bank = _make_inputs(3, seed=5)
+        packed = torch.empty(
+            (prefix.shape[0], 3 * _H), dtype=prefix.dtype, device=prefix.device
+        )
+        slot = packed[:, 2 * _H :]
+
+        out = aggregate_stream(prefix, bank, 0, self.proj, self.norm, out=slot)
+
+        self.assertIs(out, slot)
+        self.assertTrue(torch.equal(out, prefix))
 
     def test_fused_wrapper_applies_out_norm(self):
         out_norm = RMSNorm(_H, eps=_EPS).to(device="cuda", dtype=torch.bfloat16)
