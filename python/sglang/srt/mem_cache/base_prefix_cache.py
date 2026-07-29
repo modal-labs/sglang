@@ -345,6 +345,20 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # content-stable and overrides this where relevant.
         return 0
 
+    def reprefill_tail_tokens(self) -> int:
+        """Return the largest non-reusable cache tail that must be rebuilt."""
+        return max(
+            self.swa_reprefill_tail_tokens(),
+            int(
+                getattr(
+                    self,
+                    "dflash_draft_ring_reprefill_tail_tokens",
+                    0,
+                )
+                or 0
+            ),
+        )
+
     def supports_mamba(self) -> bool:
         return False
 
