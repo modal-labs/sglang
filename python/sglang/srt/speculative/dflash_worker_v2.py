@@ -64,6 +64,38 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 
+def _get_dflash_sampling_tp_group():
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+
+
+def _sync_dflash_sampling_results(
+    accept_len: torch.Tensor,
+    bonus: torch.Tensor,
+    *,
+    tp_group,
+    outcome_buffer: torch.Tensor,
+) -> None:
+    """Broadcast rank 0's stochastic verification outcome before state mutation."""
+    if int(tp_group.world_size) <= 1:
+        return
+
+    bs = int(accept_len.numel())
+    if bonus.numel() != bs:
+        raise ValueError("DFlash accept_len and bonus must have the same length")
+    outcome = outcome_buffer[:bs]
+    if outcome.dtype != torch.int64 or tuple(outcome.shape) != (bs, 2):
+        raise ValueError("DFlash TP outcome buffer must be int64 with shape [bs, 2]")
+
+    outcome[:, 0].copy_(accept_len)
+    outcome[:, 1].copy_(bonus)
+    tp_group.broadcast(outcome, src=0)
+    accept_len.copy_(outcome[:, 0])
+    bonus.copy_(outcome[:, 1])
+
+
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
@@ -316,6 +348,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._sampling_outcome_buf: Optional[torch.Tensor] = None
 
     @property
     def draft_worker(self):
@@ -1452,6 +1485,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._new_seq_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
         ]
+        self._sampling_outcome_buf = torch.empty(
+            (new_cap, 2), dtype=torch.int64, device=device
+        )
         self._accept_bonus_buffer_cap = new_cap
 
     def _next_accept_bonus_buffers(self, bs: int) -> tuple[
@@ -1911,6 +1947,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+            # Sampling uses rank-local numerics and RNG. Canonicalize the whole
+            # decision before it can change Mamba state, draft KV, output tokens,
+            # sequence lengths, radix state, or subsequent scheduler batches.
+            tp_group = _get_dflash_sampling_tp_group()
+            self._ensure_accept_bonus_buffers(bs)
+            assert self._sampling_outcome_buf is not None
+            _sync_dflash_sampling_results(
+                accept_len,
+                bonus,
+                tp_group=tp_group,
+                outcome_buffer=self._sampling_outcome_buf,
             )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
