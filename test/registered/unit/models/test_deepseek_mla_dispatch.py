@@ -36,6 +36,19 @@ def _fake_attn(backend: str, rocm_fused_decode_mla: bool = True):
     )
 
 
+def _fake_trt_prefill_batch(prefix_len: int = 0):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_extend_without_speculative=lambda: True,
+        ),
+        extend_prefix_lens_cpu=[prefix_len],
+    )
+
+
+def _fake_trt_attn():
+    return SimpleNamespace(disable_chunked_prefix_cache=False)
+
+
 class TestDispatchMLASubtype(CustomTestCase):
     def test_hip_aiter_decode_takes_fused_rope(self):
         # aiter + fused-decode + decode -> fused ROPE fast path (unchanged).
@@ -60,6 +73,50 @@ class TestDispatchMLASubtype(CustomTestCase):
             method = abh._dispatch_mla_subtype(
                 _fake_attn("aiter"), _fake_forward_batch(is_decode=False)
             )
+        self.assertEqual(method, AttnForwardMethod.MLA)
+
+
+class TestTRTLLMPrefillDispatch(CustomTestCase):
+    def _dispatch(self, *, prefix_len=0, breakable=True, tc_piecewise=False):
+        with (
+            mock.patch.object(
+                abh, "is_in_breakable_cuda_graph", return_value=breakable
+            ),
+            mock.patch.object(
+                abh, "is_in_tc_piecewise_cuda_graph", return_value=tc_piecewise
+            ),
+        ):
+            return abh.handle_attention_trtllm_mla(
+                _fake_trt_attn(), _fake_trt_prefill_batch(prefix_len)
+            )
+
+    def test_breakable_pure_prefill_uses_expanded_mha(self):
+        self.assertEqual(
+            self._dispatch(),
+            AttnForwardMethod.MHA_CHUNKED_KV,
+        )
+
+    def test_breakable_cached_prefix_uses_expanded_mha(self):
+        self.assertEqual(
+            self._dispatch(prefix_len=8192),
+            AttnForwardMethod.MHA_CHUNKED_KV,
+        )
+
+    def test_tc_piecewise_stays_absorbed_mla(self):
+        self.assertEqual(
+            self._dispatch(breakable=False, tc_piecewise=True),
+            AttnForwardMethod.MLA,
+        )
+
+    def test_tokenspeed_breakable_stays_absorbed_mla(self):
+        with (
+            mock.patch.object(abh, "is_in_breakable_cuda_graph", return_value=True),
+            mock.patch.object(abh, "is_in_tc_piecewise_cuda_graph", return_value=False),
+        ):
+            method = abh.handle_attention_tokenspeed_mla(
+                _fake_trt_attn(), _fake_trt_prefill_batch()
+            )
+
         self.assertEqual(method, AttnForwardMethod.MLA)
 
 

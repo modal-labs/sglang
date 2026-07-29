@@ -4264,6 +4264,7 @@ class ServerArgs:
         prefill backend (this folds in the old
         --enforce-piecewise-cuda-graph contract).
         """
+        self._force_breakable_prefill_cuda_graph_for_trtllm_mla()
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
 
@@ -4287,6 +4288,24 @@ class ServerArgs:
             self._disable_breakable_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.FULL:
             self._disable_full_prefill_cudagraph_if_incompatible()
+
+    def _force_breakable_prefill_cuda_graph_for_trtllm_mla(self):
+        """TRT-LLM prefill attention must run as an eager BCG region."""
+        prefill_config = self.cuda_graph_config.prefill
+        if prefill_config.backend in (Backend.DISABLED, Backend.BREAKABLE):
+            return
+        if not self.get_model_config().is_mla_breakable_cuda_graph_supported:
+            return
+        prefill_attention_backend, _ = self._resolved_attention_backends()
+        if prefill_attention_backend != "trtllm_mla":
+            return
+
+        logger.warning(
+            "TRT-LLM MLA prefill requires breakable CUDA graph so attention "
+            "can run eagerly between captured segments; replacing backend %r.",
+            prefill_config.backend,
+        )
+        prefill_config.backend = Backend.BREAKABLE
 
     def _apply_cuda_graph_disaggregation_roles(self):
         if self.disaggregation_mode == "prefill":
@@ -4382,7 +4401,11 @@ class ServerArgs:
 
         rules = [
             # MLA prefill takes a different attn-forward path under BCG.
-            ("MLA attention", lambda: self.use_mla_backend()),
+            (
+                "MLA attention",
+                lambda: self.use_mla_backend()
+                and not self.get_model_config().is_mla_breakable_cuda_graph_supported,
+            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -4410,7 +4433,10 @@ class ServerArgs:
             (
                 "multimodal model",
                 lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+                and not (
+                    self.get_model_config().is_multimodal_breakable_cuda_graph_supported
+                    or self.get_model_config().is_mla_breakable_cuda_graph_supported
+                ),
             ),
         ]
         for name, predicate in rules:

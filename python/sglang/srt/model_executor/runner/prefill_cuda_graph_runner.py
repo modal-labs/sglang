@@ -152,6 +152,22 @@ _PREFILL_STATIC_FIELDS = (
     "orig_seq_lens",
 )
 
+_MHA_PREFIX_DERIVED_FIELDS = (
+    "num_prefix_chunks",
+    "prefix_chunk_idx",
+    "prefix_chunk_len",
+    "prefix_chunk_starts",
+    "prefix_chunk_starts_cpu",
+    "prefix_chunk_seq_lens_cpu",
+    "prefix_chunk_seq_lens",
+    "prefix_chunk_cu_seq_lens",
+    "prefix_chunk_max_seq_lens",
+    "prefix_chunk_has_zero_kv",
+    "prefix_chunk_num_tokens",
+    "prefix_chunk_kv_indices",
+    "mha_one_shot_kv_indices",
+)
+
 
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
@@ -174,6 +190,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = model_runner.server_args.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        if (
+            model_runner.model_config.is_mla_breakable_cuda_graph_supported
+            and model_runner.prefill_attention_backend_str == "trtllm_mla"
+            and self.prefill_backend_name != Backend.BREAKABLE
+        ):
+            raise ValueError(
+                "TRT-LLM MLA prefill CUDA graph requires the breakable backend"
+            )
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
@@ -246,11 +270,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
         )
-        # Archs on the MLA-BCG allowlist pin the absorbed MLA path inside
-        # capture/replay (attention_backend_handler), so the MHA companion is
-        # never captured and the MHA-prefix restrictions below don't apply.
+        self.breakable_mha_prefix_supported = (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.model_runner.prefill_attention_backend_str == "trtllm_mla"
+        )
+        # Most MLA backends pin absorbed MLA inside BCG. TRT-LLM instead runs
+        # expanded suffix+prefix MHA as one dynamic eager region.
         self.mla_pinned_under_bcg = (
             self.model_runner.model_config.is_mla_breakable_cuda_graph_supported
+            and not self.breakable_mha_prefix_supported
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
@@ -674,16 +702,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
             and not self.mla_pinned_under_bcg
+            and not self.breakable_mha_prefix_supported
             and forward_batch.extend_prefix_lens_cpu is not None
             and any(forward_batch.extend_prefix_lens_cpu)
         )
 
     @staticmethod
-    def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
+    def _restore_mha_capture_state(
+        forward_batch: ForwardBatch, *, dynamic_prefix: bool
+    ) -> None:
         """Restore Python state omitted from breakable graph segments."""
-        forward_batch.mha_one_shot = True
+        forward_batch.mha_one_shot = not dynamic_prefix
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
+        if dynamic_prefix:
+            # load_batch creates a fresh replay view, but reset the derived
+            # prefix plan explicitly: the eager region must rebuild it from
+            # this replay's lengths, never reuse zero-prefix capture state.
+            for field in _MHA_PREFIX_DERIVED_FIELDS:
+                setattr(forward_batch, field, None)
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
@@ -1029,8 +1066,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,
-            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_prefix_lens_cpu=(
+                list(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.extend_prefix_lens_cpu is not None
+                else None
+            ),
+            extend_seq_lens_cpu=(
+                list(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.extend_seq_lens_cpu is not None
+                else None
+            ),
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
@@ -1071,7 +1116,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and self.has_mha_companion_layers
             and not self.mla_pinned_under_bcg
         ):
-            self._restore_mha_capture_state(static_forward_batch)
+            self._restore_mha_capture_state(
+                static_forward_batch,
+                dynamic_prefix=self.breakable_mha_prefix_supported,
+            )
 
         # Under Breakable / Full, copy serving-time values into the static
         # buffers so the addresses captured segments hold stay live with

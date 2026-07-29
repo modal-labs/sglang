@@ -1812,9 +1812,9 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
 
 # MLA archs validated to run breakable CUDA graph when it is explicitly
 # requested (--cuda-graph-backend-prefill=breakable bypasses the ServerArgs
-# disable rules). Dispatch pins the absorbed MLA path inside capture/replay
-# for these archs, so the prefill runner's MHA-companion prefix restrictions
-# do not apply (see PrefillCudaGraphRunner.mla_pinned_under_bcg).
+# disable rules). Most backends pin absorbed MLA inside capture/replay; TRT-LLM
+# instead runs expanded suffix+prefix MHA eagerly between captured segments
+# (see PrefillCudaGraphRunner.mla_pinned_under_bcg).
 mla_breakable_cuda_graph_supported_model_archs = [
     "KimiK3ForConditionalGeneration",
 ]
