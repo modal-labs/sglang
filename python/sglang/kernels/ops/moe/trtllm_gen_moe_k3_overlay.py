@@ -69,7 +69,7 @@ _SELECT_K3_DYNBLOCK = """\
       data.mDtypeOutput == tg::Dtype::Bfloat16 && data.mUsePdl &&
       data.mTileTokensDim == 8 && data.mPaddingLog2 == 3 &&
       data.mLocalExpertsStartIdx == 0 && data.mLocalExpertsStrideLog2 == 0 &&
-      data.mNumLocalExperts == 896 && data.mNumFusedSharedExperts == 0 &&
+      data.mNumLocalExperts == data.mNumExperts &&
       dispatchedMaxExperts == routingCustom::NumExperts1024Experts;
   bool const useDynBlock = useGenericDynBlock || useKimiK3DynBlock;"""
 

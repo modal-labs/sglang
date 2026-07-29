@@ -20,8 +20,9 @@ def test_k3_dynblock_selector_is_exactly_guarded():
         "data.mPtrTopKPacked != nullptr",
         "data.mDtypeOutput == tg::Dtype::Bfloat16",
         "data.mUsePdl",
-        "data.mNumLocalExperts == 896",
-        "data.mNumFusedSharedExperts == 0",
+        "data.mLocalExpertsStartIdx == 0",
+        "data.mLocalExpertsStrideLog2 == 0",
+        "data.mNumLocalExperts == data.mNumExperts",
         "dispatchedMaxExperts == routingCustom::NumExperts1024Experts",
     ):
         assert predicate in source
