@@ -16,11 +16,13 @@ Every unmodified source and the CUTLASS headers come from the installed
 JIT), so running this backend needs exactly one download and one env var —
 no extra source checkout.
 
-This module vendors only glue:
+This module vendors glue plus one narrowly scoped routing-source override:
 
   * header staging: the pool ships the batched-gemm ABI headers flat; they
     are copied into a content-addressed include tree shaped like
     ``flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/``;
+  * an opt-in Kimi K3 dynamic-block routing selector for the exact validated
+    E=896, top-k=16, TP/BF16/PDL decode envelope;
   * JIT build of the 12 launcher/runner/routing sources with the private
     ABI defines (``TLLM_GEN_LOCAL_CUBINS_ABI`` etc.);
   * the ctypes cubin-loader callback (the .so asks for cubins by absolute
@@ -52,6 +54,9 @@ from sglang.kernels.jit.utils import (
     load_jit,
     override_jit_cuda_arch,
 )
+from sglang.kernels.ops.moe.trtllm_gen_moe_k3_overlay import (
+    stage_k3_dynblock_overlay,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -66,6 +71,10 @@ _ROUTING_INPUT_FROM_LOGITS = 0
 # NOTE: the enum VALUES start at 0; the "Mode 1/2/3" wording in upstream
 # comments is documentation numbering, not the enum value.
 _ROUTING_INPUT_PACKED = 1
+
+_ROUTING_COMMON_SOURCE = (
+    "csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu"
+)
 
 # Batched-gemm ABI headers shipped flat in the cubin pool; the launcher
 # includes them as flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/<h>.
@@ -101,7 +110,7 @@ _SOURCES = [
     "csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
     "csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
     "csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
-    "csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
+    _ROUTING_COMMON_SOURCE,
     "csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
     "csrc/trtllm_batched_gemm_runner.cu",
 ]
@@ -238,10 +247,15 @@ def _jit_trtllm_gen_moe_module() -> Module:
             "(cubins + flat ABI headers + overlay/) and install the public "
             "flashinfer package."
         )
-    # Overlay first (its modified sources/headers shadow the public copies),
-    # installed flashinfer data as the base.
-    src_roots = [pool / "overlay", fi_data]
-    include_roots = [pool / "overlay", fi_data]
+
+    cache = pathlib.Path(
+        os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+    ).expanduser()
+    k3_overlay, k3_overlay_tag = stage_k3_dynblock_overlay(pool / "overlay", cache)
+    # The staged K3 sources shadow the pool overlay. The pool's remaining
+    # modified sources shadow the installed FlashInfer base.
+    src_roots = [k3_overlay, pool / "overlay", fi_data]
+    include_roots = [k3_overlay, pool / "overlay", fi_data]
 
     def _resolve_source(rel: str) -> str:
         for root in src_roots:
@@ -254,13 +268,10 @@ def _jit_trtllm_gen_moe_module() -> Module:
     meta_tag = staged.name
     cubin_path = str((pool / "local").resolve())
 
-    cache = pathlib.Path(
-        os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
-    ).expanduser()
     # Flags are not part of load_jit's source hash: fold the pool identity
-    # (meta hash + path) into the module marker so a pool change rebuilds.
+    # and staged overlay into both the module marker and build directory.
     path_tag = hashlib.sha256(cubin_path.encode()).hexdigest()[:8]
-    build_dir = cache / f"sgl_trtllm_gen_moe_{meta_tag}_{path_tag}"
+    build_dir = cache / f"sgl_trtllm_gen_moe_{meta_tag}_{path_tag}_{k3_overlay_tag}"
 
     cpp_files = [_resolve_source(s) for s in _SOURCES if s.endswith(".cpp")]
     cuda_files = [_resolve_source(s) for s in _SOURCES if s.endswith(".cu")]
@@ -274,6 +285,7 @@ def _jit_trtllm_gen_moe_module() -> Module:
             "trtllm_gen_moe",
             meta_tag,
             path_tag,
+            k3_overlay_tag,
             cpp_files=cpp_files,
             cuda_files=cuda_files,
             header_only=False,  # the launcher exports its own tvm-ffi functions
@@ -329,10 +341,12 @@ def _jit_trtllm_gen_moe_module() -> Module:
             ],
             build_directory=str(build_dir),
         )
-    so_files = sorted(build_dir.glob("*.so"))
-    if not so_files:
-        raise RuntimeError(f"no built .so under {build_dir}")
-    _setup_cubin_loader(str(so_files[-1]), pool / "local")
+    so_files = list(build_dir.glob("*.so"))
+    if len(so_files) != 1:
+        raise RuntimeError(
+            f"expected exactly one built .so under {build_dir}, got {so_files}"
+        )
+    _setup_cubin_loader(str(so_files[0]), pool / "local")
     return module
 
 
