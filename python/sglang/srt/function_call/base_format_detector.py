@@ -359,6 +359,18 @@ class BaseFormatDetector(ABC):
         constraints and parse the model's native output format instead."""
         return False
 
+    def requires_strict_tool_for_constraint(self) -> bool:
+        """Return True if tool-call constraints need an explicit strictness
+        opt-in from the caller.
+
+        Formats that answer True are left completely unconstrained unless a
+        tool carries ``strict: true`` or the server sets
+        ``SGLANG_TOOL_STRICT_LEVEL``; see
+        ``FunctionCallParser.suppresses_tool_call_constraint``. The default is
+        False, which keeps the constraint routes open exactly as before.
+        """
+        return False
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """

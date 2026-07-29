@@ -105,6 +105,19 @@ class KimiK3Detector(BaseFormatDetector):
     def parses_required_natively(self) -> bool:
         return False
 
+    def requires_strict_tool_for_constraint(self) -> bool:
+        """K3 is only constrained when the caller asks for strictness.
+
+        The grammar in ``kimik3_structural_tag.py`` is exact, so a request that
+        did not ask for it pays its cost without having requested the
+        guarantee. Declaring the opt-in here makes every constraint route --
+        the auto tag, the model-native tag, the legacy begin/schema/end tag and
+        both generic JSON-schema fallbacks -- stand down together for such
+        requests, which matters because the JSON-schema fallbacks describe
+        OpenAI-style JSON calls that K3's XTML channel does not emit.
+        """
+        return True
+
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError(
             "Kimi K3 uses its model-native structural tag implementation"

@@ -572,12 +572,12 @@ def test_tool_strict_level_controls_native_tag_parameter_schema():
     empty_call = _tools_section(_call("weather", 264))
 
     with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        # No strictness opt-in from either the tool or the server, so K3 is left
+        # entirely unconstrained rather than given a looser grammar.
         constraint = FunctionCallParser(
             [_tool(strict=False)], "kimi_k3"
         ).get_structure_constraint("auto")
-        assert constraint is not None
-        assert _token_accepts(constraint[1], invalid_call)
-        assert not _token_accepts(constraint[1], empty_call)
+        assert constraint is None
 
     with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.FUNCTION):
         constraint = FunctionCallParser(
@@ -681,7 +681,9 @@ def test_auto_hook_does_not_swallow_parser_visible_closes():
 @pytest.mark.parametrize(
     "tool_strict_level",
     [
-        ToolStrictLevel.OFF,
+        # OFF is absent on purpose: with a non-strict tool and no server-side
+        # opt-in K3 gets no grammar at all, so there is no parallel-call limit
+        # to assert. That case is covered by the suppression tests below.
         ToolStrictLevel.FUNCTION,
         ToolStrictLevel.PARAMETER,
     ],
@@ -817,10 +819,12 @@ def test_all_of_number_branches_do_not_narrow_to_integer():
 
 
 def test_auto_hook_serializes_into_sampling_parameters():
-    constraint = FunctionCallParser(
-        [_tool(strict=False)], "kimi_k3"
-    ).get_structure_constraint("auto")
-    assert constraint is not None
+    # Built from the hook directly rather than through the parser: the parser
+    # only reaches this hook when no strictness was requested, and that is
+    # exactly the case where K3 now declines every constraint.
+    structural_tag = get_kimik3_auto_tool_call_structural_tag([_tool(strict=False)])
+    assert structural_tag is not None
+    constraint = ("structural_tag", structural_tag)
     request = ChatCompletionRequest(
         model="test",
         messages=[{"role": "user", "content": "Weather?"}],
@@ -901,6 +905,69 @@ def test_parameter_level_applies_to_other_model_native_tags():
     serialized = constraint[1].model_dump_json()
     assert '"properties"' in serialized
     assert '"city"' in serialized
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "required"])
+def test_no_strict_tool_leaves_kimi_k3_unconstrained(tool_choice):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        parser = FunctionCallParser([_tool(strict=False)], "kimi_k3")
+
+        assert parser.suppresses_tool_call_constraint()
+        assert parser.get_structure_constraint(tool_choice) is None
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "required"])
+def test_one_strict_tool_restores_kimi_k3_constraint(tool_choice):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        parser = FunctionCallParser(
+            [_tool("lookup", strict=False), _tool("weather", strict=True)], "kimi_k3"
+        )
+
+        assert not parser.suppresses_tool_call_constraint()
+        constraint = parser.get_structure_constraint(tool_choice)
+
+    assert constraint is not None
+    assert constraint[0] == "structural_tag"
+    grammar = xgr.Grammar.from_structural_tag(constraint[1])
+    assert _accepts(grammar, _tools_section(_valid_weather_call()))
+
+
+def test_server_strict_level_overrides_missing_tool_strictness():
+    for level in (ToolStrictLevel.FUNCTION, ToolStrictLevel.PARAMETER):
+        with envs.SGLANG_TOOL_STRICT_LEVEL.override(level):
+            parser = FunctionCallParser([_tool(strict=False)], "kimi_k3")
+
+            assert not parser.suppresses_tool_call_constraint()
+            constraint = parser.get_structure_constraint("auto")
+            assert constraint is not None
+            assert constraint[0] == "structural_tag"
+
+
+def test_suppression_closes_the_legacy_and_json_schema_fallbacks():
+    # The two fallbacks behind the model-native tags stay reachable in
+    # principle -- the detector still advertises them -- so suppression has to
+    # come from the parser, not from these capability flags.
+    detector = KimiK3Detector()
+    assert detector.supports_structural_tag()
+    assert not detector.parses_required_natively()
+    assert detector.requires_strict_tool_for_constraint()
+
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        parser = FunctionCallParser([_tool(strict=False)], "kimi_k3")
+        # "required" is the route that would otherwise reach the generic
+        # JSON-schema constraint, which describes OpenAI-style JSON tool calls
+        # that K3's XTML channel never emits.
+        assert parser.get_structure_constraint("required") is None
+
+
+def test_suppression_does_not_apply_to_other_model_families():
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        for parser_name in ("kimi_k2", "qwen25"):
+            parser = FunctionCallParser([_tool(strict=False)], parser_name)
+
+            assert not parser.detector.requires_strict_tool_for_constraint()
+            assert not parser.suppresses_tool_call_constraint()
+            assert parser.get_structure_constraint("required") is not None
 
 
 def test_reasoning_prefix_is_owned_by_exactly_one_layer():

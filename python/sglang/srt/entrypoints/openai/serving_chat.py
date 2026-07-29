@@ -947,6 +947,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         required_parsed_natively = False
         all_tools = self._collect_tools(request)
+        tool_constraint_suppressed = False
         if self.chat_encoding_spec == "kimi_k3" and request.tools:
             tools = [dump_kimi_k3_template_value(tool) for tool in request.tools]
         if all_tools and request.tool_choice != "none":
@@ -988,11 +989,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     thinking_mode=xgrammar_reasoning,
                 )
                 required_parsed_natively = parser.detector.parses_required_natively()
+                tool_constraint_suppressed = parser.suppresses_tool_call_constraint()
             # Fallback: use generic JSON schema for required/named tool choice
-            # only when no parser-specific constraint was set
+            # only when no parser-specific constraint was set. A parser that
+            # deliberately suppressed all constraints is excluded: its None is a
+            # decision, not an absence, and this fallback's JSON tool-call shape
+            # would not match the format it declined to constrain.
             if (
                 tool_call_constraint is None
                 and not required_parsed_natively
+                and not tool_constraint_suppressed
                 and (
                     request.tool_choice == "required"
                     or isinstance(request.tool_choice, ToolChoice)

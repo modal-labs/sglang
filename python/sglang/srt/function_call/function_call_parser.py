@@ -227,6 +227,34 @@ class FunctionCallParser:
             at_least_one=at_least_one,
         )
 
+    def suppresses_tool_call_constraint(self) -> bool:
+        """Whether this request must stay entirely free of tool-call constraints.
+
+        Detectors that answer True to ``requires_strict_tool_for_constraint``
+        want a grammar only when the caller asked for one: ``strict: true`` on
+        at least one tool, or a server-side ``SGLANG_TOOL_STRICT_LEVEL`` of
+        FUNCTION or above. Absent either signal, no route may install a
+        constraint. Suppression has to be all-or-nothing because the routes are
+        ordered fallbacks: declining only the model-native tag hands the
+        request to the legacy begin/schema/end tag and then to the generic
+        JSON-schema constraint, which encodes a tool-call shape borrowed from
+        another format and so is worse than no constraint at all.
+
+        Callers outside ``get_structure_constraint`` -- notably the serving
+        layer's own JSON-schema fallback for required/named tool choice -- must
+        consult this too, since that fallback triggers on a ``None`` constraint
+        and cannot otherwise tell deliberate suppression from "nothing applied".
+
+        Detectors that do not opt in return False here, leaving every other
+        model family's behaviour untouched.
+        """
+        if not self.detector.requires_strict_tool_for_constraint():
+            return False
+        # An explicit server-side strictness level is itself the opt-in.
+        if self.tool_strict_level >= ToolStrictLevel.FUNCTION:
+            return False
+        return not any(tool.function.strict for tool in self.tools)
+
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
@@ -244,6 +272,12 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
+        # Decided before any route is tried: a format that requires a
+        # strictness opt-in and did not get one is left unconstrained on every
+        # route, including the JSON-schema fallback below.
+        if self.suppresses_tool_call_constraint():
+            return None
+
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
         should_constrain_auto = tool_choice == "auto" and (
             any(tool.function.strict for tool in self.tools)
