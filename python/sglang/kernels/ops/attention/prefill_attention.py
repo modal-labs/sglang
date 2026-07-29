@@ -167,6 +167,29 @@ def _fwd_kernel(
     )
 
 
+_VISION_CONTEXT_ATTENTION_AUTOTUNE_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": block_m, "BLOCK_N": block_n},
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for block_m, block_n in ((64, 64), (64, 128), (128, 64), (128, 128))
+    for num_warps in (4, 8)
+    for num_stages in (1, 2)
+]
+
+
+def _make_vision_context_attention_autotuner():
+    return triton.autotune(
+        configs=_VISION_CONTEXT_ATTENTION_AUTOTUNE_CONFIGS,
+        key=["Lk", "kv_group_num", "IS_CAUSAL"],
+        cache_results=True,
+    )(_fwd_kernel)
+
+
+_vision_context_attention_fwd_kernel = _make_vision_context_attention_autotuner()
+
+
 def context_attention_fwd(
     q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True, sm_scale=None
 ):
@@ -182,17 +205,14 @@ def context_attention_fwd(
     else:
         BLOCK = 64
 
-    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+    Lq, Lk = q.shape[-1], k.shape[-1]
 
     if sm_scale is None:
         sm_scale = 1.0 / (Lq**0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
 
-    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
-    num_warps = 4 if Lk <= 64 else 8
-
-    _fwd_kernel[grid](
+    kernel_args = (
         q,
         k,
         v,
@@ -208,12 +228,34 @@ def context_attention_fwd(
         v.stride(1),
         o.stride(0),
         o.stride(1),
-        kv_group_num=kv_group_num,
-        BLOCK_M=BLOCK,
-        BLOCK_DMODEL=triton.next_power_of_2(Lk),
-        BLOCK_N=BLOCK,
-        IS_CAUSAL=is_causal,
-        num_warps=num_warps,
-        num_stages=1,
-        Lk=Lk,
     )
+    kernel_kwargs = {
+        "kv_group_num": kv_group_num,
+        "BLOCK_DMODEL": triton.next_power_of_2(Lk),
+        "IS_CAUSAL": is_causal,
+        "Lk": Lk,
+    }
+
+    if is_causal:
+        # Preserve the fixed launch for text prefill. Only non-causal vision
+        # attention pays or consumes the persisted autotune result.
+        grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
+        num_warps = 4 if Lk <= 64 else 8
+        _fwd_kernel[grid](
+            *kernel_args,
+            **kernel_kwargs,
+            BLOCK_M=BLOCK,
+            BLOCK_N=BLOCK,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+        return
+
+    def grid(meta):
+        return (
+            batch,
+            head,
+            triton.cdiv(max_input_len, meta["BLOCK_M"]),
+        )
+
+    _vision_context_attention_fwd_kernel[grid](*kernel_args, **kernel_kwargs)

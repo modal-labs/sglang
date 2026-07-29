@@ -3561,7 +3561,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.vision_tower.precompile_fused_rope():
             logger.info("Precompiled dynamic-token fused K3 vision RoPE kernel")
         if self.vision_tower.precompile_attention_backend():
-            logger.info("Precompiled Kimi-K3 vision FA4 kernel")
+            logger.info(
+                "Prepared Kimi-K3 vision attention kernels "
+                "(persistent Triton autotune at 448x448; FA4 when available)"
+            )
 
     def get_input_embeddings(self):
         if self.language_model is None:

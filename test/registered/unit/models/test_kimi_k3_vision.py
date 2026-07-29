@@ -1,3 +1,4 @@
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -91,6 +92,126 @@ def test_kimi_k3_skips_attention_precompile_on_cpu():
     )
 
     assert not encoder.precompile_attention_backend(torch.bfloat16, torch.device("cpu"))
+
+
+def test_kimi_k3_attention_precompile_matches_production_qkv_layout():
+    tensor_refs = []
+    observed = {}
+
+    class RecordingAttention:
+        def __call__(
+            self,
+            q,
+            k,
+            v,
+            *,
+            cu_seqlens,
+            bsz,
+            seq_len,
+            forward_metadata,
+        ):
+            tensor_refs.extend(weakref.ref(tensor) for tensor in (q, k, v))
+            observed.update(
+                q_shape=q.shape,
+                q_contiguous=q.is_contiguous(),
+                k_contiguous=k.is_contiguous(),
+                v_contiguous=v.is_contiguous(),
+                v_stride=v.stride(),
+                cu_seqlens=cu_seqlens.tolist(),
+                max_seqlen=forward_metadata.max_seqlen,
+                bsz=bsz,
+                seq_len=seq_len,
+                inference_mode=torch.is_inference_mode_enabled(),
+            )
+            return torch.empty_like(q)
+
+    kimi_k3_vl._precompile_vision_attention_impl(
+        RecordingAttention(),
+        num_tokens=5,
+        num_heads=3,
+        head_dim=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert observed == {
+        "q_shape": torch.Size([5, 3, 4]),
+        "q_contiguous": True,
+        "k_contiguous": True,
+        "v_contiguous": False,
+        "v_stride": (36, 4, 1),
+        "cu_seqlens": [0, 5],
+        "max_seqlen": 5,
+        "bsz": 1,
+        "seq_len": 5,
+        "inference_mode": True,
+    }
+    assert all(tensor_ref() is None for tensor_ref in tensor_refs)
+
+
+@pytest.mark.parametrize("fa4_available", [False, True])
+def test_kimi_k3_precompiles_exact_server_warmup_attention_shape(
+    monkeypatch, fa4_available
+):
+    triton_impl = object()
+    fa4_impl = object()
+    calls = []
+    encoder = SimpleNamespace(
+        attention_backend="auto",
+        blocks=[
+            SimpleNamespace(
+                num_heads=12,
+                hidden_size_per_attention_head=128,
+                attention_backend_impls={
+                    "triton_attn": triton_impl,
+                    "fa4": fa4_impl,
+                },
+            )
+        ],
+    )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 3))
+    monkeypatch.setattr(kimi_k3_vl, "_is_fa4_available", lambda: fa4_available)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: calls.append(("sync",)))
+
+    def record_precompile(attention_impl, **kwargs):
+        calls.append((attention_impl, kwargs))
+
+    monkeypatch.setattr(
+        kimi_k3_vl,
+        "_precompile_vision_attention_impl",
+        record_precompile,
+    )
+
+    assert MoonViT3dEncoder.precompile_attention_backend(
+        encoder, torch.bfloat16, torch.device("cuda")
+    )
+    expected = [
+        (
+            triton_impl,
+            {
+                "num_tokens": 1024,
+                "num_heads": 12,
+                "head_dim": 128,
+                "dtype": torch.bfloat16,
+                "device": torch.device("cuda"),
+            },
+        )
+    ]
+    if fa4_available:
+        expected.append(
+            (
+                fa4_impl,
+                {
+                    "num_tokens": 256,
+                    "num_heads": 12,
+                    "head_dim": 128,
+                    "dtype": torch.bfloat16,
+                    "device": torch.device("cuda"),
+                },
+            )
+        )
+    assert calls == [*expected, ("sync",)]
 
 
 def test_kimi_k3_sdpa_reuses_prepared_segment_bounds():

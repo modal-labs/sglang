@@ -44,6 +44,8 @@ if _use_aiter:
 
 _SM103_TRITON_MAX_SEQLEN = 1536
 _SM103_FA4_MIN_ATTENTION_WORK = 3_000_000
+_VISION_SERVER_WARMUP_TOKENS = 1024
+_VISION_FA4_PRECOMPILE_TOKENS = 256
 
 GridTHW = Tuple[int, int, int]
 SegmentBounds = Tuple[Tuple[int, int], ...]
@@ -98,6 +100,49 @@ def _resolve_mm_attention_backend(
             fa4_available = _is_fa4_available()
         return "fa4" if fa4_available else "sdpa"
     return "triton_attn"
+
+
+def _precompile_vision_attention_impl(
+    attention_impl: nn.Module,
+    *,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Run one production-shaped vision attention launch.
+
+    Keeping the synthetic tensors local ensures they become unreachable as soon
+    as the launch returns. The model-load wrapper synchronizes and empties the
+    CUDA allocator cache after all model precompiles finish.
+    """
+    packed_qkv = torch.zeros(
+        (num_tokens, 3, num_heads, head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    # Match MoonViTEncoderLayer._attention: RoPE materializes contiguous Q/K,
+    # while V remains the strided third slice of the packed projection output.
+    q = packed_qkv[:, 0].contiguous()
+    k = packed_qkv[:, 1].contiguous()
+    v = packed_qkv[:, 2]
+    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+    metadata = prepare_vision_attention_metadata(
+        cu_seqlens,
+        device=device,
+        max_seqlen=num_tokens,
+    )
+    with torch.inference_mode():
+        attention_impl(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            bsz=1,
+            seq_len=num_tokens,
+            forward_metadata=metadata,
+        )
 
 
 def apply_rope(
@@ -603,42 +648,34 @@ class MoonViT3dEncoder(nn.Module):
             or not self.blocks
             or device.type != "cuda"
             or torch.cuda.get_device_capability(device) != (10, 3)
-            or not _is_fa4_available()
         ):
             return False
 
         block = self.blocks[0]
-        if "fa4" not in block.attention_backend_impls:
-            return False
+        # The built-in 448x448 image warmup produces 1,024 raw ViT patch
+        # tokens, which the SM103 auto resolver sends through triton_attn.
+        # Keep the existing FA4 precompile for larger resolver-selected shapes.
+        precompile_plan = [("triton_attn", _VISION_SERVER_WARMUP_TOKENS)]
+        if _is_fa4_available():
+            precompile_plan.append(("fa4", _VISION_FA4_PRECOMPILE_TOKENS))
 
-        num_tokens = 256
-        packed_qkv = torch.zeros(
-            (
-                num_tokens,
-                3,
-                block.num_heads,
-                block.hidden_size_per_attention_head,
-            ),
-            dtype=dtype,
-            device=device,
-        )
-        q = packed_qkv[:, 0].contiguous()
-        k = packed_qkv[:, 1].contiguous()
-        v = packed_qkv[:, 2]
-        cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
-        metadata = prepare_vision_attention_metadata(cu_seqlens, device=device)
-        with torch.inference_mode():
-            block.attention_backend_impls["fa4"](
-                q,
-                k,
-                v,
-                cu_seqlens=cu_seqlens,
-                bsz=1,
-                seq_len=num_tokens,
-                forward_metadata=metadata,
+        compiled_any = False
+        for backend, num_tokens in precompile_plan:
+            if backend not in block.attention_backend_impls:
+                continue
+            _precompile_vision_attention_impl(
+                block.attention_backend_impls[backend],
+                num_tokens=num_tokens,
+                num_heads=block.num_heads,
+                head_dim=block.hidden_size_per_attention_head,
+                dtype=dtype,
+                device=device,
             )
-        torch.cuda.synchronize(device)
-        return True
+            compiled_any = True
+
+        if compiled_any:
+            torch.cuda.synchronize(device)
+        return compiled_any
 
     def prepare_forward_metadata(
         self,
