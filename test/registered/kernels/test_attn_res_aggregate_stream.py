@@ -109,7 +109,7 @@ class TestAggregateStream(CustomTestCase):
                     )
 
                     self.assertIs(actual, slot)
-                    self.assertFalse(slot.is_contiguous())
+                    self.assertEqual(slot.stride(), (3 * _H, 1))
                     self.assertTrue(torch.equal(actual, expected))
 
     def test_nvb0_passthrough(self):
