@@ -40,6 +40,7 @@ def test_k3_dynblock_1024_tier_uses_512_threads():
 def test_k3_dynblock_policy_supports_per_kernel_geometry():
     source = _patch_text("RoutingCustomPolicy.cuh")
 
+    assert '#include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"' in source
     assert "LAUNCH_ROUTING_CUSTOM_WITH_CONFIG" in source
     assert "LaunchConfig_::blockDim(data, static_cast<int>(numThreads))" in source
     assert "LAUNCH_ROUTING_WITH_POLICIES" in source

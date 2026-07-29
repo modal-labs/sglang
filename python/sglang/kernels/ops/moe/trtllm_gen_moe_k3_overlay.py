@@ -174,6 +174,10 @@ SOURCE_PATCHES = (
         sha256="7acd9b3eb05e7f8e88de990c9003ebab7f59e0425ef3c6ecd37b3a01d978f968",
         replacements=(
             (
+                '#include "RoutingKernel.cuh"',
+                '#include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"',
+            ),
+            (
                 "#define LAUNCH_ROUTING_CUSTOM(data, coopLaunch, kernel, "
                 "numBlocks, numThreads, smemSize, stream)",
                 _CUSTOM_LAUNCH_DISPATCH
