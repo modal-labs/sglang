@@ -415,7 +415,11 @@ class ServingChatTestCase(unittest.TestCase):
             '{"broken":',
         )
         self.assertEqual(call.kwargs["tool_choice"], "required")
-        self.assertNotIn("response_format", call.kwargs)
+        self.assertEqual(
+            call.kwargs["response_format"]["json_schema"]["schema"],
+            {"type": "object"},
+        )
+        self.assertNotIn("strict", call.kwargs["response_format"]["json_schema"])
 
     def test_kimi_k3_tool_choice_none_keeps_declarations(self):
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -485,7 +489,7 @@ class ServingChatTestCase(unittest.TestCase):
             [tool.function.name for tool in parser_tools], ["lookup", "other"]
         )
 
-    def test_kimi_k3_forced_tool_omits_conflicting_response_format_hint(self):
+    def test_kimi_k3_forced_tool_keeps_response_format_hint(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         self.chat.tool_call_parser = "kimi_k3"
         self.template_manager.chat_template_name = None
@@ -520,7 +524,17 @@ class ServingChatTestCase(unittest.TestCase):
             adapted_request, _ = self.chat._convert_to_internal_request(request)
 
         template_kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-        self.assertNotIn("response_format", template_kwargs)
+        self.assertEqual(
+            template_kwargs["response_format"],
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": True,
+                    "schema": {"type": "object"},
+                },
+            },
+        )
         self.assertEqual(
             json.loads(adapted_request.sampling_params["json_schema"]),
             {"type": "array"},

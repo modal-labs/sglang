@@ -1138,7 +1138,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 template_kwargs["tool_choice"] = "required"
             elif request.tool_choice == "none" and bool(self._collect_tools(request)):
                 template_kwargs["tool_choice"] = "none"
-            if request.response_format is not None and not forced_tool_choice:
+            # K3's native prompt includes the response-format directive even
+            # when forced tool choice wins at the constrained-decoding layer.
+            if request.response_format is not None:
                 template_kwargs["response_format"] = dump_kimi_k3_template_value(
                     request.response_format
                 )
