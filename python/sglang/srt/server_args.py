@@ -1282,6 +1282,18 @@ class ServerArgs:
         "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
         NS("serving"),
     ] = False
+    api_early_reject_max_concurrency: A[
+        Optional[int],
+        (
+            "Opt in to a shared early-overload gate for OpenAI generation and "
+            "Anthropic Messages endpoints. When this many HTTP requests are "
+            "active in one tokenizer worker, new requests receive HTTP 429 "
+            "before request parsing or scheduler enqueue. A streaming request "
+            "holds its slot until its final SSE body is sent. Unset disables "
+            "this HTTP admission gate."
+        ),
+        NS("serving"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -3487,6 +3499,15 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._validate_mamba_max_states_per_path()
+
+        if (
+            self.api_early_reject_max_concurrency is not None
+            and self.api_early_reject_max_concurrency <= 0
+        ):
+            raise ValueError(
+                "--api-early-reject-max-concurrency must be positive "
+                "when configured"
+            )
 
         if self.model_path.lower() in ["none", "dummy"]:
             return

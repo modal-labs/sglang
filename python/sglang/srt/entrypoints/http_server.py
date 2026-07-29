@@ -82,6 +82,10 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.early_reject import (
+    APIEarlyRejectMiddleware,
+    configure_api_early_reject,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -279,6 +283,10 @@ async def lifespan(fast_api_app: FastAPI):
         warmup_thread_kwargs = dict(server_args=server_args)
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
+    configure_api_early_reject(
+        fast_api_app, server_args.api_early_reject_max_concurrency
+    )
+
     # Add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
@@ -457,6 +465,7 @@ app = FastAPI(
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
 app.router.route_class = ORJSONRoute
+app.add_middleware(APIEarlyRejectMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

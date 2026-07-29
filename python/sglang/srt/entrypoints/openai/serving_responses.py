@@ -69,6 +69,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.sse_keepalive import stream_sse_with_keepalives
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -476,22 +477,26 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             if request.stream:
                 if self.use_harmony:
-                    return self.responses_stream_generator(
+                    return stream_sse_with_keepalives(
+                        self.responses_stream_generator(
+                            request,
+                            sampling_params,
+                            result_generator,
+                            context,
+                            model_name,
+                            tokenizer,
+                            request_metadata,
+                        )
+                    )
+                return stream_sse_with_keepalives(
+                    self.responses_stream_generator_non_harmony(
                         request,
                         sampling_params,
                         result_generator,
-                        context,
                         model_name,
                         tokenizer,
                         request_metadata,
                     )
-                return self.responses_stream_generator_non_harmony(
-                    request,
-                    sampling_params,
-                    result_generator,
-                    model_name,
-                    tokenizer,
-                    request_metadata,
                 )
             try:
                 result: Union[ORJSONResponse, ResponsesResponse] = (
@@ -1020,8 +1025,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
         if msg_type == "reasoning":
-            # Prefer ``summary``; fall back to ``content`` only when summary
-            # is empty, since clients often populate both with the same text.
             def _collect(parts):
                 out: list[str] = []
                 for entry in parts or []:
@@ -1031,9 +1034,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                             out.append(text)
                 return out
 
-            text_parts = _collect(message.get("summary"))
+            # ``content`` is the full reasoning trace needed to continue an
+            # interleaved-thinking turn. ``summary`` is an abbreviated
+            # presentation field and is only a fallback for clients that do
+            # not send the full trace.
+            text_parts = _collect(message.get("content"))
             if not text_parts:
-                text_parts = _collect(message.get("content"))
+                text_parts = _collect(message.get("summary"))
             if not text_parts:
                 return None
             return {
@@ -1166,10 +1173,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.extend(prev_msg)
 
             for output_item in prev_response.output:
+                # Replay every assistant-side item, not just visible text.
+                # A Responses turn may contain separate reasoning, message,
+                # and function_call items; normalization plus the assistant
+                # merge below reconstructs the single chat-template turn.
                 assistant_text = self._output_message_text(output_item)
-                if assistant_text is None:
+                if assistant_text is not None:
+                    messages.append({"role": "assistant", "content": assistant_text})
                     continue
-                messages.append({"role": "assistant", "content": assistant_text})
+                normalized = self._normalize_response_message_for_chat(output_item)
+                if normalized is not None:
+                    messages.append(normalized)  # type: ignore
 
         # Append the new input
         # Responses API supports simple text inputs without chat format

@@ -959,6 +959,8 @@ class Envs:
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Emit legal SSE comments during streaming silence. Zero disables it.
+    SGLANG_SSE_KEEPALIVE_INTERVAL = EnvFloat(0.0)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)

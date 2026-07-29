@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -26,6 +27,10 @@ from jsonschema import Draft7Validator, Draft202012Validator, SchemaError
 from jsonschema.validators import validator_for
 
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.sse_keepalive import (
+    prime_sse_stream,
+    stream_sse_with_keepalives,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
@@ -345,10 +350,6 @@ class OpenAIServingChat(OpenAIServingBase):
             chunk_type = chunk.get("type")
             if chunk_type in ("text", "input_text"):
                 text = chunk["text"]
-                if "<|kimi_image_placeholder|>" in text:
-                    raise ValueError(
-                        "<|kimi_image_placeholder|> is reserved for Kimi-K3 image input"
-                    )
                 parts.append({"type": "text", "text": text})
             elif chunk_type in ("image_url", "input_image"):
                 image_obj = chunk.get("image_url") or {}
@@ -1124,14 +1125,14 @@ class OpenAIServingChat(OpenAIServingBase):
                         request.reasoning_effort,
                     )
 
-            if isinstance(request.tool_choice, str) and (
-                request.tool_choice == "required"
-                or (
-                    request.tool_choice == "none" and bool(self._collect_tools(request))
-                )
-            ):
-                template_kwargs["tool_choice"] = request.tool_choice
-            if request.response_format is not None:
+            forced_tool_choice = request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
+            )
+            if forced_tool_choice:
+                template_kwargs["tool_choice"] = "required"
+            elif request.tool_choice == "none" and bool(self._collect_tools(request)):
+                template_kwargs["tool_choice"] = "none"
+            if request.response_format is not None and not forced_tool_choice:
                 template_kwargs["response_format"] = dump_kimi_k3_template_value(
                     request.response_format
                 )
@@ -1416,23 +1417,30 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming chat completion request"""
-        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+        response_will_stream = asyncio.Event()
+        generator = self._generate_chat_stream(
+            adapted_request,
+            request,
+            raw_request,
+            response_will_stream=response_will_stream,
+        )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
         # If validation fails (e.g., context length exceeded), we can still return
         # a proper HTTP 400 error response instead of streaming it as SSE payload.
         try:
-            first_chunk = await generator.__anext__()
+            primed = await prime_sse_stream(generator)
         except ValueError as e:
             return self.create_error_response(str(e))
 
-        async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
+        # A pending read means priming reached the keep-alive deadline. From
+        # here the request will return HTTP 200 and any later validation error
+        # must be encoded as SSE instead of tearing down the response body.
+        if primed.pending_next is not None:
+            response_will_stream.set()
 
         return StreamingResponse(
-            prepend_first_chunk(),
+            stream_sse_with_keepalives(generator, primed=primed),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
@@ -1442,6 +1450,8 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
+        *,
+        response_will_stream: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         # Parsers for tool calls and reasoning
@@ -1671,7 +1681,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
-            if not stream_started:
+            if not stream_started and not (
+                response_will_stream is not None and response_will_stream.is_set()
+            ):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"

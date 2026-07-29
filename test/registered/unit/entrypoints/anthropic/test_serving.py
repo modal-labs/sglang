@@ -27,9 +27,15 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeOpenAIServingChat:
-    def __init__(self, stream_lines=None, chat_template=None):
+    def __init__(
+        self,
+        stream_lines=None,
+        chat_template=None,
+        chat_encoding_spec=None,
+    ):
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
+        self.chat_encoding_spec = chat_encoding_spec
         self.tokenizer_manager = SimpleNamespace(
             tokenizer=SimpleNamespace(chat_template=chat_template)
         )
@@ -141,8 +147,19 @@ class TestAnthropicServing(unittest.TestCase):
         "{%- endfor %}"
     )
 
-    def _serving(self, stream_lines=None, chat_template=None):
-        return AnthropicServing(_FakeOpenAIServingChat(stream_lines, chat_template))
+    def _serving(
+        self,
+        stream_lines=None,
+        chat_template=None,
+        chat_encoding_spec=None,
+    ):
+        return AnthropicServing(
+            _FakeOpenAIServingChat(
+                stream_lines,
+                chat_template,
+                chat_encoding_spec,
+            )
+        )
 
     def _anthropic_request(self, **overrides):
         data = {
@@ -817,9 +834,9 @@ class TestAnthropicServing(unittest.TestCase):
             serving._convert_to_chat_completion_request(request)
         self.assertTrue(any("thinking-2025-08-04" in r for r in log.output))
 
-    def test_assistant_thinking_history_is_rewrapped_for_chat_template(self):
-        """Past-turn thinking blocks get re-emitted via wrap_reasoning_history."""
-        serving = self._serving()
+    def test_assistant_thinking_history_is_structured_reasoning_content(self):
+        """Past thinking stays structural instead of becoming response text."""
+        serving = self._serving(chat_encoding_spec="kimi_k3")
         request = self._anthropic_request(
             stream=False,
             messages=[
@@ -838,22 +855,76 @@ class TestAnthropicServing(unittest.TestCase):
         # ``ChatCompletionRequest.messages`` is a list of Pydantic
         # ChatCompletionMessage*Param instances; access via attributes.
         assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
-        content = assistant_msg.content
-        # Reasoning history sits in front; the thinking block itself is dropped
-        # from the prompt so its text is not duplicated.
-        if isinstance(content, list):
-            texts = []
-            for part in content:
-                if isinstance(part, dict):
-                    texts.append(part.get("text", ""))
-                else:
-                    texts.append(getattr(part, "text", "") or "")
-        else:
-            texts = [content]
-        joined = "\n".join(texts)
-        self.assertIn("<think>", joined)
-        self.assertIn("ponder", joined)
-        self.assertNotIn("<think>\nponder\n</think>\nponder", joined)
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "hello")
+        self.assertNotIn("<think>", assistant_msg.content)
+
+    def test_interleaved_thinking_tool_history_preserves_structure(self):
+        """Thinking, response, calls, and results survive a K3-style tool loop."""
+        serving = self._serving(chat_encoding_spec="kimi_k3")
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "look it up"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "first thought"},
+                        {"type": "thinking", "thinking": "second thought"},
+                        {"type": "text", "text": "I will check."},
+                        {
+                            "type": "tool_use",
+                            "id": "call_weather",
+                            "name": "weather",
+                            "input": {"city": "SF"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_weather",
+                            "content": "foggy",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "use the result"},
+                        {"type": "text", "text": "It is foggy."},
+                    ],
+                },
+            ],
+        )
+
+        chat_request = serving._convert_to_chat_completion_request(request)
+        messages = chat_request.messages
+        self.assertEqual(
+            [message.role for message in messages],
+            ["user", "assistant", "tool", "assistant"],
+        )
+
+        first_assistant = messages[1]
+        self.assertEqual(
+            first_assistant.reasoning_content, "first thought\nsecond thought"
+        )
+        self.assertEqual(first_assistant.content, "I will check.")
+        self.assertEqual(first_assistant.tool_calls[0].id, "call_weather")
+        self.assertEqual(first_assistant.tool_calls[0].function.name, "weather")
+        self.assertEqual(
+            first_assistant.tool_calls[0].function.arguments, '{"city": "SF"}'
+        )
+
+        tool_result = messages[2]
+        self.assertEqual(tool_result.tool_call_id, "call_weather")
+        self.assertEqual(tool_result.content, "foggy")
+
+        second_assistant = messages[3]
+        self.assertEqual(second_assistant.reasoning_content, "use the result")
+        self.assertEqual(second_assistant.content, "It is foggy.")
 
     def test_redacted_thinking_history_is_rejected(self):
         """``redacted_thinking`` cannot be rendered by local parsers."""
@@ -1359,7 +1430,7 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(chat_request.messages[0].content, "be terse")
 
     def test_thinking_history_drop_on_missing_detector(self):
-        """Replaying a thinking block on a non-reasoning model should not 400."""
+        """Replaying thinking on a non-reasoning model should not 400."""
 
         class _NoDetectorOpenAI(_FakeOpenAIServingChat):
             def wrap_reasoning_history(self, text):
@@ -1376,13 +1447,33 @@ class TestAnthropicServing(unittest.TestCase):
                 {"role": "user", "content": "follow-up"},
             ],
         )
-        # Must convert successfully; the thinking block is silently dropped.
         chat_request = serving._convert_to_chat_completion_request(request)
-        roles = [m.role for m in chat_request.messages]
+        roles = [message.role for message in chat_request.messages]
         self.assertIn("user", roles)
-        # The assistant turn was rendered (as empty placeholder) so
-        # alternation is preserved.
         self.assertIn("assistant", roles)
+
+    def test_kimi_thinking_history_does_not_require_reasoning_detector(self):
+        """Kimi's native encoder consumes structured reasoning directly."""
+        serving = AnthropicServing(
+            _FakeOpenAIServingChat(chat_encoding_spec="kimi_k3")
+        )
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "I think..."}],
+                },
+                {"role": "user", "content": "follow-up"},
+            ],
+        )
+
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant = next(
+            message for message in chat_request.messages if message.role == "assistant"
+        )
+        self.assertEqual(assistant.reasoning_content, "I think...")
+        self.assertEqual(assistant.content, "")
 
     def test_stop_reason_content_filter_falls_back_with_warning(self):
         """Unmapped OpenAI finish_reasons default to 'end_turn' + log a warning.

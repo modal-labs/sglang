@@ -1157,17 +1157,32 @@ class ChatCompletionRequest(BaseModel):
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 
+        response_format_constraint_key = None
         if self.response_format and self.response_format.type == "json_schema":
             if self.response_format.json_schema.strict is not False:
                 sampling_params["json_schema"] = convert_json_schema_to_str(
                     self.response_format.json_schema.schema_
                 )
+                response_format_constraint_key = "json_schema"
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
+            response_format_constraint_key = "json_schema"
         elif self.response_format and self.response_format.type == "structural_tag":
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 self.response_format.model_dump(by_alias=True)
             )
+            response_format_constraint_key = "structural_tag"
+
+        forced_tool_choice = self.tool_choice == "required" or isinstance(
+            self.tool_choice, ToolChoice
+        )
+        if (
+            tool_call_constraint
+            and forced_tool_choice
+            and response_format_constraint_key
+        ):
+            logger.warning("Forced tool_choice overrides response_format.")
+            sampling_params.pop(response_format_constraint_key, None)
 
         # Check if there are already existing output constraints
         has_existing_constraints = (

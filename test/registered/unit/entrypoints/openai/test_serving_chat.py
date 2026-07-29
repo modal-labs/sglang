@@ -10,6 +10,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import asyncio
 import json
 import unittest
 import uuid
@@ -414,11 +415,7 @@ class ServingChatTestCase(unittest.TestCase):
             '{"broken":',
         )
         self.assertEqual(call.kwargs["tool_choice"], "required")
-        self.assertEqual(
-            call.kwargs["response_format"]["json_schema"]["schema"],
-            {"type": "object"},
-        )
-        self.assertNotIn("strict", call.kwargs["response_format"]["json_schema"])
+        self.assertNotIn("response_format", call.kwargs)
 
     def test_kimi_k3_tool_choice_none_keeps_declarations(self):
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -444,6 +441,90 @@ class ServingChatTestCase(unittest.TestCase):
             ["global_tool"],
         )
         self.assertEqual(call.kwargs["tool_choice"], "none")
+
+    def test_kimi_k3_named_tool_choice_uses_canonical_chat_shape(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Call lookup."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "parameters": {"type": "object"}},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "other", "parameters": {"type": "object"}},
+                },
+            ],
+            tool_choice={"type": "function", "function": {"name": "lookup"}},
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as parser_cls:
+            parser_cls.return_value.get_structure_constraint.return_value = (
+                "json_schema",
+                {"type": "array"},
+            )
+            self.chat._process_messages(request, is_multimodal=False)
+
+        template_tools = self.tm.tokenizer.apply_chat_template.call_args.kwargs["tools"]
+        self.assertEqual(
+            [tool["function"]["name"] for tool in template_tools], ["lookup"]
+        )
+        self.assertEqual(
+            self.tm.tokenizer.apply_chat_template.call_args.kwargs["tool_choice"],
+            "required",
+        )
+        parser_tools = parser_cls.call_args.args[0]
+        self.assertEqual(
+            [tool.function.name for tool in parser_tools], ["lookup", "other"]
+        )
+
+    def test_kimi_k3_forced_tool_omits_conflicting_response_format_hint(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Call lookup."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "parameters": {"type": "object"}},
+                }
+            ],
+            tool_choice="required",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": True,
+                    "schema": {"type": "object"},
+                },
+            },
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as parser_cls:
+            parser_cls.return_value.get_structure_constraint.return_value = (
+                "json_schema",
+                {"type": "array"},
+            )
+            adapted_request, _ = self.chat._convert_to_internal_request(request)
+
+        template_kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertNotIn("response_format", template_kwargs)
+        self.assertEqual(
+            json.loads(adapted_request.sampling_params["json_schema"]),
+            {"type": "array"},
+        )
 
     def test_kimi_k3_implicit_none_omits_tool_choice_directive(self):
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -641,7 +722,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(response.usage.total_tokens, 2073)
         self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
 
-    def test_kimi_k3_rejects_internal_placeholder_in_user_text(self):
+    def test_kimi_k3_preserves_internal_placeholder_as_user_text(self):
         message = {
             "role": "user",
             "content": [
@@ -652,8 +733,9 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         }
 
-        with self.assertRaisesRegex(ValueError, "reserved for Kimi-K3 image input"):
-            self.chat._flatten_kimi_k3_content(message, [], [], [])
+        flattened = self.chat._flatten_kimi_k3_content(message, [], [], [])
+
+        self.assertEqual(flattened, message)
 
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -1872,6 +1954,51 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_slow_validation_error_after_keepalive_is_encoded_as_sse(self):
+        async def _mock_generate_error():
+            await asyncio.sleep(0.015)
+            raise ValueError("late validation failure")
+            yield  # pragma: no cover
+
+        self.tm.generate_request.return_value = _mock_generate_error()
+
+        async def run():
+            with patch(
+                "sglang.srt.entrypoints.sse_keepalive.sse_keepalive_interval",
+                return_value=0.01,
+            ):
+                response = await self.chat._handle_streaming_request(
+                    Mock(), self.stream_req, self.fastapi_request
+                )
+                chunks = [chunk async for chunk in response.body_iterator]
+                return response.status_code, chunks
+
+        status_code, chunks = asyncio.run(run())
+        self.assertEqual(status_code, 200)
+        self.assertEqual(chunks[0], ": keep-alive\n\n")
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertTrue(any("late validation failure" in chunk for chunk in chunks))
+
+    def test_fast_validation_error_retains_http_error_status(self):
+        async def _mock_generate_error():
+            raise ValueError("immediate validation failure")
+            yield  # pragma: no cover
+
+        self.tm.generate_request.return_value = _mock_generate_error()
+
+        async def run():
+            with patch(
+                "sglang.srt.entrypoints.sse_keepalive.sse_keepalive_interval",
+                return_value=1.0,
+            ):
+                return await self.chat._handle_streaming_request(
+                    Mock(), self.stream_req, self.fastapi_request
+                )
+
+        response = asyncio.run(run())
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"immediate validation failure", response.body)
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():

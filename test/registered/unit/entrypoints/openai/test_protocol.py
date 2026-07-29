@@ -13,6 +13,7 @@
 # ==============================================================================
 """Tests for OpenAI API protocol models"""
 
+import json
 import unittest
 from typing import List, Optional
 
@@ -177,6 +178,90 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(params["max_new_tokens"], 150)
         self.assertEqual(params["min_new_tokens"], 5)
         self.assertEqual(params["stop"], ["</s>"])
+
+    def test_forced_tool_choice_overrides_response_format_constraint(self):
+        tool_schema = {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {"name": {"const": "lookup"}},
+            },
+        }
+
+        for tool_choice in (
+            "required",
+            {"type": "function", "function": {"name": "lookup"}},
+        ):
+            with self.subTest(tool_choice=tool_choice):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Call lookup."}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    tool_choice=tool_choice,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "answer",
+                            "strict": True,
+                            "schema": {
+                                "type": "object",
+                                "properties": {"answer": {"type": "string"}},
+                            },
+                        },
+                    },
+                )
+
+                params = request.to_sampling_params(
+                    stop=[],
+                    model_generation_config={},
+                    tool_call_constraint=("json_schema", tool_schema),
+                )
+
+                self.assertEqual(json.loads(params["json_schema"]), tool_schema)
+
+    def test_auto_tool_choice_keeps_response_format_constraint(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Answer or call lookup."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="auto",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": True,
+                    "schema": {"type": "object"},
+                },
+            },
+        )
+
+        params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=(
+                "json_schema",
+                {"type": "array", "minItems": 1},
+            ),
+        )
+
+        self.assertEqual(json.loads(params["json_schema"]), {"type": "object"})
 
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""

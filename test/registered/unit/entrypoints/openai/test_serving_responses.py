@@ -150,6 +150,161 @@ class InputMessageConstructionTestCase(unittest.TestCase):
         except Exception:
             pass
 
+    def test_manual_interleaved_reasoning_tool_turn_is_coalesced(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "short thought"}],
+                    "content": [
+                        {
+                            "type": "reasoning_text",
+                            "text": "full private reasoning",
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": '{"query":"weather"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "sunny",
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "What next?"}],
+                },
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages(request)
+
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "assistant",
+                    "reasoning_content": "full private reasoning",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"query":"weather"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "What next?"}],
+                },
+            ],
+        )
+
+    def test_previous_response_replays_interleaved_reasoning_and_tool_call(self):
+        serving = make_serving()
+        prev_response = Mock(id="resp_prev")
+        prev_response.output = [
+            ResponseReasoningItem(
+                id="rs_prev",
+                type="reasoning",
+                summary=[{"type": "summary_text", "text": "abbreviated reasoning"}],
+                content=[
+                    {
+                        "type": "reasoning_text",
+                        "text": "complete reasoning trace",
+                    }
+                ],
+                status="completed",
+            ),
+            ResponseOutputMessage(
+                id="msg_prev",
+                content=[
+                    ResponseOutputText(
+                        text="I will check.",
+                        annotations=[],
+                        type="output_text",
+                        logprobs=None,
+                    )
+                ],
+                role="assistant",
+                status="completed",
+                type="message",
+            ),
+            ResponseFunctionToolCall(
+                arguments='{"query":"weather"}',
+                call_id="call_prev",
+                name="lookup",
+                type="function_call",
+                id="fc_prev",
+                status="completed",
+            ),
+        ]
+        serving.msg_store["resp_prev"] = [
+            {"role": "user", "content": "What is the weather?"}
+        ]
+        request = ResponsesRequest(
+            model="x",
+            previous_response_id="resp_prev",
+            input=[
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_prev",
+                    "output": "sunny",
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Should I go out?"}],
+                },
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages(request, prev_response)
+
+        self.assertEqual(
+            messages,
+            [
+                {"role": "user", "content": "What is the weather?"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "complete reasoning trace",
+                    "content": "I will check.",
+                    "tool_calls": [
+                        {
+                            "id": "call_prev",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"query":"weather"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_prev",
+                    "content": "sunny",
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Should I go out?"}],
+                },
+            ],
+        )
+
 
 class ChatToolForwardingTestCase(unittest.TestCase):
     def test_make_request_passes_function_tools_to_chat_processing(self):
@@ -213,6 +368,38 @@ class ChatToolForwardingTestCase(unittest.TestCase):
 
 
 class InputItemNormalizationTestCase(unittest.TestCase):
+    def test_reasoning_prefers_full_content_over_summary(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "short"}],
+                "content": [
+                    {"type": "reasoning_text", "text": "first full step"},
+                    {"type": "reasoning_text", "text": "second full step"},
+                ],
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "assistant",
+                "reasoning_content": "first full step\nsecond full step",
+            },
+        )
+
+    def test_reasoning_uses_summary_when_full_content_is_absent(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "summary only"}],
+                "content": [],
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {"role": "assistant", "reasoning_content": "summary only"},
+        )
+
     def test_function_call_becomes_assistant_tool_call(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {

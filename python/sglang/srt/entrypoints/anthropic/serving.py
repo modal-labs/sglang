@@ -52,6 +52,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.entrypoints.sse_keepalive import stream_sse_with_keepalives
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.template_detection import detect_inline_system_support
 
@@ -357,14 +358,16 @@ class AnthropicServing:
         def _convert_assistant_thinking_blocks(
             blocks: list[AnthropicContentBlock],
         ) -> Optional[str]:
-            """Re-wrap prior-turn thinking blocks in the parser's own tokens.
+            """Render prior-turn thinking for the active chat encoder.
 
             ``redacted_thinking`` carries encrypted bytes that no local
-            parser can interpret, so we raise rather than silently drop it.
-            On non-reasoning models (no detector configured) the rewrap is
-            best-effort: we log a warning and drop the thinking text so a
-            history echo doesn't 400 the whole request — the prior thinking
-            is opaque context the model didn't need anyway.
+            model can interpret, so we raise rather than silently drop it.
+
+            Kimi K3 consumes the returned text through its native structured
+            ``reasoning_content`` field. Other chat templates still need the
+            reasoning parser's own delimiters in visible assistant content;
+            changing that globally would silently drop history for templates
+            that do not consume ``reasoning_content``.
             """
             if any(block.type == "redacted_thinking" for block in blocks):
                 raise ValueError("Anthropic redacted_thinking history is not supported")
@@ -377,10 +380,19 @@ class AnthropicServing:
             if not thinking_parts:
                 return None
 
-            try:
-                return self.openai_serving_chat.wrap_reasoning_history(
-                    "\n".join(thinking_parts)
+            reasoning_text = "\n".join(thinking_parts)
+            if (
+                getattr(
+                    self.openai_serving_chat,
+                    "chat_encoding_spec",
+                    None,
                 )
+                == "kimi_k3"
+            ):
+                return reasoning_text
+
+            try:
+                return self.openai_serving_chat.wrap_reasoning_history(reasoning_text)
             except ValueError as e:
                 logger.warning(
                     "Dropping prior-turn thinking history (%d blocks): %s",
@@ -444,12 +456,24 @@ class AnthropicServing:
             if msg.role == "assistant":
                 reasoning_history = _convert_assistant_thinking_blocks(msg.content)
                 if reasoning_history is not None:
-                    content_parts.append({"type": "text", "text": reasoning_history})
+                    if (
+                        getattr(
+                            self.openai_serving_chat,
+                            "chat_encoding_spec",
+                            None,
+                        )
+                        == "kimi_k3"
+                    ):
+                        openai_msg["reasoning_content"] = reasoning_history
+                    else:
+                        content_parts.append(
+                            {"type": "text", "text": reasoning_history}
+                        )
 
             for block in msg.content:
-                # ``thinking``/``redacted_thinking`` blocks are surfaced via
-                # the reasoning-history reconstruction above; skip them here
-                # to avoid double-injecting their text into the prompt.
+                # Thinking was rendered once above, either structurally for
+                # Kimi K3 or with the active parser's delimiters for another
+                # reasoning template.
                 if block.type in ("thinking", "redacted_thinking"):
                     continue
 
@@ -798,11 +822,13 @@ class AnthropicServing:
             )
 
         return StreamingResponse(
-            self._generate_anthropic_stream(
-                adapted_request,
-                processed_request,
-                anthropic_request,
-                raw_request,
+            stream_sse_with_keepalives(
+                self._generate_anthropic_stream(
+                    adapted_request,
+                    processed_request,
+                    anthropic_request,
+                    raw_request,
+                )
             ),
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
@@ -1044,8 +1070,7 @@ class AnthropicServing:
                 effective_finish = finish_reason or "stop"
                 if effective_finish not in STOP_REASON_MAP:
                     logger.warning(
-                        "Unmapped streaming finish_reason %r; defaulting "
-                        "to end_turn",
+                        "Unmapped streaming finish_reason %r; defaulting to end_turn",
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
