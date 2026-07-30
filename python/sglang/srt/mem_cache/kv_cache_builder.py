@@ -70,6 +70,33 @@ def get_draft_kv_pool(
     return draft_runner.token_to_kv_pool
 
 
+def get_hicache_draft_kv_pool(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+    enable_hierarchical_cache: bool,
+):
+    """Return the concrete draft pool that will receive a mirrored L2 cache."""
+    if (
+        not enable_hierarchical_cache
+        or getattr(draft_worker, "use_draft_ring", False)
+    ):
+        return None
+
+    pool = get_draft_kv_pool(
+        draft_worker=draft_worker,
+        spec_algorithm=spec_algorithm,
+        server_args=server_args,
+    )
+    if pool is None:
+        return None
+
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache: BasePrefixCache,
@@ -89,29 +116,35 @@ def maybe_register_hicache_draft(
         logger.info("HiCache draft KV mirroring disabled for the DFlash ring")
         return
 
-    draft_kv_pool = get_draft_kv_pool(
+    pool = get_hicache_draft_kv_pool(
         draft_worker=draft_worker,
         spec_algorithm=spec_algorithm,
         server_args=server_args,
+        enable_hierarchical_cache=enable_hierarchical_cache,
     )
-    if draft_kv_pool is None:
+    if pool is None:
         return
 
     from sglang.srt.mem_cache.memory_pool import (
-        HybridLinearKVPool,
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-    pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
-        pool = pool.full_kv_pool
-
     # Create host pool for draft with the same slot count as the target host pool,
     # so that host indices stay 1-to-1 between target and draft KV caches.
     primary = tree_cache.cache_controller.mem_pool_host
+    if tree_cache.cache_controller.mla_broadcast_enabled:
+        from sglang.srt.mem_cache.mla_host_dedup import (
+            enforce_dedup_draft_host_budget,
+        )
+
+        enforce_dedup_draft_host_budget(
+            tree_cache.cache_controller,
+            pool,
+            page_size=page_size,
+        )
     kw = dict(
         host_to_device_ratio=primary.size / pool.size,
         host_size=0,
@@ -149,6 +182,7 @@ def build_kv_cache(
     tp_group: GroupCoordinator,
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
+    hicache_draft_kv_pool=None,
 ) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -214,6 +248,7 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        hicache_draft_kv_pool=hicache_draft_kv_pool,
         # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
         # TreeCache.page_size should keep the same as allocator.page_size to
         # avoid kv page eviction conflicts.

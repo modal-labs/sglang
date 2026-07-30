@@ -146,6 +146,8 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    hicache_host_pool_used_slots: Dict[str, int] = field(default_factory=dict)
+    hicache_host_pool_total_slots: Dict[str, int] = field(default_factory=dict)
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -639,6 +641,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
                 labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_pool_used_slots = Gauge(
+                name="sglang:hicache_host_pool_used_slots",
+                documentation=(
+                    "Number of occupied host-cache slots, partitioned by "
+                    "physical pool (for example kv, mamba, or draft)."
+                ),
+                labelnames=[*labels.keys(), "pool"],
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_pool_total_slots = Gauge(
+                name="sglang:hicache_host_pool_total_slots",
+                documentation=(
+                    "Total host-cache slot capacity, partitioned by physical "
+                    "pool (for example kv, mamba, or draft)."
+                ),
+                labelnames=[*labels.keys(), "pool"],
                 multiprocess_mode="mostrecent",
             )
 
@@ -1352,6 +1372,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            for pool, value in stats.hicache_host_pool_used_slots.items():
+                self.hicache_host_pool_used_slots.labels(
+                    **self.labels, pool=pool
+                ).set(value)
+            for pool, value in stats.hicache_host_pool_total_slots.items():
+                self.hicache_host_pool_total_slots.labels(
+                    **self.labels, pool=pool
+                ).set(value)
 
         # Streaming session metrics
         if self.enable_streaming_session:

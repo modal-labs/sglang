@@ -173,6 +173,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.staging_token_capacity = 0
         self.staging_buffer = None
         self.kv_buffer = None
+        self.fd = None
         self.data_refs = None
         self.data_ptrs = None
 

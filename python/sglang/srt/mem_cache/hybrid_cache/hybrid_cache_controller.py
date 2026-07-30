@@ -254,17 +254,15 @@ class HybridCacheController(BaseHiCacheController):
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
-            # The broadcast indexes the MLA KV buffer by layer_num; an
-            # expanded transfer layer count (e.g. +Mamba state) would index
-            # out of bounds and the extra pools aren't deduped — disable.
-            if self.mla_broadcast_enabled:
-                logger.info(
-                    "Disabling MLA host-dedup broadcast: transfer layer count "
-                    "(%d) exceeds the MLA KV layers, so extra hybrid pools "
-                    "(e.g. Mamba) are not deduplicated.",
-                    self.layer_num,
+        if self.mla_broadcast_enabled:
+            mamba_entry = getattr(mem_pool_host, "entry_map", {}).get(PoolName.MAMBA)
+            if mamba_entry is not None and getattr(
+                mamba_entry.host_pool, "_is_dummy", False
+            ):
+                raise AssertionError(
+                    "Mamba/KDA HiCache state must remain rank-local when target "
+                    "MLA host memory is deduplicated."
                 )
-                self._destroy_mla_broadcast_group()
 
         if startup_storage_backend is not None:
             self.attach_storage_backend(
@@ -287,6 +285,13 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if self.mla_broadcast_enabled and PoolName.MAMBA in getattr(
+            self.mem_pool_host, "entry_map", {}
+        ):
+            raise RuntimeError(
+                "Hybrid MLA+Mamba host dedup currently supports L2 only. "
+                "Rank-local Mamba/KDA L3 storage keys are not implemented."
+            )
         super().attach_storage_backend(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -507,7 +512,16 @@ class HybridCacheController(BaseHiCacheController):
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
-        if self._mla_skip_host_io and not self.has_draft:
+        rank_local_pool_names = {PoolName.MAMBA}
+        has_rank_local_transfers = any(
+            transfer.name in rank_local_pool_names
+            for transfer in op.pool_transfers or []
+        )
+        if (
+            self._mla_skip_host_io
+            and not self.has_draft
+            and not has_rank_local_transfers
+        ):
             # MLA/DSA dedup: dummy target host pools on this rank; skip D2H.
             start_event.record()
             finish_event.record()
@@ -548,6 +562,14 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices,
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
+                )
+            elif has_rank_local_transfers:
+                # Kimi's Mamba/KDA state is rank-sharded and therefore must
+                # still be backed up into a real per-rank host pool.
+                self.mem_pool_host.backup_extra_from_device_all_layer(
+                    self.io_backend,
+                    pool_transfers=resolved_pool_transfers,
+                    pool_names=rank_local_pool_names,
                 )
             if self.has_draft and host_indices.numel() > 0:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
@@ -735,6 +757,64 @@ class HybridCacheController(BaseHiCacheController):
             device_indices,
             resolved_pool_transfers,
         )
+
+    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+        # Hybrid transfer ids are global model-layer ids. Only target MLA
+        # layers have an anchor mapping; Mamba/KDA layers are rank-local and
+        # deliberately do not participate in the target broadcast.
+        anchor = getattr(self.mem_pool_host, "anchor_entry", None)
+        if anchor is None:
+            return transfer_layer_id
+        return anchor.layer_mapper(transfer_layer_id)
+
+    def _prepare_mla_rank_local_load(
+        self, op: CacheOperation
+    ) -> Optional[list[PoolTransfer]]:
+        # Source already loads all pools through _load_mla_source_layer().
+        if self.mla_broadcaster.is_src:
+            return None
+        resolved = []
+        for transfer in op.pool_transfers or []:
+            if transfer.name != PoolName.MAMBA:
+                continue
+            host_indices, device_indices = self.move_indices(
+                transfer.host_indices, transfer.device_indices
+            )
+            resolved.append(
+                PoolTransfer(
+                    name=transfer.name,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    keys=transfer.keys,
+                    hit_policy=transfer.hit_policy,
+                    indices_from_pool=transfer.indices_from_pool,
+                )
+            )
+        return resolved or None
+
+    def _load_mla_rank_local_layer(
+        self, state: Optional[list[PoolTransfer]], layer_id: int
+    ) -> None:
+        if not state:
+            return
+        self.mem_pool_host.load_extra_to_device_per_layer(
+            layer_id,
+            self.io_backend,
+            pool_transfers=state,
+            pool_names={PoolName.MAMBA},
+        )
+
+    def _record_mla_rank_local_load(
+        self, state: Optional[list[PoolTransfer]]
+    ) -> None:
+        for transfer in state or []:
+            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
+                transfer.host_indices.record_stream(self.load_stream)
+            if (
+                transfer.device_indices is not None
+                and transfer.device_indices.is_cuda
+            ):
+                transfer.device_indices.record_stream(self.load_stream)
 
     def _record_transfer_indices_on_stream(
         self,

@@ -2660,6 +2660,13 @@ class ServerArgs:
         "The ratio of the size of host KV cache memory pool to the size of device pool.",
         NS("memory"),
     ] = 2.0
+    hicache_mamba_ratio: A[
+        Optional[float],
+        "Optional host/device ratio for rank-local Mamba/KDA state. "
+        "Defaults to --hicache-ratio and is never overridden by "
+        "--hicache-size.",
+        NS("memory"),
+    ] = None
     hicache_size: A[
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
@@ -7086,6 +7093,26 @@ class ServerArgs:
                 "--enable-mla-hicache-host-dedup cannot be used with "
                 "--enable-dsa-cache-layer-split."
             )
+        if self.enable_mla_hicache_host_dedup:
+            if not self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--enable-mla-hicache-host-dedup requires "
+                    "--enable-hierarchical-cache."
+                )
+            if self.dcp_size > 1:
+                raise ValueError(
+                    "--enable-mla-hicache-host-dedup requires --dcp-size=1: "
+                    "DCP shards target MLA KV across ranks, while host dedup "
+                    "requires replicated target KV."
+                )
+            if self.hicache_storage_backend not in (None, "", "file"):
+                raise ValueError(
+                    "--enable-mla-hicache-host-dedup only supports L2-only "
+                    "HiCache or --hicache-storage-backend=file; got "
+                    f"{self.hicache_storage_backend!r}."
+                )
+        if self.hicache_mamba_ratio is not None and self.hicache_mamba_ratio <= 0:
+            raise ValueError("--hicache-mamba-ratio must be positive.")
 
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (

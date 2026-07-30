@@ -976,6 +976,7 @@ class HiCacheController:
             source_state = None
             if self.mla_broadcaster.is_src:
                 source_state = self._prepare_mla_source_load(op)
+            rank_local_state = self._prepare_mla_rank_local_load(op)
             draft_state = self._prepare_draft_load(op)
 
             for i in range(self.layer_num):
@@ -984,18 +985,30 @@ class HiCacheController:
                     self._load_mla_source_layer(source_state, i)
                     self._finish_mla_trace_phase(trace, "h2d", h2d_start)
 
+                rank_local_start = self._mla_trace_event(trace)
+                self._load_mla_rank_local_layer(rank_local_state, i)
+                self._finish_mla_trace_phase(
+                    trace, "rank_local_h2d", rank_local_start
+                )
+
                 # H2D, staging gather, NCCL broadcast, and receiver scatter are
                 # all enqueued on load_stream.  Recording the layer event below
                 # therefore makes this layer visible to the forward stream while
                 # later layers continue loading.
-                broadcast_start = self._mla_trace_event(trace)
-                if trace is None:
-                    self.mla_broadcaster.broadcast_loaded_layer(i, broadcast_plan)
-                else:
-                    self.mla_broadcaster.broadcast_loaded_layer(
-                        i, broadcast_plan, trace=trace
+                broadcast_layer_id = self._mla_broadcast_layer_id(i)
+                if broadcast_layer_id is not None:
+                    broadcast_start = self._mla_trace_event(trace)
+                    if trace is None:
+                        self.mla_broadcaster.broadcast_loaded_layer(
+                            broadcast_layer_id, broadcast_plan
+                        )
+                    else:
+                        self.mla_broadcaster.broadcast_loaded_layer(
+                            broadcast_layer_id, broadcast_plan, trace=trace
+                        )
+                    self._finish_mla_trace_phase(
+                        trace, "broadcast_total", broadcast_start
                     )
-                self._finish_mla_trace_phase(trace, "broadcast_total", broadcast_start)
                 if draft_state is not None:
                     draft_start = self._mla_trace_event(trace)
                     self._load_draft_layer(draft_state, i)
@@ -1019,6 +1032,7 @@ class HiCacheController:
 
             if source_state is not None:
                 self._record_mla_source_load(source_state)
+            self._record_mla_rank_local_load(rank_local_state)
             self._record_draft_load(draft_state)
             ack_finish_event.record()
             if trace is not None:
@@ -1037,6 +1051,20 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+        """Map a transfer-layer id to the target MLA layer to broadcast."""
+        return transfer_layer_id
+
+    def _prepare_mla_rank_local_load(self, op: CacheOperation):
+        """Prepare non-deduplicated sidecar state on every rank."""
+        return None
+
+    def _load_mla_rank_local_layer(self, state, layer_id: int) -> None:
+        pass
+
+    def _record_mla_rank_local_load(self, state) -> None:
+        pass
 
     def _begin_mla_trace(self, op: CacheOperation):
         """Create a bounded, asynchronous CUDA-event trace for MLA dedup."""

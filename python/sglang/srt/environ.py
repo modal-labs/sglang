@@ -485,6 +485,10 @@ class Envs:
     # corrupts the CUDA context. Set larger than the total host pool to fall
     # back to a single call.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Aggregate physical host-memory cap for one TP cache group. This is
+    # intentionally below 1 TiB: per-process availability checks race when
+    # eight TP ranks allocate replicated sidecars concurrently.
+    SGLANG_HICACHE_HOST_BUDGET_GIB = EnvInt(800)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)

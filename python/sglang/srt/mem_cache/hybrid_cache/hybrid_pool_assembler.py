@@ -23,7 +23,12 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupPrebuild,
+    enforce_hicache_host_budget,
+    estimate_draft_host_pool_bytes,
+    estimate_mamba_host_pool_bytes,
+    estimate_mla_host_pool_bytes,
     is_mla_dedup_dummy_rank,
+    mla_dedup_rank_and_size,
     maybe_prebuild_mla_host_dedup,
 )
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
@@ -49,6 +54,11 @@ logger = logging.getLogger(__name__)
 
 def _get_allocator_type(server_args: ServerArgs) -> str:
     return get_allocator_type(server_args)
+
+
+def _get_mamba_ratio(server_args: ServerArgs) -> float:
+    ratio = server_args.hicache_mamba_ratio
+    return server_args.hicache_ratio if ratio is None else ratio
 
 
 def _make_layer_mapper(
@@ -551,16 +561,87 @@ def build_hybrid_mamba_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
+
+    mla_is_dummy = False
+    mla_dedup_prebuild = None
+    if server_args.enable_mla_hicache_host_dedup:
+        if not use_mla:
+            raise ValueError(
+                "--enable-mla-hicache-host-dedup requires the hybrid target "
+                "attention pool to use MLA."
+            )
+        if storage_backend not in (None, ""):
+            raise ValueError(
+                "Hybrid MLA+Mamba host dedup currently supports L2 only; "
+                "rank-local Mamba/KDA L3 keys are not implemented."
+            )
+
+        # Compute the whole TP-group physical plan before any rank starts a
+        # host allocation. Target MLA has one owner; Mamba/KDA and any
+        # mirrored speculative draft are rank-local.
+        target_bytes, target_tokens = estimate_mla_host_pool_bytes(
+            kv_pool,
+            host_to_device_ratio=server_args.hicache_ratio,
+            host_size_gb=server_args.hicache_size,
+            page_size=params.page_size,
+        )
+        mamba_ratio = _get_mamba_ratio(server_args)
+        mamba_bytes, mamba_tokens = estimate_mamba_host_pool_bytes(
+            mamba_pool,
+            host_to_device_ratio=mamba_ratio,
+            host_size_gb=0,
+        )
+        _, attn_tp_size = mla_dedup_rank_and_size()
+        rank_local_bytes = {"mamba": mamba_bytes}
+        draft_tokens = 0
+        if params.hicache_draft_kv_pool is not None:
+            draft_bytes, draft_tokens = estimate_draft_host_pool_bytes(
+                params.hicache_draft_kv_pool,
+                host_tokens=target_tokens,
+                page_size=params.page_size,
+            )
+            rank_local_bytes["draft"] = draft_bytes
+
+        # Preallocated allocator tensors: target/draft mem_state(uint8) +
+        # free_slots(int64) + slot_used(bool); Mamba mem_state + free_slots.
+        # Target allocator state exists on every rank (dummy or physical).
+        allocator_metadata_bytes = (
+            target_tokens * 10 + mamba_tokens * 9 + draft_tokens * 10
+        )
+        rank_local_bytes["allocator_metadata"] = allocator_metadata_bytes
+        enforce_hicache_host_budget(
+            target_bytes=target_bytes,
+            rank_local_bytes=rank_local_bytes,
+            tp_size=attn_tp_size,
+            context=(
+                f"hybrid MLA+Mamba L2 "
+                f"(target_tokens={target_tokens}, mamba_slots={mamba_tokens}, "
+                f"draft_tokens={draft_tokens})"
+            ),
+        )
+
+        # Rendezvous before rank 0 begins the much larger physical MLA alloc.
+        mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
+            kv_pool,
+            params.tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            storage_backend,
+            True,
+        )
+        mla_is_dummy = is_mla_dedup_dummy_rank(kv_pool, storage_backend, True)
+
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         server_args=server_args,
         use_mla=use_mla,
+        is_dummy=mla_is_dummy,
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        server_args.hicache_ratio,
-        server_args.hicache_size,
+        _get_mamba_ratio(server_args),
+        0,
         allocator_type=_get_allocator_type(server_args),
         layout=server_args.hicache_mem_layout,
     )
@@ -603,6 +684,8 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        mla_dedup_prebuild=mla_dedup_prebuild,
+        enable_mla_hicache_host_dedup=server_args.enable_mla_hicache_host_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -652,8 +735,8 @@ def build_hybrid_mamba_swa_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        server_args.hicache_ratio,
-        server_args.hicache_size,
+        _get_mamba_ratio(server_args),
+        0,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
     )

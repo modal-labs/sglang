@@ -1258,6 +1258,10 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.detach_storage_backend()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+        try:
+            self.cache_controller._destroy_mla_broadcast_group()
+        except Exception:
+            logger.exception("Failed to destroy MLA broadcast group.")
 
     def _apply_storage_runtime_config(
         self,

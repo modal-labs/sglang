@@ -1251,6 +1251,7 @@ class TestHiCacheArgs(unittest.TestCase):
 
     def test_mla_host_dedup_rejects_dsa_cache_layer_split(self):
         args = self._make_args(
+            enable_hierarchical_cache=True,
             enable_mla_hicache_host_dedup=True,
             enable_dsa_cache_layer_split=True,
         )
@@ -1260,6 +1261,42 @@ class TestHiCacheArgs(unittest.TestCase):
             "--enable-mla-hicache-host-dedup cannot be used with "
             "--enable-dsa-cache-layer-split",
         ):
+            args._handle_hicache()
+
+    def test_mla_host_dedup_requires_hicache(self):
+        args = self._make_args(enable_mla_hicache_host_dedup=True)
+        with self.assertRaisesRegex(ValueError, "requires --enable-hierarchical-cache"):
+            args._handle_hicache()
+
+    def test_mla_host_dedup_rejects_dcp(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            dcp_size=8,
+        )
+        with self.assertRaisesRegex(ValueError, "requires --dcp-size=1"):
+            args._handle_hicache()
+
+    def test_mla_host_dedup_rejects_registered_storage(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            hicache_storage_backend="mooncake",
+        )
+        with self.assertRaisesRegex(ValueError, "only supports L2-only"):
+            args._handle_hicache()
+
+    def test_hicache_mamba_ratio_is_optional_and_positive(self):
+        self.assertIsNone(self._make_args().hicache_mamba_ratio)
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_mamba_ratio=1.8,
+        )
+        args._handle_hicache()
+        self.assertEqual(args.hicache_mamba_ratio, 1.8)
+
+        args.hicache_mamba_ratio = 0
+        with self.assertRaisesRegex(ValueError, "must be positive"):
             args._handle_hicache()
 
 

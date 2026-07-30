@@ -12,8 +12,12 @@ from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheO
 from sglang.srt.managers.cache_controller import (
     HiCacheController,
 )
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    SchedulerMetricsReporter,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
@@ -27,9 +31,13 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     PoolEntry,
 )
-from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupBroadcaster
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupBroadcaster,
+    enforce_hicache_host_budget,
+)
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.observability.metrics_collector import SchedulerStats
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -1280,6 +1288,282 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             op.host_indices,
             op.device_indices,
             pool_transfers,
+        )
+
+    def test_hybrid_mla_dedup_peer_broadcasts_only_target_and_loads_mamba(self):
+        operations = []
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+            node_id=1,
+            pool_transfers=[transfer],
+        )
+
+        class FakeHostGroup:
+            anchor_entry = SimpleNamespace(
+                layer_mapper=lambda global_id: {1: 0, 3: 1}.get(global_id)
+            )
+
+            def load_extra_to_device_per_layer(
+                self, layer_id, io_backend, pool_transfers=None, pool_names=None
+            ):
+                if layer_id in {0, 2}:
+                    operations.append(("mamba", layer_id))
+
+        class FakeProducerEvent:
+            start_event = _FakeEvent()
+            finish_event = _FakeEvent()
+
+            def complete(self, layer_index):
+                operations.append(("complete", layer_index))
+
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeHostGroup()
+        controller.mem_pool_device = object()
+        controller.has_draft = False
+        controller.layer_num = 4
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[FakeProducerEvent()]
+        )
+        controller.mla_broadcaster = SimpleNamespace(
+            is_src=False,
+            prepare_broadcast=lambda device_indices, stream: (device_indices, None),
+            broadcast_loaded_layer=lambda layer_id, prepared: operations.append(
+                ("broadcast", layer_id)
+            ),
+        )
+        controller.load_stream = object()
+        controller.ack_load_queue = []
+        controller.move_indices = mock.Mock(
+            side_effect=lambda host_indices, device_indices: (
+                host_indices,
+                device_indices,
+            )
+        )
+
+        with (
+            mock.patch.object(
+                hybrid_cache_controller, "device_module", _FakeDeviceModule
+            ),
+            mock.patch.object(
+                manager_cache_controller, "device_module", _FakeDeviceModule
+            ),
+        ):
+            controller.start_loading()
+
+        self.assertEqual(
+            operations,
+            [
+                ("mamba", 0),
+                ("complete", 0),
+                ("broadcast", 0),
+                ("complete", 1),
+                ("mamba", 2),
+                ("complete", 2),
+                ("broadcast", 1),
+                ("complete", 3),
+            ],
+        )
+
+    def test_hybrid_mla_dedup_peer_still_writes_rank_local_mamba(self):
+        writes = []
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+            node_id=1,
+            pool_transfers=[transfer],
+        )
+
+        class FakeHostGroup:
+            layout = "page_first"
+            can_use_write_back_jit = False
+
+            def backup_from_device_all_layer(self, *args, **kwargs):
+                raise AssertionError("peer must not write target MLA")
+
+            def backup_extra_from_device_all_layer(
+                self, io_backend, pool_transfers=None, pool_names=None
+            ):
+                writes.append((io_backend, pool_transfers, pool_names))
+
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeHostGroup()
+        controller.mem_pool_device = object()
+        controller.has_draft = False
+        controller.mla_broadcaster = SimpleNamespace(is_src=False)
+        controller.write_stream = object()
+        controller.ack_write_queue = []
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, [transfer])
+        )
+        controller._record_transfer_indices_on_stream = lambda *args: None
+
+        with mock.patch.object(
+            hybrid_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_writing()
+
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][1], [transfer])
+        self.assertEqual(writes[0][2], {PoolName.MAMBA})
+
+    def test_mla_dedup_aggregate_host_budget_is_fail_closed(self):
+        budget = mock.Mock(get=mock.Mock(return_value=1))
+        with mock.patch(
+            "sglang.srt.environ.envs.SGLANG_HICACHE_HOST_BUDGET_GIB", budget
+        ):
+            with self.assertRaisesRegex(ValueError, "requires 1.12 GiB"):
+                enforce_hicache_host_budget(
+                    target_bytes=600_000_000,
+                    rank_local_bytes={"mamba": 300_000_000},
+                    tp_size=2,
+                    context="unit-test",
+                )
+
+        budget.get.return_value = 2
+        with mock.patch(
+            "sglang.srt.environ.envs.SGLANG_HICACHE_HOST_BUDGET_GIB", budget
+        ):
+            self.assertEqual(
+                enforce_hicache_host_budget(
+                    target_bytes=600_000_000,
+                    rank_local_bytes={"mamba": 300_000_000},
+                    tp_size=2,
+                    context="unit-test",
+                ),
+                1_200_000_000,
+            )
+
+    def test_hybrid_mla_dedup_preflight_includes_draft_before_host_alloc(self):
+        params = SimpleNamespace(
+            page_size=64,
+            hicache_draft_kv_pool=mock.sentinel.draft_pool,
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            req_to_token_pool=SimpleNamespace(mamba_allocator=object()),
+        )
+        server_args = SimpleNamespace(
+            enable_mla_hicache_host_dedup=True,
+            hicache_ratio=3.0,
+            hicache_size=230,
+            hicache_mamba_ratio=6.75,
+        )
+
+        with (
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "estimate_mla_host_pool_bytes",
+                return_value=(100, 10),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "estimate_mamba_host_pool_bytes",
+                return_value=(20, 2),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "estimate_draft_host_pool_bytes",
+                return_value=(30, 10),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "mla_dedup_rank_and_size",
+                return_value=(0, 8),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "enforce_hicache_host_budget"
+            ) as enforce,
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "maybe_prebuild_mla_host_dedup",
+                side_effect=RuntimeError("stop before allocation"),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "build_kv_host_pool"
+            ) as build_host_pool,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop before allocation"):
+                hybrid_pool_assembler.build_hybrid_mamba_stack(
+                    params=params,
+                    server_args=server_args,
+                    kv_pool=mock.sentinel.kv_pool,
+                    mamba_pool=mock.sentinel.mamba_pool,
+                    full_layer_mapping={0: 0},
+                    mamba_layer_mapping={1: 0},
+                    load_cache_event=None,
+                    storage_backend=None,
+                    use_mla=True,
+                )
+
+        enforce.assert_called_once_with(
+            target_bytes=100,
+            rank_local_bytes={
+                "mamba": 20,
+                "draft": 30,
+                "allocator_metadata": 218,
+            },
+            tp_size=8,
+            context=(
+                "hybrid MLA+Mamba L2 "
+                "(target_tokens=10, mamba_slots=2, draft_tokens=10)"
+            ),
+        )
+        build_host_pool.assert_not_called()
+
+    def test_hicache_metrics_use_stable_per_pool_labels(self):
+        class FakePool:
+            def __init__(self, total, available):
+                self.size = total
+                self.logical_size = total
+                self._available = available
+
+            def available_size(self):
+                return self._available
+
+        kv = FakePool(100, 60)
+        mamba = FakePool(8, 3)
+        draft = FakePool(100, 75)
+        group = SimpleNamespace(
+            entries=[
+                SimpleNamespace(name=PoolName.KV, host_pool=kv),
+                SimpleNamespace(name=PoolName.MAMBA, host_pool=mamba),
+            ]
+        )
+        tree_cache = SimpleNamespace(
+            token_to_kv_pool_host=kv,
+            host_pool_group=group,
+            cache_controller=SimpleNamespace(mem_pool_host_draft=draft),
+        )
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=True, tree_cache=tree_cache
+        )
+        reporter.stats = SchedulerStats()
+
+        reporter._log_hicache_stats()
+
+        self.assertEqual(
+            reporter.stats.hicache_host_pool_total_slots,
+            {"kv": 100, "mamba": 8, "draft": 100},
+        )
+        self.assertEqual(
+            reporter.stats.hicache_host_pool_used_slots,
+            {"kv": 40, "mamba": 5, "draft": 25},
         )
 
 

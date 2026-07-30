@@ -1617,7 +1617,21 @@ class HostPoolGroup:
             )
 
         # 2. Extra pool transfers
+        self.load_extra_to_device_per_layer(
+            layer_id, io_backend, pool_transfers=pool_transfers
+        )
+
+    def load_extra_to_device_per_layer(
+        self,
+        layer_id,
+        io_backend,
+        pool_transfers: Optional[list] = None,
+        pool_names: Optional[set[PoolName]] = None,
+    ) -> None:
+        """Load selected non-anchor pools for one global transfer layer."""
         for transfer in pool_transfers or []:
+            if pool_names is not None and transfer.name not in pool_names:
+                continue
             entry = self.entry_map.get(transfer.name)
             if entry is None or transfer.host_indices is None:
                 continue
@@ -1648,7 +1662,20 @@ class HostPoolGroup:
             io_backend,
         )
         # 2. Extra pool backup
+        self.backup_extra_from_device_all_layer(
+            io_backend, pool_transfers=pool_transfers
+        )
+
+    def backup_extra_from_device_all_layer(
+        self,
+        io_backend,
+        pool_transfers: Optional[list] = None,
+        pool_names: Optional[set[PoolName]] = None,
+    ) -> None:
+        """Back up selected non-anchor pools without touching the anchor."""
         for transfer in pool_transfers or []:
+            if pool_names is not None and transfer.name not in pool_names:
+                continue
             entry = self.entry_map.get(transfer.name)
             if entry is None or transfer.host_indices is None:
                 continue
@@ -1677,6 +1704,9 @@ class DSAIndexerPoolHost(HostKVCache):
     ):
         self._is_dummy = is_dummy
         self.device_pool = device_pool
+        self.dcp_size = anchor_host.dcp_size
+        self.dcp_rank = anchor_host.dcp_rank
+        self.logical_page_size = anchor_host.logical_page_size
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -1695,6 +1725,7 @@ class DSAIndexerPoolHost(HostKVCache):
             + self.index_head_dim // self.indexer_quant_block_size * 4
         )
         self.size = anchor_host.size
+        self.logical_size = anchor_host.logical_size
         self.page_num = anchor_host.page_num
 
         self.indexer_page_stride_size = (

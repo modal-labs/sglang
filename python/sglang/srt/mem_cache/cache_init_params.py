@@ -20,6 +20,10 @@ class CacheInitParams:
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    # Device pool for a speculative draft whose L2 cache will mirror target
+    # host indices. Passed early so aggregate host-memory validation can run
+    # before any large target/Mamba host allocation.
+    hicache_draft_kv_pool: Optional[object] = None
 
     is_eagle: bool = False
     tp_cache_group: Optional[torch.distributed.ProcessGroup] = None

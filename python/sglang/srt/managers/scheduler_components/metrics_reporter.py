@@ -1017,6 +1017,36 @@ class SchedulerMetricsReporter:
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
 
+        # Hybrid caches have independently-sized physical pools. The legacy
+        # aggregate metrics above intentionally retain their anchor-token
+        # semantics; these labeled gauges expose each pool's real occupancy so
+        # operators can verify that a small Mamba pool is not the binding tier.
+        pool_used: dict[str, int] = {}
+        pool_total: dict[str, int] = {}
+        host_pool_group = getattr(self.scheduler.tree_cache, "host_pool_group", None)
+        if host_pool_group is not None:
+            for entry in host_pool_group.entries:
+                pool = entry.host_pool
+                name = getattr(entry.name, "value", str(entry.name))
+                total = getattr(pool, "logical_size", pool.size)
+                pool_total[name] = total
+                pool_used[name] = total - pool.available_size()
+        else:
+            pool_total["kv"] = host_total
+            pool_used["kv"] = self.stats.hicache_host_used_tokens
+
+        cache_controller = getattr(
+            self.scheduler.tree_cache, "cache_controller", None
+        )
+        draft_pool = getattr(cache_controller, "mem_pool_host_draft", None)
+        if draft_pool is not None:
+            draft_total = getattr(draft_pool, "logical_size", draft_pool.size)
+            pool_total["draft"] = draft_total
+            pool_used["draft"] = draft_total - draft_pool.available_size()
+
+        self.stats.hicache_host_pool_used_slots = pool_used
+        self.stats.hicache_host_pool_total_slots = pool_total
+
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
         if not self.scheduler.enable_lora:
