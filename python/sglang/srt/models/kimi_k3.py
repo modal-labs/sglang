@@ -3524,20 +3524,42 @@ class KimiK3LinearForCausalLM(nn.Module):
         # All TP ranks use identical KDA geometry on identical GPUs and share
         # Triton's on-disk cache. Let one rank benchmark, then have the other
         # ranks invoke the same direct kernel path and load the persisted
-        # winners. The second barrier makes completion a strict pre-ready
-        # invariant on every rank.
+        # winners. Broadcast failures before the peer load so an autotune
+        # exception cannot strand the other ranks at a barrier until timeout.
         parallel = get_parallel()
         tp_group = get_tp_group()
         tic = time.perf_counter()
         benchmarked = None
+        rank_zero_error = None
         if parallel.tp_rank == 0:
-            benchmarked = precompile_k3_triton_prefill_kernels(**kwargs)
+            try:
+                benchmarked = precompile_k3_triton_prefill_kernels(**kwargs)
+            except Exception as exc:
+                rank_zero_error = f"{type(exc).__name__}: {exc}"
         if parallel.tp_size > 1:
-            tp_group.barrier()
+            rank_zero_error = tp_group.broadcast_object(rank_zero_error, src=0)
+        if rank_zero_error is not None:
+            raise RuntimeError(
+                "K3 KDA Triton precompile failed on TP rank 0: "
+                f"{rank_zero_error}"
+            )
+
+        peer_error = None
         if parallel.tp_rank != 0:
-            precompile_k3_triton_prefill_kernels(**kwargs)
+            try:
+                precompile_k3_triton_prefill_kernels(**kwargs)
+            except Exception as exc:
+                peer_error = (
+                    f"rank={parallel.tp_rank} {type(exc).__name__}: {exc}"
+                )
         if parallel.tp_size > 1:
-            tp_group.barrier()
+            peer_errors = tp_group.all_gather_object(peer_error)
+            peer_errors = [error for error in peer_errors if error is not None]
+            if peer_errors:
+                raise RuntimeError(
+                    "K3 KDA Triton artifact load failed: "
+                    + "; ".join(peer_errors)
+                )
 
         if benchmarked is not None:
             chunk_counts = _k3_prefill_autotune_chunk_counts(kda_layer.local_num_heads)

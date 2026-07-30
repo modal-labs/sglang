@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from sglang.kernels.ops.attention.fla import (
@@ -137,6 +138,60 @@ def test_text_model_skips_kda_precompile_for_non_triton_prefill(monkeypatch):
 
     get_tp_group.assert_not_called()
     precompile.assert_not_called()
+
+
+def test_kda_precompile_broadcasts_rank_zero_failure(monkeypatch):
+    class FakeKDA:
+        local_num_heads = 12
+        head_k_dim = 128
+        head_v_dim = 128
+        config = SimpleNamespace(dtype=torch.bfloat16)
+        A_log = torch.empty(1, 1, 12, 1, dtype=torch.float32)
+        dt_bias = torch.empty(12 * 128, dtype=torch.float32)
+        attn = SimpleNamespace(lower_bound=-5.0)
+
+    model = object.__new__(kimi_k3.KimiK3LinearForCausalLM)
+    object.__setattr__(
+        model,
+        "model",
+        SimpleNamespace(layers=[SimpleNamespace(self_attn=FakeKDA())]),
+    )
+    object.__setattr__(model, "config", SimpleNamespace())
+    tp_group = Mock()
+    tp_group.broadcast_object.side_effect = lambda value, src: value
+    monkeypatch.setattr(kimi_k3, "KimiK3DeltaAttention", FakeKDA)
+    monkeypatch.setattr(
+        kimi_k3,
+        "get_server_args",
+        lambda: SimpleNamespace(
+            linear_attn_prefill_backend="triton",
+            linear_attn_backend="triton",
+        ),
+    )
+    monkeypatch.setattr(
+        kimi_k3,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0, tp_size=8),
+    )
+    monkeypatch.setattr(kimi_k3, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(
+        kda_ops,
+        "precompile_k3_triton_prefill_kernels",
+        Mock(side_effect=RuntimeError("synthetic autotune failure")),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.configs.mamba_utils.mamba2_state_dtype",
+        lambda config: SimpleNamespace(temporal=torch.bfloat16),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="K3 KDA Triton precompile failed on TP rank 0.*synthetic",
+    ):
+        model.precompile_kernels_after_loading()
+
+    tp_group.broadcast_object.assert_called_once()
+    tp_group.all_gather_object.assert_not_called()
 
 
 def test_vl_wrapper_delegates_text_precompile_before_vision():
