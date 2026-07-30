@@ -485,6 +485,14 @@ class Envs:
     # corrupts the CUDA context. Set larger than the total host pool to fall
     # back to a single call.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Threads for chunked cudaHostRegister of host KV pools. 1 keeps the
+    # historical serial behavior; 0 picks min(8, cores). Values >1 only help
+    # when libcudart is reachable via ctypes (the torch cudart binding holds
+    # the GIL for the whole call).
+    SGLANG_HICACHE_HOST_REGISTER_THREADS = EnvInt(1)
+    # Threads for the MADV_POPULATE_WRITE prefault of host KV pools.
+    # 0 picks min(16, cores); 1 forces the single-threaded walk.
+    SGLANG_HICACHE_HOST_POPULATE_THREADS = EnvInt(0)
     # Aggregate physical host-memory cap for one TP cache group. This is
     # intentionally below 1 TiB: per-process availability checks race when
     # eight TP ranks allocate replicated sidecars concurrently.

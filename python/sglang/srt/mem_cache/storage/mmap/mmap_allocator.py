@@ -7,6 +7,7 @@ import os
 import time
 import uuid
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -42,6 +43,48 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+
+if _libc is not None:
+    _libc.madvise.restype = ctypes.c_int
+    _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+
+
+def _populate_threads() -> int:
+    threads = envs.SGLANG_HICACHE_HOST_POPULATE_THREADS.get()
+    if threads <= 0:
+        threads = min(16, os.cpu_count() or 1)
+    return max(1, threads)
+
+
+def _madvise_populate_parallel(addr: int, alloc_bytes: int) -> None:
+    """Prefault ``[addr, addr + alloc_bytes)`` with MADV_POPULATE_WRITE.
+
+    Population is split into page-aligned shards faulted from a thread pool:
+    ctypes releases the GIL around each libc call and the kernel faults
+    disjoint ranges concurrently, so this scales with page-zeroing bandwidth
+    where a single madvise call is core-bound. Raises OSError (e.g. EINVAL on
+    pre-5.14 kernels, ENOMEM under memory pressure) so callers can fall back.
+    """
+    threads = min(_populate_threads(), max(1, alloc_bytes // (256 * 1024 * 1024)))
+    shard_pages = math.ceil(alloc_bytes / mmap.PAGESIZE / threads)
+    shard_bytes = shard_pages * mmap.PAGESIZE
+    shards = [
+        (addr + off, min(shard_bytes, alloc_bytes - off))
+        for off in range(0, alloc_bytes, shard_bytes)
+    ]
+
+    def _one(shard: tuple[int, int]) -> None:
+        rc = _libc.madvise(shard[0], shard[1], _MADV_POPULATE_WRITE)
+        if rc != 0:
+            errno = ctypes.get_errno()
+            raise OSError(errno, os.strerror(errno))
+
+    if len(shards) == 1:
+        _one(shards[0])
+        return
+    with ThreadPoolExecutor(max_workers=len(shards)) as pool:
+        for future in [pool.submit(_one, shard) for shard in shards]:
+            future.result()
 
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
@@ -121,15 +164,21 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
+    #
+    # The mapping is created WITHOUT MAP_POPULATE: MAP_POPULATE faults the whole
+    # range inside the mmap syscall and MADV_POPULATE_WRITE would then walk it a
+    # second time, doubling single-threaded prefault cost. MADV_POPULATE_WRITE
+    # alone gives the same guarantee cudaHostRegister needs (real, writable,
+    # pre-faulted physical pages) and can be sharded across threads.
     mmap_start = time.perf_counter()
     mm = mmap.mmap(
         -1,
         alloc_bytes,
-        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
+        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS,
         prot=mmap.PROT_READ | mmap.PROT_WRITE,
     )
     logger.info(
-        "HiCache host buffer phase=mmap_populate state=done bytes=%d "
+        "HiCache host buffer phase=mmap state=done bytes=%d "
         "gib=%.2f page_size=%d page_count=%d elapsed_s=%.3f",
         n_bytes,
         n_bytes / (1024**3),
@@ -138,28 +187,53 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         time.perf_counter() - mmap_start,
     )
     madvise_start = time.perf_counter()
-    try:
-        # MADV_POPULATE_WRITE guarantees pages are populated and writable,
-        # throwing an error on failure (e.g. out of memory).
-        mm.madvise(_MADV_POPULATE_WRITE)
-    except OSError as error:
-        # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-        logger.warning(
-            "HiCache host buffer phase=madvise_populate_write "
-            "state=failed_or_unsupported "
-            "bytes=%d gib=%.2f errno=%s elapsed_s=%.3f",
+    populated = False
+    if _libc is not None:
+        view = ctypes.c_char.from_buffer(mm)
+        addr = ctypes.addressof(view)
+        try:
+            _madvise_populate_parallel(addr, alloc_bytes)
+            populated = True
+        except OSError as error:
+            # <5.14 kernels reject MADV_POPULATE_WRITE with EINVAL; ENOMEM and
+            # friends also land here and get one MAP_POPULATE retry below.
+            logger.warning(
+                "HiCache host buffer phase=madvise_populate_write "
+                "state=failed_or_unsupported "
+                "bytes=%d gib=%.2f errno=%s elapsed_s=%.3f",
+                n_bytes,
+                n_bytes / (1024**3),
+                error.errno,
+                time.perf_counter() - madvise_start,
+            )
+        finally:
+            del view
+    if populated:
+        logger.info(
+            "HiCache host buffer phase=madvise_populate_write state=done "
+            "bytes=%d gib=%.2f threads=%d elapsed_s=%.3f",
             n_bytes,
             n_bytes / (1024**3),
-            error.errno,
+            _populate_threads(),
             time.perf_counter() - madvise_start,
         )
     else:
+        # Fallback: re-map with MAP_POPULATE so the pages are still guaranteed
+        # to be faulted in before cudaHostRegister pins them.
+        mm.close()
+        fallback_start = time.perf_counter()
+        mm = mmap.mmap(
+            -1,
+            alloc_bytes,
+            flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
         logger.info(
-            "HiCache host buffer phase=madvise_populate_write state=done "
+            "HiCache host buffer phase=mmap_populate_fallback state=done "
             "bytes=%d gib=%.2f elapsed_s=%.3f",
             n_bytes,
             n_bytes / (1024**3),
-            time.perf_counter() - madvise_start,
+            time.perf_counter() - fallback_start,
         )
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import ctypes
+import glob
 import json
 import logging
 import math
 import os
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 
 logger = logging.getLogger(__name__)
@@ -125,30 +130,159 @@ def get_allocator_type(server_args) -> str:
     return backend or "default"
 
 
+# Chunk base pointers of every buffer registered through _cuda_host_register,
+# keyed by the buffer's base data_ptr, so destroy() can unregister each chunk.
+_REGISTERED_CHUNK_PTRS: dict[int, list[int]] = {}
+_REGISTERED_CHUNK_LOCK = threading.Lock()
+
+_cudart_ctypes = None
+_cudart_ctypes_lock = threading.Lock()
+
+
+def _load_cudart_ctypes():
+    """Load libcudart via ctypes for GIL-releasing cudaHostRegister calls.
+
+    torch.cuda.cudart()'s pybind wrapper holds the GIL across the whole call,
+    which serializes multi-threaded registration; ctypes drops the GIL for the
+    duration of each foreign call. Returns None when no libcudart is loadable
+    (callers must fall back to the torch binding).
+    """
+    global _cudart_ctypes
+    if _cudart_ctypes is not None:
+        return _cudart_ctypes
+    with _cudart_ctypes_lock:
+        if _cudart_ctypes is not None:
+            return _cudart_ctypes
+        torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+        candidates = sorted(
+            glob.glob(os.path.join(torch_lib_dir, "libcudart*.so*")), reverse=True
+        ) + ["libcudart.so", "libcudart.so.13", "libcudart.so.12"]
+        for name in candidates:
+            try:
+                lib = ctypes.CDLL(name)
+                lib.cudaHostRegister.restype = ctypes.c_int
+                lib.cudaHostRegister.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                    ctypes.c_uint,
+                ]
+                lib.cudaHostUnregister.restype = ctypes.c_int
+                lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+                lib.cudaGetErrorString.restype = ctypes.c_char_p
+                lib.cudaGetErrorString.argtypes = [ctypes.c_int]
+                lib.cudaSetDevice.restype = ctypes.c_int
+                lib.cudaSetDevice.argtypes = [ctypes.c_int]
+            except (OSError, AttributeError):
+                continue
+            _cudart_ctypes = lib
+            return lib
+    return None
+
+
+def _register_threads(num_chunks: int) -> int:
+    threads = envs.SGLANG_HICACHE_HOST_REGISTER_THREADS.get()
+    if threads <= 0:
+        threads = min(8, os.cpu_count() or 1)
+    return max(1, min(threads, num_chunks))
+
+
 def _cuda_host_register(buffer: torch.Tensor) -> None:
-    cudart = torch.cuda.cudart()
+    """Pin ``buffer`` with cudaHostRegister, in chunks.
+
+    Chunking keeps every single call well under the Blackwell driver's
+    single-registration failure zone (see SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB)
+    and lets registration run on several threads. A device transfer that spans
+    a chunk boundary degrades to a staged copy but stays correct; HiCache moves
+    page-granular ranges, so spanning transfers are rare.
+    """
+    base_ptr = buffer.data_ptr()
     n_bytes = buffer.numel() * buffer.element_size()
-    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
-    if int(rc) != 0:
-        raise RuntimeError(
-            f"cudaHostRegister failed (rc={int(rc)}, "
-            f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-            f"size={n_bytes}; host buffer is not pinned and device transfers "
-            f"may silently return stale data."
+    chunk_bytes = max(1, envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get()) * 1024**3
+    chunks = [
+        (base_ptr + off, min(chunk_bytes, n_bytes - off))
+        for off in range(0, n_bytes, chunk_bytes)
+    ]
+    threads = _register_threads(len(chunks))
+    lib = _load_cudart_ctypes()
+    if threads > 1 and lib is None:
+        logger.warning(
+            "SGLANG_HICACHE_HOST_REGISTER_THREADS=%d requested but libcudart is "
+            "not loadable via ctypes; registering %d chunks serially.",
+            threads,
+            len(chunks),
         )
+        threads = 1
+    device_index = torch.cuda.current_device()
+    registered: list[int] = []
+    registered_lock = threading.Lock()
+
+    def _register_one(chunk: tuple[int, int]) -> None:
+        ptr, size = chunk
+        if lib is not None:
+            lib.cudaSetDevice(device_index)
+            rc = lib.cudaHostRegister(ptr, size, 0)
+            err = lib.cudaGetErrorString(rc).decode() if rc != 0 else ""
+        else:
+            cudart = torch.cuda.cudart()
+            rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            err = cudart.cudaGetErrorString(rc) if rc != 0 else ""
+        if rc != 0:
+            raise RuntimeError(
+                f"cudaHostRegister failed (rc={rc}, {err}) for ptr={ptr:#x} "
+                f"size={size} (chunk of {n_bytes}-byte buffer at "
+                f"{base_ptr:#x}); host buffer is not pinned and device "
+                f"transfers may silently return stale data."
+            )
+        with registered_lock:
+            registered.append(ptr)
+
+    start = time.perf_counter()
+    try:
+        if threads == 1:
+            for chunk in chunks:
+                _register_one(chunk)
+        else:
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                for future in [pool.submit(_register_one, c) for c in chunks]:
+                    future.result()
+    except Exception:
+        # Unpin whatever succeeded so a retry or teardown starts clean.
+        for ptr in registered:
+            _unregister_ptr(ptr)
+        raise
+    logger.info(
+        "HiCache host buffer phase=cuda_host_register_chunks state=done "
+        "bytes=%d gib=%.2f chunks=%d chunk_gib=%d threads=%d elapsed_s=%.3f",
+        n_bytes,
+        n_bytes / (1024**3),
+        len(chunks),
+        chunk_bytes // 1024**3,
+        threads,
+        time.perf_counter() - start,
+    )
+    with _REGISTERED_CHUNK_LOCK:
+        _REGISTERED_CHUNK_PTRS[base_ptr] = [ptr for ptr, _ in chunks]
+
+
+def _unregister_ptr(ptr: int) -> None:
+    lib = _load_cudart_ctypes()
+    if lib is not None:
+        rc = int(lib.cudaHostUnregister(ptr))
+        err = lib.cudaGetErrorString(rc).decode() if rc != 0 else ""
+    else:
+        cudart = torch.cuda.cudart()
+        rc = int(cudart.cudaHostUnregister(ptr))
+        err = cudart.cudaGetErrorString(rc) if rc != 0 else ""
+    if rc != 0:
+        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
+        logger.warning("cudaHostUnregister failed (rc=%d, %s) for ptr=%#x", rc, err, ptr)
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
-    cudart = torch.cuda.cudart()
-    rc = cudart.cudaHostUnregister(buffer.data_ptr())
-    if int(rc) != 0:
-        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
-        logger.warning(
-            "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
-            int(rc),
-            cudart.cudaGetErrorString(rc),
-            buffer.data_ptr(),
-        )
+    with _REGISTERED_CHUNK_LOCK:
+        ptrs = _REGISTERED_CHUNK_PTRS.pop(buffer.data_ptr(), [buffer.data_ptr()])
+    for ptr in ptrs:
+        _unregister_ptr(ptr)
 
 
 def alloc_with_host_register(
