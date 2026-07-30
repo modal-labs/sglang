@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -51,7 +52,6 @@ _SUPPORTED_SCOPES = frozenset({"off", "front", "wide"})
 _SUPPORTED_REPRESENTATIONS = frozenset({"tensor_static", "channel_static"})
 _FRONT_ROLE = "moe_front"
 _KDA_QKVG_ROLE = "kda_qkvg"
-_EMPTY_DEFAULT_CACHE_EVERY_GROUPS = 8
 _CHECKPOINT_COMPONENTS_BY_ROLE = {
     _FRONT_ROLE: frozenset(
         {
@@ -336,9 +336,9 @@ class K3TargetFP8State:
         )
         self._checkpoint_load_started = False
         self._checkpoint_load_finished = False
-        self._released_groups = 0
         self._finalized = False
         self._conversion_started = False
+        self._conversion_started_at: float | None = None
         self._memory_before: dict[str, int] | None = None
 
     @classmethod
@@ -618,6 +618,7 @@ class K3TargetFP8State:
         if self._conversion_started:
             return
         self._conversion_started = True
+        self._conversion_started_at = time.perf_counter()
         if (
             not self.enabled
             or not torch.cuda.is_available()
@@ -662,6 +663,11 @@ class K3TargetFP8State:
 
         if self.enabled:
             stats = self.stats.as_dict()
+            conversion_elapsed_seconds = (
+                time.perf_counter() - self._conversion_started_at
+                if self._conversion_started_at is not None
+                else 0.0
+            )
             rank0_log(
                 "K3 target dense FP8 replacement: "
                 + ", ".join(f"{key}={value}" for key, value in stats.items())
@@ -680,6 +686,7 @@ class K3TargetFP8State:
                     }
                 )
                 + f", configured_global_kda={self._configured_kda_count}"
+                + f", conversion_elapsed_seconds={conversion_elapsed_seconds:.3f}"
             )
             if self._memory_before is not None:
                 after = _cuda_memory_snapshot()
@@ -693,11 +700,6 @@ class K3TargetFP8State:
                         for key in before
                     )
                 )
-
-    def _on_source_group_released(self) -> None:
-        self._released_groups += 1
-        if self._released_groups % _EMPTY_DEFAULT_CACHE_EVERY_GROUPS == 0:
-            torch.cuda.empty_cache()
 
 
 class K3TargetFP8SourceGroup:
@@ -772,9 +774,16 @@ class K3TargetFP8SourceGroup:
             return
         if self._pool is None:
             raise RuntimeError("K3 target FP8 source group lost its pool.")
-        gc.collect()
         torch.cuda.synchronize()
         use_count = self._pool.use_count()
+        if use_count != 1:
+            # The normal path relies on deterministic reference release and
+            # avoids a full-model cyclic-GC scan for every converted linear.
+            # Retain one conservative recovery attempt for an unexpectedly
+            # delayed pool context/reference before failing closed.
+            gc.collect()
+            torch.cuda.synchronize()
+            use_count = self._pool.use_count()
         if use_count != 1:
             raise RuntimeError(
                 "K3 target FP8 source pool still has live users after "
@@ -783,8 +792,6 @@ class K3TargetFP8SourceGroup:
             )
         self._pool = None
         self.released = True
-        gc.collect()
-        self.owner._on_source_group_released()
 
 
 def moe_front_role() -> str:

@@ -10,6 +10,7 @@ from torch import nn
 from sglang.srt.layers.k3_target_fp8 import (
     K3TargetFP8Linear,
     K3TargetFP8MemoryStats,
+    K3TargetFP8SourceGroup,
     K3TargetFP8State,
     kda_qkvg_role,
     moe_front_role,
@@ -254,6 +255,133 @@ class TestK3TargetFP8Scope(unittest.TestCase):
             state.new_source_group(moe_front_role(), 1)
         with self.assertRaisesRegex(RuntimeError, "live BF16 source pools"):
             state.finalize()
+
+    def test_source_group_release_avoids_gc_and_default_allocator_flush(self):
+        state = K3TargetFP8State("wide", "tensor_static")
+        pool = MagicMock()
+        pool.use_count.return_value = 1
+        group = K3TargetFP8SourceGroup(
+            owner=state,
+            role=moe_front_role(),
+            identifier=1,
+            pool=pool,
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.synchronize"
+            ) as synchronize,
+            patch("sglang.srt.layers.k3_target_fp8.gc.collect") as collect,
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.empty_cache"
+            ) as empty_cache,
+        ):
+            group.release()
+            group.release()
+
+        synchronize.assert_called_once_with()
+        pool.use_count.assert_called_once_with()
+        collect.assert_not_called()
+        empty_cache.assert_not_called()
+        self.assertTrue(group.released)
+        self.assertIsNone(group._pool)
+
+    def test_source_group_release_gc_fallback_recovers_delayed_pool_reference(self):
+        state = K3TargetFP8State("wide", "tensor_static")
+        pool = MagicMock()
+        pool.use_count.side_effect = (2, 1)
+        group = K3TargetFP8SourceGroup(
+            owner=state,
+            role=kda_qkvg_role(),
+            identifier=1,
+            pool=pool,
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.synchronize"
+            ) as synchronize,
+            patch("sglang.srt.layers.k3_target_fp8.gc.collect") as collect,
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.empty_cache"
+            ) as empty_cache,
+        ):
+            group.release()
+
+        self.assertEqual(synchronize.call_count, 2)
+        self.assertEqual(pool.use_count.call_count, 2)
+        collect.assert_called_once_with()
+        empty_cache.assert_not_called()
+        self.assertTrue(group.released)
+        self.assertIsNone(group._pool)
+
+    def test_source_group_release_retains_pool_when_gc_fallback_fails(self):
+        state = K3TargetFP8State("wide", "tensor_static")
+        pool = MagicMock()
+        pool.use_count.return_value = 2
+        group = K3TargetFP8SourceGroup(
+            owner=state,
+            role=kda_qkvg_role(),
+            identifier=1,
+            pool=pool,
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.synchronize"
+            ) as synchronize,
+            patch("sglang.srt.layers.k3_target_fp8.gc.collect") as collect,
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.empty_cache"
+            ) as empty_cache,
+            self.assertRaisesRegex(RuntimeError, "live users"),
+        ):
+            group.release()
+
+        self.assertEqual(synchronize.call_count, 2)
+        self.assertEqual(pool.use_count.call_count, 2)
+        collect.assert_called_once_with()
+        empty_cache.assert_not_called()
+        self.assertFalse(group.released)
+        self.assertIs(group._pool, pool)
+
+    def test_finalize_performs_one_cleanup_and_logs_aggregate_elapsed_time(self):
+        state = K3TargetFP8State("wide", "tensor_static")
+
+        with (
+            patch(
+                "sglang.srt.layers.k3_target_fp8.envs."
+                "SGLANG_K3_TARGET_DENSE_FP8_MEMORY_DIAGNOSTICS.get",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.is_available",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.k3_target_fp8.time.perf_counter",
+                side_effect=(10.0, 13.25),
+            ),
+            patch("sglang.srt.layers.k3_target_fp8.gc.collect") as collect,
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.empty_cache"
+            ) as empty_cache,
+            patch(
+                "sglang.srt.layers.k3_target_fp8.torch.cuda.synchronize"
+            ) as synchronize,
+            patch("sglang.srt.layers.k3_target_fp8.rank0_log") as rank0_log,
+        ):
+            state.begin_conversion()
+            state.finalize()
+
+        collect.assert_called_once_with()
+        empty_cache.assert_called_once_with()
+        synchronize.assert_called_once_with()
+        rank0_log.assert_called_once()
+        self.assertIn(
+            "conversion_elapsed_seconds=3.250",
+            rank0_log.call_args.args[0],
+        )
 
     def test_config_derived_layer_ids_fail_closed(self):
         state = K3TargetFP8State("wide", "tensor_static")
