@@ -118,6 +118,7 @@ _SOURCES = [
 
 
 logger = logging.getLogger(__name__)
+_TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
 
 _FP4_WORKSPACE_LAYOUT_VERSION = 1
 _FP4_WORKSPACE_LAYOUT_FIELDS = 10
@@ -695,7 +696,7 @@ def trtllm_fp4_block_scale_moe(
             routed_scaling_factor,
             routing_method_type,
             True,  # do_finalize
-            True,  # enable_pdl
+            num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS,  # enable_pdl
             activation_type,
             output,
             list(tactic_pair),
@@ -823,7 +824,7 @@ def trtllm_fp4_block_scale_routed_moe(
             1.0,  # routed_scaling_factor (already applied by the router)
             _ROUTING_TOPK,  # routing_method_type (unused for precomputed)
             do_finalize,
-            True,  # enable_pdl
+            num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS,  # enable_pdl
             activation_type,
             output,
             list(tactic_pair),
