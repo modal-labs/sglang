@@ -196,10 +196,10 @@ class HiMambaRadixCache(MambaRadixCache):
         target_tokens: int,
         mamba_tree_rows: int,
         request_mamba_rows: int,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         """One fixed-shape gather validates success and the full DMA shape."""
         if self.tp_world_size <= 1:
-            return local_ok and not local_error, local_error
+            return local_ok and not local_error, local_error, True
         local = torch.tensor(
             [
                 int(local_ok),
@@ -217,18 +217,18 @@ class HiMambaRadixCache(MambaRadixCache):
         torch.distributed.all_gather(gathered, local, group=self.tp_group)
         reference = gathered[0]
         any_error = any(state[1].item() == 1 for state in gathered)
-        group_ok = all(
-            state[0].item() == 1
-            and state[1].item() == 0
-            and torch.equal(state[2:], reference[2:])
-            for state in gathered
+        fingerprint_match = all(
+            torch.equal(state[2:], reference[2:]) for state in gathered
+        )
+        group_ok = fingerprint_match and all(
+            state[0].item() == 1 and state[1].item() == 0 for state in gathered
         )
         if not group_ok:
             logger.warning(
                 "HiMamba HiCache transaction consensus rejected: states=%s",
                 [state.tolist() for state in gathered],
             )
-        return group_ok, any_error
+        return group_ok, any_error, fingerprint_match
 
     def reset(self) -> None:
         TreeNode.counter = 0
@@ -293,7 +293,52 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_tree_rows = 0 if node.mamba_value is None else len(node.mamba_value)
         try:
             if self.tp_world_size > 1:
-                group_ok, peer_error = self._tp_transaction_consensus(
+                group_ok, peer_error, fingerprint_match = (
+                    self._tp_transaction_consensus(
+                        local_ok=reservation is not None and reserve_error is None,
+                        local_error=reserve_error is not None,
+                        opcode=1,
+                        node_id=node.id,
+                        target_tokens=len(node.value),
+                        mamba_tree_rows=mamba_tree_rows,
+                        request_mamba_rows=0,
+                    )
+                )
+            else:
+                group_ok = reservation is not None and reserve_error is None
+                peer_error = reserve_error is not None
+                fingerprint_match = True
+        except Exception:
+            if reservation is not None:
+                self.cache_controller.abort_write(reservation)
+            raise
+
+        # If every rank describes the same write and none raised, a rejection
+        # means at least one rank ran out of host capacity. Roll back every
+        # successful reservation, evict the same deterministic tree prefix on
+        # every rank, then make exactly one coordinated retry.
+        if (
+            self.tp_world_size > 1
+            and not group_ok
+            and not peer_error
+            and fingerprint_match
+        ):
+            try:
+                if reservation is not None:
+                    reservation_to_abort = reservation
+                    reservation = None
+                    self.cache_controller.abort_write(reservation_to_abort)
+                self.evict_host(len(node.value))
+                reservation = self.cache_controller.reserve_write(
+                    device_indices=node.value,
+                    node_id=node.id,
+                    extra_pools=extra_pools,
+                    allow_evict=False,
+                )
+            except Exception as error:
+                reserve_error = error
+            try:
+                group_ok, peer_error, _ = self._tp_transaction_consensus(
                     local_ok=reservation is not None and reserve_error is None,
                     local_error=reserve_error is not None,
                     opcode=1,
@@ -302,13 +347,10 @@ class HiMambaRadixCache(MambaRadixCache):
                     mamba_tree_rows=mamba_tree_rows,
                     request_mamba_rows=0,
                 )
-            else:
-                group_ok = reservation is not None and reserve_error is None
-                peer_error = reserve_error is not None
-        except Exception:
-            if reservation is not None:
-                self.cache_controller.abort_write(reservation)
-            raise
+            except Exception:
+                if reservation is not None:
+                    self.cache_controller.abort_write(reservation)
+                raise
         if not group_ok:
             if reservation is not None:
                 self.cache_controller.abort_write(reservation)
@@ -457,7 +499,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         try:
             if multi_rank:
-                group_ok, peer_error = self._tp_transaction_consensus(
+                group_ok, peer_error, _ = self._tp_transaction_consensus(
                     local_ok=reservation is not None and reserve_error is None,
                     local_error=reserve_error is not None,
                     opcode=2,

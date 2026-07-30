@@ -42,18 +42,21 @@ class TestHiMambaTPTransactions(unittest.TestCase):
         with mock.patch.object(
             torch.distributed, "all_gather", side_effect=gather_opcode_mismatch
         ):
-            group_ok, peer_error = HiMambaRadixCache._tp_transaction_consensus(
-                fake,
-                local_ok=True,
-                local_error=False,
-                opcode=1,
-                node_id=17,
-                target_tokens=4,
-                mamba_tree_rows=1,
-                request_mamba_rows=0,
+            group_ok, peer_error, fingerprint_match = (
+                HiMambaRadixCache._tp_transaction_consensus(
+                    fake,
+                    local_ok=True,
+                    local_error=False,
+                    opcode=1,
+                    node_id=17,
+                    target_tokens=4,
+                    mamba_tree_rows=1,
+                    request_mamba_rows=0,
+                )
             )
         self.assertFalse(group_ok)
         self.assertFalse(peer_error)
+        self.assertFalse(fingerprint_match)
 
         def gather_peer_error(outputs, local, group):
             outputs[0].copy_(local)
@@ -65,18 +68,21 @@ class TestHiMambaTPTransactions(unittest.TestCase):
         with mock.patch.object(
             torch.distributed, "all_gather", side_effect=gather_peer_error
         ):
-            group_ok, peer_error = HiMambaRadixCache._tp_transaction_consensus(
-                fake,
-                local_ok=True,
-                local_error=False,
-                opcode=1,
-                node_id=17,
-                target_tokens=4,
-                mamba_tree_rows=1,
-                request_mamba_rows=0,
+            group_ok, peer_error, fingerprint_match = (
+                HiMambaRadixCache._tp_transaction_consensus(
+                    fake,
+                    local_ok=True,
+                    local_error=False,
+                    opcode=1,
+                    node_id=17,
+                    target_tokens=4,
+                    mamba_tree_rows=1,
+                    request_mamba_rows=0,
+                )
             )
         self.assertFalse(group_ok)
         self.assertTrue(peer_error)
+        self.assertTrue(fingerprint_match)
 
     def test_peer_write_rejection_aborts_without_tree_or_queue_mutation(self):
         transfer = PoolTransfer(
@@ -98,7 +104,9 @@ class TestHiMambaTPTransactions(unittest.TestCase):
             tp_world_size=2,
             cache_controller=controller,
             mamba_backup_transfers=mock.Mock(return_value=[transfer]),
-            _tp_transaction_consensus=mock.Mock(return_value=(False, False)),
+            _tp_transaction_consensus=mock.Mock(
+                return_value=(False, False, False)
+            ),
             mamba_backup_commit=mock.Mock(),
             mamba_host_lru_list=SimpleNamespace(
                 in_list=mock.Mock(return_value=False),
@@ -120,7 +128,58 @@ class TestHiMambaTPTransactions(unittest.TestCase):
         fake.inc_lock_ref.assert_not_called()
         fake.mamba_backup_commit.assert_not_called()
 
-    def _load_fixture(self, *, consensus=(False, False)):
+    def test_peer_host_full_retries_after_synchronized_eviction(self):
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            device_indices=_indices(1),
+            host_indices=None,
+        )
+        first = SimpleNamespace(
+            host_indices=_indices(4, 30),
+            pool_reservation=SimpleNamespace(transfers=[transfer]),
+        )
+        second = SimpleNamespace(
+            host_indices=_indices(4, 40),
+            pool_reservation=SimpleNamespace(transfers=[transfer]),
+        )
+        controller = SimpleNamespace(
+            reserve_write=mock.Mock(side_effect=[first, second]),
+            abort_write=mock.Mock(),
+            commit_write=mock.Mock(return_value=second.host_indices),
+        )
+        fake = SimpleNamespace(
+            root_node=object(),
+            tp_world_size=2,
+            cache_controller=controller,
+            mamba_backup_transfers=mock.Mock(return_value=[transfer]),
+            _tp_transaction_consensus=mock.Mock(
+                side_effect=[
+                    (False, False, True),
+                    (True, False, True),
+                ]
+            ),
+            mamba_backup_commit=mock.Mock(),
+            mamba_host_lru_list=SimpleNamespace(
+                in_list=mock.Mock(return_value=False),
+                reset_node_mru=mock.Mock(),
+            ),
+            ongoing_write_through={},
+            inc_lock_ref=mock.Mock(),
+            evict_host=mock.Mock(),
+        )
+        node = _write_node(fake)
+
+        result = HiMambaRadixCache.write_backup(fake, node)
+
+        self.assertEqual(result, 4)
+        controller.abort_write.assert_called_once_with(first)
+        fake.evict_host.assert_called_once_with(4)
+        self.assertEqual(controller.reserve_write.call_count, 2)
+        controller.commit_write.assert_called_once_with(second)
+        self.assertEqual(node.host_value.tolist(), [40, 41, 42, 43])
+        self.assertIs(fake.ongoing_write_through[node.id], node)
+
+    def _load_fixture(self, *, consensus=(False, False, False)):
         ancestor = SimpleNamespace(evicted=False)
         node = SimpleNamespace(
             evicted=True,
@@ -212,7 +271,9 @@ class TestHiMambaTPTransactions(unittest.TestCase):
         fake.dec_lock_ref.assert_called_once()
 
     def test_success_assigns_request_slot_only_after_commit(self):
-        fake, node, req, pending, _ = self._load_fixture(consensus=(True, False))
+        fake, node, req, pending, _ = self._load_fixture(
+            consensus=(True, False, True)
+        )
 
         def commit_load(reservation):
             self.assertIsNone(req.mamba_pool_idx)
