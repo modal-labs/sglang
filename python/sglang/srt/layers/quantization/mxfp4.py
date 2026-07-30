@@ -348,8 +348,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self._fi_kernel: Optional[str] = None
         # Bound once, after target and draft weights are loaded but before KV
         # pool sizing. All compatible MoE layers on this process-local GPU share
-        # the same arena; graph capture deliberately keeps using its private
-        # graph pool instead.
+        # the same stable arena across eager execution and CUDA-graph replay.
         self._trtllm_gen_eager_workspace: Optional[torch.Tensor] = None
         self._trtllm_gen_eager_workspace_max_tile_n: Optional[int] = None
         if self.use_flashinfer:
@@ -408,11 +407,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return {}
         max_tile_n = self._trtllm_gen_eager_workspace_max_tile_n
         assert max_tile_n is not None
-        # Captured allocations must remain in the graph-private pool. Passing
-        # the process-wide eager arena here would bake a serving-time pointer
-        # into multiple graph execs and mix the two ownership domains.
-        if torch.cuda.is_current_stream_capturing():
-            workspace = None
+        # CUDA graphs intentionally bake this process-lifetime pointer into
+        # every captured bucket. The normal scheduler serializes graph and
+        # eager forwards on one stream; unsafe multi-stream modes are rejected
+        # when the arena is initialized.
         return {"workspace": workspace, "max_tile_n": max_tile_n}
 
     def create_weights(

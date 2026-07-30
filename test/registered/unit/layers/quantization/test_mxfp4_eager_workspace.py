@@ -22,35 +22,24 @@ def _bare_method(*, workspace=None, max_tile_n=None):
     return method
 
 
-def test_eager_workspace_is_passed_outside_capture():
+def test_bound_workspace_is_always_passed_to_launcher():
     workspace = object()
     method = _bare_method(workspace=workspace, max_tile_n=256)
 
-    with patch.object(
-        torch.cuda, "is_current_stream_capturing", return_value=False
-    ):
-        kwargs = method._trtllm_gen_eager_workspace_kwargs()
-
-    assert kwargs == {"workspace": workspace, "max_tile_n": 256}
-
-
-def test_capture_uses_graph_private_workspace_but_keeps_tactic_cap():
-    method = _bare_method(workspace=object(), max_tile_n=256)
-
-    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
-        kwargs = method._trtllm_gen_eager_workspace_kwargs()
-
-    assert kwargs == {"workspace": None, "max_tile_n": 256}
+    for capturing in (False, True):
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=capturing
+        ):
+            assert method._trtllm_gen_eager_workspace_kwargs() == {
+                "workspace": workspace,
+                "max_tile_n": 256,
+            }
 
 
 def test_unbound_workspace_does_not_change_launcher_kwargs():
     method = _bare_method()
 
-    with patch.object(
-        torch.cuda, "is_current_stream_capturing",
-        side_effect=AssertionError("capture state must not be queried"),
-    ):
-        assert method._trtllm_gen_eager_workspace_kwargs() == {}
+    assert method._trtllm_gen_eager_workspace_kwargs() == {}
 
 
 def test_deferred_finalize_output_anchors_workspace_lifetime():

@@ -50,6 +50,7 @@ def _worker(target_runner):
     worker = object.__new__(TpModelWorker)
     worker.server_args = SimpleNamespace(
         enable_pdmux=False,
+        enable_two_batch_overlap=False,
         enable_memory_saver=False,
     )
     worker.model_runner_list = []
@@ -146,6 +147,7 @@ def test_enabled_workspace_does_not_hide_allocation_failure():
     ("server_arg", "error"),
     [
         ("enable_pdmux", "--enable-pdmux"),
+        ("enable_two_batch_overlap", "--enable-two-batch-overlap"),
         ("enable_memory_saver", "--enable-memory-saver"),
     ],
 )

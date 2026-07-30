@@ -364,10 +364,12 @@ class TpModelWorker(BaseTpWorker):
     def init_trtllm_gen_moe_eager_workspace(
         self, additional_model_runners: Optional[List[ModelRunner]] = None
     ) -> Optional[torch.Tensor]:
-        """Allocate and bind one eager MXFP4 arena before KV-pool sizing.
+        """Allocate and bind one shared MXFP4 arena before KV-pool sizing.
 
-        The target and colocated draft runners execute on one process-local GPU
-        and share one forward stream, so they intentionally share one arena.
+        Target and colocated draft graph captures are serialized before serving,
+        and their serving forwards are scheduler-ordered on one process-local
+        GPU. Eager calls and captured graph replays therefore intentionally
+        share one stable arena.
         """
         workspace_bytes = envs.SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES.get()
         max_tile_n = envs.SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N.get()
@@ -390,15 +392,22 @@ class TpModelWorker(BaseTpWorker):
 
         # One arena is reused by every compatible target/draft MoE invocation.
         # The normal scheduler and K3 DFlash path serialize those launches, but
-        # PDMux may execute eager prefill and decode on different CUDA streams.
-        # Memory-saver handoff also requires every persistent allocation to be
-        # released and restored through its tagged regions. Until those modes
-        # have dedicated arena ownership, fail closed instead of risking
-        # cross-stream corruption or retaining 4 GiB across a handoff.
+        # PDMux may execute eager prefill and decode on different CUDA streams,
+        # while TBO may interleave two MoE microbatches. Memory-saver handoff
+        # also requires every persistent allocation to be released and restored
+        # through its tagged regions. Until those modes have dedicated arena
+        # ownership, fail closed instead of risking cross-stream corruption or
+        # retaining 4 GiB across a handoff.
         if self.server_args.enable_pdmux:
             raise RuntimeError(
                 "TRT-LLM-gen eager workspace is incompatible with --enable-pdmux; "
                 "use per-stream arenas before enabling both"
+            )
+        if self.server_args.enable_two_batch_overlap:
+            raise RuntimeError(
+                "TRT-LLM-gen eager workspace is incompatible with "
+                "--enable-two-batch-overlap; use per-microbatch arenas before "
+                "enabling both"
             )
         if self.server_args.enable_memory_saver:
             raise RuntimeError(
