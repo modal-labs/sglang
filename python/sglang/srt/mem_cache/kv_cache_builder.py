@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -91,10 +92,44 @@ def get_hicache_draft_kv_pool(
     )
     if pool is None:
         return None
+    if (
+        server_args.enable_mla_hicache_host_dedup
+        and not spec_algorithm.is_dflash()
+    ):
+        raise ValueError(
+            "MLA HiCache host dedup draft mirroring is currently validated only "
+            "for non-ring DFlash, whose draft pool shares the target global KV "
+            "index space."
+        )
 
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+
+
+def _validate_dedup_draft_index_domain(
+    *, cache_controller, draft_pool, spec_algorithm
+) -> None:
+    """Fail closed unless target indices are valid in the mirrored draft pool."""
+    if not cache_controller.mla_broadcast_enabled:
+        return
+    if not spec_algorithm.is_dflash():
+        raise ValueError(
+            "MLA HiCache host dedup draft mirroring requires non-ring DFlash."
+        )
+
+    target_pool = cache_controller.mem_pool_device
+    target_size = int(target_pool.size)
+    draft_size = int(draft_pool.size)
+    target_page_size = int(target_pool.page_size)
+    draft_page_size = int(draft_pool.page_size)
+    if draft_size != target_size or draft_page_size != target_page_size:
+        raise ValueError(
+            "MLA HiCache host dedup requires target and DFlash draft pools to "
+            "share one global KV slot domain; got "
+            f"target(size={target_size}, page_size={target_page_size}) and "
+            f"draft(size={draft_size}, page_size={draft_page_size})."
+        )
 
 
 def maybe_register_hicache_draft(
@@ -124,6 +159,11 @@ def maybe_register_hicache_draft(
     )
     if pool is None:
         return
+    _validate_dedup_draft_index_domain(
+        cache_controller=tree_cache.cache_controller,
+        draft_pool=pool,
+        spec_algorithm=spec_algorithm,
+    )
 
     from sglang.srt.mem_cache.memory_pool import (
         MHATokenToKVPool,
@@ -138,6 +178,8 @@ def maybe_register_hicache_draft(
     if tree_cache.cache_controller.mla_broadcast_enabled:
         from sglang.srt.mem_cache.mla_host_dedup import (
             enforce_dedup_draft_host_budget,
+            estimate_draft_host_pool_bytes,
+            mla_dedup_rank_and_size,
         )
 
         enforce_dedup_draft_host_budget(
@@ -145,6 +187,22 @@ def maybe_register_hicache_draft(
             pool,
             page_size=page_size,
         )
+        draft_bytes, _ = estimate_draft_host_pool_bytes(
+            pool,
+            host_tokens=primary.size,
+            page_size=page_size,
+        )
+        dedup_rank, dedup_tp_size = mla_dedup_rank_and_size()
+        draft_pool_start = time.perf_counter()
+        logger.info(
+            "HiCache startup phase=draft_host_pool state=start rank=%d/%d "
+            "role=rank_local physical_gib=%.2f",
+            dedup_rank,
+            dedup_tp_size,
+            draft_bytes / (1024**3),
+        )
+    else:
+        draft_pool_start = None
     kw = dict(
         host_to_device_ratio=primary.size / pool.size,
         host_size=0,
@@ -162,6 +220,17 @@ def maybe_register_hicache_draft(
             type(pool).__name__,
         )
         return
+
+    if draft_pool_start is not None:
+        logger.info(
+            "HiCache startup phase=draft_host_pool state=done rank=%d/%d "
+            "role=rank_local elapsed_s=%.3f physical_gib=%.2f slots=%d",
+            dedup_rank,
+            dedup_tp_size,
+            time.perf_counter() - draft_pool_start,
+            draft_host_pool.size * draft_host_pool.size_per_token / (1024**3),
+            draft_host_pool.size,
+        )
 
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 

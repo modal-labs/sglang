@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -56,9 +57,20 @@ def _get_allocator_type(server_args: ServerArgs) -> str:
     return get_allocator_type(server_args)
 
 
-def _get_mamba_ratio(server_args: ServerArgs) -> float:
+def _get_mamba_host_sizing(server_args: ServerArgs) -> tuple[float, int]:
+    """Resolve Mamba host sizing without changing legacy non-dedup behavior.
+
+    Historically ``--hicache-size`` sized every pool in a hybrid stack.  MLA
+    host dedup needs independent rank-local Mamba sizing, and an explicit
+    ``--hicache-mamba-ratio`` opts into the same behavior.  Otherwise preserve
+    the historical fixed-size override.
+    """
     ratio = server_args.hicache_mamba_ratio
-    return server_args.hicache_ratio if ratio is None else ratio
+    if ratio is not None:
+        return ratio, 0
+    if server_args.enable_mla_hicache_host_dedup:
+        return server_args.hicache_ratio, 0
+    return server_args.hicache_ratio, server_args.hicache_size
 
 
 def _make_layer_mapper(
@@ -71,6 +83,25 @@ def _make_layer_mapper(
         return layer_mapping.get(layer_id)
 
     return mapper
+
+
+def _require_dense_layer_ids(
+    *,
+    mappings: tuple[dict[int, int], ...],
+    transfer_layer_num: int,
+    context: str,
+) -> None:
+    """The controller iterates dense transfer ids, so reject gapped mappings."""
+    actual = set().union(*(mapping.keys() for mapping in mappings))
+    expected = set(range(transfer_layer_num))
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise ValueError(
+            f"{context} requires dense stage-local layer ids "
+            f"0..{transfer_layer_num - 1}; missing={missing[:8]}, "
+            f"unexpected={unexpected[:8]}."
+        )
 
 
 def build_kv_host_pool(
@@ -564,6 +595,10 @@ def build_hybrid_mamba_stack(
 
     mla_is_dummy = False
     mla_dedup_prebuild = None
+    dedup_rank = 0
+    dedup_tp_size = 1
+    target_bytes = 0
+    mamba_bytes = 0
     if server_args.enable_mla_hicache_host_dedup:
         if not use_mla:
             raise ValueError(
@@ -575,23 +610,36 @@ def build_hybrid_mamba_stack(
                 "Hybrid MLA+Mamba host dedup currently supports L2 only; "
                 "rank-local Mamba/KDA L3 keys are not implemented."
             )
+        _require_dense_layer_ids(
+            mappings=(full_layer_mapping, mamba_layer_mapping),
+            transfer_layer_num=transfer_layer_num,
+            context="Hybrid MLA+Mamba host dedup",
+        )
 
         # Compute the whole TP-group physical plan before any rank starts a
         # host allocation. Target MLA has one owner; Mamba/KDA and any
         # mirrored speculative draft are rank-local.
+        preflight_start = time.perf_counter()
+        dedup_rank, dedup_tp_size = mla_dedup_rank_and_size()
+        role = "owner" if dedup_rank == 0 else "receiver"
+        logger.info(
+            "HiCache startup phase=preflight state=start rank=%d/%d role=%s",
+            dedup_rank,
+            dedup_tp_size,
+            role,
+        )
         target_bytes, target_tokens = estimate_mla_host_pool_bytes(
             kv_pool,
             host_to_device_ratio=server_args.hicache_ratio,
             host_size_gb=server_args.hicache_size,
             page_size=params.page_size,
         )
-        mamba_ratio = _get_mamba_ratio(server_args)
+        mamba_ratio, mamba_size = _get_mamba_host_sizing(server_args)
         mamba_bytes, mamba_tokens = estimate_mamba_host_pool_bytes(
             mamba_pool,
             host_to_device_ratio=mamba_ratio,
-            host_size_gb=0,
+            host_size_gb=mamba_size,
         )
-        _, attn_tp_size = mla_dedup_rank_and_size()
         rank_local_bytes = {"mamba": mamba_bytes}
         draft_tokens = 0
         if params.hicache_draft_kv_pool is not None:
@@ -609,18 +657,38 @@ def build_hybrid_mamba_stack(
             target_tokens * 10 + mamba_tokens * 9 + draft_tokens * 10
         )
         rank_local_bytes["allocator_metadata"] = allocator_metadata_bytes
-        enforce_hicache_host_budget(
+        aggregate_bytes = enforce_hicache_host_budget(
             target_bytes=target_bytes,
             rank_local_bytes=rank_local_bytes,
-            tp_size=attn_tp_size,
+            tp_size=dedup_tp_size,
             context=(
                 f"hybrid MLA+Mamba L2 "
                 f"(target_tokens={target_tokens}, mamba_slots={mamba_tokens}, "
                 f"draft_tokens={draft_tokens})"
             ),
         )
+        logger.info(
+            "HiCache startup phase=preflight state=done rank=%d/%d role=%s "
+            "elapsed_s=%.3f target_gib=%.2f mamba_per_rank_gib=%.2f "
+            "draft_per_rank_gib=%.2f aggregate_gib=%.2f",
+            dedup_rank,
+            dedup_tp_size,
+            role,
+            time.perf_counter() - preflight_start,
+            target_bytes / (1024**3),
+            mamba_bytes / (1024**3),
+            rank_local_bytes.get("draft", 0) / (1024**3),
+            aggregate_bytes / (1024**3),
+        )
 
         # Rendezvous before rank 0 begins the much larger physical MLA alloc.
+        prebuild_start = time.perf_counter()
+        logger.info(
+            "HiCache startup phase=nccl_prebuild state=start rank=%d/%d role=%s",
+            dedup_rank,
+            dedup_tp_size,
+            role,
+        )
         mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
             kv_pool,
             params.tp_cache_group,
@@ -630,7 +698,25 @@ def build_hybrid_mamba_stack(
             True,
         )
         mla_is_dummy = is_mla_dedup_dummy_rank(kv_pool, storage_backend, True)
+        logger.info(
+            "HiCache startup phase=nccl_prebuild state=done rank=%d/%d role=%s "
+            "elapsed_s=%.3f",
+            dedup_rank,
+            dedup_tp_size,
+            role,
+            time.perf_counter() - prebuild_start,
+        )
 
+    target_pool_start = time.perf_counter()
+    if server_args.enable_mla_hicache_host_dedup:
+        logger.info(
+            "HiCache startup phase=target_host_pool state=start rank=%d/%d "
+            "role=%s physical_gib=%.2f",
+            dedup_rank,
+            dedup_tp_size,
+            "receiver" if mla_is_dummy else "owner",
+            (0 if mla_is_dummy else target_bytes) / (1024**3),
+        )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -638,13 +724,45 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         is_dummy=mla_is_dummy,
     )
+    if server_args.enable_mla_hicache_host_dedup:
+        logger.info(
+            "HiCache startup phase=target_host_pool state=done rank=%d/%d "
+            "role=%s elapsed_s=%.3f physical_gib=%.2f slots=%d",
+            dedup_rank,
+            dedup_tp_size,
+            "receiver" if mla_is_dummy else "owner",
+            time.perf_counter() - target_pool_start,
+            (0 if mla_is_dummy else kv_host_pool.size * kv_host_pool.size_per_token)
+            / (1024**3),
+            kv_host_pool.size,
+        )
+    mamba_ratio, mamba_size = _get_mamba_host_sizing(server_args)
+    mamba_pool_start = time.perf_counter()
+    if server_args.enable_mla_hicache_host_dedup:
+        logger.info(
+            "HiCache startup phase=mamba_host_pool state=start rank=%d/%d "
+            "role=rank_local physical_gib=%.2f",
+            dedup_rank,
+            dedup_tp_size,
+            mamba_bytes / (1024**3),
+        )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        _get_mamba_ratio(server_args),
-        0,
+        mamba_ratio,
+        mamba_size,
         allocator_type=_get_allocator_type(server_args),
         layout=server_args.hicache_mem_layout,
     )
+    if server_args.enable_mla_hicache_host_dedup:
+        logger.info(
+            "HiCache startup phase=mamba_host_pool state=done rank=%d/%d "
+            "role=rank_local elapsed_s=%.3f physical_gib=%.2f slots=%d",
+            dedup_rank,
+            dedup_tp_size,
+            time.perf_counter() - mamba_pool_start,
+            mamba_host_pool.size * mamba_host_pool.size_per_token / (1024**3),
+            mamba_host_pool.size,
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -733,10 +851,11 @@ def build_hybrid_mamba_swa_stack(
         server_args=server_args,
         use_mla=False,
     )
+    mamba_ratio, mamba_size = _get_mamba_host_sizing(server_args)
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        _get_mamba_ratio(server_args),
-        0,
+        mamba_ratio,
+        mamba_size,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
     )

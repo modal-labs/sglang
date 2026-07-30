@@ -4,6 +4,7 @@ import logging
 import math
 import mmap
 import os
+import time
 import uuid
 import weakref
 
@@ -120,19 +121,46 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
+    mmap_start = time.perf_counter()
     mm = mmap.mmap(
         -1,
         alloc_bytes,
         flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
         prot=mmap.PROT_READ | mmap.PROT_WRITE,
     )
+    logger.info(
+        "HiCache host buffer phase=mmap_populate state=done bytes=%d "
+        "gib=%.2f page_size=%d page_count=%d elapsed_s=%.3f",
+        n_bytes,
+        n_bytes / (1024**3),
+        mmap.PAGESIZE,
+        alloc_bytes // mmap.PAGESIZE,
+        time.perf_counter() - mmap_start,
+    )
+    madvise_start = time.perf_counter()
     try:
         # MADV_POPULATE_WRITE guarantees pages are populated and writable,
         # throwing an error on failure (e.g. out of memory).
         mm.madvise(_MADV_POPULATE_WRITE)
-    except OSError:
+    except OSError as error:
         # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-        pass
+        logger.warning(
+            "HiCache host buffer phase=madvise_populate_write "
+            "state=failed_or_unsupported "
+            "bytes=%d gib=%.2f errno=%s elapsed_s=%.3f",
+            n_bytes,
+            n_bytes / (1024**3),
+            error.errno,
+            time.perf_counter() - madvise_start,
+        )
+    else:
+        logger.info(
+            "HiCache host buffer phase=madvise_populate_write state=done "
+            "bytes=%d gib=%.2f elapsed_s=%.3f",
+            n_bytes,
+            n_bytes / (1024**3),
+            time.perf_counter() - madvise_start,
+        )
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 

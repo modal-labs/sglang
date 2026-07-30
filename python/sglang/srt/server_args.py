@@ -2663,8 +2663,9 @@ class ServerArgs:
     hicache_mamba_ratio: A[
         Optional[float],
         "Optional host/device ratio for rank-local Mamba/KDA state. "
-        "Defaults to --hicache-ratio and is never overridden by "
-        "--hicache-size.",
+        "When set, it is not overridden by --hicache-size. MLA host dedup "
+        "also sizes Mamba/KDA independently, defaulting to --hicache-ratio. "
+        "Otherwise legacy --hicache-size behavior is preserved.",
         NS("memory"),
     ] = None
     hicache_size: A[

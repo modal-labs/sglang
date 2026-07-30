@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
 )
+from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -1524,6 +1525,71 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             ),
         )
         build_host_pool.assert_not_called()
+
+    def test_mamba_host_sizing_preserves_legacy_fixed_size_without_opt_in(self):
+        args = SimpleNamespace(
+            hicache_ratio=3.0,
+            hicache_size=230,
+            hicache_mamba_ratio=None,
+            enable_mla_hicache_host_dedup=False,
+        )
+
+        self.assertEqual(
+            hybrid_pool_assembler._get_mamba_host_sizing(args),
+            (3.0, 230),
+        )
+
+    def test_mamba_host_sizing_is_independent_for_dedup_or_explicit_ratio(self):
+        args = SimpleNamespace(
+            hicache_ratio=3.0,
+            hicache_size=230,
+            hicache_mamba_ratio=None,
+            enable_mla_hicache_host_dedup=True,
+        )
+        self.assertEqual(
+            hybrid_pool_assembler._get_mamba_host_sizing(args),
+            (3.0, 0),
+        )
+
+        args.enable_mla_hicache_host_dedup = False
+        args.hicache_mamba_ratio = 6.75
+        self.assertEqual(
+            hybrid_pool_assembler._get_mamba_host_sizing(args),
+            (6.75, 0),
+        )
+
+    def test_mla_dedup_requires_dense_stage_local_layer_ids(self):
+        hybrid_pool_assembler._require_dense_layer_ids(
+            mappings=({0: 0, 2: 1}, {1: 0, 3: 1}),
+            transfer_layer_num=4,
+            context="unit-test",
+        )
+
+        with self.assertRaisesRegex(ValueError, "dense stage-local layer ids"):
+            hybrid_pool_assembler._require_dense_layer_ids(
+                mappings=({4: 0}, {5: 0}),
+                transfer_layer_num=2,
+                context="unit-test",
+            )
+
+    def test_dedup_draft_requires_the_target_slot_domain(self):
+        controller = SimpleNamespace(
+            mla_broadcast_enabled=True,
+            mem_pool_device=SimpleNamespace(size=1024, page_size=64),
+        )
+        dflash = SimpleNamespace(is_dflash=lambda: True)
+        kv_cache_builder._validate_dedup_draft_index_domain(
+            cache_controller=controller,
+            draft_pool=SimpleNamespace(size=1024, page_size=64),
+            spec_algorithm=dflash,
+        )
+
+        with self.assertRaisesRegex(ValueError, "share one global KV slot domain"):
+            kv_cache_builder._validate_dedup_draft_index_domain(
+                cache_controller=controller,
+                draft_pool=SimpleNamespace(size=512, page_size=64),
+                spec_algorithm=dflash,
+            )
 
     def test_hicache_metrics_use_stable_per_pool_labels(self):
         class FakePool:

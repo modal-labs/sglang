@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import time
 from collections import defaultdict
 
 import torch
@@ -10,6 +12,12 @@ import torch
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 
 logger = logging.getLogger(__name__)
+
+
+def _distributed_rank() -> tuple[int, int]:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    return 0, 1
 
 
 class HostTensorAllocator:
@@ -154,9 +162,90 @@ def alloc_with_host_register(
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
-    buffer = allocator.allocate(dims, dtype=dtype, device=device)
+    rank, world_size = _distributed_rank()
+    n_bytes = math.prod(dims) * torch.empty((), dtype=dtype).element_size()
+    allocate_start = time.perf_counter()
+    logger.info(
+        "HiCache host buffer phase=allocate state=start rank=%d/%d "
+        "allocator=%s bytes=%d gib=%.2f dims=%s dtype=%s",
+        rank,
+        world_size,
+        type(allocator).__name__,
+        n_bytes,
+        n_bytes / (1024**3),
+        dims,
+        dtype,
+    )
+    try:
+        buffer = allocator.allocate(dims, dtype=dtype, device=device)
+    except Exception:
+        logger.exception(
+            "HiCache host buffer phase=allocate state=failed rank=%d/%d "
+            "allocator=%s bytes=%d gib=%.2f dims=%s dtype=%s elapsed_s=%.3f",
+            rank,
+            world_size,
+            type(allocator).__name__,
+            n_bytes,
+            n_bytes / (1024**3),
+            dims,
+            dtype,
+            time.perf_counter() - allocate_start,
+        )
+        raise
+    logger.info(
+        "HiCache host buffer phase=allocate state=done rank=%d/%d "
+        "allocator=%s bytes=%d gib=%.2f dims=%s dtype=%s elapsed_s=%.3f",
+        rank,
+        world_size,
+        type(allocator).__name__,
+        n_bytes,
+        n_bytes / (1024**3),
+        dims,
+        dtype,
+        time.perf_counter() - allocate_start,
+    )
     if pin_memory:
-        _cuda_host_register(buffer)
+        register_start = time.perf_counter()
+        logger.info(
+            "HiCache host buffer phase=cuda_host_register state=start rank=%d/%d "
+            "bytes=%d gib=%.2f dims=%s dtype=%s ptr=%#x",
+            rank,
+            world_size,
+            n_bytes,
+            n_bytes / (1024**3),
+            dims,
+            dtype,
+            buffer.data_ptr(),
+        )
+        try:
+            _cuda_host_register(buffer)
+        except Exception:
+            logger.exception(
+                "HiCache host buffer phase=cuda_host_register state=failed "
+                "rank=%d/%d bytes=%d gib=%.2f dims=%s dtype=%s ptr=%#x "
+                "elapsed_s=%.3f",
+                rank,
+                world_size,
+                n_bytes,
+                n_bytes / (1024**3),
+                dims,
+                dtype,
+                buffer.data_ptr(),
+                time.perf_counter() - register_start,
+            )
+            raise
+        logger.info(
+            "HiCache host buffer phase=cuda_host_register state=done rank=%d/%d "
+            "bytes=%d gib=%.2f dims=%s dtype=%s ptr=%#x elapsed_s=%.3f",
+            rank,
+            world_size,
+            n_bytes,
+            n_bytes / (1024**3),
+            dims,
+            dtype,
+            buffer.data_ptr(),
+            time.perf_counter() - register_start,
+        )
     return buffer
 
 

@@ -186,6 +186,50 @@ class HiMambaRadixCache(MambaRadixCache):
 
         super().__init__(params=params)
 
+    def _tp_transaction_consensus(
+        self,
+        *,
+        local_ok: bool,
+        local_error: bool,
+        opcode: int,
+        node_id: int,
+        target_tokens: int,
+        mamba_tree_rows: int,
+        request_mamba_rows: int,
+    ) -> tuple[bool, bool]:
+        """One fixed-shape gather validates success and the full DMA shape."""
+        if self.tp_world_size <= 1:
+            return local_ok and not local_error, local_error
+        local = torch.tensor(
+            [
+                int(local_ok),
+                int(local_error),
+                opcode,
+                node_id,
+                target_tokens,
+                mamba_tree_rows,
+                request_mamba_rows,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        gathered = [torch.empty_like(local) for _ in range(self.tp_world_size)]
+        torch.distributed.all_gather(gathered, local, group=self.tp_group)
+        reference = gathered[0]
+        any_error = any(state[1].item() == 1 for state in gathered)
+        group_ok = all(
+            state[0].item() == 1
+            and state[1].item() == 0
+            and torch.equal(state[2:], reference[2:])
+            for state in gathered
+        )
+        if not group_ok:
+            logger.warning(
+                "HiMamba HiCache transaction consensus rejected: states=%s",
+                [state.tolist() for state in gathered],
+            )
+        return group_ok, any_error
+
     def reset(self) -> None:
         TreeNode.counter = 0
         self._flush_pending_storage_backups_before_reset()
@@ -218,37 +262,81 @@ class HiMambaRadixCache(MambaRadixCache):
             node.parent != self.root_node and not node.parent.backuped
         ):
             return 0
+        if write_back and self.tp_world_size > 1:
+            raise RuntimeError(
+                "HiMamba HiCache write-back eviction is not supported with TP>1 "
+                "until victim selection is coordinated across ranks."
+            )
 
-        # If mamba host slot already exists, refresh its LRU position.
-        if node.mamba_value is not None and node.mamba_host_value is not None:
-            if self.mamba_host_lru_list.in_list(node):
-                self.mamba_host_lru_list.reset_node_mru(node)
-
-        extra_pools = self.mamba_backup_transfers(node)
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-            extra_pools=extra_pools,
-        )
-        if host_indices is None:
-            self.evict_host(len(node.value))
-            host_indices = self.cache_controller.write(
+        extra_pools = None
+        reservation = None
+        reserve_error = None
+        try:
+            extra_pools = self.mamba_backup_transfers(node)
+            reservation = self.cache_controller.reserve_write(
                 device_indices=node.value,
                 node_id=node.id,
                 extra_pools=extra_pools,
+                allow_evict=False,
             )
-        if host_indices is not None:
-            node.host_value = host_indices.clone()
-            if extra_pools is not None:
-                self.mamba_backup_commit(node, extra_pools)
-            assert len(node.host_value) > 0
-            self.ongoing_write_through[node.id] = node
-            if not write_back:
-                # no need to lock nodes if write back
-                self.inc_lock_ref(node)
-        else:
+            if reservation is None and self.tp_world_size == 1:
+                self.evict_host(len(node.value))
+                reservation = self.cache_controller.reserve_write(
+                    device_indices=node.value,
+                    node_id=node.id,
+                    extra_pools=extra_pools,
+                    allow_evict=True,
+                )
+        except Exception as error:
+            reserve_error = error
+
+        mamba_tree_rows = 0 if node.mamba_value is None else len(node.mamba_value)
+        try:
+            if self.tp_world_size > 1:
+                group_ok, peer_error = self._tp_transaction_consensus(
+                    local_ok=reservation is not None and reserve_error is None,
+                    local_error=reserve_error is not None,
+                    opcode=1,
+                    node_id=node.id,
+                    target_tokens=len(node.value),
+                    mamba_tree_rows=mamba_tree_rows,
+                    request_mamba_rows=0,
+                )
+            else:
+                group_ok = reservation is not None and reserve_error is None
+                peer_error = reserve_error is not None
+        except Exception:
+            if reservation is not None:
+                self.cache_controller.abort_write(reservation)
+            raise
+        if not group_ok:
+            if reservation is not None:
+                self.cache_controller.abort_write(reservation)
+            if reserve_error is not None:
+                raise reserve_error
+            if peer_error:
+                raise RuntimeError(
+                    "A TP peer failed while preparing a HiMamba HiCache write."
+                )
             return 0
 
+        if reserve_error is not None:
+            raise reserve_error
+        assert reservation is not None
+        host_indices = self.cache_controller.commit_write(reservation)
+        node.host_value = host_indices.clone()
+        transfers = reservation.pool_reservation.transfers
+        if transfers is not None:
+            self.mamba_backup_commit(node, transfers)
+        # Defer every tree/LRU mutation until the whole TP group committed.
+        if node.mamba_value is not None and node.mamba_host_value is not None:
+            if self.mamba_host_lru_list.in_list(node):
+                self.mamba_host_lru_list.reset_node_mru(node)
+        assert len(node.host_value) > 0
+        self.ongoing_write_through[node.id] = node
+        if not write_back:
+            # no need to lock nodes if write back
+            self.inc_lock_ref(node)
         return len(host_indices)
 
     def load_back(
@@ -277,7 +365,7 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             full_host_indices = torch.empty((0,), dtype=torch.int64, device="cpu")
 
-        if (
+        skip_local_load = (
             len(full_host_indices) > 0
             and (
                 (len(full_host_indices) < self.load_back_threshold)
@@ -288,7 +376,8 @@ class HiMambaRadixCache(MambaRadixCache):
                 )
             )
             and len(mamba_restore_nodes) == 0
-        ):
+        )
+        if skip_local_load and self.tp_world_size <= 1:
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancestor_node)
             return None
@@ -296,32 +385,129 @@ class HiMambaRadixCache(MambaRadixCache):
         logger.debug(
             f"Init load back from cpu -> gpu, kv hit length: {len(full_host_indices)}, mamba host hit length: {len(mamba_restore_nodes)}"
         )
-        mamba_pools = self.mamba_restore_transfers(
-            last_hit_node, mamba_restore_nodes, req
+        multi_rank = self.tp_world_size > 1
+        reservation = None
+        reserve_error = None
+        mamba_pools = None
+        pending_request_indices = None
+        owns_pending_request_indices = False
+        needs_request_slot = (
+            req is not None
+            and last_hit_node in mamba_restore_nodes
+            and last_hit_node.mamba_host_value is not None
         )
-        full_device_indices = self.cache_controller.load(
-            host_indices=full_host_indices,
-            node_id=last_hit_node.id,
-            extra_pools=mamba_pools,
+        request_mamba_rows = (
+            len(last_hit_node.mamba_host_value) if needs_request_slot else 0
         )
-        if full_device_indices is None:
-            if len(full_host_indices) > 0:
-                self.evict(EvictParams(num_tokens=len(full_host_indices)))
+        mamba_tree_rows = sum(
+            len(n.mamba_host_value) for n in mamba_restore_nodes
+        )
+        try:
+            if not skip_local_load:
+                if needs_request_slot and request_mamba_rows != 1:
+                    raise RuntimeError(
+                        "HiMamba load-back expected exactly one request Mamba row, "
+                        f"got {request_mamba_rows}."
+                    )
+                if needs_request_slot:
+                    if req.mamba_pool_idx is None:
+                        if multi_rank:
+                            pending_request_indices = (
+                                self.req_to_token_pool.mamba_allocator.alloc(
+                                    request_mamba_rows
+                                )
+                            )
+                        else:
+                            pending_request_indices = self._alloc_with_evict(
+                                self.req_to_token_pool.mamba_allocator,
+                                request_mamba_rows,
+                                self.evict_mamba,
+                                lock_node=last_hit_node,
+                            )
+                        owns_pending_request_indices = (
+                            pending_request_indices is not None
+                        )
+                    else:
+                        pending_request_indices = req.mamba_pool_idx.unsqueeze(0)
 
-            mamba_pools = self.mamba_restore_transfers(
-                last_hit_node, mamba_restore_nodes, req
-            )
-            full_device_indices = self.cache_controller.load(
-                host_indices=full_host_indices,
-                node_id=last_hit_node.id,
-                extra_pools=mamba_pools,
-            )
-        self.dec_lock_ref(ancestor_node)
-        if full_device_indices is None:
-            # no sufficient GPU memory to load back KV caches
+                if not needs_request_slot or pending_request_indices is not None:
+                    mamba_pools = self.mamba_restore_transfers(
+                        last_hit_node,
+                        mamba_restore_nodes,
+                        req,
+                        pending_request_indices=pending_request_indices,
+                    )
+                    reservation = self.cache_controller.reserve_load(
+                        host_indices=full_host_indices,
+                        node_id=last_hit_node.id,
+                        extra_pools=mamba_pools,
+                        allow_evict=False,
+                    )
+                    if reservation is None and not multi_rank:
+                        if len(full_host_indices) > 0:
+                            self.evict(EvictParams(num_tokens=len(full_host_indices)))
+                        reservation = self.cache_controller.reserve_load(
+                            host_indices=full_host_indices,
+                            node_id=last_hit_node.id,
+                            extra_pools=mamba_pools,
+                            allow_evict=True,
+                        )
+        except Exception as error:
+            reserve_error = error
+
+        try:
+            if multi_rank:
+                group_ok, peer_error = self._tp_transaction_consensus(
+                    local_ok=reservation is not None and reserve_error is None,
+                    local_error=reserve_error is not None,
+                    opcode=2,
+                    node_id=last_hit_node.id,
+                    target_tokens=len(full_host_indices),
+                    mamba_tree_rows=mamba_tree_rows,
+                    request_mamba_rows=request_mamba_rows,
+                )
+            else:
+                group_ok = reservation is not None and reserve_error is None
+                peer_error = reserve_error is not None
+        except Exception:
+            if reservation is not None:
+                self.cache_controller.abort_load(reservation)
+            if owns_pending_request_indices:
+                self.req_to_token_pool.mamba_allocator.free(
+                    pending_request_indices
+                )
+            self.dec_lock_ref(ancestor_node)
+            raise
+
+        if not group_ok:
+            if reservation is not None:
+                self.cache_controller.abort_load(reservation)
+            if owns_pending_request_indices:
+                self.req_to_token_pool.mamba_allocator.free(
+                    pending_request_indices
+                )
+            self.dec_lock_ref(ancestor_node)
+            if reserve_error is not None:
+                raise reserve_error
+            if peer_error:
+                raise RuntimeError(
+                    "A TP peer failed while preparing a HiMamba HiCache load."
+                )
             return None
 
-        self.mamba_restore_commit(mamba_restore_nodes, mamba_pools)
+        if reserve_error is not None:
+            raise reserve_error
+        assert reservation is not None
+        full_device_indices = self.cache_controller.commit_load(reservation)
+        if owns_pending_request_indices:
+            req.mamba_pool_idx = pending_request_indices[0]
+            owns_pending_request_indices = False
+        self.dec_lock_ref(ancestor_node)
+        self.mamba_restore_commit(
+            mamba_restore_nodes,
+            reservation.pool_reservation.transfers,
+            req=req,
+        )
 
         offset = 0
         for n in nodes_to_load:
@@ -2132,6 +2318,7 @@ class HiMambaRadixCache(MambaRadixCache):
         last_hit_node: TreeNode,
         nodes_to_restore: list[TreeNode],
         req,
+        pending_request_indices: Optional[torch.Tensor] = None,
     ) -> Optional[list[PoolTransfer]]:
         # build H→D transfer descriptors for mamba state
         backed_up_host_indices: list[torch.Tensor] = []
@@ -2155,19 +2342,15 @@ class HiMambaRadixCache(MambaRadixCache):
             and last_hit_node in nodes_to_restore
             and last_hit_node.mamba_host_value is not None
         ):
-            if req.mamba_pool_idx is None:
-                req.mamba_pool_idx = self._alloc_with_evict(
-                    self.req_to_token_pool.mamba_allocator,
-                    len(last_hit_node.mamba_host_value),
-                    self.evict_mamba,
-                    lock_node=last_hit_node,
-                    error_message="Cannot alloc request mamba cache for host load back",
-                )[0]
             transfers.append(
                 PoolTransfer(
                     name=PoolName.MAMBA,
                     host_indices=last_hit_node.mamba_host_value,
-                    device_indices=req.mamba_pool_idx.unsqueeze(0),
+                    device_indices=(
+                        req.mamba_pool_idx.unsqueeze(0)
+                        if req.mamba_pool_idx is not None
+                        else pending_request_indices
+                    ),
                 )
             )
 
@@ -2177,6 +2360,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self,
         restored_nodes: list[TreeNode],
         transfers: Optional[list[PoolTransfer]],
+        req=None,
     ) -> None:
         # write back controller-allocated device indices after H→D restore
         if not restored_nodes or not transfers or transfers[0].device_indices is None:
@@ -2187,3 +2371,10 @@ class HiMambaRadixCache(MambaRadixCache):
             count = len(node.mamba_host_value)
             node.mamba_value = device_indices[offset : offset + count].clone()
             offset += count
+        if req is not None and len(transfers) > 1 and req.mamba_pool_idx is None:
+            req_indices = transfers[1].device_indices
+            if req_indices is None or req_indices.numel() != 1:
+                raise RuntimeError(
+                    "HiMamba load-back expected one reserved request Mamba slot."
+                )
+            req.mamba_pool_idx = req_indices[0]
