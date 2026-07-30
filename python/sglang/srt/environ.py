@@ -738,6 +738,15 @@ class Envs:
     # single downloadable archive). Needs the public flashinfer package
     # installed for the unmodified JIT sources. Unset = feature off.
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
+    # Optional process-local eager workspace for the private TRT-LLM-gen MXFP4
+    # MoE path. The value is bytes; 0 disables it. The serving launcher must
+    # allocate this after every target/draft model has loaded and before KV-pool
+    # sizing so the reservation is reflected in the KV budget.
+    SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES = EnvInt(0)
+    # Optional tactic cap for TRT-LLM-gen MoE; 0 means disabled/unlimited. This
+    # and EAGER_WORKSPACE_BYTES must be enabled together because the persistent
+    # arena is sized for the capped tile range.
+    SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N = EnvInt(0)
 
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for

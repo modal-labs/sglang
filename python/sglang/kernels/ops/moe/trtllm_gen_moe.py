@@ -44,6 +44,7 @@ import logging
 import os
 import pathlib
 import shutil
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -117,6 +118,241 @@ _SOURCES = [
 
 
 logger = logging.getLogger(__name__)
+
+_FP4_WORKSPACE_LAYOUT_VERSION = 1
+_FP4_WORKSPACE_LAYOUT_FIELDS = 10
+_fp4_workspace_layout_cache: dict[tuple[object, ...], TrtllmFp4WorkspaceLayout] = {}
+
+
+@dataclass(frozen=True)
+class TrtllmFp4WorkspaceLayout:
+    """Native layout of one FP4 MoE invocation inside a byte arena."""
+
+    descriptor: tuple[int, ...]
+    required_bytes: int
+    alignment: int
+    tile_n: int
+    tactic: int
+    gemm2_offset: int
+    gemm2_rows: int
+    gemm2_size_bytes: int
+    expanded_idx_offset: int
+    expanded_idx_size_bytes: int
+
+    @classmethod
+    def from_native(cls, values: Sequence[int]) -> TrtllmFp4WorkspaceLayout:
+        descriptor = tuple(int(value) for value in values)
+        if len(descriptor) != _FP4_WORKSPACE_LAYOUT_FIELDS:
+            raise RuntimeError(
+                "Invalid TRTLLM FP4 workspace layout: expected "
+                f"{_FP4_WORKSPACE_LAYOUT_FIELDS} fields, got {len(descriptor)}."
+            )
+        if descriptor[0] != _FP4_WORKSPACE_LAYOUT_VERSION:
+            raise RuntimeError(
+                "Unsupported TRTLLM FP4 workspace layout ABI "
+                f"{descriptor[0]}; expected {_FP4_WORKSPACE_LAYOUT_VERSION}."
+            )
+        layout = cls(
+            descriptor=descriptor,
+            required_bytes=descriptor[1],
+            alignment=descriptor[2],
+            tile_n=descriptor[3],
+            tactic=descriptor[4],
+            gemm2_offset=descriptor[5],
+            gemm2_rows=descriptor[6],
+            gemm2_size_bytes=descriptor[7],
+            expanded_idx_offset=descriptor[8],
+            expanded_idx_size_bytes=descriptor[9],
+        )
+        if layout.required_bytes < 0 or layout.alignment <= 0:
+            raise RuntimeError(f"Invalid TRTLLM FP4 workspace layout: {layout}.")
+        if layout.gemm2_size_bytes % 2 or layout.expanded_idx_size_bytes % 4:
+            raise RuntimeError(
+                f"TRTLLM FP4 workspace layout has mis-sized typed segments: {layout}."
+            )
+        return layout
+
+    def typed_views(
+        self, workspace: torch.Tensor, hidden_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _validate_workspace_tensor(workspace, self)
+        expected_gemm2_bytes = self.gemm2_rows * hidden_size * 2
+        if self.gemm2_size_bytes != expected_gemm2_bytes:
+            raise RuntimeError(
+                "TRTLLM FP4 gemm2 layout mismatch: native segment has "
+                f"{self.gemm2_size_bytes} bytes, expected "
+                f"{expected_gemm2_bytes} for [{self.gemm2_rows}, {hidden_size}]."
+            )
+        gemm2_out = (
+            workspace.narrow(0, self.gemm2_offset, self.gemm2_size_bytes)
+            .view(torch.bfloat16)
+            .view(self.gemm2_rows, hidden_size)
+        )
+        expanded_idx = workspace.narrow(
+            0, self.expanded_idx_offset, self.expanded_idx_size_bytes
+        ).view(torch.int32)
+        return gemm2_out, expanded_idx
+
+
+def _validate_tactic_cap(
+    tactic: Sequence[int], max_tile_n: Optional[int]
+) -> tuple[int, int]:
+    if len(tactic) != 2:
+        raise ValueError(f"tactic must be (tile_N, config), got {tuple(tactic)!r}.")
+    tile_n, config = (int(tactic[0]), int(tactic[1]))
+    if max_tile_n is not None:
+        max_tile_n = int(max_tile_n)
+        if max_tile_n <= 0:
+            raise ValueError(f"max_tile_n must be positive, got {max_tile_n}.")
+        # Check the raw tile even when config == -1. Otherwise native fallback
+        # semantics ("either field is -1") could silently turn (256, -1) into
+        # a smaller default tile instead of enforcing the caller's cap.
+        if tile_n >= 0 and tile_n > max_tile_n:
+            raise ValueError(
+                f"Explicit FP4 MoE tile_N={tile_n} exceeds max_tile_n={max_tile_n}."
+            )
+    return tile_n, config
+
+
+def _validate_workspace_tensor(
+    workspace: torch.Tensor, layout: TrtllmFp4WorkspaceLayout
+) -> None:
+    if workspace.dtype != torch.uint8:
+        raise TypeError(
+            f"FP4 workspace must have torch.uint8 dtype, got {workspace.dtype}."
+        )
+    if workspace.ndim != 1 or not workspace.is_contiguous():
+        raise ValueError("FP4 workspace must be a contiguous 1-D byte arena.")
+    if workspace.device.type != "cuda":
+        raise ValueError(f"FP4 workspace must be on CUDA, got {workspace.device}.")
+    if workspace.data_ptr() % layout.alignment:
+        raise ValueError(f"FP4 workspace base must be {layout.alignment}-byte aligned.")
+    if workspace.numel() < layout.required_bytes:
+        raise ValueError(
+            f"FP4 workspace has {workspace.numel()} bytes, but tile_N="
+            f"{layout.tile_n}, tactic={layout.tactic} requires "
+            f"{layout.required_bytes} bytes."
+        )
+
+
+def _workspace_layout_op(module):
+    # Private cubin-pool builds suffix the op; source-only/unit builds may not.
+    for name in (
+        "trtllm_fp4_block_scale_moe_workspace_layout_private",
+        "trtllm_fp4_block_scale_moe_workspace_layout",
+    ):
+        try:
+            return getattr(module, name)
+        except AttributeError:
+            pass
+    raise AttributeError("TRTLLM FP4 workspace layout query is unavailable.")
+
+
+def _workspace_moe_op(module):
+    for name in (
+        "trtllm_fp4_block_scale_moe_workspace_private",
+        "trtllm_fp4_block_scale_moe_workspace",
+    ):
+        try:
+            return getattr(module, name)
+        except AttributeError:
+            pass
+    raise AttributeError("TRTLLM FP4 workspace-aware MoE op is unavailable.")
+
+
+def _legacy_moe_op(module):
+    for name in (
+        "trtllm_fp4_block_scale_moe_private",
+        "trtllm_fp4_block_scale_moe",
+    ):
+        try:
+            return getattr(module, name)
+        except AttributeError:
+            pass
+    raise AttributeError("TRTLLM FP4 legacy MoE op is unavailable.")
+
+
+def _invoke_fp4_moe(
+    module,
+    args: tuple[object, ...],
+    *,
+    workspace: Optional[torch.Tensor],
+    workspace_layout: Optional[TrtllmFp4WorkspaceLayout],
+    max_tile_n: Optional[int],
+):
+    if workspace is None and max_tile_n is None:
+        return _legacy_moe_op(module)(*args)
+    return _workspace_moe_op(module)(
+        *args,
+        workspace,
+        [] if workspace_layout is None else list(workspace_layout.descriptor),
+        max_tile_n,
+    )
+
+
+def trtllm_fp4_block_scale_moe_workspace_layout(
+    *,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    activation_type: int = ACTIVATION_SITU,
+    local_num_experts: Optional[int] = None,
+    tactic: Sequence[int] = (-1, -1),
+    per_token_scale: Optional[torch.Tensor] = None,
+    max_tile_n: Optional[int] = None,
+) -> TrtllmFp4WorkspaceLayout:
+    """Query and cache the native byte layout for one FP4 MoE shape."""
+    module = _jit_trtllm_gen_moe_module()
+    tactic_pair = _validate_tactic_cap(tactic, max_tile_n)
+    local_num_experts = num_experts if local_num_experts is None else local_num_experts
+    key = (
+        id(module),
+        hidden_states.shape[0],
+        hidden_states.shape[1],
+        hidden_states.dtype,
+        (
+            None
+            if hidden_states_scale is None
+            else (tuple(hidden_states_scale.shape), hidden_states_scale.dtype)
+        ),
+        tuple(gemm1_weights_scale.shape),
+        gemm1_weights_scale.dtype,
+        per_token_scale is not None,
+        num_experts,
+        top_k,
+        intermediate_size,
+        local_num_experts,
+        activation_type,
+        tactic_pair,
+        max_tile_n,
+    )
+    cached = _fp4_workspace_layout_cache.get(key)
+    if cached is not None:
+        return cached
+    values = _workspace_layout_op(module)(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights_scale,
+        per_token_scale,
+        num_experts,
+        top_k,
+        intermediate_size,
+        local_num_experts,
+        activation_type,
+        list(tactic_pair),
+        max_tile_n,
+    )
+    layout = TrtllmFp4WorkspaceLayout.from_native(values)
+    _fp4_workspace_layout_cache[key] = layout
+    return layout
+
+
+def trtllm_fp4_block_scale_moe_workspace_size(**kwargs) -> int:
+    """Return the native required arena size in bytes for one FP4 MoE shape."""
+    return trtllm_fp4_block_scale_moe_workspace_layout(**kwargs).required_bytes
 
 
 def cubin_pool_dir() -> Optional[pathlib.Path]:
@@ -377,15 +613,19 @@ def trtllm_fp4_block_scale_moe(
     local_num_experts: Optional[int] = None,
     tactic: Sequence[int] = (-1, -1),
     output: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    max_tile_n: Optional[int] = None,
 ) -> torch.Tensor:
     """FP4 block-scale MoE with routing from logits and finalize fused.
 
     ``hidden_states``: bf16 ``[T, hidden]`` (w4a16) or MxFP8-packed uint8
     with ``hidden_states_scale`` (w4a8). Weights are trtllm-gen shuffled
-    MxFP4 (uint8 packed, fp8 block scales, MajorK). ``tactic`` is the
-    (gemm1, gemm2) config index pair; ``(-1, -1)`` = runner heuristic.
+    MxFP4 (uint8 packed, fp8 block scales, MajorK). ``tactic`` is
+    ``(tile_N, config)``; ``(-1, -1)`` selects the runner heuristic.
+    ``workspace`` is an optional caller-owned contiguous CUDA uint8 arena.
     """
     module = _jit_trtllm_gen_moe_module()
+    tactic_pair = _validate_tactic_cap(tactic, max_tile_n)
     # The FFI launcher reads these as dense row-major; a strided slice
     # (e.g. a fused-GEMM split) would silently mis-route.
     routing_logits = routing_logits.contiguous()
@@ -403,43 +643,68 @@ def trtllm_fp4_block_scale_moe(
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
-    module.trtllm_fp4_block_scale_moe_private(
-        _ROUTING_INPUT_FROM_LOGITS,
-        routing_logits,
-        topk_ids,
-        topk_weights,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        None,  # gemm1_bias
-        gemm1_alpha,
-        gemm1_beta,
-        None,  # gemm1_clamp_limit
-        gemm2_weights,
-        gemm2_weights_scale,
-        None,  # gemm2_bias
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        None,  # per_token_scale
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        num_experts if local_num_experts is None else local_num_experts,
-        routed_scaling_factor,
-        routing_method_type,
-        True,  # do_finalize
-        True,  # enable_pdl
-        activation_type,
-        output,
-        list(tactic),
-        norm_topk_prob,
-        None,  # routing_replay_out
+    workspace_layout = None
+    if workspace is not None:
+        workspace_layout = trtllm_fp4_block_scale_moe_workspace_layout(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_weights_scale=gemm1_weights_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            activation_type=activation_type,
+            local_num_experts=local_num_experts,
+            tactic=tactic_pair,
+            max_tile_n=max_tile_n,
+        )
+        _validate_workspace_tensor(workspace, workspace_layout)
+        if workspace.device != hidden_states.device:
+            raise ValueError(
+                "FP4 workspace and hidden_states must be on the same device."
+            )
+    _invoke_fp4_moe(
+        module,
+        (
+            _ROUTING_INPUT_FROM_LOGITS,
+            routing_logits,
+            topk_ids,
+            topk_weights,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            None,  # gemm1_bias
+            gemm1_alpha,
+            gemm1_beta,
+            None,  # gemm1_clamp_limit
+            gemm2_weights,
+            gemm2_weights_scale,
+            None,  # gemm2_bias
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+            None,  # per_token_scale
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            num_experts if local_num_experts is None else local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            True,  # do_finalize
+            True,  # enable_pdl
+            activation_type,
+            output,
+            list(tactic_pair),
+            norm_topk_prob,
+            None,  # routing_replay_out
+        ),
+        workspace=workspace,
+        workspace_layout=workspace_layout,
+        max_tile_n=max_tile_n,
     )
     return output
 
@@ -466,6 +731,8 @@ def trtllm_fp4_block_scale_routed_moe(
     tactic: Sequence[int] = (-1, -1),
     output: Optional[torch.Tensor] = None,
     do_finalize: bool = True,
+    workspace: Optional[torch.Tensor] = None,
+    max_tile_n: Optional[int] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FP4 block-scale MoE with PRECOMPUTED routing (PackedPrecomputed).
 
@@ -481,8 +748,14 @@ def trtllm_fp4_block_scale_routed_moe(
     topk_weights [T, top_k] bf16 unpacked from packed_topk_ids,
     expanded_idx_to_permuted_idx [T*top_k] int32 with -1 = dropped slot)``.
     ``output`` is left unwritten in that mode.
+
+    ``workspace`` is an optional caller-owned contiguous CUDA uint8 arena.
+    When finalize is deferred, the returned GEMM2/index tensors are typed
+    PyTorch views of that arena, so their lifetime remains anchored by the
+    caller-owned tensor.
     """
     module = _jit_trtllm_gen_moe_module()
+    tactic_pair = _validate_tactic_cap(tactic, max_tile_n)
     hidden_states = hidden_states.contiguous()
     num_tokens = packed_topk_ids.shape[0]
     hidden_size = hidden_states.shape[-1]
@@ -495,46 +768,77 @@ def trtllm_fp4_block_scale_routed_moe(
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
-    result = module.trtllm_fp4_block_scale_moe_private(
-        _ROUTING_INPUT_PACKED,
-        None,  # routing_logits
-        packed_topk_ids.contiguous(),
-        topk_weights,
-        None,  # routing_bias (already applied by the external router)
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        None,  # gemm1_bias
-        gemm1_alpha,
-        gemm1_beta,
-        None,  # gemm1_clamp_limit
-        gemm2_weights,
-        gemm2_weights_scale,
-        None,  # gemm2_bias
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        None,  # per_token_scale
-        num_experts,
-        top_k,
-        None,  # n_group
-        None,  # topk_group
-        intermediate_size,
-        local_expert_offset,
-        num_experts if local_num_experts is None else local_num_experts,
-        1.0,  # routed_scaling_factor (already applied by the router)
-        _ROUTING_TOPK,  # routing_method_type (unused for precomputed)
-        do_finalize,
-        True,  # enable_pdl
-        activation_type,
-        output,
-        list(tactic),
-        True,  # norm_topk_prob (unused for precomputed)
-        None,  # routing_replay_out
+    workspace_layout = None
+    arena_deferred_views = None
+    if workspace is not None:
+        workspace_layout = trtllm_fp4_block_scale_moe_workspace_layout(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_weights_scale=gemm1_weights_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            activation_type=activation_type,
+            local_num_experts=local_num_experts,
+            tactic=tactic_pair,
+            max_tile_n=max_tile_n,
+        )
+        _validate_workspace_tensor(workspace, workspace_layout)
+        if workspace.device != hidden_states.device:
+            raise ValueError(
+                "FP4 workspace and hidden_states must be on the same device."
+            )
+        if not do_finalize:
+            arena_deferred_views = workspace_layout.typed_views(workspace, hidden_size)
+    result = _invoke_fp4_moe(
+        module,
+        (
+            _ROUTING_INPUT_PACKED,
+            None,  # routing_logits
+            packed_topk_ids.contiguous(),
+            topk_weights,
+            None,  # routing_bias (already applied by the external router)
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            None,  # gemm1_bias
+            gemm1_alpha,
+            gemm1_beta,
+            None,  # gemm1_clamp_limit
+            gemm2_weights,
+            gemm2_weights_scale,
+            None,  # gemm2_bias
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+            None,  # per_token_scale
+            num_experts,
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size,
+            local_expert_offset,
+            num_experts if local_num_experts is None else local_num_experts,
+            1.0,  # routed_scaling_factor (already applied by the router)
+            _ROUTING_TOPK,  # routing_method_type (unused for precomputed)
+            do_finalize,
+            True,  # enable_pdl
+            activation_type,
+            output,
+            list(tactic_pair),
+            True,  # norm_topk_prob (unused for precomputed)
+            None,  # routing_replay_out
+        ),
+        workspace=workspace,
+        workspace_layout=workspace_layout,
+        max_tile_n=max_tile_n,
     )
     if do_finalize:
         return output
+    if arena_deferred_views is not None:
+        gemm2_out, expanded_idx = arena_deferred_views
+        return gemm2_out, topk_weights, expanded_idx
     # Deferred: [gemm2_output, expert_weights (None in packed mode — the
     # weights live in the topk_weights buffer mode 2 unpacked into),
     # expanded_idx_to_permuted_idx]. Index access — iterating the tvm-ffi

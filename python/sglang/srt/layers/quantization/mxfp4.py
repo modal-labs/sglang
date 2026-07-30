@@ -346,6 +346,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         #   - SM90  (Hopper)     -> cutlass_fused_moe(use_w4_group_scaling=True)
         #                           (FlashInfer PR #3084, post-0.6.10)
         self._fi_kernel: Optional[str] = None
+        # Bound once, after target and draft weights are loaded but before KV
+        # pool sizing. All compatible MoE layers on this process-local GPU share
+        # the same arena; graph capture deliberately keeps using its private
+        # graph pool instead.
+        self._trtllm_gen_eager_workspace: Optional[torch.Tensor] = None
+        self._trtllm_gen_eager_workspace_max_tile_n: Optional[int] = None
         if self.use_flashinfer:
             if is_sm100_supported():
                 self._fi_kernel = "trtllm_sm100"
@@ -362,6 +368,52 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 raise NotImplementedError(
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90 or SM100."
                 )
+
+    def supports_trtllm_gen_eager_workspace(self) -> bool:
+        """Whether this method reaches the private SM100 TRT-LLM-gen path."""
+        runner_config = getattr(self, "moe_runner_config", None)
+        return (
+            self.use_flashinfer
+            and self._fi_kernel == "trtllm_sm100"
+            and runner_config is not None
+            and runner_config.activation == "situ"
+        )
+
+    def bind_trtllm_gen_eager_workspace(
+        self, workspace: torch.Tensor, *, max_tile_n: int
+    ) -> None:
+        if not self.supports_trtllm_gen_eager_workspace():
+            raise RuntimeError(
+                f"{self.prefix} does not use the private SM100 SiTU MXFP4 path"
+            )
+        if (
+            workspace.dtype != torch.uint8
+            or workspace.ndim != 1
+            or not workspace.is_cuda
+            or not workspace.is_contiguous()
+            or workspace.numel() == 0
+        ):
+            raise ValueError(
+                "TRT-LLM-gen eager workspace must be a non-empty contiguous "
+                "1D CUDA torch.uint8 tensor"
+            )
+        if max_tile_n <= 0:
+            raise ValueError("TRT-LLM-gen eager workspace requires max_tile_n > 0")
+        self._trtllm_gen_eager_workspace = workspace
+        self._trtllm_gen_eager_workspace_max_tile_n = max_tile_n
+
+    def _trtllm_gen_eager_workspace_kwargs(self) -> dict:
+        workspace = self._trtllm_gen_eager_workspace
+        if workspace is None:
+            return {}
+        max_tile_n = self._trtllm_gen_eager_workspace_max_tile_n
+        assert max_tile_n is not None
+        # Captured allocations must remain in the graph-private pool. Passing
+        # the process-wide eager arena here would bake a serving-time pointer
+        # into multiple graph execs and mix the two ownership domains.
+        if torch.cuda.is_current_stream_capturing():
+            workspace = None
+        return {"workspace": workspace, "max_tile_n": max_tile_n}
 
     def create_weights(
         self,
@@ -1388,6 +1440,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # EP is cubin-internal: each rank computes its local expert slice
                 # [offset, +num_local) and the caller all-reduces. ep=1 -> TP path.
                 local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+                workspace_kwargs = self._trtllm_gen_eager_workspace_kwargs()
                 if TopKOutputChecker.format_is_standard(topk_output):
                     # Precomputed routing (radix router upstream): skip the
                     # in-op routing kernels entirely. At small T the in-op
@@ -1428,6 +1481,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         local_num_experts=layer.num_local_experts,
                         output=symm_output,
                         do_finalize=not defer_finalize,
+                        **workspace_kwargs,
                     )
                     if defer_finalize:
                         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1440,6 +1494,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                             expert_weights=topk_weights,
                             expanded_idx_to_permuted_idx=expanded_idx,
                             top_k=packed_topk.shape[1],
+                            _workspace_owner=workspace_kwargs.get("workspace"),
                         )
                     return StandardCombineInput(hidden_states=result)
 
@@ -1481,6 +1536,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     local_expert_offset=local_expert_offset,
                     local_num_experts=layer.num_local_experts,
                     output=symm_output,
+                    **workspace_kwargs,
                 )
                 return StandardCombineInput(hidden_states=symm_output)
 

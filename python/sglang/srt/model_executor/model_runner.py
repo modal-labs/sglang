@@ -20,10 +20,13 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
@@ -294,6 +297,7 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.trtllm_gen_moe_eager_workspace: Optional[torch.Tensor] = None
 
         self.init_remote_instance_weight_transporter()
 
@@ -602,6 +606,40 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def get_trtllm_gen_moe_eager_workspace_methods(
+        self,
+    ) -> List[Mxfp4MoEMethod]:
+        """Return compatible MXFP4 methods owned by this loaded model."""
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        methods = []
+        seen = set()
+        for module in self.model.modules():
+            method = getattr(module, "quant_method", None)
+            if (
+                isinstance(method, Mxfp4MoEMethod)
+                and method.supports_trtllm_gen_eager_workspace()
+                and id(method) not in seen
+            ):
+                seen.add(id(method))
+                methods.append(method)
+        return methods
+
+    def init_trtllm_gen_moe_eager_workspace(
+        self, workspace: torch.Tensor, *, max_tile_n: int
+    ) -> int:
+        """Bind one process-local eager arena to this runner's compatible MoEs."""
+        methods = self.get_trtllm_gen_moe_eager_workspace_methods()
+        for method in methods:
+            method.bind_trtllm_gen_eager_workspace(
+                workspace, max_tile_n=max_tile_n
+            )
+        if methods:
+            # Runner-level ownership keeps the allocation alive independently
+            # of any individual layer and makes reload/lifecycle behavior clear.
+            self.trtllm_gen_moe_eager_workspace = workspace
+        return len(methods)
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(

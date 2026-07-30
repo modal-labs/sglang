@@ -38,6 +38,18 @@ class SourcePatch:
 _COMMON_PATH = "csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu"
 _CUSTOM_PATH = "csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu"
 _POLICY_PATH = "include/flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
+_PRIVATE_LAUNCHER_PATH = "csrc/trtllm_fused_moe_kernel_launcher.cu"
+_PRIVATE_LAUNCHER_BASE_SHA256 = (
+    "750f7738b2ccc2be03f66bb6df6525cfa00ef7bfaae8a86cde7bd1f0555f9e0d"
+)
+_REVIEWED_LAUNCHER_SHA256 = (
+    "f5d3b3f4ae1377a85171f03ada052e59fc8e1f31aacea0af57119be109eef705"
+)
+_REVIEWED_LAUNCHER = (
+    pathlib.Path(__file__).with_name("trtllm_gen_moe_k3_data")
+    / "csrc"
+    / "trtllm_fused_moe_kernel_launcher.cu"
+)
 
 _ENABLE_K3_DYNBLOCK = """\
 namespace moe::dev::routing {
@@ -195,6 +207,29 @@ def stage_k3_dynblock_overlay(
 ) -> tuple[pathlib.Path, str]:
     patched_sources = []
     digest = hashlib.sha256()
+
+    private_launcher = (pool_overlay / _PRIVATE_LAUNCHER_PATH).read_bytes()
+    private_launcher_sha256 = hashlib.sha256(private_launcher).hexdigest()
+    if private_launcher_sha256 != _PRIVATE_LAUNCHER_BASE_SHA256:
+        raise RuntimeError(
+            "TRT-LLM-gen private launcher does not match the reviewed base: "
+            f"expected {_PRIVATE_LAUNCHER_BASE_SHA256}, got "
+            f"{private_launcher_sha256}."
+        )
+    reviewed_launcher = _REVIEWED_LAUNCHER.read_bytes()
+    reviewed_launcher_sha256 = hashlib.sha256(reviewed_launcher).hexdigest()
+    if reviewed_launcher_sha256 != _REVIEWED_LAUNCHER_SHA256:
+        raise RuntimeError(
+            "Bundled TRT-LLM-gen private launcher failed its integrity check: "
+            f"expected {_REVIEWED_LAUNCHER_SHA256}, got "
+            f"{reviewed_launcher_sha256}."
+        )
+    patched_sources.append((_PRIVATE_LAUNCHER_PATH, reviewed_launcher))
+    digest.update(_PRIVATE_LAUNCHER_PATH.encode())
+    digest.update(b"\0")
+    digest.update(reviewed_launcher)
+    digest.update(b"\0")
+
     for patch in SOURCE_PATCHES:
         patched = patch.apply((pool_overlay / patch.path).read_bytes())
         patched_sources.append((patch.path, patched))

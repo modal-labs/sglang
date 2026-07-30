@@ -1,3 +1,8 @@
+import hashlib
+
+import pytest
+
+from sglang.kernels.ops.moe import trtllm_gen_moe_k3_overlay as overlay
 from sglang.kernels.ops.moe.trtllm_gen_moe_k3_overlay import SOURCE_PATCHES
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -50,3 +55,37 @@ def test_k3_dynblock_policy_supports_per_kernel_geometry():
 def test_k3_dynblock_overlay_hash_locks_all_three_sources():
     assert len(SOURCE_PATCHES) == 3
     assert all(len(patch.sha256) == 64 for patch in SOURCE_PATCHES)
+
+
+def test_private_launcher_integrity_and_workspace_exports():
+    source = overlay._REVIEWED_LAUNCHER.read_bytes()
+
+    assert hashlib.sha256(source).hexdigest() == overlay._REVIEWED_LAUNCHER_SHA256
+    text = source.decode()
+    for export in (
+        "trtllm_fp4_block_scale_moe_private",
+        "trtllm_fp4_block_scale_moe_workspace_private",
+        "trtllm_fp4_block_scale_moe_workspace_layout_private",
+    ):
+        assert export in text
+
+
+def test_private_launcher_staging_is_fail_closed(monkeypatch, tmp_path):
+    base = b"reviewed private launcher base"
+    pool_overlay = tmp_path / "pool" / "overlay"
+    launcher = pool_overlay / overlay._PRIVATE_LAUNCHER_PATH
+    launcher.parent.mkdir(parents=True)
+    launcher.write_bytes(base)
+
+    monkeypatch.setattr(overlay, "SOURCE_PATCHES", ())
+    monkeypatch.setattr(
+        overlay, "_PRIVATE_LAUNCHER_BASE_SHA256", hashlib.sha256(base).hexdigest()
+    )
+    staged, _ = overlay.stage_k3_dynblock_overlay(pool_overlay, tmp_path / "cache")
+    assert (staged / overlay._PRIVATE_LAUNCHER_PATH).read_bytes() == (
+        overlay._REVIEWED_LAUNCHER.read_bytes()
+    )
+
+    launcher.write_bytes(base + b" drift")
+    with pytest.raises(RuntimeError, match="does not match the reviewed base"):
+        overlay.stage_k3_dynblock_overlay(pool_overlay, tmp_path / "other-cache")

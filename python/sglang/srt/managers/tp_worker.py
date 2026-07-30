@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -303,6 +304,8 @@ class TpModelWorker(BaseTpWorker):
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
+        self.trtllm_gen_moe_eager_workspace: Optional[torch.Tensor] = None
+        self.trtllm_gen_moe_eager_workspace_max_tile_n: Optional[int] = None
 
         self._init_model_config()
         self._init_model_runner()
@@ -357,6 +360,118 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+
+    def init_trtllm_gen_moe_eager_workspace(
+        self, additional_model_runners: Optional[List[ModelRunner]] = None
+    ) -> Optional[torch.Tensor]:
+        """Allocate and bind one eager MXFP4 arena before KV-pool sizing.
+
+        The target and colocated draft runners execute on one process-local GPU
+        and share one forward stream, so they intentionally share one arena.
+        """
+        workspace_bytes = envs.SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES.get()
+        max_tile_n = envs.SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N.get()
+        if workspace_bytes < 0:
+            raise ValueError(
+                "SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES must be >= 0"
+            )
+        if max_tile_n < 0:
+            raise ValueError("SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N must be >= 0")
+        if (workspace_bytes == 0) != (max_tile_n == 0):
+            raise ValueError(
+                "SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES and "
+                "SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N must both be zero or both "
+                "be non-zero"
+            )
+        if workspace_bytes == 0:
+            return None
+        if max_tile_n & (max_tile_n - 1):
+            raise ValueError("SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N must be a power of two")
+
+        # One arena is reused by every compatible target/draft MoE invocation.
+        # The normal scheduler and K3 DFlash path serialize those launches, but
+        # PDMux may execute eager prefill and decode on different CUDA streams.
+        # Memory-saver handoff also requires every persistent allocation to be
+        # released and restored through its tagged regions. Until those modes
+        # have dedicated arena ownership, fail closed instead of risking
+        # cross-stream corruption or retaining 4 GiB across a handoff.
+        if self.server_args.enable_pdmux:
+            raise RuntimeError(
+                "TRT-LLM-gen eager workspace is incompatible with --enable-pdmux; "
+                "use per-stream arenas before enabling both"
+            )
+        if self.server_args.enable_memory_saver:
+            raise RuntimeError(
+                "TRT-LLM-gen eager workspace is incompatible with "
+                "--enable-memory-saver until the arena participates in "
+                "memory-saver pause/resume"
+            )
+
+        runners = list(self.model_runner_list) or [self.model_runner]
+        runners.extend(additional_model_runners or [])
+        unique_runners = []
+        seen = set()
+        for runner in runners:
+            if id(runner) not in seen:
+                seen.add(id(runner))
+                unique_runners.append(runner)
+
+        compatible_count = sum(
+            len(runner.get_trtllm_gen_moe_eager_workspace_methods())
+            for runner in unique_runners
+        )
+        if compatible_count == 0:
+            raise RuntimeError(
+                "TRT-LLM-gen eager workspace is enabled, but no loaded target "
+                "or draft model uses the compatible SM100 SiTU MXFP4 path"
+            )
+
+        if self.trtllm_gen_moe_eager_workspace is not None:
+            workspace = self.trtllm_gen_moe_eager_workspace
+            if workspace.numel() != workspace_bytes:
+                raise RuntimeError(
+                    "TRT-LLM-gen eager workspace was already initialized with "
+                    f"{workspace.numel()} bytes, requested {workspace_bytes}"
+                )
+            if self.trtllm_gen_moe_eager_workspace_max_tile_n != max_tile_n:
+                raise RuntimeError(
+                    "TRT-LLM-gen eager workspace was already initialized with "
+                    f"max_tile_n={self.trtllm_gen_moe_eager_workspace_max_tile_n}, "
+                    f"requested {max_tile_n}"
+                )
+        else:
+            primary = unique_runners[0]
+            device_type = torch.device(primary.device).type
+            device = torch.device(device_type, primary.gpu_id)
+            # Intentionally no OOM fallback: when the deployment opts in, KV
+            # sizing must observe this exact active reservation.
+            workspace = torch.empty(
+                workspace_bytes, dtype=torch.uint8, device=device
+            )
+            self.trtllm_gen_moe_eager_workspace = workspace
+            self.trtllm_gen_moe_eager_workspace_max_tile_n = max_tile_n
+
+        bound_count = sum(
+            runner.init_trtllm_gen_moe_eager_workspace(
+                workspace, max_tile_n=max_tile_n
+            )
+            for runner in unique_runners
+        )
+        if bound_count != compatible_count:
+            raise RuntimeError(
+                "TRT-LLM-gen eager workspace binding changed while initializing: "
+                f"found {compatible_count}, bound {bound_count}"
+            )
+        logger.info(
+            "Initialized TRT-LLM-gen eager workspace: bytes=%d, max_tile_n=%d, "
+            "bound_moe_methods=%d, device=%s, data_ptr=%#x",
+            workspace_bytes,
+            max_tile_n,
+            bound_count,
+            workspace.device,
+            workspace.data_ptr(),
+        )
+        return workspace
 
     def alloc_memory_pool(
         self,

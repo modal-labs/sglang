@@ -57,6 +57,11 @@ class FlashInferTrtllmDeferredFinalizeOutput:
     expert_weights: torch.Tensor
     expanded_idx_to_permuted_idx: torch.Tensor
     top_k: int
+    # Some launchers return views into a persistent workspace. This reference
+    # only anchors the arena's lifetime; it is not a lease and does not make
+    # overlapping users safe. The K3 pipeline's safety comes from enqueuing the
+    # deferred finalizer on the same forward stream before the next MoE launch.
+    _workspace_owner: Optional[torch.Tensor] = None
 
 
 @contextmanager

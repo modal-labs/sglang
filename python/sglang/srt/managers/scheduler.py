@@ -871,6 +871,59 @@ class Scheduler(
             return
         self.tp_worker.alloc_memory_pool()
 
+    @staticmethod
+    def _collect_trtllm_gen_moe_model_runners(worker: Any) -> List[Any]:
+        """Find model runners through each speculative worker's wrapper shape."""
+        runners: List[Any] = []
+        seen_objects = set()
+
+        def visit(candidate: Any) -> None:
+            if candidate is None or id(candidate) in seen_objects:
+                return
+            seen_objects.add(id(candidate))
+
+            if callable(
+                getattr(
+                    candidate,
+                    "get_trtllm_gen_moe_eager_workspace_methods",
+                    None,
+                )
+            ):
+                runners.append(candidate)
+                return
+
+            for attr in ("draft_model_runner", "draft_runner", "model_runner"):
+                visit(getattr(candidate, attr, None))
+            for attr in ("draft_runners", "draft_runner_list", "model_runner_list"):
+                nested_runners = getattr(candidate, attr, None)
+                if nested_runners is not None:
+                    for nested_runner in nested_runners:
+                        visit(nested_runner)
+            visit(getattr(candidate, "draft_worker", None))
+
+        visit(worker)
+        return runners
+
+    def init_trtllm_gen_moe_eager_workspace(self) -> None:
+        """Reserve the shared eager MoE arena after all model loads, before KV sizing."""
+        workspace_bytes = envs.SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES.get()
+        initializer = getattr(
+            self.tp_worker, "init_trtllm_gen_moe_eager_workspace", None
+        )
+        if initializer is None:
+            if workspace_bytes:
+                raise RuntimeError(
+                    "TRT-LLM-gen eager workspace is enabled on a worker that "
+                    "does not support its explicit initialization"
+                )
+            return
+
+        additional_model_runners = self._collect_trtllm_gen_moe_model_runners(
+            self.draft_worker
+        )
+
+        initializer(additional_model_runners=additional_model_runners)
+
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
         self.init_target_memory_pool()
@@ -898,6 +951,11 @@ class Scheduler(
         # Load model weights.
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
+
+        # The optional persistent MXFP4 arena is intentionally reserved only
+        # after both models are resident, but before available-memory-based KV
+        # sizing. Target and draft share the one process-local GPU arena.
+        self.init_trtllm_gen_moe_eager_workspace()
 
         # Prepare KV cache pools for all workers
         self.init_memory_pools()
