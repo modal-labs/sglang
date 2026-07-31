@@ -277,6 +277,14 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+# Opcodes carried in the fingerprinted radix-cache collectives (see
+# _all_ranks_succeeded / writing_check / loading_check): a cross-paired
+# reduce shows up as an opcode/seq mismatch instead of a silent value swap.
+_HICACHE_OP_WRITE = 1
+_HICACHE_OP_LOAD = 2
+_HICACHE_OP_WRITE_CHECK = 3
+_HICACHE_OP_LOAD_CHECK = 4
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -426,23 +434,70 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
 
-    def _all_ranks_succeeded(self, local_success: bool) -> bool:
+    def _fingerprint_ok(self, vec_min: torch.Tensor, vec_max: torch.Tensor) -> bool:
+        """True when all ranks reduced the same transaction (seq/op/node/tokens)."""
+        if torch.equal(vec_min[1:], vec_max[1:]):
+            return True
+        self._hicache_desync_logged += 1
+        if self._hicache_desync_logged <= 20 or self._hicache_desync_logged % 100 == 0:
+            logger.error(
+                "HiCache TP consensus fingerprint mismatch (rank desync #%d): "
+                "min=%s max=%s [value, seq, opcode, node_id, tokens]. Failing "
+                "this transaction closed on every rank.",
+                self._hicache_desync_logged,
+                vec_min.tolist(),
+                vec_max.tolist(),
+            )
+        return False
+
+    def _fingerprinted_check_reduce(self, value: int, *, opcode: int) -> int:
+        """MIN-reduce an ack count with the same fingerprint scheme as
+        _all_ranks_succeeded (same _all_reduce topology writing_check and
+        loading_check used before). Returns 0 on fingerprint mismatch so a
+        desynchronized rank drains nothing instead of popping foreign acks."""
+        if self.tp_world_size == 1 and self.pp_size == 1:
+            return value
+        self._hicache_consensus_seq += 1
+        base = [int(value), self._hicache_consensus_seq, int(opcode), -1, -1]
+        vec_min = torch.tensor(base, dtype=torch.long, device="cpu")
+        vec_max = torch.tensor(base, dtype=torch.long, device="cpu")
+        self._all_reduce(vec_min, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(vec_max, torch.distributed.ReduceOp.MAX)
+        if not self._fingerprint_ok(vec_min, vec_max):
+            return 0
+        return int(vec_min[0].item())
+
+    def _all_ranks_succeeded(
+        self,
+        local_success: bool,
+        *,
+        opcode: int,
+        node_id: int = -1,
+        tokens: int = -1,
+    ) -> bool:
         if self.tp_world_size == 1 and self.pp_size == 1:
             return local_success
-        succeeded = torch.tensor(
+        self._hicache_consensus_seq += 1
+        base = [
             int(local_success),
-            dtype=torch.int,
-            device="cpu",
-        )
-        self._all_reduce_attn_groups(succeeded, torch.distributed.ReduceOp.MIN)
-        if self.pp_size > 1:
-            assert self.pp_group is not None
-            torch.distributed.all_reduce(
-                succeeded,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.pp_group,
-            )
-        return succeeded.item() == 1
+            self._hicache_consensus_seq,
+            int(opcode),
+            int(node_id),
+            int(tokens),
+        ]
+        vec_min = torch.tensor(base, dtype=torch.long, device="cpu")
+        vec_max = torch.tensor(base, dtype=torch.long, device="cpu")
+        for vec, op in (
+            (vec_min, torch.distributed.ReduceOp.MIN),
+            (vec_max, torch.distributed.ReduceOp.MAX),
+        ):
+            self._all_reduce_attn_groups(vec, op)
+            if self.pp_size > 1:
+                assert self.pp_group is not None
+                torch.distributed.all_reduce(vec, op=op, group=self.pp_group)
+        if not self._fingerprint_ok(vec_min, vec_max):
+            return False
+        return vec_min[0].item() == 1
 
     def _pp_sync(self, data: torch.Tensor) -> None:
         """
@@ -580,6 +635,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+
+        # Every radix-cache collective carries [value, seq, opcode, node_id,
+        # tokens]; seq is a per-rank monotonic counter so a rank that skips or
+        # double-runs one collective is detected at the next fingerprint check
+        # instead of silently cross-pairing same-shape reduces.
+        self._hicache_consensus_seq = 0
+        self._hicache_desync_logged = 0
+        # Watermark host eviction for TP>1 (single-rank evicts inline in
+        # write_backup): trigger when a host pool's free fraction drops below
+        # the trigger ratio, evict a batch-ratio slice.
+        self._host_evict_trigger_ratio = (
+            envs.SGLANG_HICACHE_HOST_EVICT_TRIGGER_RATIO.get()
+        )
+        self._host_evict_batch_ratio = envs.SGLANG_HICACHE_HOST_EVICT_BATCH_RATIO.get()
 
         if storage_backend is not None:
             self._apply_storage_runtime_config(
@@ -1688,10 +1757,71 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
+    def _watermark_evict_host_pools(self) -> None:
+        """Free host-pool headroom before coordinated (TP>1) write-throughs.
+
+        For each host pool (anchor KV, plus mamba/swa extra pools) whose free
+        fraction fell below SGLANG_HICACHE_HOST_EVICT_TRIGGER_RATIO, evict an
+        SGLANG_HICACHE_HOST_EVICT_BATCH_RATIO slice through the component's
+        LRU eviction driver. No collectives: determinism across ranks follows
+        from mirrored trees and allocators (every rank sees the same insert
+        and eviction stream), which the coordinated reservation protocol
+        already assumes. Victims are never DMA-in-flight: loadbacks hold
+        host_lock_ref and pending write-throughs are not yet backuped, so
+        neither qualifies as an evictable host node.
+        """
+        cc = self.cache_controller
+        if cc is None or self._host_evict_trigger_ratio <= 0:
+            return
+        targets: list[tuple[ComponentType, Any]] = [
+            (BASE_COMPONENT_TYPE, cc.mem_pool_host)
+        ]
+        entry_map = getattr(cc.mem_pool_host, "entry_map", None) or {}
+        for pool_name, component_type in (
+            (PoolName.MAMBA, ComponentType.MAMBA),
+            (PoolName.SWA, ComponentType.SWA),
+        ):
+            entry = entry_map.get(pool_name)
+            if entry is not None and component_type in self.components:
+                targets.append((component_type, entry.host_pool))
+        for component_type, pool in targets:
+            capacity = getattr(pool, "size", 0)
+            if capacity <= 0:
+                continue
+            available = pool.available_size()
+            if available >= self._host_evict_trigger_ratio * capacity:
+                continue
+            need = max(1, int(self._host_evict_batch_ratio * capacity))
+            evicted = self.evict_host(need, component_type=component_type)
+            logger.info(
+                "HiCache host watermark eviction: component=%s available=%d/%d "
+                "requested=%d evicted=%d",
+                component_type,
+                available,
+                capacity,
+                need,
+                evicted,
+            )
+
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
             return 0
+
+        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
+        if write_back and multi_rank:
+            raise RuntimeError(
+                "Unified HiCache write_back cannot run independently on TP/PP ranks"
+            )
+        # At TP>1 no on-demand eviction is safe inside the coordinated
+        # reservation (see below), so without this preflight the host pools
+        # fill monotonically and every later backup fails its reservation —
+        # a permanent write-through outage plus a per-node consensus storm.
+        # The watermark eviction has no collectives and runs at symmetric
+        # call sites, so it stays in lockstep given mirrored trees (the same
+        # assumption the coordinated protocol itself relies on).
+        if multi_rank and not write_back:
+            self._watermark_evict_host_pools()
 
         # Backup invariant (write-through): parent must be backuped first
         if not write_back and (
@@ -1700,41 +1830,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if self.write_backup(node.parent) <= 0:
                 return 0
 
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
-        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
-
-        # Build aux transfers, keyed per component.
-        comp_xfers: dict[ComponentType, list] = {}
-        for comp in self._components_tuple:
-            if comp.component_type == BASE_COMPONENT_TYPE:
-                continue
-            t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
-            if t:
-                comp_xfers[comp.component_type] = t
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
-        )
-
-        kv_tokens = len(device_value)
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
-        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
-        if write_back and multi_rank:
-            raise RuntimeError(
-                "Unified HiCache write_back cannot run independently on TP/PP ranks"
-            )
         coordinated = multi_rank
-        # Coordinated backups fail closed under pressure. Safe victim eviction
-        # needs its own cross-rank reservation protocol.
-        if not coordinated:
-            host_avail = self.cache_controller.mem_pool_host.available_size()
-            if host_avail < kv_tokens:
-                needed = kv_tokens - host_avail
-                evicted = self.evict_host(needed)
-                if evicted < needed:
-                    return 0
-
+        kv_tokens = -1
+        reservation = None
         try:
+            device_value = node.component_data[BASE_COMPONENT_TYPE].value
+            kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
+
+            # Build aux transfers, keyed per component.
+            comp_xfers: dict[ComponentType, list] = {}
+            for comp in self._components_tuple:
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+                if t:
+                    comp_xfers[comp.component_type] = t
+            sidecar_xfers = self._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+            )
+
+            kv_tokens = len(device_value)
+            aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+            aux_xfers.extend(sidecar_xfers)
+            # Coordinated backups fail closed under pressure. Safe victim
+            # eviction inside the reservation needs its own cross-rank
+            # protocol; the watermark preflight above keeps headroom instead.
+            if not coordinated:
+                host_avail = self.cache_controller.mem_pool_host.available_size()
+                if host_avail < kv_tokens:
+                    needed = kv_tokens - host_avail
+                    evicted = self.evict_host(needed)
+                    if evicted < needed:
+                        return 0
+
             reservation = self.cache_controller.reserve_write(
                 device_value,
                 node_id=node.id,
@@ -1742,13 +1870,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 allow_evict=not coordinated,
             )
         except Exception:
+            # A one-rank failure anywhere before the consensus must still
+            # reach the consensus, or the other ranks block in it forever.
             if not coordinated:
                 raise
-            logger.exception("HiCache write reservation failed on this rank")
+            logger.exception("HiCache write transfer build/reservation failed")
             reservation = None
         try:
             group_succeeded = (
-                self._all_ranks_succeeded(reservation is not None)
+                self._all_ranks_succeeded(
+                    reservation is not None,
+                    opcode=_HICACHE_OP_WRITE,
+                    node_id=node.id,
+                    tokens=kv_tokens,
+                )
                 if coordinated
                 else reservation is not None
             )
@@ -1929,20 +2064,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         host_anchor_params: Optional[DecLockRefParams],
     ) -> bool:
         kv_tokens = len(kv_xfer.host_indices)
-        # Build aux transfers, keyed per component.
+        multi_rank_build = self.tp_world_size > 1 or self.pp_size > 1
+        # Build aux transfers, keyed per component. A one-rank failure here
+        # (e.g. a component assert) must still reach the consensus below, or
+        # the other ranks block in it forever.
         comp_xfers: dict[ComponentType, list] = {}
-        if local_prepare_ok:
-            for comp in self._components_tuple:
-                if comp.component_type == BASE_COMPONENT_TYPE:
-                    continue
-                t = comp.build_hicache_transfers(
-                    best_match_node, CacheTransferPhase.LOAD_BACK, req=req
-                )
-                if t:
-                    comp_xfers[comp.component_type] = t
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
-        )
+        sidecar_xfers: list = []
+        try:
+            if local_prepare_ok:
+                for comp in self._components_tuple:
+                    if comp.component_type == BASE_COMPONENT_TYPE:
+                        continue
+                    t = comp.build_hicache_transfers(
+                        best_match_node, CacheTransferPhase.LOAD_BACK, req=req
+                    )
+                    if t:
+                        comp_xfers[comp.component_type] = t
+            sidecar_xfers = self._build_sidecar_transfers(
+                CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
+            )
+        except Exception:
+            if not multi_rank_build:
+                raise
+            logger.exception("HiCache load transfer build failed on this rank")
+            local_prepare_ok = False
+            comp_xfers = {}
+            sidecar_xfers = []
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
@@ -1988,7 +2135,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_ok = reservation is not None
 
         try:
-            group_succeeded = self._all_ranks_succeeded(local_ok)
+            group_succeeded = self._all_ranks_succeeded(
+                local_ok,
+                opcode=_HICACHE_OP_LOAD,
+                node_id=best_match_node.id,
+                tokens=kv_tokens,
+            )
         except Exception:
             if reservation is not None:
                 try:
@@ -2768,16 +2920,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     break
                 finish_count += 1
 
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        finish_count = self._fingerprinted_check_reduce(
+            finish_count, opcode=_HICACHE_OP_WRITE_CHECK
+        )
 
         # Process completed acks
         while finish_count > 0:
+            if not cc.ack_write_queue:
+                logger.error(
+                    "HiCache writing_check: reduced finish_count exceeds the "
+                    "local ack queue (rank desync); dropping the remainder."
+                )
+                break
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
-                self._finish_write_through_ack(ack_id)
+                if ack_id in self.ongoing_write_through:
+                    self._finish_write_through_ack(ack_id)
+                else:
+                    logger.error(
+                        "HiCache writing_check: ack %d has no ongoing "
+                        "write-through entry (rank desync).",
+                        ack_id,
+                    )
             finish_count -= 1
 
     def loading_check(self) -> None:
@@ -2793,15 +2958,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if not ack.finish_event.query():
                     break
                 finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        finish_count = self._fingerprinted_check_reduce(
+            finish_count, opcode=_HICACHE_OP_LOAD_CHECK
+        )
 
         while finish_count > 0:
+            if not cc.ack_load_queue:
+                logger.error(
+                    "HiCache loading_check: reduced finish_count exceeds the "
+                    "local ack queue (rank desync); dropping the remainder."
+                )
+                break
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
+                entry = self.ongoing_load_back.pop(ack_id, None)
+                if entry is None:
+                    logger.error(
+                        "HiCache loading_check: ack %d has no ongoing "
+                        "load-back entry (rank desync).",
+                        ack_id,
+                    )
+                    continue
+                node, lock_params, host_lock_params = entry
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
 

@@ -207,12 +207,20 @@ class MambaComponent(TreeComponent):
             return
 
         tracker = {component: 0 for component in self.cache.tree_components}
+        ongoing_writes = getattr(self.cache, "ongoing_write_through", None) or {}
+        ongoing_loads = getattr(self.cache, "ongoing_load_back", None) or {}
         for node in reversed(holders):
             if excess <= 0 or node is tail:
                 break
             if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
                 continue
             if node in self.cache.evictable_device_leaves:
+                continue
+            # A pending write-through DMA reads this node's device mamba
+            # state and a pending load-back writes into it; pruning either
+            # mid-flight corrupts the transfer (and the skip must stay
+            # TP-symmetric, which these post-consensus sets are).
+            if node.id in ongoing_writes or node.id in ongoing_loads:
                 continue
             self.cache._evict_component_and_detach_lru(
                 node, self, target=EvictLayer.DEVICE, tracker=tracker
