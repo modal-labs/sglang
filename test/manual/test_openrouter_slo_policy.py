@@ -208,6 +208,17 @@ class TestSloAdmissionCheck(CustomTestCase):
         req = _make_req("r", 5000, entry_time=0.0)
         self.assertFalse(check(req))
 
+    def test_never_rejects_requests_with_output(self):
+        # Retracted / requeued requests already streamed tokens; a 429 there
+        # would kill a stream mid-generation.
+        check, sent = self._fake_scheduler(
+            waiting_queue=[self._blocker()], enforce=True
+        )
+        req = _make_req("r", 5000, entry_time=0.0)
+        req.output_ids = [1, 2, 3]
+        self.assertFalse(check(req))
+        self.assertEqual(sent, [])
+
 
 if __name__ == "__main__":
     unittest.main()

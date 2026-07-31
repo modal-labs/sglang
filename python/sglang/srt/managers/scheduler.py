@@ -2648,6 +2648,11 @@ class Scheduler(
             or args.slo_prefill_tokens_per_s <= 0
         ):
             return False
+        # Never consider requests re-entering the queue (retraction, requeued
+        # aborts, requests that already produced output): rejecting those would
+        # 429 a stream mid-generation. The predicate is for fresh admissions.
+        if req.output_ids or req.finished_reason is not None:
+            return False
 
         slope_s = args.slo_ttft_slope_ms_per_uncached_token / 1000.0
         match_prefix_for_req(self.tree_cache, req, include_req=True)
