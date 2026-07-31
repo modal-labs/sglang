@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 import os
 import random
 from collections import Counter, defaultdict
+import contextlib
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
@@ -1169,7 +1170,21 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
-        with self._lock_node(req.last_node):
+        # Lock the CoW source too: under HiCache best_match_node can be
+        # strictly deeper than last_node, and init_load_back below may evict
+        # mamba — an unlocked CoW source node could lose its slot between
+        # match and the deferred CoW copy (dangling req.mamba_cow_src_index).
+        best_match = getattr(req, "best_match_node", None)
+        lock_best_match = (
+            best_match is not None
+            and best_match is not req.last_node
+            and self.tree_cache.is_tree_cache()
+        )
+        with self._lock_node(req.last_node), (
+            self._lock_node(best_match)
+            if lock_best_match
+            else contextlib.nullcontext()
+        ):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
@@ -1211,7 +1226,18 @@ class PrefillAdder:
                         req=req,
                     )
                 )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                if new_indices is None:
+                    # Load-back failed: no usable recurrent state for the
+                    # matched prefix. Drop it and recompute fully rather than
+                    # pairing deep KV with a zeroed mamba state.
+                    req.prefix_indices = req.prefix_indices[:0]
+                    req.host_hit_length = 0
+                    req.swa_host_hit_length = 0
+                    req.mamba_host_hit_length = 0
+                else:
+                    req.prefix_indices = torch.cat(
+                        [req.prefix_indices, new_indices]
+                    )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 

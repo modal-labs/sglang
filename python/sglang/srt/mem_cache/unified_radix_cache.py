@@ -300,6 +300,10 @@ class _OngoingLoadBack(NamedTuple):
     node: UnifiedTreeNode
     lock_params: DecLockRefParams
     host_lock_params: DecLockRefParams
+    # Device mamba slots named by this op's committed transfers, pinned in the
+    # slot allocator until the load acks: a slot freed while a queued DMA
+    # still targets it would be re-allocated and clobbered mid-forward.
+    pinned_mamba_slots: Optional[torch.Tensor] = None
 
 
 class _OngoingPrefetch(NamedTuple):
@@ -2179,10 +2183,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # The pre-eviction lock skipped tombstones. Acquire the complete
             # restored path first, then release only what the old lock owned.
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
+
+        # Pin every device mamba slot this op's transfers name (tree-restore
+        # slot and the per-request CoW slot): the request can still be
+        # rejected by admission AFTER this commit and its slot freed, or a
+        # finished request's slot recycled, while the queued DMA is pending —
+        # the allocator must not re-hand those slots out until the ack.
+        pinned_mamba_slots = None
+        mamba_xfers = comp_xfers.get(ComponentType.MAMBA) or []
+        slot_tensors = [
+            x.device_indices for x in mamba_xfers if x.device_indices is not None
+        ]
+        if slot_tensors:
+            pinned_mamba_slots = torch.cat([t.flatten() for t in slot_tensors])
+            self.req_to_token_pool.mamba_allocator.pin_slots(pinned_mamba_slots)
+
         self.ongoing_load_back[best_match_node.id] = _OngoingLoadBack(
             best_match_node,
             ongoing_lock_params,
             host_anchor_params,
+            pinned_mamba_slots,
         )
 
         return True
@@ -2980,9 +3000,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         ack_id,
                     )
                     continue
-                node, lock_params, host_lock_params = entry
-                self.dec_lock_ref(node, lock_params)
-                self.dec_host_lock_ref(node, host_lock_params)
+                if entry.pinned_mamba_slots is not None:
+                    self.req_to_token_pool.mamba_allocator.unpin_slots(
+                        entry.pinned_mamba_slots
+                    )
+                self.dec_lock_ref(entry.node, entry.lock_params)
+                self.dec_host_lock_ref(entry.node, entry.host_lock_params)
 
             if self.metrics_collector is not None:
                 self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
@@ -3042,6 +3065,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     best_match_node.id,
                 )
                 return new_indices, best_match_node
+
+            # Load-back failed (group reject / pressure). The matched prefix
+            # has no usable recurrent state to resume from — reusing it would
+            # pair a deep KV hit with a zeroed mamba state (the same
+            # corruption class as the gone-everywhere match clamp). Signal
+            # the caller to drop the prefix and recompute fully.
+            return None, self.root_node
 
         return (
             self._empty_match_result.device_indices,

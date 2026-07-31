@@ -209,6 +209,10 @@ class DecodeHiCacheTransferMixin:
                 req=dr.req,
             )
         )
+        if new_indices is None:
+            # Load-back failed (see UnifiedRadixCache.init_load_back); treat
+            # as zero coverage so the failback below handles it.
+            new_indices = rematch.device_indices[:0]
         # Failback: total coverage < required prefix means device alloc likely failed.
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
             logger.warning(

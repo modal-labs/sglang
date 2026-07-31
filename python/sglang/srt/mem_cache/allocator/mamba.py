@@ -85,9 +85,52 @@ class MambaSlotAllocator:
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
+    def pin_slots(self, indices: torch.Tensor) -> None:
+        """Pin slots referenced by a committed (queued/in-flight) HiCache
+        load-back DMA. A pinned slot that gets freed is parked instead of
+        returning to the free list, so it cannot be re-allocated while the
+        transfer still targets it (cross-request state clobber otherwise)."""
+        for slot in indices.flatten().tolist():
+            slot = int(slot)
+            self._pinned[slot] = self._pinned.get(slot, 0) + 1
+
+    def unpin_slots(self, indices: torch.Tensor) -> None:
+        """Release pins (at load ack) and flush any deferred frees."""
+        for slot in indices.flatten().tolist():
+            slot = int(slot)
+            count = self._pinned.get(slot, 0) - 1
+            if count > 0:
+                self._pinned[slot] = count
+            else:
+                self._pinned.pop(slot, None)
+        if self._deferred_free:
+            still_pinned = [s for s in self._deferred_free if s in self._pinned]
+            release = [s for s in self._deferred_free if s not in self._pinned]
+            self._deferred_free = still_pinned
+            if release:
+                self.free_slots = torch.cat(
+                    (
+                        self.free_slots,
+                        torch.tensor(
+                            release, dtype=torch.int64, device=self.device
+                        ),
+                    )
+                )
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        if self._pinned:
+            slots = free_index.flatten().tolist()
+            deferred = [int(s) for s in slots if int(s) in self._pinned]
+            if deferred:
+                self._deferred_free.extend(deferred)
+                keep = [int(s) for s in slots if int(s) not in self._pinned]
+                if not keep:
+                    return
+                free_index = torch.tensor(
+                    keep, dtype=torch.int64, device=self.device
+                )
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
@@ -95,3 +138,6 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        # DMA-referenced slot pins (see pin_slots/free); reset with the pool.
+        self._pinned: dict[int, int] = {}
+        self._deferred_free: list[int] = []

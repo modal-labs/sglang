@@ -123,8 +123,17 @@ class MambaComponent(TreeComponent):
             aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
         )
 
+        # A node with an in-flight load-back has cd.value published while the
+        # H2D may not have landed (the slot holds a previous tenant's state
+        # until then), and the deferred CoW copy runs on the forward stream
+        # with no ordering against the load stream. Treat it as not
+        # CoW-able; the host-hit branch below issues a properly gated load
+        # for this request instead.
+        load_in_flight = (
+            last_node.id in getattr(self.cache, "ongoing_load_back", {})
+        )
         mamba_value = last_node.component_data[self.component_type].value
-        if cow_mamba and mamba_value is not None:
+        if cow_mamba and mamba_value is not None and not load_in_flight:
             assert req is not None
             if req.mamba_pool_idx is None:
                 dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
@@ -143,14 +152,17 @@ class MambaComponent(TreeComponent):
             req.mamba_cow_src_index = mamba_value
             req.mamba_needs_clear = False
 
-        # HiCache: if mamba was evicted from device but has host backup,
-        # ensure mamba_host_hit_length >= 1 so load_back is triggered.
+        # HiCache: if mamba was evicted from device but has host backup (or
+        # its device state is mid-load for another request), ensure
+        # mamba_host_hit_length >= 1 so this request gets its own gated load.
         cd = last_node.component_data[self.component_type]
-        if cd.value is None and cd.host_value is not None:
+        if (cd.value is None or load_in_flight) and cd.host_value is not None:
             result = result._replace(
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
             )
-        elif cd.value is None and cd.host_value is None and (
+        elif (cd.value is None or load_in_flight) and cd.host_value is None and (
+            last_node is not self.cache.root_node
+        ) and (
             result.full_kv_hit_length > 0 or result.device_indices.numel() > 0
         ):
             # Mamba state is gone from BOTH tiers (device state pruned/evicted
