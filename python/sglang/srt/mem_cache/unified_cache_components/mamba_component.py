@@ -477,6 +477,11 @@ class MambaComponent(TreeComponent):
                     self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
                 )
                 if write_pos_buf is not None:
+                    # Schedule-stream RMW of a cursor the in-flight forward's
+                    # spec commit may still be scattering into; fence first.
+                    fence = getattr(self.cache, "fence_state_read", None)
+                    if fence is not None:
+                        fence()
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
 
@@ -524,6 +529,13 @@ class MambaComponent(TreeComponent):
                 )
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
+                # This copy runs on the schedule stream and reads a slot the
+                # overlapped in-flight forward may still be writing; fence
+                # against the forward's writes first or the donated tree
+                # checkpoint (and its write-through) captures a torn state.
+                fence = getattr(self.cache, "fence_state_read", None)
+                if fence is not None:
+                    fence()
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices

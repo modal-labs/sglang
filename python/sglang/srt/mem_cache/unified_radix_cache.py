@@ -1761,6 +1761,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
+    def note_forward_launch(self, forward_done_event) -> None:
+        """Scheduler hands us each forward's completion event (recorded on
+        the forward stream right after launch)."""
+        self._latest_forward_done_event = forward_done_event
+
+    def fence_state_read(self) -> None:
+        """Order the CURRENT stream behind the latest launched forward.
+
+        The overlap scheduler launches batch N before processing batch N-1's
+        results, and the WAR barrier's fast path orders only the forward's
+        READS. Any schedule/write-stream READ of mutable pool state (mamba
+        donate copy_from, ReplaySSM cursor RMW, write-through D2H) must fence
+        against the in-flight forward's WRITES via this event, or the host
+        tier freezes torn checkpoints. Targeted replacement for
+        SGLANG_FORCE_COARSE_WAR_BARRIER=1.
+        """
+        event = getattr(self, "_latest_forward_done_event", None)
+        if event is not None:
+            torch.get_device_module().current_stream().wait_event(event)
+
     def _watermark_evict_host_pools(self) -> None:
         """Free host-pool headroom before coordinated (TP>1) write-throughs.
 
@@ -1826,6 +1846,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # assumption the coordinated protocol itself relies on).
         if multi_rank and not write_back:
             self._watermark_evict_host_pools()
+
+        # The write-through D2H reads device pool state (KV pages + mamba
+        # states) from the write stream, gated only on the schedule stream;
+        # fence against the in-flight forward's writes first.
+        self.fence_state_read()
 
         # Backup invariant (write-through): parent must be backuped first
         if not write_back and (

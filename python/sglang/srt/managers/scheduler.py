@@ -3596,13 +3596,21 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
+                        # Record a `forward_done` event after the forward (before
+                        # copy_to_cpu). Consumers: the unified pool's lazy
+                        # compaction, and the tree cache's mamba-state read
+                        # fence (donate copy_from / cursor RMW / write-through
+                        # D2H all read pool state on the schedule or write
+                        # streams while this forward may still write it — the
+                        # WAR barrier's fast path only orders READS).
+                        forward_done = self.device_module.Event()
+                        forward_done.record(stream=self.forward_stream)
+                        _note = getattr(self.tree_cache, "note_forward_launch", None)
+                        if _note is not None:
+                            _note(forward_done)
                         if self.enable_unified_memory:
-                            # Record a `forward_done` event after the forward (before
-                            # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
+                            # Only the unified pool's allocator exposes these hooks.
                             allocator = self.token_to_kv_pool_allocator
-                            forward_done = self.device_module.Event()
-                            forward_done.record(stream=self.forward_stream)
                             allocator.set_latest_forward_done_event(forward_done)
                             # Write-set classification: hand the allocator this
                             # forward's virtual out_cache_loc as a tensor ref (no GPU work).

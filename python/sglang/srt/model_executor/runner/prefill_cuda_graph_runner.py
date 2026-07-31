@@ -723,17 +723,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 setattr(forward_batch, field, None)
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        # HiCache load-backs gate state reads with a Python-level per-layer
-        # wait (mamba2_layer_cache -> layer_transfer_counter.wait_until) that
-        # a captured graph body never executes on replay: a prefill batch
-        # carrying a live consumer index must run eagerly or it reads
-        # not-yet-landed H2D state. (Resolves the standing TODO at
-        # scheduler.get_new_batch_prefill.)
-        counter = getattr(
-            self.model_runner.req_to_token_pool, "layer_transfer_counter", None
-        )
-        if counter is not None and getattr(counter, "consumer_index", -1) >= 0:
-            return False
+        # HiCache load-back batches keep the graph: ModelRunner.forward
+        # enqueues a single wait on the load op's final event on the forward
+        # stream before dispatch (the per-layer Python waits inside the body
+        # never execute under replay). See the load fence in
+        # model_runner.forward.
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
         if forward_batch.input_embeds is not None:

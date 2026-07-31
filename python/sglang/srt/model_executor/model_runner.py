@@ -1587,6 +1587,19 @@ class ModelRunner:
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
 
+            # HiCache load fence: the per-layer wait_until calls inside the
+            # model body are Python-side and never execute under a CUDA-graph
+            # replay. One wait on the pending load op's FINAL event here (on
+            # the forward stream, before the deferred CoW below reads the
+            # pool) covers every layer — trading the layerwise H2D/compute
+            # pipelining for keeping the prefill graph, which is the better
+            # side of the trade (the transfer started a scheduler pass ago).
+            _counter = getattr(self.req_to_token_pool, "layer_transfer_counter", None)
+            if _counter is not None and getattr(_counter, "consumer_index", -1) >= 0:
+                torch.get_device_module(self.device).current_stream().wait_event(
+                    _counter.events[_counter.consumer_index].finish_event
+                )
+
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
