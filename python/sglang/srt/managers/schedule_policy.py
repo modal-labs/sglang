@@ -147,6 +147,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    OPENROUTER_SLO = "openrouter_slo"  # FCFS handicapped by uncached tokens
 
 
 class CacheAgnosticPolicy(Enum):
@@ -213,6 +214,12 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+            elif policy == CacheAwarePolicy.OPENROUTER_SLO:
+                SchedulePolicy._sort_by_openrouter_slo(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    get_server_args().slo_ttft_slope_ms_per_uncached_token / 1000.0,
+                )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -233,7 +240,10 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
-        if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
+        if (
+            self.policy in (CacheAwarePolicy.LPM, CacheAwarePolicy.OPENROUTER_SLO)
+            and len(waiting_queue) > 128
+        ):
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
         return self.policy
@@ -316,6 +326,52 @@ class SchedulePolicy:
                 -r.num_matched_prefix_tokens
                 if r.rid not in temporary_deprioritized
                 else float("inf")
+            )
+        )
+
+    @staticmethod
+    def update_min_uncached_seen(r: Req) -> int:
+        """Update and return the running-min uncached token count for a request.
+
+        Uses the freshly computed num_matched_prefix_tokens. The running min
+        means cache eviction while waiting can never demote a request; an
+        improved match (e.g. a shared prefix landing in cache) promotes it.
+        """
+        uncached = max(0, len(r.origin_input_ids) - r.num_matched_prefix_tokens)
+        if r.min_uncached_seen is None or uncached < r.min_uncached_seen:
+            r.min_uncached_seen = uncached
+        return r.min_uncached_seen
+
+    @staticmethod
+    def virtual_arrival_time(r: Req, slope_s_per_token: float) -> float:
+        """openrouter_slo sort key: FCFS arrival handicapped by 1 slope-unit per
+        uncached token — exactly the extra TTFT allowance the SLO line
+        (base + slope * tokens) grants for that token, and no more."""
+        return (
+            r.time_stats.wait_queue_entry_time
+            + slope_s_per_token * SchedulePolicy.update_min_uncached_seen(r)
+        )
+
+    @staticmethod
+    def _sort_by_openrouter_slo(
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        slope_s_per_token: float,
+    ) -> None:
+        """Sorts by virtual arrival time (FCFS + uncached-token handicap).
+
+        Ties break toward the longer cached prefix: among equally urgent
+        requests, serve the one whose cache is largest (cheapest now, most at
+        risk of eviction). In-batch-dedup'd followers sort last for this pass;
+        once their leader's shared prefix lands in cache, their uncached count
+        collapses and the running min pulls them forward while the prefix is
+        hot.
+        """
+        waiting_queue.sort(
+            key=lambda r: (
+                r.rid in temporary_deprioritized,
+                SchedulePolicy.virtual_arrival_time(r, slope_s_per_token),
+                -r.num_matched_prefix_tokens,
             )
         )
 

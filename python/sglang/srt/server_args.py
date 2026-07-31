@@ -832,10 +832,44 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "openrouter_slo",
             ],
         ),
         NS("schedule"),
     ] = "fcfs"
+    slo_ttft_slope_ms_per_uncached_token: A[
+        float,
+        "For --schedule-policy openrouter_slo: waiting-queue sort key is "
+        "wait_queue_entry_time + slope * uncached_tokens (FCFS handicapped by "
+        "uncached work), matching a TTFT SLO line of base + slope * tokens.",
+        NS("schedule"),
+    ] = 1.0
+    slo_ttft_base_s: A[
+        float,
+        "TTFT SLO base in seconds (slo_429 predicate only; a constant base "
+        "does not affect the openrouter_slo sort order).",
+        NS("schedule"),
+    ] = 10.0
+    slo_429_margin_s: A[
+        float,
+        "Safety margin subtracted from the SLO line in the slo_429 predicate.",
+        NS("schedule"),
+    ] = 1.0
+    slo_prefill_tokens_per_s: A[
+        float,
+        "Estimated prefill throughput used by the slo_429 predicate to convert "
+        "queued uncached tokens into predicted TTFT. 0 disables the predicate "
+        "(including shadow logging). Set from measured throughput.",
+        NS("schedule"),
+    ] = 0.0
+    openrouter_slo_429: A[
+        bool,
+        "Reject requests with 429 at admission when the slo_429 predicate "
+        "predicts the TTFT SLO cannot be met. When False (default), the "
+        "predicate runs in shadow mode: predicted misses are logged/counted "
+        "but nothing is rejected.",
+        NS("schedule"),
+    ] = False
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

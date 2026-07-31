@@ -909,6 +909,10 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # Running min of (input_len - num_matched_prefix_tokens) across schedule
+        # passes, used by the openrouter_slo policy so cache eviction while
+        # waiting can never push a request's virtual arrival time later.
+        self.min_uncached_seen: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref

@@ -174,6 +174,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    match_prefix_for_req,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -2535,6 +2536,8 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
+            if self._slo_admission_check(req):
+                return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
@@ -2626,6 +2629,88 @@ class Scheduler(
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
+
+    def _slo_admission_check(self, req: Req) -> bool:
+        """Predictive TTFT-SLO admission check for --schedule-policy openrouter_slo.
+
+        Predicts the request's TTFT from the uncached work scheduled ahead of it
+        (inflight chunked prefill + waiting requests with earlier virtual
+        arrival). If the SLO line (slo_ttft_base_s + slope * input_tokens)
+        cannot be met, logs the predicted miss (shadow mode, default) or rejects
+        with 429 when --openrouter-slo-429 is set. Returns True iff rejected.
+
+        Requires slo_prefill_tokens_per_s > 0 (measured estimate); 0 disables
+        the check entirely.
+        """
+        args = self.server_args
+        if (
+            args.schedule_policy != "openrouter_slo"
+            or args.slo_prefill_tokens_per_s <= 0
+        ):
+            return False
+
+        slope_s = args.slo_ttft_slope_ms_per_uncached_token / 1000.0
+        match_prefix_for_req(self.tree_cache, req, include_req=True)
+        uncached = SchedulePolicy.update_min_uncached_seen(req)
+
+        now = time.perf_counter()
+        virtual_arrival = now + slope_s * uncached
+        work_ahead = uncached
+        if self.chunked_req is not None:
+            cr = self.chunked_req
+            work_ahead += max(0, len(cr.origin_input_ids) - len(cr.prefix_indices))
+        for r in self.waiting_queue:
+            # Requests not yet seen by calc_priority have no match computed;
+            # falling back to their full input length overestimates work ahead,
+            # which only makes the check more conservative.
+            r_uncached = (
+                r.min_uncached_seen
+                if r.min_uncached_seen is not None
+                else max(
+                    0, len(r.origin_input_ids) - r.num_matched_prefix_tokens
+                )
+            )
+            r_vtime = r.time_stats.wait_queue_entry_time + slope_s * r_uncached
+            if r_vtime <= virtual_arrival:
+                work_ahead += r_uncached
+
+        predicted_ttft = work_ahead / args.slo_prefill_tokens_per_s
+        limit = (
+            args.slo_ttft_base_s
+            + slope_s * len(req.origin_input_ids)
+            - args.slo_429_margin_s
+        )
+        if predicted_ttft <= limit:
+            return False
+
+        logger.info(
+            f"slo_429 {'reject' if args.openrouter_slo_429 else 'shadow'}: "
+            f"rid={req.rid} predicted_ttft={predicted_ttft:.2f}s "
+            f"limit={limit:.2f}s uncached={uncached} "
+            f"input={len(req.origin_input_ids)} work_ahead={work_ahead} "
+            f"queue={len(self.waiting_queue)} "
+            f"r_est={args.slo_prefill_tokens_per_s:.0f}"
+        )
+        if not args.openrouter_slo_429:
+            return False
+
+        message = (
+            f"Predicted TTFT {predicted_ttft:.1f}s exceeds the SLO of "
+            f"{limit + args.slo_429_margin_s:.1f}s for this request."
+        )
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                    "message": message,
+                },
+                rid=req.rid,
+            ),
+            req,
+        )
+        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        return True
 
     def _abort_on_waiting_timeout(self):
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
