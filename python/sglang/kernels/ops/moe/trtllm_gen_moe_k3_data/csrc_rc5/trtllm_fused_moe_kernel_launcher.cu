@@ -2352,9 +2352,21 @@ private:
     mRoutingLogitsDtype = routing_logits_dtype == dl_float32
                               ? btg::Dtype::Fp32
                               : btg::Dtype::Bfloat16;
+    // Review F1: the arena path must mirror prepare_routing()'s rc5 dtype
+    // plumbing, or UnpackedPrecomputed fp32 topk_weights would be read as
+    // bf16 by finalize (silent garbage). Unreachable today (both wrappers use
+    // FromLogits/PackedPrecomputed) but armed the moment mode 2 is wired up.
+    if (routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed) {
+      args->mDtypeExpW =
+          topk_weights.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+    }
   }
 
   void configure_moe_args() {
+    // Review F3: routing buffers here are sized without fused shared experts;
+    // reject a nonzero count loudly rather than writing out of bounds.
+    TVM_FFI_ICHECK_EQ(args->num_fused_shared_experts, 0)
+        << "K3 arena launcher sizes routing buffers without fused shared experts";
     args->hidden_states = hidden_states.data_ptr();
     args->hidden_states_scale = hidden_states_scale.has_value()
                                     ? hidden_states_scale.value().data_ptr()

@@ -382,7 +382,7 @@ _RC5_LAUNCHER = (
     / "trtllm_fused_moe_kernel_launcher.cu"
 )
 _RC5_LAUNCHER_SHA256 = (
-    "cae4c56044a5d4178d6ee73cdc59a49c46f1f645483b204c0d553624a0282f71"
+    "5781adde57807134174130fe94a2f208c471fe9074e264f3a58066793542a08e"
 )
 
 
@@ -684,6 +684,12 @@ def _jit_flashinfer_native_module() -> Module:
             extra_cflags=["-fvisibility=hidden", "-std=c++17"],
             extra_cuda_cflags=[
                 "-std=c++17",
+                # Match upstream's module recipe (flashinfer/jit/core.py):
+                # missing feature defines route FP4/FP8 templates through
+                # fallback branches upstream never compiles.
+                "-DNDEBUG",
+                "-DFLASHINFER_ENABLE_FP8_E8M0",
+                "-DFLASHINFER_ENABLE_FP4_E2M1",
                 "-DTLLM_GEN_EXPORT_INTERFACE",
                 "-DTLLM_GEN_EXPORT_FLASHINFER",
                 "-DTLLM_ENABLE_CUDA",
@@ -696,6 +702,12 @@ def _jit_flashinfer_native_module() -> Module:
             ],
             extra_ldflags=[*_cuda_stub_ldflags(), "-lcuda", "-lnvrtc"],
             extra_include_paths=[
+                # Vendored CCCL first, mirroring upstream's CTK-override
+                # precedence: rc5 sources target these cub/libcudacxx/thrust
+                # versions, not the CUDA toolkit's.
+                str(fi_data / "cccl" / "cub"),
+                str(fi_data / "cccl" / "libcudacxx" / "include"),
+                str(fi_data / "cccl" / "thrust"),
                 str(staged),
                 str(
                     staged
