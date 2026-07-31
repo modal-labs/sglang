@@ -137,6 +137,8 @@ def transfer_hicache_one_layer(
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> None:
+    if indices_dst.numel() == 0:
+        return  # nothing to move; a zero-grid launch is invalid in CUDA
     element_dim = element_dim or k_cache_dst.size(-1)
     k_cache_src = k_cache_src.view(-1, element_dim)
     v_cache_src = v_cache_src.view(-1, element_dim)
@@ -175,6 +177,8 @@ def transfer_hicache_all_layer(
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> None:
+    if indices_dst.numel() == 0:
+        return  # nothing to move; a zero-grid launch is invalid in CUDA
     if element_size is None:  # assume both contiguous
         assert kv_cache_dst_stride_bytes == kv_cache_src_stride_bytes
         element_size = kv_cache_dst_stride_bytes
@@ -208,6 +212,8 @@ def transfer_hicache_one_layer_mla(
     unroll: int | None = None,
     block_quota: int | None = None,
 ) -> None:
+    if indices_dst.numel() == 0:
+        return  # nothing to move; a zero-grid launch is invalid in CUDA
     element_dim = element_dim or cache_dst.size(-1)
     cache_src = cache_src.view(-1, element_dim)
     cache_dst = cache_dst.view(-1, element_dim)
@@ -239,6 +245,8 @@ def transfer_hicache_all_layer_mla(
     unroll: int | None = None,
     block_quota: int | None = None,
 ) -> None:
+    if indices_dst.numel() == 0:
+        return  # nothing to move; a zero-grid launch is invalid in CUDA
     if element_size is None:
         assert cache_dst_stride_bytes == cache_src_stride_bytes
         element_size = cache_dst_stride_bytes

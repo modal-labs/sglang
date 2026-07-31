@@ -1,13 +1,22 @@
 """Focused CPU tests for HiMamba HiCache TP transactions."""
 
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.managers import cache_controller as manager_cache_controller
 from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    CacheOperation as HybridCacheOperation,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -228,6 +237,133 @@ class TestHiMambaTPTransactions(unittest.TestCase):
         fake.req_to_token_pool.mamba_allocator.free.assert_not_called()
         fake.cache_controller.abort_load.assert_not_called()
         fake.cache_controller.commit_load.assert_called_once()
+
+
+# NOTE: no **kwargs on purpose — the cached _timing_events_supported() probe
+# must fail on Event(enable_timing=True), matching every other fake-event
+# harness in this suite (a kwargs-tolerant fake would cache timing support as
+# True and break those harnesses later in the same process).
+class _FakeEvent:
+    def record(self):
+        pass
+
+    def wait(self, stream):
+        pass
+
+
+class _FakeDeviceModule:
+    Event = _FakeEvent
+
+    @staticmethod
+    @contextmanager
+    def stream(stream):
+        yield
+
+
+class TestMambaOnlyLoadOp(unittest.TestCase):
+    def test_empty_kv_load_with_mamba_transfer_completes_and_acks(self):
+        """A mamba-only load op (zero KV pages) must run to completion.
+
+        The dedup source rank must still execute the mamba pool transfer on
+        every layer, complete every layer event, skip the draft pool, and
+        append a well-formed ack.
+        """
+        operations = []
+        broadcasts = []
+        mamba_transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=_indices(1, 50),
+            device_indices=_indices(1, 60),
+        )
+        op = HybridCacheOperation(
+            host_indices=torch.empty((0,), dtype=torch.int64),
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            node_id=23,
+            pool_transfers=[mamba_transfer],
+        )
+
+        class FakeHostGroup:
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+                pool_transfers=None,
+            ):
+                operations.append((layer_id, host_indices.numel(), pool_transfers))
+
+        class FakeProducerEvent:
+            start_event = _FakeEvent()
+            finish_event = _FakeEvent()
+
+            def __init__(self):
+                self.completed = []
+
+            def complete(self, layer_index):
+                self.completed.append(layer_index)
+
+        producer_event = FakeProducerEvent()
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.device = torch.device("cpu")
+        controller.mem_pool_host = FakeHostGroup()
+        controller.mem_pool_device = object()
+        controller.has_draft = True
+        controller.mem_pool_host_draft = SimpleNamespace(
+            layer_num=2,
+            load_to_device_per_layer=mock.Mock(
+                side_effect=AssertionError("draft must not load on a mamba-only op")
+            ),
+        )
+        controller.mem_pool_device_draft = object()
+        controller.layer_num = 2
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[producer_event]
+        )
+        controller.mla_broadcaster = SimpleNamespace(
+            is_src=True,
+            prepare_broadcast=lambda device_indices, stream: (device_indices, None),
+            broadcast_loaded_layer=lambda layer_id, prepared: broadcasts.append(
+                layer_id
+            ),
+        )
+        controller.load_stream = object()
+        controller.ack_load_queue = []
+
+        with (
+            mock.patch.object(
+                hybrid_cache_controller, "device_module", _FakeDeviceModule
+            ),
+            mock.patch.object(
+                manager_cache_controller, "device_module", _FakeDeviceModule
+            ),
+        ):
+            producer_id = controller.start_loading()
+
+        self.assertEqual(producer_id, 0)
+        self.assertEqual(producer_event.completed, [0, 1])
+        self.assertEqual(broadcasts, [0, 1])
+        self.assertEqual([layer_id for layer_id, _, _ in operations], [0, 1])
+        for _, kv_numel, transfers in operations:
+            self.assertEqual(kv_numel, 0)
+            self.assertEqual(len(transfers), 1)
+            self.assertIs(transfers[0].name, PoolName.MAMBA)
+            self.assertEqual(
+                transfers[0].host_indices.tolist(),
+                mamba_transfer.host_indices.tolist(),
+            )
+            self.assertEqual(
+                transfers[0].device_indices.tolist(),
+                mamba_transfer.device_indices.tolist(),
+            )
+        controller.mem_pool_host_draft.load_to_device_per_layer.assert_not_called()
+        self.assertEqual(len(controller.ack_load_queue), 1)
+        ack = controller.ack_load_queue[0]
+        self.assertEqual(ack.node_ids, [23])
+        self.assertEqual(ack.num_tokens, 0)
 
 
 if __name__ == "__main__":

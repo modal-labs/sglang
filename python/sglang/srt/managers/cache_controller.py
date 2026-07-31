@@ -960,6 +960,13 @@ class HiCacheController:
     def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
         """Layerwise H2D on the dedup source followed by layerwise broadcast."""
         self._log_ready_mla_traces()
+        if op.host_indices.numel() == 0:
+            # Legitimate op shape: KV resident, only sidecar pools (Mamba) to
+            # restore. Keep it visible so producer regressions surface in logs.
+            logger.info(
+                "HiCache mamba-only load op (zero KV pages) nodes=%s",
+                op.node_ids,
+            )
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -1194,6 +1201,12 @@ class HiCacheController:
         a complete, per-rank L2 cache because its KV layout may be TP-sharded.
         """
         if not self.has_draft:
+            return None
+
+        if op.host_indices.numel() == 0:
+            # Mamba-only restore: the KV prefix is L1-resident, so there are no
+            # pages to move. A zero-length JIT transfer is a guarded no-op, but
+            # skipping keeps the draft loop out of the trace entirely.
             return None
 
         return self.move_indices(op.host_indices, op.device_indices)

@@ -217,6 +217,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            # Mamba-only ops carry no KV pages; the kernel io-backend launchers
+            # (sgl_kernel and JIT alike) reject zero-length transfers.
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -329,6 +333,10 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            # Mamba-only ops carry no KV pages; the kernel io-backend launchers
+            # (sgl_kernel and JIT alike) reject zero-length transfers.
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -733,6 +741,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            # Mamba-only ops carry no KV pages; the kernel io-backend launchers
+            # (sgl_kernel and JIT alike) reject zero-length transfers.
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -798,6 +810,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            # Mamba-only ops carry no KV pages; the kernel io-backend launchers
+            # (sgl_kernel and JIT alike) reject zero-length transfers.
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1078,6 +1094,10 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         layer_id,
         io_backend,
     ):
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            # Mamba-only ops carry no KV pages; the kernel io-backend launchers
+            # (sgl_kernel and JIT alike) reject zero-length transfers.
+            return
         if io_backend == "kernel":
             if self.layout != "page_first":
                 raise ValueError(
@@ -1134,6 +1154,10 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            # Mamba-only ops carry no KV pages; the kernel io-backend launchers
+            # (sgl_kernel and JIT alike) reject zero-length transfers.
+            return
         if io_backend == "kernel":
             if self.layout != "page_first":
                 raise ValueError(

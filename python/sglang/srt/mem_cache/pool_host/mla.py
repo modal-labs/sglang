@@ -317,6 +317,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            # Mamba-only ops carry no KV pages; the kernel io-backend launchers
+            # (sgl_kernel and JIT alike) reject zero-length transfers.
+            return
         if not self._is_device_layer_owned(device_pool, layer_id):
             return
         assert not self._is_dummy, "load on a dummy (non-src MLA) host pool"
@@ -468,6 +472,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            # Mamba-only ops carry no KV pages; the kernel io-backend launchers
+            # (sgl_kernel and JIT alike) reject zero-length transfers.
+            return
         assert not self._is_dummy, "backup on a dummy (non-src MLA) host pool"
         host_indices = self.dcp_kernel_indices(host_indices)
         device_indices = self.dcp_kernel_indices(device_indices)

@@ -331,6 +331,9 @@ struct HiCacheKernel {
     const auto device = indices_device.unwrap();
 
     constexpr auto kWorkersPerBlock = kBlockSize / (device::kWarpThreads / kUnroll);
+    if (length == 0) {
+      return;  // zero pages to move; a gridDim of 0 is cudaErrorInvalidValue
+    }
     const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
     const auto params = HicacheKernelParams{
         .k_cache_dst = k_cache_dst_ptr,
@@ -388,6 +391,9 @@ struct HiCacheKernel {
     const auto device = device_.unwrap();
 
     constexpr auto kWorkersPerBlock = kBlockSize / (device::kWarpThreads / kUnroll);
+    if (length == 0) {
+      return;  // zero pages to move; a gridDim of 0 is cudaErrorInvalidValue
+    }
     const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
     const auto params = HicacheKernelParams{
         .k_cache_dst = k_cache_dst_ptr,
@@ -451,6 +457,9 @@ struct HiCacheKernel {
     const auto device = indices_device.unwrap();
 
     constexpr auto kWorkersPerBlock = kBlockSize / (device::kWarpThreads / kUnroll);
+    if (length == 0) {
+      return;  // zero pages to move; a gridDim of 0 is cudaErrorInvalidValue
+    }
     const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
     const auto params = HicacheKernelParams{
         .k_cache_dst = cache_dst_ptr,
@@ -501,6 +510,9 @@ struct HiCacheKernel {
     const auto device = device_.unwrap();
 
     constexpr auto kWorkersPerBlock = kBlockSize / (device::kWarpThreads / kUnroll);
+    if (length == 0) {
+      return;  // zero pages to move; a gridDim of 0 is cudaErrorInvalidValue
+    }
     const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
     const auto params = HicacheKernelParams{
         .k_cache_dst = cache_dst_ptr,
