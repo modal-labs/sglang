@@ -757,6 +757,13 @@ class Envs:
     # single downloadable archive). Needs the public flashinfer package
     # installed for the unmodified JIT sources. Unset = feature off.
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
+    # Source selection for the TRT-LLM-gen SiTU MoE build: "pool" compiles the
+    # private cubin-pool overlay stack above, "flashinfer" compiles the
+    # bundled rc5-merged launcher against the installed flashinfer package's
+    # own JIT source tree and resolves cubins from the flashinfer-cubin wheel
+    # (upstream SiTU ActivationType, no private pool/overlay). Empty selects
+    # "pool" when a cubin pool is configured, else "flashinfer".
+    SGLANG_TRTLLM_GEN_MOE_SOURCE = EnvStr("")
     # Optional process-local eager workspace for the private TRT-LLM-gen MXFP4
     # MoE path. The value is bytes; 0 disables it. The serving launcher must
     # allocate this after every target/draft model has loaded and before KV-pool

@@ -34,6 +34,19 @@ This module vendors glue plus one narrowly scoped routing-source override:
 Validated for the Kimi K3 decode/prefill MoE regime: MxFP4 weights with
 bf16 (w4a16) or MxFP8 (w4a8) activations, ``ActivationType.Situ`` (SiTuGlu:
 ``a*tanh(g/a)*sigmoid(g) * b*tanh(u/b)``), DeepSeekV3/noaux_tc routing.
+
+Two build sources are supported (``SGLANG_TRTLLM_GEN_MOE_SOURCE``):
+
+  * ``pool`` (default when a cubin pool is configured): the private
+    self-contained pool described above (pre-fix v0.6.13-era cubins).
+  * ``flashinfer``: compiles the bundled rc5-merged launcher
+    (``trtllm_gen_moe_k3_data/csrc_rc5/``, our workspace-arena/max-tile-N/PDL
+    launcher rebased onto flashinfer v0.6.16rc5) against the installed
+    flashinfer package's own JIT source tree. SiTU is upstream in rc5
+    (``ActivationType.Situ == 10``); cubins and the batched-gemm ABI headers
+    resolve from the flashinfer-cubin wheel through upstream's own loader,
+    so the private pool, its overlay, and the K3 dynblock routing patches
+    are all bypassed (rc5 ships its own high-expert routing optimization).
 """
 
 from __future__ import annotations
@@ -65,7 +78,11 @@ if TYPE_CHECKING:
 
 # ActivationType / RoutingMethodType values from trtllm-gen's tllm_enums
 # (kept as plain ints here to avoid importing anything for them).
+# NOTE: 9 is the PRIVATE cubin-pool ABI value for SiTU. Upstream flashinfer
+# >= 0.6.16rc5 has Identity = 9 and Situ = 10; the "flashinfer" source mode
+# translates at the wrapper boundary (see _resolve_activation_type).
 ACTIVATION_SITU = 9
+_UPSTREAM_ACTIVATION_SITU = 10
 ROUTING_DEEPSEEK_V3 = 2
 _ROUTING_TOPK = 5
 _ROUTING_INPUT_FROM_LOGITS = 0
@@ -307,6 +324,7 @@ def trtllm_fp4_block_scale_moe_workspace_layout(
 ) -> TrtllmFp4WorkspaceLayout:
     """Query and cache the native byte layout for one FP4 MoE shape."""
     module = _jit_trtllm_gen_moe_module()
+    activation_type = _resolve_activation_type(activation_type)
     tactic_pair = _validate_tactic_cap(tactic, max_tile_n)
     local_num_experts = num_experts if local_num_experts is None else local_num_experts
     key = (
@@ -356,6 +374,43 @@ def trtllm_fp4_block_scale_moe_workspace_size(**kwargs) -> int:
     return trtllm_fp4_block_scale_moe_workspace_layout(**kwargs).required_bytes
 
 
+# The rc5-merged private launcher (workspace arena + max_tile_n + explicit
+# PDL plumbed through routing) compiled by the "flashinfer" source mode.
+_RC5_LAUNCHER = (
+    pathlib.Path(__file__).with_name("trtllm_gen_moe_k3_data")
+    / "csrc_rc5"
+    / "trtllm_fused_moe_kernel_launcher.cu"
+)
+_RC5_LAUNCHER_SHA256 = (
+    "cae4c56044a5d4178d6ee73cdc59a49c46f1f645483b204c0d553624a0282f71"
+)
+
+
+def moe_source() -> str:
+    """Resolve the build source: explicit env wins, else pool-if-configured."""
+    value = (envs.SGLANG_TRTLLM_GEN_MOE_SOURCE.get() or "").strip().lower()
+    if value in ("pool", "flashinfer"):
+        return value
+    if value:
+        raise ValueError(
+            "SGLANG_TRTLLM_GEN_MOE_SOURCE must be 'pool', 'flashinfer' or "
+            f"empty, got {value!r}"
+        )
+    return "pool" if cubin_pool_dir() is not None else "flashinfer"
+
+
+def _resolve_activation_type(activation_type: int) -> int:
+    """Translate the private SiTU ABI value to upstream's on the rc5 path.
+
+    Idempotent: the upstream value passes through unchanged, so internal
+    re-entry (the MoE wrappers call the layout query with an
+    already-translated value) is safe.
+    """
+    if activation_type == ACTIVATION_SITU and moe_source() == "flashinfer":
+        return _UPSTREAM_ACTIVATION_SITU
+    return activation_type
+
+
 def cubin_pool_dir() -> Optional[pathlib.Path]:
     p = envs.SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL.get()
     if not p:
@@ -376,7 +431,54 @@ def _flashinfer_data_dir() -> Optional[pathlib.Path]:
     return data if (data / "csrc").is_dir() else None
 
 
+def _flashinfer_bmm_artifact_dir() -> Optional[pathlib.Path]:
+    """The trtllm-gen batched-gemm artifact inside the flashinfer-cubin wheel.
+
+    Holds the post-fix cubins plus the paired ``flashinferMetaInfo.h`` and
+    flat ABI headers. Returns None when the wheel (or the artifact pin) is
+    missing, so availability fails closed.
+    """
+    try:
+        from flashinfer.artifacts import ArtifactPath  # noqa: PLC0415
+        from flashinfer.jit import env as fi_jit_env  # noqa: PLC0415
+    except ImportError:
+        return None
+    artifact = (
+        pathlib.Path(fi_jit_env.FLASHINFER_CUBIN_DIR) / ArtifactPath.TRTLLM_GEN_BMM
+    )
+    include = artifact / "include"
+    if not (include / "flashinferMetaInfo.h").is_file():
+        return None
+    if not (include / "trtllmGen_bmm_export").is_dir():
+        return None
+    return artifact
+
+
+def _flashinfer_has_upstream_situ() -> bool:
+    """Whether the installed flashinfer ships SiTU natively (>= 0.6.16rc5)."""
+    fi_data = _flashinfer_data_dir()
+    if fi_data is None:
+        return False
+    runner_header = (
+        fi_data / "include" / "flashinfer" / "trtllm" / "fused_moe" / "runner.h"
+    )
+    try:
+        return "Situ = 10," in runner_header.read_text()
+    except OSError:
+        return False
+
+
+def _flashinfer_native_available() -> bool:
+    return (
+        _RC5_LAUNCHER.is_file()
+        and _flashinfer_has_upstream_situ()
+        and _flashinfer_bmm_artifact_dir() is not None
+    )
+
+
 def available() -> bool:
+    if moe_source() == "flashinfer":
+        return _flashinfer_native_available()
     pool = cubin_pool_dir()
     return (
         pool is not None
@@ -475,6 +577,156 @@ def _setup_cubin_loader(so_path: str, pool_local: pathlib.Path) -> None:
 
 @cache_once
 def _jit_trtllm_gen_moe_module() -> Module:
+    if moe_source() == "flashinfer":
+        return _jit_flashinfer_native_module()
+    return _jit_pool_module()
+
+
+def _stage_flashinfer_headers(artifact_include: pathlib.Path) -> pathlib.Path:
+    """Copy the wheel artifact's ABI headers into a content-addressed tree.
+
+    Mirrors ``_stage_headers`` (the pool variant): the launcher includes the
+    headers as ``flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/<h>``
+    and ``BatchedGemmInterface.h`` includes ``flashinferMetaInfo.h`` relative
+    to itself, so the metainfo header is staged into the same directory.
+    """
+    meta = (artifact_include / "flashinferMetaInfo.h").read_bytes()
+    tag = hashlib.sha256(meta).hexdigest()[:12]
+    cache = pathlib.Path(
+        os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+    ).expanduser()
+    root = cache / "trtllm_gen_moe_headers_fi" / tag
+    dest = root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
+    stamp = root / ".staged"
+    if not stamp.is_file():
+        for name in _BMM_EXPORT_HEADERS:
+            target = dest / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(artifact_include / "trtllmGen_bmm_export" / name, target)
+        shutil.copyfile(
+            artifact_include / "flashinferMetaInfo.h", dest / "flashinferMetaInfo.h"
+        )
+        stamp.touch()
+    return root
+
+
+def _jit_flashinfer_native_module() -> Module:
+    """Build the rc5-merged launcher against the installed flashinfer tree.
+
+    No private pool, no overlay: every source except the launcher comes from
+    the flashinfer wheel's ``data/`` tree, the batched-gemm ABI headers and
+    ``flashinferMetaInfo.h`` come from the flashinfer-cubin wheel's pinned
+    artifact, and the runtime cubins resolve through upstream's own loader
+    callback (``flashinfer.jit.cubin_loader.setup_cubin_loader``).
+    """
+    from flashinfer.artifacts import ArtifactPath  # noqa: PLC0415
+    from flashinfer.jit import env as fi_jit_env  # noqa: PLC0415
+
+    fi_data = _flashinfer_data_dir()
+    artifact = _flashinfer_bmm_artifact_dir()
+    if fi_data is None or artifact is None or not _flashinfer_has_upstream_situ():
+        raise RuntimeError(
+            "trtllm-gen MoE flashinfer-native sources not found: needs "
+            "flashinfer-python >= 0.6.16rc5 (upstream SiTU) and the matching "
+            "flashinfer-cubin wheel."
+        )
+
+    logger.info(
+        "trtllm-gen MoE build source=flashinfer-native-rc5 (upstream SiTU, "
+        "flashinfer-cubin wheel; private pool/overlay bypassed)"
+    )
+    launcher = _RC5_LAUNCHER.read_bytes()
+    launcher_sha256 = hashlib.sha256(launcher).hexdigest()
+    if launcher_sha256 != _RC5_LAUNCHER_SHA256:
+        raise RuntimeError(
+            "Bundled rc5 TRT-LLM-gen launcher failed its integrity check: "
+            f"expected {_RC5_LAUNCHER_SHA256}, got {launcher_sha256}."
+        )
+
+    cache = pathlib.Path(
+        os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+    ).expanduser()
+    staged = _stage_flashinfer_headers(artifact / "include")
+    meta_tag = staged.name
+    launcher_tag = launcher_sha256[:12]
+    build_dir = cache / f"sgl_trtllm_gen_moe_fi_{meta_tag}_{launcher_tag}"
+
+    def _fi_source(rel: str) -> str:
+        cand = fi_data / rel
+        if not cand.is_file():
+            raise RuntimeError(f"flashinfer JIT source not found: {cand}")
+        return str(cand)
+
+    cpp_files = [_fi_source(s) for s in _SOURCES if s.endswith(".cpp")]
+    cuda_files = [
+        str(_RC5_LAUNCHER)
+        if s == "csrc/trtllm_fused_moe_kernel_launcher.cu"
+        else _fi_source(s)
+        for s in _SOURCES
+        if s.endswith(".cu")
+    ]
+
+    # Upstream passes the artifact-relative path (trailing slash included);
+    # the runtime callback prepends FLASHINFER_CUBIN_DIR. Keep it identical.
+    cubin_path = ArtifactPath.TRTLLM_GEN_BMM
+    arch = get_jit_cuda_arch()
+    with override_jit_cuda_arch(arch.major, arch.minor, "a"):
+        module = load_jit(
+            "trtllm_gen_moe_fi",
+            meta_tag,
+            launcher_tag,
+            cpp_files=cpp_files,
+            cuda_files=cuda_files,
+            header_only=False,  # the launcher exports its own tvm-ffi functions
+            extra_cflags=["-fvisibility=hidden"],
+            extra_cuda_cflags=[
+                "-DTLLM_GEN_EXPORT_INTERFACE",
+                "-DTLLM_GEN_EXPORT_FLASHINFER",
+                "-DTLLM_ENABLE_CUDA",
+                "-DENABLE_BF16",
+                "-DENABLE_FP8",
+                "-DENABLE_FP4",
+                "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+                f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{cubin_path}\\"',
+                "-Xcompiler=-fvisibility=hidden",
+            ],
+            extra_ldflags=[*_cuda_stub_ldflags(), "-lcuda", "-lnvrtc"],
+            extra_include_paths=[
+                str(staged),
+                str(
+                    staged
+                    / "flashinfer"
+                    / "trtllm"
+                    / "batched_gemm"
+                    / "trtllmGen_bmm_export"
+                ),
+                str(fi_data / "include"),
+                str(fi_data / "csrc"),
+                str(fi_data / "csrc" / "nv_internal"),
+                str(fi_data / "csrc" / "nv_internal" / "include"),
+                str(fi_data / "cutlass" / "include"),
+                # rc5's flashinfer/logging.h requires the wheel's bundled spdlog.
+                str(fi_data / "spdlog" / "include"),
+                _cuda_include_dir(),
+            ],
+            build_directory=str(build_dir),
+        )
+    so_files = list(build_dir.glob("*.so"))
+    if len(so_files) != 1:
+        raise RuntimeError(
+            f"expected exactly one built .so under {build_dir}, got {so_files}"
+        )
+    # Upstream cubin resolution: reads from FLASHINFER_CUBIN_DIR (the
+    # flashinfer-cubin wheel) with per-kernel sha256 verification against the
+    # hashes baked into flashinferMetaInfo.h.
+    from flashinfer.jit.cubin_loader import setup_cubin_loader  # noqa: PLC0415
+
+    setup_cubin_loader(str(so_files[0]))
+    _ = fi_jit_env  # imported for its FLASHINFER_CUBIN_DIR side effects above
+    return module
+
+
+def _jit_pool_module() -> Module:
     pool = cubin_pool_dir()
     fi_data = _flashinfer_data_dir()
     if pool is None or not (pool / "overlay" / "csrc").is_dir() or fi_data is None:
@@ -626,6 +878,7 @@ def trtllm_fp4_block_scale_moe(
     ``workspace`` is an optional caller-owned contiguous CUDA uint8 arena.
     """
     module = _jit_trtllm_gen_moe_module()
+    activation_type = _resolve_activation_type(activation_type)
     tactic_pair = _validate_tactic_cap(tactic, max_tile_n)
     # The FFI launcher reads these as dense row-major; a strided slice
     # (e.g. a fused-GEMM split) would silently mis-route.
@@ -756,6 +1009,7 @@ def trtllm_fp4_block_scale_routed_moe(
     caller-owned tensor.
     """
     module = _jit_trtllm_gen_moe_module()
+    activation_type = _resolve_activation_type(activation_type)
     tactic_pair = _validate_tactic_cap(tactic, max_tile_n)
     hidden_states = hidden_states.contiguous()
     num_tokens = packed_topk_ids.shape[0]
