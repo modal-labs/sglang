@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -180,6 +181,13 @@ class HiMambaRadixCache(MambaRadixCache):
         # _enforce_mamba_path_state_cap for the HiCache-aware semantics.
         self.mamba_max_states_per_path = server_args.mamba_max_states_per_path
 
+        # Symmetric host-pool watermark eviction; see
+        # _watermark_evict_host_pools for semantics and TP-symmetry argument.
+        self.host_evict_trigger_ratio = (
+            envs.SGLANG_HICACHE_HOST_EVICT_TRIGGER_RATIO.get()
+        )
+        self.host_evict_batch_ratio = envs.SGLANG_HICACHE_HOST_EVICT_BATCH_RATIO.get()
+
         self.evictable_full_device_leaves: set[TreeNode] = set()
         self.evictable_full_host_leaves: set[TreeNode] = set()
         self.mamba_host_lru_list = HostLRUList()
@@ -270,6 +278,13 @@ class HiMambaRadixCache(MambaRadixCache):
                 "HiMamba HiCache write-back eviction is not supported with TP>1 "
                 "until victim selection is coordinated across ranks."
             )
+
+        # Watermark preflight BEFORE the reservation. At TP>1 every host
+        # reservation runs with allow_evict=False (the consensus fingerprint
+        # below stays the backstop that turns residual divergence into a
+        # symmetric reject), so this lockstep call site is the only place
+        # host pool capacity is ever reclaimed for L2-only deployments.
+        self._watermark_evict_host_pools(node)
 
         extra_pools = None
         reservation = None
@@ -415,6 +430,16 @@ class HiMambaRadixCache(MambaRadixCache):
                 if needs_request_slot:
                     if req.mamba_pool_idx is None:
                         if multi_rank:
+                            # Plain (no-evict) alloc on purpose. This is the
+                            # DEVICE request-slot pool, not a host pool: its
+                            # capacity is returned when requests finish and
+                            # tree pressure is relieved by the scheduler's
+                            # symmetric evict path, so a failure here degrades
+                            # to a symmetric consensus skip of the load-back
+                            # rather than the monotonic host-pool exhaustion
+                            # fixed by the write_backup watermark preflight.
+                            # No watermark mirror is needed on this path:
+                            # reserve_load allocates only device-side pools.
                             pending_request_indices = (
                                 self.req_to_token_pool.mamba_allocator.alloc(
                                     request_mamba_rows
@@ -934,6 +959,83 @@ class HiMambaRadixCache(MambaRadixCache):
             mamba_num_evicted=mamba_num_evicted,
         )
 
+    def _watermark_evict_host_pools(self, node: TreeNode) -> None:
+        """Symmetric watermark eviction for the host KV and host Mamba pools.
+
+        Called at the top of write_backup, which every scheduler rank reaches
+        in lockstep with identical arguments, BEFORE the reservation. At TP>1
+        reservations run with allow_evict=False, so without this preflight no
+        code path ever frees L2 host capacity: once a pool fills, every
+        reserve_write fails and the opcode-1 consensus rejects on all ranks
+        forever (write-through permanently disabled plus one rejected
+        all_gather per insert).
+
+        TP symmetry: the decision is a pure function of rank-symmetric state —
+        host pool free counts (mutated only at consensus-committed or
+        scheduler-symmetric sites, or drained by TP-MIN counts), the host LRU
+        lists, node lock refs, and ongoing_write_through/ongoing_load_back
+        membership (kept symmetric by the write/load consensus and the MIN
+        all_reduce drains). It must NOT consult DMA completion state, ack
+        queues, or CUDA events.
+        """
+        if self.disable:
+            return
+        # A row is only allocated by reserve_write when the node has a device
+        # Mamba state and no host copy yet (mamba_backup_transfers passes the
+        # existing host_indices otherwise, and the controller skips the alloc).
+        if node.mamba_value is not None and node.mamba_host_value is None:
+            self._watermark_evict_pool(
+                pool=self.mamba_pool_host,
+                needed=len(node.mamba_value),
+                evict_fn=self.evict_mamba_host,
+                pool_label="host_mamba",
+                unit="rows",
+            )
+        if node.value is not None and len(node.value) > 0:
+            self._watermark_evict_pool(
+                pool=self.full_kv_pool_host,
+                needed=len(node.value),
+                evict_fn=self.evict_host,
+                pool_label="host_kv",
+                unit="tokens",
+            )
+
+    def _watermark_evict_pool(
+        self, *, pool, needed: int, evict_fn, pool_label: str, unit: str
+    ) -> None:
+        """Evict from one host pool when free capacity drops below the watermark.
+
+        Trigger: free < needed + trigger_ratio * pool_size.
+        Batch:   max(deficit, batch_ratio * pool_size, 1) — the batch floor
+        amortizes eviction-heap walks so large pools are not evicted one
+        write at a time once they reach the watermark.
+        """
+        size = pool.size
+        free_before = pool.available_size()
+        trigger_free = needed + int(size * self.host_evict_trigger_ratio)
+        if free_before >= trigger_free:
+            return
+        target = max(
+            trigger_free - free_before,
+            int(size * self.host_evict_batch_ratio),
+            1,
+        )
+        evict_fn(target)
+        free_after = pool.available_size()
+        logger.info(
+            "HiCache host watermark eviction: pool=%s requested=%d %s "
+            "freed=%d %s occupancy=%d/%d -> %d/%d",
+            pool_label,
+            target,
+            unit,
+            free_after - free_before,
+            unit,
+            size - free_before,
+            size,
+            size - free_after,
+            size,
+        )
+
     def evict_host(self, num_tokens: int):
         """Evict host-resident leaf nodes: free host KV + mamba, delete from tree, cascade."""
         heap = [(n.last_access_time, n) for n in self.evictable_full_host_leaves]
@@ -964,6 +1066,22 @@ class HiMambaRadixCache(MambaRadixCache):
         num_evicted = 0
         while num_evicted < num_mamba_hosts and self.mamba_host_lru_list.in_list(x):
             x_next = self.mamba_host_lru_list.get_prev_no_lock(x)
+            if (
+                x.full_lock_ref > 0
+                or x.mamba_lock_ref > 0
+                or x.id in self.ongoing_write_through
+                or x.id in self.ongoing_load_back
+            ):
+                # In-use rows: a locked or in-flight node's host Mamba row can
+                # be a live DMA target (write-through backup) or source
+                # (load-back). The LRU walk already skips mamba_lock_ref > 0;
+                # this covers full-locked and in-flight-map nodes explicitly.
+                # All four conditions are rank-symmetric (lock refs mutate at
+                # scheduler-symmetric sites; both maps are committed under TP
+                # consensus and drained by MIN all_reduce counts), so skipping
+                # preserves TP-symmetric victim selection.
+                x = x_next
+                continue
             if x in self.evictable_full_host_leaves:
                 # Leaf: evictable_full_host_leaves guarantees both counters == 0
                 assert (

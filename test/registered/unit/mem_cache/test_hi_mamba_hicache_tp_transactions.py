@@ -116,6 +116,7 @@ class TestHiMambaTPTransactions(unittest.TestCase):
             ongoing_write_through={},
             inc_lock_ref=mock.Mock(),
             evict_host=mock.Mock(),
+            _watermark_evict_host_pools=mock.Mock(),
         )
         node = _write_node(fake)
 

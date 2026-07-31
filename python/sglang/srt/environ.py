@@ -497,6 +497,15 @@ class Envs:
     # intentionally below 1 TiB: per-process availability checks race when
     # eight TP ranks allocate replicated sidecars concurrently.
     SGLANG_HICACHE_HOST_BUDGET_GIB = EnvInt(800)
+    # Symmetric host-pool watermark eviction (HiMamba HiCache, L2). At TP>1
+    # every host reservation runs with allow_evict=False, so the lockstep
+    # preflight in write_backup is the only path that reclaims host KV /
+    # host Mamba capacity. Trigger: evict when free < needed +
+    # TRIGGER_RATIO * pool_size. Batch: evict at least BATCH_RATIO *
+    # pool_size per pass (amortizes heap walks on large pools). Both are
+    # fractions of the pool size; 0 evicts only when the write cannot fit.
+    SGLANG_HICACHE_HOST_EVICT_TRIGGER_RATIO = EnvFloat(0.02)
+    SGLANG_HICACHE_HOST_EVICT_BATCH_RATIO = EnvFloat(0.01)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
