@@ -2019,6 +2019,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
+            # Greedy verify consumes a rank-local argmax over hidden states
+            # that are not bitwise-deterministic across TP ranks (MoE combine
+            # ordering): one near-tie logit diverges accept lengths →
+            # committed sequence lengths → radix tree shape (observed live as
+            # a one-page node-length disagreement in the HiCache write
+            # consensus). The stochastic branch canonicalizes its outcome for
+            # exactly this reason; greedy must too. Broadcasting rank 0's
+            # target_predict canonicalizes every derived quantity
+            # (accept_len, bonus, out_tokens, new_seq_lens, kv_committed_len)
+            # across all three sub-paths at one insert point.
+            _greedy_tp_group = _get_dflash_sampling_tp_group()
+            if int(_greedy_tp_group.world_size) > 1:
+                _greedy_tp_group.broadcast(target_predict, src=0)
             if self._use_triton_accept_bonus:
                 try:
                     (

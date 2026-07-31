@@ -133,21 +133,28 @@ class FullComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.num_tokens
+        # Tie-break on node.id: set iteration order and heap layout are
+        # rank-local (memory addresses); at TP>1 eviction choices must be a
+        # pure function of mirrored tree state.
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
+            (self.cache.eviction_strategy.get_priority(n), n.id, n)
             for n in self.cache.evictable_device_leaves
         ]
         heapq.heapify(heap)
         ct = self.component_type
         while tracker[ct] < request and heap:
-            _, x = heapq.heappop(heap)
+            _, _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_device_leaves:
                 continue
             self.cache._evict_device_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
                 heapq.heappush(
                     heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    (
+                        self.cache.eviction_strategy.get_priority(x.parent),
+                        x.parent.id,
+                        x.parent,
+                    ),
                 )
 
     def drive_host_eviction(
@@ -155,20 +162,24 @@ class FullComponent(TreeComponent):
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
+            (self.cache.eviction_strategy.get_priority(n), n.id, n)
             for n in self.cache.evictable_host_leaves
         ]
         heapq.heapify(heap)
         ct = self.component_type
         while tracker[ct] < num_tokens and heap:
-            _, x = heapq.heappop(heap)
+            _, _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_host_leaves:
                 continue
             self.cache._evict_host_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
                 heapq.heappush(
                     heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    (
+                        self.cache.eviction_strategy.get_priority(x.parent),
+                        x.parent.id,
+                        x.parent,
+                    ),
                 )
 
     def acquire_component_lock(
