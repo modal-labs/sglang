@@ -571,6 +571,15 @@ class MambaComponent(TreeComponent):
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
             return PrepareLoadBackResult(succeeded=False)
+        # Slot hygiene: this raw alloc bypasses HybridReqToTokenPool.alloc
+        # (which resets the ReplaySSM ring cursors for fresh slots), and the
+        # H2D loadback writes only temporal+conv — the host tier carries no
+        # ring state. Without this reset the decode kernel replays the slot's
+        # PREVIOUS tenant's ring (write_pos>0) on top of the loaded
+        # checkpoint: cross-conversation state bleed, observed as sticky
+        # wrong retrievals on revisits served through load-back.
+        pool = self.cache.req_to_token_pool
+        pool.mamba_pool.reset_replayssm_cursors(pool.translate_mamba_indices(dst))
         req.mamba_pool_idx = dst[0]
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
