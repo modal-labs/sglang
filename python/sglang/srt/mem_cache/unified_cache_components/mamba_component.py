@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -147,6 +150,31 @@ class MambaComponent(TreeComponent):
             result = result._replace(
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
             )
+        elif cd.value is None and cd.host_value is None and (
+            result.full_kv_hit_length > 0 or result.device_indices.numel() > 0
+        ):
+            # Mamba state is gone from BOTH tiers (device state pruned/evicted
+            # and host backup evicted) while the Full KV prefix is still
+            # matchable. There is no state to resume from: reusing the KV hit
+            # would attach a fresh zero mamba state at a deep position and
+            # generate from corrupt state (observed as deterministic wrong
+            # answers on revisits after host mamba eviction). Fall back to a
+            # no-match so the request recomputes and re-inserts fresh states.
+            self._mamba_gone_match_drops = (
+                getattr(self, "_mamba_gone_match_drops", 0) + 1
+            )
+            if self._mamba_gone_match_drops <= 20 or (
+                self._mamba_gone_match_drops % 1000 == 0
+            ):
+                logger.info(
+                    "Mamba state unavailable on device and host for matched "
+                    "node %d (kv_hit=%d); dropping prefix match #%d to force "
+                    "recompute.",
+                    last_node.id,
+                    result.full_kv_hit_length,
+                    self._mamba_gone_match_drops,
+                )
+            return self.cache._empty_match_result
 
         return result._replace(mamba_branching_seqlen=branching_seqlen)
 
