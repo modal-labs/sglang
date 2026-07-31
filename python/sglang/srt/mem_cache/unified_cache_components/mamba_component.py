@@ -123,17 +123,37 @@ class MambaComponent(TreeComponent):
             aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
         )
 
-        # A node with an in-flight load-back has cd.value published while the
-        # H2D may not have landed (the slot holds a previous tenant's state
-        # until then), and the deferred CoW copy runs on the forward stream
-        # with no ordering against the load stream. Treat it as not
-        # CoW-able; the host-hit branch below issues a properly gated load
-        # for this request instead.
-        load_in_flight = (
-            last_node.id in getattr(self.cache, "ongoing_load_back", {})
+        # A node whose MAMBA load-back is still in flight has cd.value
+        # published while the H2D may not have landed (the slot holds a
+        # previous tenant's state until then), and the deferred CoW copy runs
+        # on the forward stream with no ordering against the load stream.
+        # Precise check: the op's pinned_mamba_slots is non-None only when it
+        # carried mamba transfers (a pending FULL-KV-only load must not
+        # degrade this node's mamba). Such a node is not CoW-able and a
+        # rebound load can't be built either (cd.value is already published),
+        # so drop the match: the window is commit→ack, short enough that the
+        # next attempt CoWs normally.
+        _ongoing = getattr(self.cache, "ongoing_load_back", {}).get(last_node.id)
+        mamba_load_in_flight = (
+            _ongoing is not None
+            and getattr(_ongoing, "pinned_mamba_slots", None) is not None
         )
         mamba_value = last_node.component_data[self.component_type].value
-        if cow_mamba and mamba_value is not None and not load_in_flight:
+        if mamba_load_in_flight and mamba_value is not None:
+            self._mamba_inflight_match_drops = (
+                getattr(self, "_mamba_inflight_match_drops", 0) + 1
+            )
+            if self._mamba_inflight_match_drops <= 20 or (
+                self._mamba_inflight_match_drops % 1000 == 0
+            ):
+                logger.info(
+                    "Mamba load-back in flight for matched node %d; dropping "
+                    "prefix match #%d to avoid CoW from an unlanded slot.",
+                    last_node.id,
+                    self._mamba_inflight_match_drops,
+                )
+            return self.cache._empty_match_result
+        if cow_mamba and mamba_value is not None:
             assert req is not None
             if req.mamba_pool_idx is None:
                 dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
@@ -152,15 +172,14 @@ class MambaComponent(TreeComponent):
             req.mamba_cow_src_index = mamba_value
             req.mamba_needs_clear = False
 
-        # HiCache: if mamba was evicted from device but has host backup (or
-        # its device state is mid-load for another request), ensure
-        # mamba_host_hit_length >= 1 so this request gets its own gated load.
+        # HiCache: if mamba was evicted from device but has host backup,
+        # ensure mamba_host_hit_length >= 1 so load_back is triggered.
         cd = last_node.component_data[self.component_type]
-        if (cd.value is None or load_in_flight) and cd.host_value is not None:
+        if cd.value is None and cd.host_value is not None:
             result = result._replace(
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
             )
-        elif (cd.value is None or load_in_flight) and cd.host_value is None and (
+        elif cd.value is None and cd.host_value is None and (
             last_node is not self.cache.root_node
         ) and (
             result.full_kv_hit_length > 0 or result.device_indices.numel() > 0

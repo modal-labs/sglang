@@ -1229,11 +1229,17 @@ class PrefillAdder:
                 if new_indices is None:
                     # Load-back failed: no usable recurrent state for the
                     # matched prefix. Drop it and recompute fully rather than
-                    # pairing deep KV with a zeroed mamba state.
+                    # pairing deep KV with a zeroed mamba state. The mamba
+                    # CoW staging from finalize_match_result must be dropped
+                    # with it: a deep-position CoW copied into a token-0
+                    # recompute is itself the corruption class this guards
+                    # against, and the CoW-path slot was never cleared.
                     req.prefix_indices = req.prefix_indices[:0]
                     req.host_hit_length = 0
                     req.swa_host_hit_length = 0
                     req.mamba_host_hit_length = 0
+                    req.mamba_cow_src_index = None
+                    req.mamba_needs_clear = True
                 else:
                     req.prefix_indices = torch.cat(
                         [req.prefix_indices, new_indices]

@@ -3485,7 +3485,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 E(
                     f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
-        for nid, (n, _, _) in self.ongoing_load_back.items():
+        for nid, entry in self.ongoing_load_back.items():
+            n = entry.node
             if n not in all_node_set:
                 E(f"[Ongoing] load_back node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:
