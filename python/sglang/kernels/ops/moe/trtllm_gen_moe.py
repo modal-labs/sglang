@@ -678,8 +678,12 @@ def _jit_flashinfer_native_module() -> Module:
             cpp_files=cpp_files,
             cuda_files=cuda_files,
             header_only=False,  # the launcher exports its own tvm-ffi functions
-            extra_cflags=["-fvisibility=hidden"],
+            # c++17 must come last: gcc-13 ICEs (cc1plus segfault) on rc5's
+            # trtllm_batched_gemm_runner.cu under the default -std=c++20, and
+            # upstream's own JIT compiles these sources as c++17.
+            extra_cflags=["-fvisibility=hidden", "-std=c++17"],
             extra_cuda_cflags=[
+                "-std=c++17",
                 "-DTLLM_GEN_EXPORT_INTERFACE",
                 "-DTLLM_GEN_EXPORT_FLASHINFER",
                 "-DTLLM_ENABLE_CUDA",
