@@ -186,18 +186,23 @@ def _register_threads(num_chunks: int) -> int:
     return max(1, min(threads, num_chunks))
 
 
-def _cuda_host_register(buffer: torch.Tensor) -> None:
+def _cuda_host_register(buffer: torch.Tensor, align_bytes: int = 1) -> None:
     """Pin ``buffer`` with cudaHostRegister, in chunks.
 
     Chunking keeps every single call well under the Blackwell driver's
     single-registration failure zone (see SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB)
-    and lets registration run on several threads. A device transfer that spans
-    a chunk boundary degrades to a staged copy but stays correct; HiCache moves
-    page-granular ranges, so spanning transfers are rare.
+    and lets registration run on several threads.
+
+    ``align_bytes`` must be the transfer granule of the buffer (page span for
+    token-major KV pools, one dim-0 row otherwise). cudaMemcpy* rejects a copy
+    whose byte range spans two separate registrations with
+    cudaErrorInvalidValue, so chunk cuts may only land on granule boundaries.
     """
     base_ptr = buffer.data_ptr()
     n_bytes = buffer.numel() * buffer.element_size()
     chunk_bytes = max(1, envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get()) * 1024**3
+    if align_bytes > 1:
+        chunk_bytes = max(align_bytes, chunk_bytes - chunk_bytes % align_bytes)
     chunks = [
         (base_ptr + off, min(chunk_bytes, n_bytes - off))
         for off in range(0, n_bytes, chunk_bytes)
@@ -291,13 +296,22 @@ def alloc_with_host_register(
     device: str,
     pin_memory: bool,
     allocator: HostTensorAllocator,
+    register_align_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
+
+    ``register_align_bytes`` aligns registration-chunk cuts to the buffer's
+    transfer granule (see _cuda_host_register). Defaults to one dim-0 row,
+    which is correct for page-major and slot-major buffers; token-major KV
+    pools must pass their page span (page_size rows).
     """
     rank, world_size = _distributed_rank()
-    n_bytes = math.prod(dims) * torch.empty((), dtype=dtype).element_size()
+    element_size = torch.empty((), dtype=dtype).element_size()
+    if register_align_bytes is None:
+        register_align_bytes = math.prod(dims[1:]) * element_size
+    n_bytes = math.prod(dims) * element_size
     allocate_start = time.perf_counter()
     logger.info(
         "HiCache host buffer phase=allocate state=start rank=%d/%d "
@@ -352,7 +366,7 @@ def alloc_with_host_register(
             buffer.data_ptr(),
         )
         try:
-            _cuda_host_register(buffer)
+            _cuda_host_register(buffer, align_bytes=register_align_bytes)
         except Exception:
             logger.exception(
                 "HiCache host buffer phase=cuda_host_register state=failed "
@@ -389,9 +403,14 @@ def alloc_with_pin_memory(
     device: str,
     pin_memory: bool,
     allocator: None,
+    register_align_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
+
+    ``register_align_bytes`` is accepted for signature parity with
+    alloc_with_host_register; pinned allocation is a single registration, so
+    alignment is moot here.
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer

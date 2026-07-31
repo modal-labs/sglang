@@ -273,6 +273,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
+        # Registration chunks may only be cut on page-span boundaries: the
+        # write-back/loadback copies move one page per memcpy and the driver
+        # rejects copies spanning two registrations (cudaErrorInvalidValue).
+        if self.layout == "page_first":
+            register_align_bytes = self.page_size * self.layout_dim
+        elif self.layout == "layer_first":
+            register_align_bytes = self.page_size * self.token_stride_size
+        else:  # page_first_direct: dim-0 rows are whole pages already
+            register_align_bytes = None
+
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         buffer = alloc_func(
             dims,
@@ -280,6 +290,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            register_align_bytes=register_align_bytes,
         )
         return buffer
 

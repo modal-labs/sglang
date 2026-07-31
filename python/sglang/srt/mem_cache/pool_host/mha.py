@@ -158,6 +158,17 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
+        # Registration chunks may only be cut on page-span boundaries (see
+        # pool_host/mla.py init_kv_buffer). The K/V planes on dim 0 are whole
+        # multiples of the page span (size % page_size == 0), so page-span
+        # alignment keeps every per-page memcpy inside one registration.
+        if self.layout == "page_first":
+            register_align_bytes = self.page_size * self.layout_dim
+        elif self.layout == "layer_first":
+            register_align_bytes = self.page_size * self.token_stride_size
+        else:  # page-major layouts: dim-0 rows are whole pages already
+            register_align_bytes = None
+
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         buffer = alloc_func(
             dims,
@@ -165,6 +176,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            register_align_bytes=register_align_bytes,
         )
         return buffer
 
