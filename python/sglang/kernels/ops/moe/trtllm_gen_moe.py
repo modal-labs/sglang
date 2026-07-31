@@ -382,7 +382,7 @@ _RC5_LAUNCHER = (
     / "trtllm_fused_moe_kernel_launcher.cu"
 )
 _RC5_LAUNCHER_SHA256 = (
-    "5781adde57807134174130fe94a2f208c471fe9074e264f3a58066793542a08e"
+    "4153db87ecc2aa0acf1d21927dd4c6ea74fed8a14d4f0d64f59f43c819ce3de3"
 )
 
 

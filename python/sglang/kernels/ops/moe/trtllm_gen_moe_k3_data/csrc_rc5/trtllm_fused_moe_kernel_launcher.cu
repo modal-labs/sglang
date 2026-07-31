@@ -3391,9 +3391,14 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   return Array<Array<int64_t>>();
 }
 
+// The cubin-callback C API must stay in the dynamic symbol table: flashinfer's
+// setup_cubin_loader resolves it via ctypes, and the module builds with
+// -fvisibility=hidden.
+#pragma GCC visibility push(default)
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
+#pragma GCC visibility pop
 
 #ifdef FLASHINFER_PRIVATE_MOE_FFI_NAMES
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_bf16_moe_private, trtllm_bf16_moe);
