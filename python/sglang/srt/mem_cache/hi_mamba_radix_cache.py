@@ -177,9 +177,9 @@ class HiMambaRadixCache(MambaRadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
-        # Per-path device Mamba state cap (-1 = unlimited); see
-        # _enforce_mamba_path_state_cap for the HiCache-aware semantics.
-        self.mamba_max_states_per_path = server_args.mamba_max_states_per_path
+        # mamba_max_states_per_path is set by the MambaRadixCache base
+        # __init__ (super().__init__ below); this class only customizes the
+        # pruning skip rules via _mamba_cap_extra_skip.
 
         # Symmetric host-pool watermark eviction; see
         # _watermark_evict_host_pools for semantics and TP-symmetry argument.
@@ -1265,64 +1265,26 @@ class HiMambaRadixCache(MambaRadixCache):
         self._update_full_device_leaf_status(parent)
         return new_node
 
-    def _enforce_mamba_path_state_cap(self, tail: TreeNode) -> None:
-        """Tombstone shallow device Mamba states beyond the per-path cap.
+    def _mamba_cap_extra_skip(self, node: TreeNode) -> bool:
+        """HiCache guard for the base ``_enforce_mamba_path_state_cap``:
+        preserve nodes with an in-flight host transfer — a write-through
+        backup uses the node's device slot as its DMA source, and a
+        load-back targets the node's device state. ``mamba_host_value`` /
+        ``mamba_backuped`` are never touched by the cap (the base method
+        only frees the device slot), so a pruned-but-host-backed state
+        remains restorable through the mamba-only load path.
 
-        Port of MambaComponent._evict_excess_path_states for the HiCache tree:
-        walk root->tail over the just-inserted path, and while more than
-        ``mamba_max_states_per_path`` nodes hold a device state, tombstone the
-        shallowest eligible interior ones (same mechanism as evict_mamba's
-        internal-node branch). Only the DEVICE state (``mamba_value``) is
-        freed; ``mamba_host_value`` / ``mamba_backuped`` are never touched, so
-        a pruned-but-host-backed state remains restorable through the
-        mamba-only load path. Full KV always stays.
-
-        Preserved (soft cap): the tail itself, fork nodes (> 1 child), leaves
-        (cannot be tombstoned), locked nodes (mamba_lock_ref > 0 or
-        full_lock_ref > 0), and nodes with an in-flight host backup
-        (ongoing_write_through), whose device slot is the DMA source.
-
-        TP symmetry: this runs at the insert call site, which every scheduler
-        rank executes with identical tree state, and the decision is a pure
-        function of tree state (values, children, lock refs) plus
-        ongoing_write_through, whose membership is kept rank-symmetric by the
-        TP consensus in write_backup and the MIN all_reduce in writing_check.
-        It must NOT consult ack queues, CUDA events, or any other
-        timing-dependent DMA-completion state.
+        TP symmetry (base-contract compliance): membership of both maps is
+        rank-symmetric — commits go through the TP transaction consensus in
+        write_backup/load_back and drains through the MIN all_reduce counts
+        in writing_check/loading_check — so this stays a pure function of
+        scheduler-symmetric state and never consults ack queues or CUDA
+        events.
         """
-        cap = self.mamba_max_states_per_path
-        if cap < 0:
-            return
-
-        holders = []
-        node = tail
-        while node is not None and node is not self.root_node:
-            if node.mamba_value is not None:
-                holders.append(node)
-            node = node.parent
-
-        excess = len(holders) - cap
-        if excess <= 0:
-            return
-
-        for node in reversed(holders):  # shallowest first
-            if excess <= 0 or node is tail:
-                break
-            if len(node.children) != 1:
-                # Preserve forks; leaves (0 children) cannot be tombstoned.
-                continue
-            if node.mamba_lock_ref > 0 or node.full_lock_ref > 0:
-                continue
-            if node.id in self.ongoing_write_through:
-                continue
-            if not self.mamba_lru_list.in_list(node):
-                continue
-            # Same tombstone mechanism as evict_mamba's internal-node branch:
-            # free the device slot, drop from the device LRU, keep host state.
-            self.req_to_token_pool.mamba_allocator.free(node.mamba_value)
-            self.mamba_lru_list.remove_node(node)
-            self._tombstone_internal_node(node)
-            excess -= 1
+        return (
+            node.id in self.ongoing_write_through
+            or node.id in self.ongoing_load_back
+        )
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key

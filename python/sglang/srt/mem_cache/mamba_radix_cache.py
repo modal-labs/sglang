@@ -451,6 +451,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        # Per-path device Mamba state cap (-1 = unlimited); enforced at the
+        # insert call sites, see _enforce_mamba_path_state_cap.
+        self.mamba_max_states_per_path = get_server_args().mamba_max_states_per_path
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -1270,18 +1273,92 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
             self._record_store_event(new_node)
+            self._enforce_mamba_path_state_cap(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
+            self._enforce_mamba_path_state_cap(node)
         else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
         return total_prefix_length, mamba_value_exist
+
+    def _mamba_cap_extra_skip(self, node: TreeNode) -> bool:
+        """Subclass hook: extra reasons to preserve a node's device Mamba
+        state during ``_enforce_mamba_path_state_cap`` pruning.
+
+        The base tree has none; HiMambaRadixCache preserves nodes with an
+        in-flight host transfer. Overrides MUST stay a pure, rank-symmetric
+        function of scheduler-visible state (see the TP-symmetry contract on
+        ``_enforce_mamba_path_state_cap``).
+        """
+        return False
+
+    def _enforce_mamba_path_state_cap(self, tail: TreeNode) -> None:
+        """Tombstone shallow device Mamba states beyond the per-path cap.
+
+        Counterpart of MambaComponent._evict_excess_path_states for this
+        tree: walk root->tail over the just-inserted path, and while more
+        than ``mamba_max_states_per_path`` nodes hold a device state,
+        tombstone the shallowest eligible interior ones (same mechanism as
+        evict_mamba's internal-node branch). Only the DEVICE state
+        (``mamba_value``) is freed; any host backup a subclass maintains
+        (e.g. ``mamba_host_value`` in HiMambaRadixCache) is never touched,
+        so a pruned-but-host-backed state remains restorable through the
+        mamba-only load path. Full KV always stays.
+
+        Preserved (soft cap): the tail itself, fork nodes (> 1 child),
+        leaves (cannot be tombstoned), locked nodes (mamba_lock_ref > 0 or
+        full_lock_ref > 0), and anything ``_mamba_cap_extra_skip``
+        preserves (HiMambaRadixCache: nodes with an in-flight host backup
+        or load-back).
+
+        TP symmetry: this runs at the insert call site, which every
+        scheduler rank executes with identical tree state, and the decision
+        is a pure function of tree state (values, children, lock refs) plus
+        the ``_mamba_cap_extra_skip`` hook, whose inputs subclasses must
+        keep rank-symmetric. It must NOT consult ack queues, CUDA events,
+        or any other timing-dependent DMA-completion state.
+        """
+        cap = self.mamba_max_states_per_path
+        if cap < 0:
+            return
+
+        holders = []
+        node = tail
+        while node is not None and node is not self.root_node:
+            if node.mamba_value is not None:
+                holders.append(node)
+            node = node.parent
+
+        excess = len(holders) - cap
+        if excess <= 0:
+            return
+
+        for node in reversed(holders):  # shallowest first
+            if excess <= 0 or node is tail:
+                break
+            if len(node.children) != 1:
+                # Preserve forks; leaves (0 children) cannot be tombstoned.
+                continue
+            if node.mamba_lock_ref > 0 or node.full_lock_ref > 0:
+                continue
+            if self._mamba_cap_extra_skip(node):
+                continue
+            if not self.mamba_lru_list.in_list(node):
+                continue
+            # Same tombstone mechanism as evict_mamba's internal-node branch:
+            # free the device slot, drop it from the device LRU, and keep any
+            # subclass-managed host state.
+            self._free_mamba_value(node.mamba_value)
+            self.mamba_lru_list.remove_node(node)
+            self._tombstone_internal_node(node)
+            excess -= 1
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode

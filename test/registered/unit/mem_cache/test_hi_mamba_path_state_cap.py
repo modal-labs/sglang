@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache, HostLRUList
-from sglang.srt.mem_cache.mamba_radix_cache import LRUList, TreeNode
+from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -38,6 +38,7 @@ def _build_cache(cap: int) -> HiMambaRadixCache:
     # write_back short-circuits _inc_hit_count, keeping inserts controller-free
     cache.cache_controller = SimpleNamespace(write_policy="write_back")
     cache.ongoing_write_through = {}
+    cache.ongoing_load_back = {}
     cache.evictable_full_device_leaves = set()
     cache.evictable_full_host_leaves = set()
     cache.full_lru_list = LRUList(mamba=False)
@@ -183,6 +184,30 @@ class TestHiMambaPathStateCap(unittest.TestCase):
         self.assertIsNotNone(nodes[0].mamba_value)  # mid-backup DMA source
         self.assertIsNone(nodes[1].mamba_value)
         self.assertEqual(cache.req_to_token_pool.mamba_allocator.freed, [11])
+
+    def test_inflight_load_back_node_preserved(self):
+        cache = _build_cache(cap=-1)
+        nodes = _build_chain(cache, 2)
+        cache.ongoing_load_back[nodes[0].id] = nodes[0]
+
+        cache.mamba_max_states_per_path = 2
+        _insert(cache, [1, 2, 3], 12)
+
+        self.assertIsNotNone(nodes[0].mamba_value)  # mid-load-back DMA target
+        self.assertIsNone(nodes[1].mamba_value)
+        self.assertEqual(cache.req_to_token_pool.mamba_allocator.freed, [11])
+
+    def test_enforcement_is_shared_with_base_class(self):
+        # The pruning mechanism lives in MambaRadixCache; HiMamba only
+        # customizes the in-flight-transfer skip rules via the hook.
+        self.assertIs(
+            HiMambaRadixCache._enforce_mamba_path_state_cap,
+            MambaRadixCache._enforce_mamba_path_state_cap,
+        )
+        self.assertIsNot(
+            HiMambaRadixCache._mamba_cap_extra_skip,
+            MambaRadixCache._mamba_cap_extra_skip,
+        )
 
 
 if __name__ == "__main__":
