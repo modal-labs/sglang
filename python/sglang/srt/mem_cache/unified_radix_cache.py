@@ -284,6 +284,7 @@ _HICACHE_OP_WRITE = 1
 _HICACHE_OP_LOAD = 2
 _HICACHE_OP_WRITE_CHECK = 3
 _HICACHE_OP_LOAD_CHECK = 4
+_HICACHE_OP_WATERMARK = 6
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -1812,9 +1813,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # mirrored trees" assumption above is exactly what an upstream insert
         # divergence violates -- rank-local free fractions then fire
         # evictions on different rounds per rank and cross-pair the write
-        # collectives. MIN-reduce `available` (this preflight is already a
-        # lockstep site) so every rank triggers off the same, most
-        # pessimistic value.
+        # collectives. MIN-reduce `available` per pool THROUGH THE
+        # FINGERPRINT SCHEME (seq + opcode + pool index + capacity), so a
+        # collective-count skew fails closed like every other cache
+        # collective instead of shape-mismatching raw reduces. On
+        # fingerprint mismatch the whole preflight round is skipped on every
+        # rank symmetrically (no eviction from garbage inputs).
         sized = [
             (component_type, pool, getattr(pool, "size", 0))
             for component_type, pool in targets
@@ -1823,10 +1827,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pool.available_size() if capacity > 0 else 0
             for _, pool, capacity in sized
         ]
-        if self.tp_world_size > 1 and availables:
-            avail_t = torch.tensor(availables, dtype=torch.int64)
-            self._all_reduce(avail_t, torch.distributed.ReduceOp.MIN)
-            availables = [int(v) for v in avail_t.tolist()]
+        if self.tp_world_size > 1 or self.pp_size > 1:
+            reduced: list[int] = []
+            round_ok = True
+            for pool_index, ((_, _, capacity), available) in enumerate(
+                zip(sized, availables)
+            ):
+                self._hicache_consensus_seq += 1
+                base = [
+                    int(available),
+                    self._hicache_consensus_seq,
+                    _HICACHE_OP_WATERMARK,
+                    pool_index,
+                    int(capacity),
+                ]
+                vec_min = torch.tensor(base, dtype=torch.long, device="cpu")
+                vec_max = torch.tensor(base, dtype=torch.long, device="cpu")
+                self._all_reduce(vec_min, torch.distributed.ReduceOp.MIN)
+                self._all_reduce(vec_max, torch.distributed.ReduceOp.MAX)
+                if not self._fingerprint_ok(vec_min, vec_max):
+                    round_ok = False
+                reduced.append(int(vec_min[0].item()))
+            if not round_ok:
+                return
+            availables = reduced
         for (component_type, pool, capacity), available in zip(sized, availables):
             if capacity <= 0:
                 continue
@@ -1858,7 +1882,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # reservation (see below), so without this preflight the host pools
         # fill monotonically and every later backup fails its reservation —
         # a permanent write-through outage plus a per-node consensus storm.
-        # The watermark eviction has no collectives and runs at symmetric
+        # The watermark eviction reduces its trigger inputs through the
+        # fingerprint scheme and runs at symmetric
         # call sites, so it stays in lockstep given mirrored trees (the same
         # assumption the coordinated protocol itself relies on).
         if multi_rank and not write_back:

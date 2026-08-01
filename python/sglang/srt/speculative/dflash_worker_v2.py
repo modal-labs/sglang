@@ -1983,6 +1983,48 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
+
+        # Fail-closed batch-identity probe, BOTH verify branches (the
+        # stochastic branch's row-indexed rank-0 broadcast commits tokens
+        # into the WRONG REQUESTS on peers if batch composition has
+        # diverged; the greedy branch keeps rank-local outcomes but must
+        # alarm too). Sampled 1-in-16: composition divergence is persistent
+        # once seeded, so sampling catches it within ~a second at
+        # negligible gloo cost. crc32, not hash(): str hashing is
+        # per-process salted. Ticked on EVERY verify pass (not per-branch)
+        # so probe rounds pair across ranks even if branch selection
+        # were to diverge.
+        _probe_group = _get_dflash_sampling_tp_group()
+        _identity_diverged = False
+        if int(_probe_group.world_size) > 1 and _probe_group.cpu_group is not None:
+            self._batch_identity_probe_tick = (
+                getattr(self, "_batch_identity_probe_tick", 0) + 1
+            )
+            if self._batch_identity_probe_tick % 16 == 0:
+                import zlib
+
+                import torch.distributed as _dist
+
+                _rid_hash = zlib.crc32(
+                    "|".join(r.rid for r in batch.reqs).encode()
+                )
+                _probe_min = torch.tensor([bs, _rid_hash], dtype=torch.int64)
+                _probe_max = _probe_min.clone()
+                _dist.all_reduce(
+                    _probe_min, op=_dist.ReduceOp.MIN, group=_probe_group.cpu_group
+                )
+                _dist.all_reduce(
+                    _probe_max, op=_dist.ReduceOp.MAX, group=_probe_group.cpu_group
+                )
+                if not torch.equal(_probe_min, _probe_max):
+                    _identity_diverged = True
+                    logger.error(
+                        "DFLASH verify batch identity diverged across TP "
+                        "ranks (min=%s max=%s [bs, rid_hash]); rank-local "
+                        "outcomes stay authoritative (self-consistent).",
+                        _probe_min.tolist(),
+                        _probe_max.tolist(),
+                    )
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -2080,51 +2122,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # NO outcome broadcast on the greedy path (revert of 594ade477).
             # The verify pipeline is TP-symmetric BY CONSTRUCTION: target
-            # logits are vocab-parallel and all-gathered (each vocab shard is
-            # computed exactly once and shared), and both draft samplers
-            # all-gather per-shard maxima with deterministic tie selection —
-            # so accept_len/bonus/out_tokens are already identical across
-            # ranks whenever upstream batch state is healthy, and the
-            # broadcasts were value-no-ops. When upstream CPU state HAS
-            # diverged (mamba insert/alloc doors), batch composition differs
-            # across ranks and the broadcasts — row-indexed by batch position
-            # with no identity check — commit rank 0's tokens into the WRONG
-            # REQUESTS on peer ranks: cross-request KV contamination observed
-            # live as prompt-fragment/<|sep|> output corruption. Fail closed
-            # to rank-local (self-consistent) outcomes and ALARM instead.
-            _tp_group = _get_dflash_sampling_tp_group()
-            if int(_tp_group.world_size) > 1 and _tp_group.cpu_group is not None:
-                # Sampled 1-in-16: composition divergence is persistent once
-                # seeded, so sampling still catches it within ~a second while
-                # keeping the per-step gloo cost negligible. crc32, not
-                # hash(): str hashing is per-process salted.
-                self._batch_identity_probe_tick = (
-                    getattr(self, "_batch_identity_probe_tick", 0) + 1
-                )
-                if self._batch_identity_probe_tick % 16 == 0:
-                    import zlib
-
-                    import torch.distributed as _dist
-
-                    _rid_hash = zlib.crc32(
-                        "|".join(r.rid for r in batch.reqs).encode()
-                    )
-                    _probe_min = torch.tensor([bs, _rid_hash], dtype=torch.int64)
-                    _probe_max = _probe_min.clone()
-                    _dist.all_reduce(
-                        _probe_min, op=_dist.ReduceOp.MIN, group=_tp_group.cpu_group
-                    )
-                    _dist.all_reduce(
-                        _probe_max, op=_dist.ReduceOp.MAX, group=_tp_group.cpu_group
-                    )
-                    if not torch.equal(_probe_min, _probe_max):
-                        logger.error(
-                            "DFLASH verify batch identity diverged across TP "
-                            "ranks (min=%s max=%s [bs, rid_hash]); rank-local "
-                            "outcomes stay authoritative (self-consistent).",
-                            _probe_min.tolist(),
-                            _probe_max.tolist(),
-                        )
+            # logits are vocab-parallel and all-gathered, and both draft
+            # samplers all-gather per-shard maxima with deterministic tie
+            # selection — accept_len/bonus/out_tokens are already identical
+            # across ranks whenever upstream batch state is healthy, so the
+            # 594ade477 broadcasts were value-no-ops that turned into a
+            # cross-request contamination engine once batch composition
+            # diverged (row-indexed, no identity check). The batch-identity
+            # probe above alarms on divergence for both verify branches.
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

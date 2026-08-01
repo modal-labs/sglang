@@ -2760,6 +2760,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    _MAMBA_CONSENSUS_MAX_BS_DEFAULT = 512
+
     def _mamba_lazy_alloc_consensus(self, statuses: List[int]) -> List[int]:
         """TP-symmetrize per-req mamba slot-alloc outcomes (fail closed).
 
@@ -2788,15 +2790,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         group = get_tp_group()
         if int(group.world_size) <= 1 or group.cpu_group is None:
             return statuses
-        if len(statuses) > 512:
-            return statuses
+        if len(statuses) > self._MAMBA_CONSENSUS_MAX_BS_DEFAULT:
+            # Cannot fit the fixed-width vector: demote every fresh alloc.
+            # Symmetric WITHOUT a collective (commit loops only act on
+            # locally-allocated slots, so every rank degrades in place
+            # identically), unlike a silent rank-local fallback which would
+            # reopen the divergence door.
+            logger.warning(
+                "Mamba lazy-alloc consensus: bs=%d exceeds fixed width %d; "
+                "demoting all fresh allocs symmetrically.",
+                len(statuses),
+                self._MAMBA_CONSENSUS_MAX_BS_DEFAULT,
+            )
+            return [0] * len(statuses)
+        # FIXED-WIDTH vector: gloo does not validate counts across ranks, so
+        # a bs-dependent shape would blow up (hang/garbage) on exactly the
+        # composition divergence the header check exists to catch.
         rid_crc = zlib.crc32("|".join(r.rid for r in self.reqs).encode())
         vec = [len(self.reqs), rid_crc] + statuses
+        vec += [-1] * (self._MAMBA_CONSENSUS_MAX_BS_DEFAULT + 2 - len(vec))
         t_min = torch.tensor(vec, dtype=torch.int64)
         t_max = t_min.clone()
         _dist.all_reduce(t_min, op=_dist.ReduceOp.MIN, group=group.cpu_group)
         _dist.all_reduce(t_max, op=_dist.ReduceOp.MAX, group=group.cpu_group)
-        if int(t_min[0]) != int(t_max[0]) or int(t_min[1]) != int(t_max[1]):
+        if not torch.equal(t_min, t_max):
             logger.error(
                 "Mamba lazy-alloc consensus: batch identity diverged across "
                 "TP ranks (bs %s vs %s, rid_crc %s vs %s); keeping rank-local "
@@ -2807,7 +2824,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 int(t_max[1]),
             )
             return statuses
-        return [int(v) for v in t_min[2:].tolist()]
+        return [int(v) for v in t_min[2 : 2 + len(statuses)].tolist()]
 
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
@@ -2832,13 +2849,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 statuses.append(1)
                 continue
+            # The consensus skip-gate keys off the boundary check ALONE:
+            # seq_lens_cpu is rank-symmetric, while buf occupancy is
+            # rank-local state -- gating the collective on it would let the
+            # first asymmetry desynchronize the collective COUNT itself.
+            attempted = True
             other_idx = 1 - req.mamba_next_track_idx
             if buf[other_idx].item() != -1:
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 statuses.append(1)
                 continue
-            attempted = True
             if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                 new_slot = None
             else:
@@ -2890,11 +2911,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 statuses.append(1)
                 candidates.append(None)
                 continue
+            # Symmetric skip-gate: window membership (kv-committed
+            # counters) is rank-symmetric; buf occupancy is not.
+            attempted = True
             other_idx = 1 - req.mamba_next_track_idx
             had_pending = buf[other_idx].item() != -1
             new_slot = None
             if not had_pending:
-                attempted = True
                 if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                     new_slot = None
                 else:
