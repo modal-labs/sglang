@@ -1891,6 +1891,10 @@ class Scheduler(
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            # HiCache V3: the request broadcast doubles as the cache
+            # control-plane publication carrier (None unless hierarchical
+            # cache is enabled at TP>1).
+            hicache_bus=getattr(self.tree_cache, "hicache_authority", None),
         )
 
     def init_dp_attn_adapter(self) -> None:

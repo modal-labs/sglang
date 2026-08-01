@@ -85,6 +85,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -132,6 +133,15 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+class MambaLifetimeError(RuntimeError):
+    """Fail-stop: mamba slot demand exceeded the pool with nothing evictable.
+
+    HiCache V3 (docs/HICACHE_V3.md) deletes the lazy-alloc consensus; by the
+    pool-sizing analysis this condition is structurally impossible while
+    cached-idle eviction precedes hard failure, so it only fires on true
+    cross-rank state divergence — restart loud instead of negotiating."""
 
 
 @lru_cache(maxsize=1)
@@ -2765,74 +2775,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
-    _MAMBA_CONSENSUS_MAX_BS_DEFAULT = 512
-
-    def _mamba_lazy_alloc_consensus(self, statuses: List[int]) -> List[int]:
-        """TP-symmetrize per-req mamba slot-alloc outcomes (fail closed).
-
-        The lazy ping-pong alloc result is otherwise a RANK-LOCAL input to
-        the radix insert/skip decision (batch_result_processor keys
-        ``mamba_lazy_is_insert`` off it): one rank failing an alloc while
-        the others succeed silently diverges the per-rank radix trees --
-        observed live as the one-page HiCache write-fingerprint desyncs.
-        MIN+MAX-reduce ``[bs, rid_crc, status...]`` on the TP CPU group:
-        a slot only counts if EVERY rank allocated it; callers free their
-        slot when the consensus demotes them. A header mismatch (batch
-        composition already diverged) keeps rank-local statuses on every
-        rank symmetrically and alarms. Callers skip the collective when no
-        req attempted an alloc -- symmetric under the lockstep-occupancy
-        invariant this consensus maintains.
-        """
-        import zlib
-
-        import torch.distributed as _dist
-
-        from sglang.srt.distributed import get_tp_group
-        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-
-        if is_dp_attention_enabled():
-            return statuses
-        group = get_tp_group()
-        if int(group.world_size) <= 1 or group.cpu_group is None:
-            return statuses
-        if len(statuses) > self._MAMBA_CONSENSUS_MAX_BS_DEFAULT:
-            # Cannot fit the fixed-width vector: demote every fresh alloc.
-            # Symmetric WITHOUT a collective (commit loops only act on
-            # locally-allocated slots, so every rank degrades in place
-            # identically), unlike a silent rank-local fallback which would
-            # reopen the divergence door.
-            logger.warning(
-                "Mamba lazy-alloc consensus: bs=%d exceeds fixed width %d; "
-                "demoting all fresh allocs symmetrically.",
-                len(statuses),
-                self._MAMBA_CONSENSUS_MAX_BS_DEFAULT,
-            )
-            return [0] * len(statuses)
-        # FIXED-WIDTH vector: gloo does not validate counts across ranks, so
-        # a bs-dependent shape would blow up (hang/garbage) on exactly the
-        # composition divergence the header check exists to catch.
-        rid_crc = zlib.crc32("|".join(r.rid for r in self.reqs).encode())
-        vec = [len(self.reqs), rid_crc] + statuses
-        vec += [-1] * (self._MAMBA_CONSENSUS_MAX_BS_DEFAULT + 2 - len(vec))
-        t_min = torch.tensor(vec, dtype=torch.int64)
-        t_max = t_min.clone()
-        _dist.all_reduce(t_min, op=_dist.ReduceOp.MIN, group=group.cpu_group)
-        _dist.all_reduce(t_max, op=_dist.ReduceOp.MAX, group=group.cpu_group)
-        # HEADER-ONLY comparison: the statuses payload legitimately differs
-        # across ranks in exactly the event this consensus exists for (one
-        # rank's alloc fails); only bs/rid_crc define batch identity.
-        if int(t_min[0]) != int(t_max[0]) or int(t_min[1]) != int(t_max[1]):
-            logger.error(
-                "Mamba lazy-alloc consensus: batch identity diverged across "
-                "TP ranks (bs %s vs %s, rid_crc %s vs %s); keeping rank-local "
-                "alloc outcomes.",
-                int(t_min[0]),
-                int(t_max[0]),
-                int(t_min[1]),
-                int(t_max[1]),
-            )
-            return statuses
-        return [int(v) for v in t_min[2 : 2 + len(statuses)].tolist()]
+    def _mamba_alloc_or_fail_stop(self, need: int = 1) -> torch.Tensor:
+        """HiCache V3 fail-stop replacement for the deleted lazy-alloc
+        consensus (docs/HICACHE_V3.md). Constraints: no collectives; mirrored
+        allocators + rank-identical request order make the outcome a pure
+        function of mirrored state, so every rank computes it identically
+        without negotiation. Pool sizing gives 2x headroom over worst-case
+        boundary demand and cached-idle mamba is evictable on demand
+        (local + mirrored), so a hard failure here is structurally possible
+        only on true state divergence — the event that must be LOUD."""
+        pool = self.req_to_token_pool
+        forced_fail = envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get()
+        new_slot = None if forced_fail else pool.mamba_allocator.alloc(need)
+        if new_slot is not None:
+            return new_slot
+        evictable = (
+            self.tree_cache.mamba_evictable_size()
+            if self.tree_cache is not None
+            and hasattr(self.tree_cache, "mamba_evictable_size")
+            else 0
+        )
+        if evictable > 0:
+            # Evictable-idle first (sizing analysis): device mamba eviction
+            # is deterministic over mirrored tree state.
+            self.tree_cache.evict(EvictParams(mamba_num=need))
+            new_slot = None if forced_fail else pool.mamba_allocator.alloc(need)
+            if new_slot is not None:
+                return new_slot
+        raise MambaLifetimeError(
+            "Mamba slot pool exhausted with no evictable-idle state "
+            f"(need={need}, available={pool.mamba_allocator.available_size()}, "
+            f"evictable={evictable}, bs={len(self.reqs)}). By pool sizing "
+            "this is unreachable without cross-rank state divergence; "
+            "failing stop (restart) instead of negotiating a demote."
+        )
 
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
@@ -2844,47 +2820,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_lazy_post_decode_at_boundary.
         """
         pool = self.req_to_token_pool
-        # Two-phase: attempt allocs rank-locally, then TP-symmetrize the
-        # outcomes before committing (a rank-local failure that other ranks
-        # don't share would silently diverge the radix trees downstream).
-        statuses: List[int] = []
-        pending: List[tuple] = []  # (batch_idx, req, other_idx, new_slot)
-        attempted = False
+        # V3 fail-stop: outcomes are a pure function of mirrored state
+        # (rank-identical request order + mirrored allocators), so no
+        # consensus round exists anymore; a rank whose alloc cannot be
+        # satisfied even after evicting cached-idle mamba raises
+        # MambaLifetimeError (see _mamba_alloc_or_fail_stop).
         for i, req in enumerate(self.reqs):
             buf = req.mamba_ping_pong_track_buffer
             assert buf is not None
             # Skip reqs not at a track boundary
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
-                statuses.append(1)
                 continue
-            # The consensus skip-gate keys off the boundary check ALONE:
-            # seq_lens_cpu is rank-symmetric, while buf occupancy is
-            # rank-local state -- gating the collective on it would let the
-            # first asymmetry desynchronize the collective COUNT itself.
-            attempted = True
             other_idx = 1 - req.mamba_next_track_idx
             if buf[other_idx].item() != -1:
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
-                statuses.append(1)
                 continue
-            if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
-                new_slot = None
-            else:
-                # No evict-retry: a transient slot is not worth evicting a
-                # cached checkpoint for; on failure tracking degrades in place.
-                new_slot = pool.mamba_allocator.alloc(1)
-            statuses.append(1 if new_slot is not None else 0)
-            if new_slot is not None:
-                pending.append((i, req, other_idx, new_slot))
-        if attempted:
-            statuses = self._mamba_lazy_alloc_consensus(statuses)
-        for i, req, other_idx, new_slot in pending:
-            if statuses[i] == 0:
-                # Some rank failed this alloc: give the slot back so every
-                # rank degrades identically (tracking continues in place).
-                pool.mamba_allocator.free(new_slot)
-                continue
+            new_slot = self._mamba_alloc_or_fail_stop(1)
             pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
             req.mamba_next_track_idx = other_idx
 
@@ -2900,15 +2852,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         copy (forward isolation restores batch fields).
         """
         pool = self.req_to_token_pool
-        # Two-phase like mamba_lazy_prealloc_at_boundary: rank-local alloc
-        # attempts, TP consensus, then commit -- the chosen track position
-        # feeds the verify scatter AND the downstream radix insert decision,
-        # so it must be identical on every rank.
-        statuses: List[int] = []
-        # (batch_idx, req, other_idx, new_slot|None, had_pending)
-        candidates: List[tuple] = []
-        attempted = False
-        for i, req in enumerate(self.reqs):
+        # V3 fail-stop (see mamba_lazy_prealloc_at_boundary): the chosen
+        # track position feeds the verify scatter AND the downstream radix
+        # insert decision, and stays rank-identical because every input
+        # (window membership, buf occupancy, allocator state) is mirrored;
+        # exhaustion raises MambaLifetimeError instead of demoting.
+        track_positions: List[int] = []
+        for req in self.reqs:
             buf = req.mamba_ping_pong_track_buffer
             assert buf is not None
             if not mamba_lazy_spec_in_window(
@@ -2916,48 +2866,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ):
                 # No crossing reachable: the scatter mask stays -1, the
                 # position is never written.
-                statuses.append(1)
-                candidates.append(None)
-                continue
-            # Symmetric skip-gate: window membership (kv-committed
-            # counters) is rank-symmetric; buf occupancy is not.
-            attempted = True
-            other_idx = 1 - req.mamba_next_track_idx
-            had_pending = buf[other_idx].item() != -1
-            new_slot = None
-            if not had_pending:
-                if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
-                    new_slot = None
-                else:
-                    # No evict-retry: a transient slot is not worth
-                    # evicting a cached checkpoint for.
-                    new_slot = pool.mamba_allocator.alloc(1)
-                statuses.append(1 if new_slot is not None else 0)
-            else:
-                statuses.append(1)
-            candidates.append((i, req, other_idx, new_slot, had_pending))
-        if attempted:
-            statuses = self._mamba_lazy_alloc_consensus(statuses)
-        track_positions: List[int] = []
-        for i, req in enumerate(self.reqs):
-            cand = candidates[i]
-            if cand is None:
                 track_positions.append(req.mamba_next_track_idx)
                 continue
-            _, _, other_idx, new_slot, had_pending = cand
-            has_pending = had_pending
-            if new_slot is not None:
-                if statuses[i] == 0:
-                    # Some rank failed this alloc: release ours so every
-                    # rank scatters in place into the keep slot.
-                    pool.mamba_allocator.free(new_slot)
-                else:
-                    pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
-                    has_pending = True
-            # On failure the verify scatters in place into the keep slot.
-            track_positions.append(
-                other_idx if has_pending else req.mamba_next_track_idx
-            )
+            other_idx = 1 - req.mamba_next_track_idx
+            if buf[other_idx].item() == -1:
+                new_slot = self._mamba_alloc_or_fail_stop(1)
+                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
+            track_positions.append(other_idx)
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):

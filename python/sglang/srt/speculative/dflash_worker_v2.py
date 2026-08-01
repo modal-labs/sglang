@@ -1984,45 +1984,33 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidates = draft_tokens
         new_seq_lens = None
 
-        # Fail-closed batch-identity probe, BOTH verify branches (the
-        # stochastic branch's row-indexed rank-0 broadcast commits tokens
-        # into the WRONG REQUESTS on peers if batch composition has
-        # diverged; the greedy branch keeps rank-local outcomes but must
-        # alarm too). Sampled 1-in-16: composition divergence is persistent
-        # once seeded, so sampling catches it within ~a second at
-        # negligible gloo cost. crc32, not hash(): str hashing is
-        # per-process salted. Ticked on EVERY verify pass (not per-branch)
-        # so probe rounds pair across ranks even if branch selection
-        # were to diverge.
+        # Batch-identity probe, BOTH verify branches (the stochastic branch's
+        # row-indexed rank-0 broadcast commits tokens into the WRONG REQUESTS
+        # on peers if batch composition has diverged; the greedy branch keeps
+        # rank-local outcomes but must alarm too). V3 control plane: the
+        # probe's own gloo collective is DELETED — the sampled (bs, rid_crc)
+        # identity rides the HiCache authority's published record batches and
+        # is compared rank-locally on receipt (hicache_authority.py). Sampled
+        # 1-in-16: composition divergence is persistent once seeded. crc32,
+        # not hash(): str hashing is per-process salted. Ticked on EVERY
+        # verify pass so probe samples pair across ranks by tick.
         _probe_group = _get_dflash_sampling_tp_group()
-        if int(_probe_group.world_size) > 1 and _probe_group.cpu_group is not None:
+        if int(_probe_group.world_size) > 1:
             self._batch_identity_probe_tick = (
                 getattr(self, "_batch_identity_probe_tick", 0) + 1
             )
             if self._batch_identity_probe_tick % 16 == 0:
                 import zlib
 
-                import torch.distributed as _dist
+                from sglang.srt.mem_cache.hybrid_cache.hicache_authority import (
+                    note_batch_identity,
+                )
 
-                _rid_hash = zlib.crc32(
-                    "|".join(r.rid for r in batch.reqs).encode()
+                note_batch_identity(
+                    self._batch_identity_probe_tick,
+                    bs,
+                    zlib.crc32("|".join(r.rid for r in batch.reqs).encode()),
                 )
-                _probe_min = torch.tensor([bs, _rid_hash], dtype=torch.int64)
-                _probe_max = _probe_min.clone()
-                _dist.all_reduce(
-                    _probe_min, op=_dist.ReduceOp.MIN, group=_probe_group.cpu_group
-                )
-                _dist.all_reduce(
-                    _probe_max, op=_dist.ReduceOp.MAX, group=_probe_group.cpu_group
-                )
-                if not torch.equal(_probe_min, _probe_max):
-                    logger.error(
-                        "DFLASH verify batch identity diverged across TP "
-                        "ranks (min=%s max=%s [bs, rid_hash]); rank-local "
-                        "outcomes stay authoritative (self-consistent).",
-                        _probe_min.tolist(),
-                        _probe_max.tolist(),
-                    )
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy

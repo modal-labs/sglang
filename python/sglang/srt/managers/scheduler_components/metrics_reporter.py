@@ -832,6 +832,11 @@ class SchedulerMetricsReporter:
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            # Wall-clock per decode step (forward + verify + ALL host work).
+            # The 2026-08-01 prod regression was invisible to throughput and
+            # correctness gates and obvious here: gate perf on step-ms vs
+            # the incumbent, always.
+            f"step-ms: {gap_latency / self.decode_log_interval * 1000:.1f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )
 

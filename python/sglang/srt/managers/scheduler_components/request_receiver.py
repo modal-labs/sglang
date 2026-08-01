@@ -26,6 +26,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.mem_cache.hybrid_cache.hicache_authority import HiCacheRecordBatch
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -63,6 +64,10 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    # HiCache V3 authority: the per-step rank0->peers request broadcast below
+    # is the publication carrier for cache control-plane records (bytes on an
+    # existing collective; never a new collective).
+    hicache_bus: Any = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -80,7 +85,13 @@ class SchedulerRequestReceiver:
 
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_batch()):
-                return []
+                # Flush rule (docs/HICACHE_V3.md): pending records must ride
+                # a broadcast within N=16 steps. allow_skip() is a pure
+                # function of a local counter that advances identically on
+                # every rank (the skipper decision itself is rank-symmetric),
+                # so every rank enters the forced broadcast together.
+                if self.hicache_bus is None or self.hicache_bus.allow_skip():
+                    return []
 
         recv_reqs = self._pull_raw_reqs()
 
@@ -195,12 +206,33 @@ class SchedulerRequestReceiver:
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.ps.tp_size != 1:
+            bus = self.hicache_bus
+            if bus is not None and bus.is_rank0:
+                # V3 publication: piggyback the pending cache records on this
+                # step's request broadcast. build_publish_batch() also
+                # self-applies the records to rank 0's tree, so every rank
+                # mutates mirrored state at the same loop position.
+                record_batch = bus.build_publish_batch()
+                if record_batch is not None:
+                    recv_reqs = list(recv_reqs or []) + [record_batch]
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+            if bus is not None:
+                bus.note_broadcast()
+                record_batches = [
+                    r for r in recv_reqs if isinstance(r, HiCacheRecordBatch)
+                ]
+                if record_batches:
+                    recv_reqs = [
+                        r for r in recv_reqs if not isinstance(r, HiCacheRecordBatch)
+                    ]
+                    if not bus.is_rank0:
+                        for record_batch in record_batches:
+                            bus.apply_batch(record_batch)
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:

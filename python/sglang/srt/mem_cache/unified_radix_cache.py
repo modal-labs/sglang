@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, Sequence,
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -34,6 +33,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
+)
+from sglang.srt.mem_cache.hybrid_cache.hicache_authority import (
+    HiCacheAuthority,
+    WriteIntent,
+    indices_crc,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -277,18 +281,15 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
-# Opcodes carried in the fingerprinted radix-cache collectives (see
-# _all_ranks_succeeded / writing_check / loading_check): a cross-paired
-# reduce shows up as an opcode/seq mismatch instead of a silent value swap.
+# Opcodes carried by V3 control-plane records (see docs/HICACHE_V3.md and
+# hybrid_cache/hicache_authority.py). Values kept from the V2 fingerprint
+# scheme so log forensics line up across versions.
 _HICACHE_OP_WRITE = 1
 _HICACHE_OP_LOAD = 2
-_HICACHE_OP_WRITE_CHECK = 3
-_HICACHE_OP_LOAD_CHECK = 4
-_HICACHE_OP_WATERMARK = 6
 # Mamba-only repair writes reuse the WRITE transaction but carry their own
 # opcode: a rank that classifies the same node as a normal write while
-# another classifies it as a repair must fingerprint-mismatch (fail closed),
-# not silently agree on tokens=0.
+# another classifies it as a repair must fail-stop, not silently agree on
+# tokens=0.
 _HICACHE_OP_WRITE_MAMBA_REPAIR = 7
 
 
@@ -386,10 +387,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
+        # HiCache V3 control plane (rank-0 authority; None when hierarchical
+        # cache is disabled or single-rank).
+        self.hicache_authority: Optional[HiCacheAuthority] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         self.write_through_threshold = 256
         self.prefetch_stop_policy = "best_effort"
@@ -419,118 +422,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
 
-    def _drain_async_work(self):
-        """
-        Block until all outstanding async sends are consumed, then clear.
-
-        Called at the start of each event round, so work_list holds the sends
-        accumulated since the last round. This bounds it and applies
-        backpressure when a downstream PP rank lags. Scheduler thread only.
-        """
-        for work in self.work_list:
-            work.wait()
-        self.work_list.clear()
-
-    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
-        """
-        Synchronize data across all TP and PP ranks.
-
-        In particular, "tp_reduce_op" is performed on all TP ranks of the first PP rank,
-        and then the result is propagated to all following PP ranks.
-
-        Must be called in the scheduler thread.
-        """
-        if self.pp_rank == 0:
-            self._all_reduce_attn_groups(data, tp_reduce_op)
-        self._pp_sync(data)
-
-    def _fingerprint_ok(self, vec_min: torch.Tensor, vec_max: torch.Tensor) -> bool:
-        """True when all ranks reduced the same transaction (seq/op/node/tokens)."""
-        if torch.equal(vec_min[1:], vec_max[1:]):
-            return True
-        self._hicache_desync_logged += 1
-        if self._hicache_desync_logged <= 20 or self._hicache_desync_logged % 100 == 0:
-            logger.error(
-                "HiCache TP consensus fingerprint mismatch (rank desync #%d): "
-                "min=%s max=%s [value, seq, opcode, node_id, tokens]. Failing "
-                "this transaction closed on every rank.",
-                self._hicache_desync_logged,
-                vec_min.tolist(),
-                vec_max.tolist(),
-            )
-        return False
-
-    def _fingerprinted_check_reduce(self, value: int, *, opcode: int) -> int:
-        """MIN-reduce an ack count with the same fingerprint scheme as
-        _all_ranks_succeeded (same _all_reduce topology writing_check and
-        loading_check used before). Returns 0 on fingerprint mismatch so a
-        desynchronized rank drains nothing instead of popping foreign acks."""
-        if self.tp_world_size == 1 and self.pp_size == 1:
-            return value
-        self._hicache_consensus_seq += 1
-        base = [int(value), self._hicache_consensus_seq, int(opcode), -1, -1]
-        vec_min = torch.tensor(base, dtype=torch.long, device="cpu")
-        vec_max = torch.tensor(base, dtype=torch.long, device="cpu")
-        self._all_reduce(vec_min, torch.distributed.ReduceOp.MIN)
-        self._all_reduce(vec_max, torch.distributed.ReduceOp.MAX)
-        if not self._fingerprint_ok(vec_min, vec_max):
-            return 0
-        return int(vec_min[0].item())
-
-    def _all_ranks_succeeded(
-        self,
-        local_success: bool,
-        *,
-        opcode: int,
-        node_id: int = -1,
-        tokens: int = -1,
-    ) -> bool:
-        if self.tp_world_size == 1 and self.pp_size == 1:
-            return local_success
-        self._hicache_consensus_seq += 1
-        base = [
-            int(local_success),
-            self._hicache_consensus_seq,
-            int(opcode),
-            int(node_id),
-            int(tokens),
-        ]
-        vec_min = torch.tensor(base, dtype=torch.long, device="cpu")
-        vec_max = torch.tensor(base, dtype=torch.long, device="cpu")
-        for vec, op in (
-            (vec_min, torch.distributed.ReduceOp.MIN),
-            (vec_max, torch.distributed.ReduceOp.MAX),
-        ):
-            self._all_reduce_attn_groups(vec, op)
-            if self.pp_size > 1:
-                assert self.pp_group is not None
-                torch.distributed.all_reduce(vec, op=op, group=self.pp_group)
-        if not self._fingerprint_ok(vec_min, vec_max):
-            return False
-        return vec_min[0].item() == 1
-
-    def _pp_sync(self, data: torch.Tensor) -> None:
-        """
-        Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
-        """
-        if self.pp_size <= 1 or self.pp_group is None:
-            return
-        if self.pp_rank > 0:
-            torch.distributed.recv(
-                data,
-                group_src=self.pp_rank - 1,
-                group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
-            )
-        if self.pp_rank + 1 < self.pp_size:
-            copy_of_data = data.clone()
-            send_work = torch.distributed.isend(
-                copy_of_data,
-                group_dst=self.pp_rank + 1,
-                group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
-            )
-            self.work_list.append(send_work)
+    # V3 control plane (docs/HICACHE_V3.md): the V2 per-transaction consensus
+    # helpers (_all_reduce / _fingerprinted_check_reduce / _all_ranks_succeeded
+    # / _pp_sync) are DELETED. Cross-rank agreement on the write/evict/ack
+    # paths is record-driven (rank-0 authority publishes, peers apply,
+    # fail-stop asserts + running CRC replace negotiation). The remaining
+    # attn-group reduce helpers below serve only the L3 storage paths, which
+    # are unsupported together with the authority.
 
     def reset(self) -> None:
         self._reset_full()
@@ -560,6 +458,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         }
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        # V3: enqueue-time transfer snapshots for in-flight write-throughs,
+        # keyed by the pending id (node.id at enqueue).
+        self._hicache_pending_writes: dict[int, dict] = {}
+        authority = getattr(self, "hicache_authority", None)
+        if authority is not None:
+            authority.reset()
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -646,19 +550,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
-        # Every radix-cache collective carries [value, seq, opcode, node_id,
-        # tokens]; seq is a per-rank monotonic counter so a rank that skips or
-        # double-runs one collective is detected at the next fingerprint check
-        # instead of silently cross-pairing same-shape reduces.
-        self._hicache_consensus_seq = 0
-        self._hicache_desync_logged = 0
         # Watermark host eviction for TP>1 (single-rank evicts inline in
         # write_backup): trigger when a host pool's free fraction drops below
-        # the trigger ratio, evict a batch-ratio slice.
+        # the trigger ratio, evict a batch-ratio slice. V3: rank 0 decides
+        # unilaterally from its physical pools and publishes EVICT records.
         self._host_evict_trigger_ratio = (
             envs.SGLANG_HICACHE_HOST_EVICT_TRIGGER_RATIO.get()
         )
         self._host_evict_batch_ratio = envs.SGLANG_HICACHE_HOST_EVICT_BATCH_RATIO.get()
+
+        # V3 control plane: rank-0 authority + record publication. Constraint:
+        # multi-rank hierarchical cache MUST run through the authority (the V2
+        # per-transaction consensus path is deleted).
+        self.hicache_authority = None
+        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
+        if multi_rank:
+            if server_args.enable_dp_attention:
+                raise NotImplementedError(
+                    "HiCache V3 authority does not support dp-attention "
+                    "publication routing yet (per-group authorities needed)."
+                )
+            if self.pp_size > 1:
+                raise NotImplementedError(
+                    "HiCache V3 authority supports pp_size == 1 only; the "
+                    "request-broadcast carrier does not span PP stages."
+                )
+            if storage_backend is not None:
+                raise NotImplementedError(
+                    "HiCache V3 authority does not support the L3 storage "
+                    "backend yet (storage control queues still reduce)."
+                )
+            self.hicache_authority = HiCacheAuthority(
+                cache=self,
+                controller=self.cache_controller,
+                is_rank0=torch.distributed.get_rank(group=self.tp_group) == 0,
+                device=self.device,
+            )
 
         if storage_backend is not None:
             self._apply_storage_runtime_config(
@@ -676,6 +603,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        if self.hicache_authority is not None:
+            self.hicache_authority.shutdown()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -1207,7 +1136,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        if child.backuped:
+        # V3: a pending write-through exists from ENQUEUE time (before any
+        # host commit), so track splits for pending-but-not-yet-backuped
+        # nodes too; the PLACE apply slices host indices along the chain.
+        if child.backuped or child.write_through_pending_id is not None:
             self._replace_pending_write_through_node(child, [new_node, child])
 
         self._for_each_component_lru(
@@ -1794,22 +1726,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if event is not None:
             torch.get_device_module().current_stream().wait_event(event)
 
-    def _watermark_evict_host_pools(self) -> None:
-        """Free host-pool headroom before coordinated (TP>1) write-throughs.
-
-        For each host pool (anchor KV, plus mamba/swa extra pools) whose free
-        fraction fell below SGLANG_HICACHE_HOST_EVICT_TRIGGER_RATIO, evict an
-        SGLANG_HICACHE_HOST_EVICT_BATCH_RATIO slice through the component's
-        LRU eviction driver. No collectives: determinism across ranks follows
-        from mirrored trees and allocators (every rank sees the same insert
-        and eviction stream), which the coordinated reservation protocol
-        already assumes. Victims are never DMA-in-flight: loadbacks hold
-        host_lock_ref and pending write-throughs are not yet backuped, so
-        neither qualifies as an evictable host node.
-        """
+    def _hicache_watermark_targets(self) -> list[tuple[ComponentType, Any]]:
         cc = self.cache_controller
-        if cc is None or self._host_evict_trigger_ratio <= 0:
-            return
         targets: list[tuple[ComponentType, Any]] = [
             (BASE_COMPONENT_TYPE, cc.mem_pool_host)
         ]
@@ -1821,64 +1739,60 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             entry = entry_map.get(pool_name)
             if entry is not None and component_type in self.components:
                 targets.append((component_type, entry.host_pool))
-        # Consensus on the trigger input: the "determinism follows from
-        # mirrored trees" assumption above is exactly what an upstream insert
-        # divergence violates -- rank-local free fractions then fire
-        # evictions on different rounds per rank and cross-pair the write
-        # collectives. MIN-reduce `available` per pool THROUGH THE
-        # FINGERPRINT SCHEME (seq + opcode + pool index + capacity), so a
-        # collective-count skew fails closed like every other cache
-        # collective instead of shape-mismatching raw reduces. On
-        # fingerprint mismatch the whole preflight round is skipped on every
-        # rank symmetrically (no eviction from garbage inputs).
-        sized = [
-            (component_type, pool, getattr(pool, "size", 0))
-            for component_type, pool in targets
-        ]
-        availables = [
-            pool.available_size() if capacity > 0 else 0
-            for _, pool, capacity in sized
-        ]
-        if self.tp_world_size > 1 or self.pp_size > 1:
-            reduced: list[int] = []
-            round_ok = True
-            for pool_index, ((_, _, capacity), available) in enumerate(
-                zip(sized, availables)
-            ):
-                self._hicache_consensus_seq += 1
-                base = [
-                    int(available),
-                    self._hicache_consensus_seq,
-                    _HICACHE_OP_WATERMARK,
-                    pool_index,
-                    int(capacity),
-                ]
-                vec_min = torch.tensor(base, dtype=torch.long, device="cpu")
-                vec_max = torch.tensor(base, dtype=torch.long, device="cpu")
-                self._all_reduce(vec_min, torch.distributed.ReduceOp.MIN)
-                self._all_reduce(vec_max, torch.distributed.ReduceOp.MAX)
-                if not self._fingerprint_ok(vec_min, vec_max):
-                    round_ok = False
-                reduced.append(int(vec_min[0].item()))
-            if not round_ok:
-                return
-            availables = reduced
-        for (component_type, pool, capacity), available in zip(sized, availables):
+        return targets
+
+    def _hicache_run_watermark_evictions(
+        self, force: bool = False
+    ) -> list[tuple[int, int, int]]:
+        """V3 rank-0 unilateral host eviction (replaces the V2 MIN-reduced
+        watermark preflight). Constraints: rank 0 only; runs under the
+        authority lock so physical frees serialize with the worker's allocs
+        in record order; victims come from the deterministic LRU drivers, so
+        peers replay the identical eviction from (component, need) alone and
+        the freed count is CRC-checked. ``force`` runs a batch slice on
+        every pool regardless of the watermark (a write intent stalled on
+        reservation and needs headroom now)."""
+        cc = self.cache_controller
+        out: list[tuple[int, int, int]] = []
+        if cc is None:
+            return out
+        if self._host_evict_trigger_ratio <= 0 and not force:
+            return out
+        for component_type, pool in self._hicache_watermark_targets():
+            capacity = getattr(pool, "size", 0)
             if capacity <= 0:
                 continue
-            if available >= self._host_evict_trigger_ratio * capacity:
+            available = pool.available_size()
+            if not force and available >= self._host_evict_trigger_ratio * capacity:
                 continue
             need = max(1, int(self._host_evict_batch_ratio * capacity))
-            evicted = self.evict_host(need, component_type=component_type)
+            freed = self.evict_host(need, component_type=component_type)
             logger.info(
-                "HiCache host watermark eviction: component=%s available=%d/%d "
-                "requested=%d evicted=%d",
+                "HiCache V3 watermark eviction: component=%s available=%d/%d "
+                "requested=%d evicted=%d force=%s",
                 component_type,
                 available,
                 capacity,
                 need,
-                evicted,
+                freed,
+                force,
             )
+            if freed > 0:
+                out.append((int(component_type), need, freed))
+        return out
+
+    def _hicache_apply_evict(self, record) -> tuple:
+        """Peer apply of a published EVICT: replay the deterministic LRU
+        eviction; a freed-count mismatch is state divergence (fail-stop)."""
+        component_type = ComponentType(record.component)
+        freed = self.evict_host(record.need, component_type=component_type)
+        if freed != record.freed:
+            raise RuntimeError(
+                "HiCache V3 divergence: eviction replay freed "
+                f"{freed} != published {record.freed} "
+                f"(component={component_type}, need={record.need})."
+            )
+        return (freed,)
 
     def write_backup(
         self,
@@ -1888,20 +1802,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> int:
         """Backup a node's data from device to host (D->H).
 
+        V3 control plane: at TP>1 this is a TRIGGER, not a transaction — it
+        enqueues an intent on the rank-0 authority (op _HICACHE_OP_WRITE /
+        _HICACHE_OP_WRITE_MAMBA_REPAIR) and returns; host placement arrives
+        later as published records applied on every rank. The inline
+        transaction below remains for single-rank serving and for the
+        blocking write_back flush path (single-rank only by construction:
+        init_hicache rejects multi-rank write_back).
+
         mamba_only: repair op for a node whose Full KV is already backuped but
         whose host mamba checkpoint was evicted (or never landed) — ships an
         empty KV payload plus the mamba transfer through the same reservation/
-        consensus/ack machinery. Returns the number of mamba states committed
-        (0 on failure); the regular path returns KV tokens committed.
+        ack machinery. Returns the number of mamba states committed/queued
+        (0 on failure); the regular path returns KV tokens committed/queued.
         """
         if self.cache_controller is None:
             return 0
+        authority = getattr(self, "hicache_authority", None)
+        if authority is not None and not write_back:
+            return self._hicache_enqueue_write(
+                node,
+                opcode=(
+                    _HICACHE_OP_WRITE_MAMBA_REPAIR
+                    if mamba_only
+                    else _HICACHE_OP_WRITE
+                ),
+            )
         if mamba_only:
             assert not write_back
-            # These conditions are mirrored tree state (lockstep host eviction,
-            # consensus-gated pending ids), so returning early here is
-            # rank-symmetric — the same assumption the parent-recursion early
-            # return below already makes.
             if (
                 not node.backuped
                 or node.write_through_pending_id is not None
@@ -1910,21 +1838,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 return 0
 
-        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
-        if write_back and multi_rank:
+        if self.tp_world_size > 1 or self.pp_size > 1:
+            # The V2 coordinated reservation/consensus transaction is deleted;
+            # multi-rank hierarchical cache must run through the authority.
             raise RuntimeError(
-                "Unified HiCache write_back cannot run independently on TP/PP ranks"
+                "Unified HiCache write_backup at TP/PP>1 requires the V3 "
+                "authority (write_back is single-rank only)"
             )
-        # At TP>1 no on-demand eviction is safe inside the coordinated
-        # reservation (see below), so without this preflight the host pools
-        # fill monotonically and every later backup fails its reservation —
-        # a permanent write-through outage plus a per-node consensus storm.
-        # The watermark eviction reduces its trigger inputs through the
-        # fingerprint scheme and runs at symmetric
-        # call sites, so it stays in lockstep given mirrored trees (the same
-        # assumption the coordinated protocol itself relies on).
-        if multi_rank and not write_back:
-            self._watermark_evict_host_pools()
 
         # The write-through D2H reads device pool state (KV pages + mamba
         # states) from the write stream, gated only on the schedule stream;
@@ -1938,95 +1858,53 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if self.write_backup(node.parent) <= 0:
                 return 0
 
-        coordinated = multi_rank
-        kv_tokens = -1
-        reservation = None
-        try:
-            device_value = node.component_data[BASE_COMPONENT_TYPE].value
-            if mamba_only:
-                # Empty KV payload: reserve_write allocates zero host slots and
-                # the D2H kernels/loaders early-out on length==0, so the op
-                # rides the regular write queue and ack path unchanged.
-                device_value = (
-                    device_value[:0]
-                    if device_value is not None
-                    else torch.empty((0,), dtype=torch.int64, device=self.device)
-                )
-            kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
-
-            # Build aux transfers, keyed per component.
-            comp_xfers: dict[ComponentType, list] = {}
-            for comp in self._components_tuple:
-                if comp.component_type == BASE_COMPONENT_TYPE:
-                    continue
-                if mamba_only and comp.component_type != ComponentType.MAMBA:
-                    continue
-                t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
-                if t:
-                    comp_xfers[comp.component_type] = t
-            if mamba_only and not comp_xfers:
-                # Guarded above; raising (not returning) keeps a rank whose
-                # local build unexpectedly fails inside the consensus below.
-                raise RuntimeError(
-                    f"mamba-only backup for node {node.id} built no mamba transfer"
-                )
-            sidecar_xfers = self._build_sidecar_transfers(
-                CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        if mamba_only:
+            # Empty KV payload: reserve_write allocates zero host slots and
+            # the D2H kernels/loaders early-out on length==0, so the op
+            # rides the regular write queue and ack path unchanged.
+            device_value = (
+                device_value[:0]
+                if device_value is not None
+                else torch.empty((0,), dtype=torch.int64, device=self.device)
             )
+        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
-            kv_tokens = len(device_value)
-            aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-            aux_xfers.extend(sidecar_xfers)
-            # Coordinated backups fail closed under pressure. Safe victim
-            # eviction inside the reservation needs its own cross-rank
-            # protocol; the watermark preflight above keeps headroom instead.
-            if not coordinated:
-                host_avail = self.cache_controller.mem_pool_host.available_size()
-                if host_avail < kv_tokens:
-                    needed = kv_tokens - host_avail
-                    evicted = self.evict_host(needed)
-                    if evicted < needed:
-                        return 0
+        # Build aux transfers, keyed per component.
+        comp_xfers: dict[ComponentType, list] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            if mamba_only and comp.component_type != ComponentType.MAMBA:
+                continue
+            t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+            if t:
+                comp_xfers[comp.component_type] = t
+        if mamba_only and not comp_xfers:
+            # Guarded above; a build failure here is real state corruption.
+            raise RuntimeError(
+                f"mamba-only backup for node {node.id} built no mamba transfer"
+            )
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+        )
 
-            reservation = self.cache_controller.reserve_write(
-                device_value,
-                node_id=node.id,
-                extra_pools=aux_xfers or None,
-                allow_evict=not coordinated,
-            )
-        except Exception:
-            # A one-rank failure anywhere before the consensus must still
-            # reach the consensus, or the other ranks block in it forever.
-            if not coordinated:
-                raise
-            logger.exception("HiCache write transfer build/reservation failed")
-            reservation = None
-        try:
-            group_succeeded = (
-                self._all_ranks_succeeded(
-                    reservation is not None,
-                    opcode=(
-                        _HICACHE_OP_WRITE_MAMBA_REPAIR
-                        if mamba_only
-                        else _HICACHE_OP_WRITE
-                    ),
-                    node_id=node.id,
-                    tokens=kv_tokens,
-                )
-                if coordinated
-                else reservation is not None
-            )
-        except Exception:
-            if reservation is not None:
-                try:
-                    self.cache_controller.abort_write(reservation)
-                except Exception:
-                    logger.exception("Failed to abort HiCache write reservation")
-            raise
-        if not group_succeeded:
-            if reservation is not None:
-                self.cache_controller.abort_write(reservation)
-            return 0
+        kv_tokens = len(device_value)
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        host_avail = self.cache_controller.mem_pool_host.available_size()
+        if host_avail < kv_tokens:
+            needed = kv_tokens - host_avail
+            evicted = self.evict_host(needed)
+            if evicted < needed:
+                return 0
+
+        reservation = self.cache_controller.reserve_write(
+            device_value,
+            node_id=node.id,
+            extra_pools=aux_xfers or None,
+            allow_evict=True,
+        )
         if reservation is None:
             return 0
 
@@ -2061,6 +1939,278 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if t.host_indices is not None
             )
         return len(host_indices)
+
+    def _hicache_enqueue_write(self, node: UnifiedTreeNode, opcode: int) -> int:
+        """V3 write trigger. Constraints: called at rank-symmetric sites over
+        mirrored state only; no collectives; no host allocation here. Every
+        rank takes the write-through lock and pending marker NOW (device
+        eviction must stay rank-symmetric while the op is in flight) and
+        snapshots the device-side transfers; rank 0 additionally hands the
+        snapshot to the authority worker, which reserves host slots, queues
+        the D2H, and publishes the placement."""
+        authority = self.hicache_authority
+        mamba_only = opcode == _HICACHE_OP_WRITE_MAMBA_REPAIR
+        if node is self.root_node or node.evicted:
+            return 0
+        if node.write_through_pending_id is not None:
+            return 0
+        if mamba_only:
+            if (
+                not node.backuped
+                or ComponentType.MAMBA not in self.components
+                or node.component_data[ComponentType.MAMBA].value is None
+            ):
+                return 0
+        elif node.backuped:
+            return 0
+
+        # Backup invariant: parent placement must be published before the
+        # child's. FIFO intent order guarantees it; a failed parent intent
+        # cancels dependent children on the worker (parent_ids chain).
+        parent_ids: list[int] = []
+        if not mamba_only and node.parent is not self.root_node:
+            parent = node.parent
+            if not parent.backuped and parent.write_through_pending_id is None:
+                if self._hicache_enqueue_write(parent, _HICACHE_OP_WRITE) <= 0:
+                    return 0
+            cur = parent
+            while (
+                cur is not self.root_node
+                and not cur.backuped
+                and cur.write_through_pending_id is not None
+            ):
+                parent_ids.append(cur.write_through_pending_id)
+                cur = cur.parent
+
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        if mamba_only:
+            device_value = (
+                device_value[:0]
+                if device_value is not None
+                else torch.empty((0,), dtype=torch.int64, device=self.device)
+            )
+        if device_value is None:
+            return 0
+        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
+        comp_xfers: dict[ComponentType, list] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            if mamba_only and comp.component_type != ComponentType.MAMBA:
+                continue
+            t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+            if t:
+                comp_xfers[comp.component_type] = t
+        if mamba_only and not comp_xfers:
+            raise RuntimeError(
+                f"mamba-only backup for node {node.id} built no mamba transfer"
+            )
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+        )
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+
+        lock_params = self.inc_lock_ref(node).to_dec_params()
+        self._track_write_through_node(node, lock_params)
+        self._hicache_pending_writes[node.id] = {
+            "opcode": opcode,
+            "device_value": device_value,
+            "extra_pools": aux_xfers,
+            "comp_xfers": comp_xfers,
+        }
+        if authority.is_rank0:
+            authority.submit_write_intent(
+                WriteIntent(
+                    node_id=node.id,
+                    op=opcode,
+                    kv_device=device_value,
+                    extra_pools=aux_xfers,
+                    kv_len=len(device_value),
+                    parent_ids=tuple(parent_ids),
+                    fence_event=getattr(self, "_latest_forward_done_event", None),
+                )
+            )
+        # Queued, not yet committed: report the queued size so the parent
+        # recursion's <=0 abort check keeps its meaning.
+        return len(device_value) if not mamba_only else 1
+
+    def _hicache_apply_place(self, record, stash) -> tuple:
+        """Apply a published PLACE on every rank (rank 0 passes its worker's
+        reservation as ``stash``; peers mirror the reservation locally and
+        queue their rank-local D2H). Fail-stop on any mismatch with the
+        published placement — mirrored allocators make peer outcomes a pure
+        function of record order."""
+        node_id = record.node_id
+        entry = self.ongoing_write_through.get(node_id)
+        pending = self._hicache_pending_writes.get(node_id)
+        if entry is None or pending is None:
+            raise RuntimeError(
+                f"HiCache V3 PLACE for unknown pending write {node_id} (fail-stop)"
+            )
+        mamba_only = record.op == _HICACHE_OP_WRITE_MAMBA_REPAIR
+        if stash is not None:
+            host_indices = stash.host_indices
+            observed_crc = record.kv_crc
+            pool_counts = record.pool_counts
+        else:
+            self.fence_state_read()
+            reservation = self.cache_controller.reserve_write(
+                pending["device_value"],
+                node_id=node_id,
+                extra_pools=pending["extra_pools"] or None,
+                allow_evict=False,
+            )
+            if reservation is None:
+                raise RuntimeError(
+                    "HiCache V3 divergence: peer reservation failed for "
+                    f"published PLACE (node {node_id})"
+                )
+            host_indices = reservation.host_indices
+            observed_crc = indices_crc(host_indices)
+            pool_counts = tuple(
+                (str(t.name), int(len(t.host_indices)))
+                for t in (pending["extra_pools"] or ())
+                if t.host_indices is not None
+            )
+            if (
+                len(host_indices) != record.kv_len
+                or observed_crc != record.kv_crc
+                or pool_counts != record.pool_counts
+            ):
+                raise RuntimeError(
+                    "HiCache V3 divergence: peer mirror allocation does not "
+                    f"match published placement (node {node_id}: "
+                    f"len {len(host_indices)}/{record.kv_len}, "
+                    f"crc {observed_crc}/{record.kv_crc}, "
+                    f"pools {pool_counts}/{record.pool_counts})"
+                )
+            self.cache_controller.commit_write(reservation)
+
+        # The node may have split between enqueue and apply (mirrored on
+        # every rank); the pending entry's publish_nodes chain is maintained
+        # by _split_node, prefix-first. Slice the placement along it.
+        publish_nodes = entry.publish_nodes
+        if not mamba_only:
+            offset = 0
+            for n in publish_nodes:
+                n_len = len(n.key)
+                self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+                    n,
+                    CacheTransferPhase.BACKUP_HOST,
+                    transfers=[
+                        PoolTransfer(
+                            name=PoolName.KV,
+                            host_indices=host_indices[offset : offset + n_len],
+                        )
+                    ],
+                )
+                offset += n_len
+            if offset != record.kv_len:
+                raise RuntimeError(
+                    "HiCache V3 divergence: pending-node chain covers "
+                    f"{offset} tokens, placement has {record.kv_len} "
+                    f"(node {node_id})"
+                )
+        tail = publish_nodes[-1]
+        for ct, xfers in pending["comp_xfers"].items():
+            self.components[ct].commit_hicache_transfer(
+                tail, CacheTransferPhase.BACKUP_HOST, transfers=xfers
+            )
+        return (record.kv_len, observed_crc, pool_counts)
+
+    def _hicache_apply_write_complete(self, record, pop_local_ack: bool) -> tuple:
+        """Finish write-through bookkeeping from a published COMPLETE. Peers
+        gate on their OWN DMA completion (local event, bounded wait — their
+        D2H started up to a publish cycle after rank 0's) so lock state stays
+        rank-symmetric. ok=False cancels a placement that rank 0 could not
+        reserve (fail-safe: state remains device-only on every rank)."""
+        cc = self.cache_controller
+        if record.ok and pop_local_ack:
+            queue = cc.ack_write_queue
+            idx = next(
+                (
+                    i
+                    for i, a in enumerate(queue)
+                    if tuple(a.node_ids) == tuple(record.node_ids)
+                ),
+                None,
+            )
+            if idx is None:
+                raise RuntimeError(
+                    "HiCache V3 divergence: write COMPLETE "
+                    f"{record.node_ids} has no local ack"
+                )
+            ack = queue.pop(idx)
+            ack.finish_event.synchronize()
+        for ack_id in record.node_ids:
+            self._hicache_pending_writes.pop(ack_id, None)
+            if not record.ok:
+                entry = self.ongoing_write_through.pop(ack_id, None)
+                if entry is None:
+                    continue
+                for n in entry.publish_nodes:
+                    if n.write_through_pending_id == ack_id:
+                        n.write_through_pending_id = None
+                if entry.lock_params is not None:
+                    self.dec_lock_ref(entry.node, entry.lock_params)
+                logger.error(
+                    "HiCache V3: write-through for node %d cancelled by "
+                    "rank 0 (host reservation exhausted); state remains "
+                    "device-only.",
+                    ack_id,
+                )
+                continue
+            if ack_id not in self.ongoing_write_through:
+                raise RuntimeError(
+                    f"HiCache V3 divergence: COMPLETE for unknown "
+                    f"write-through {ack_id}"
+                )
+            self._finish_write_through_ack(ack_id)
+        return (tuple(record.node_ids), record.ok)
+
+    def _hicache_apply_load_complete(self, record, local_ack=None) -> tuple:
+        """Finish load-back bookkeeping from a published COMPLETE. Rank 0
+        passes the concrete ack it popped; peers pop their own matching ack
+        and gate on its local finish event (bounded wait, no collective)."""
+        cc = self.cache_controller
+        ack = local_ack
+        if ack is None:
+            queue = cc.ack_load_queue
+            idx = next(
+                (
+                    i
+                    for i, a in enumerate(queue)
+                    if tuple(a.node_ids) == tuple(record.node_ids)
+                ),
+                None,
+            )
+            if idx is None:
+                raise RuntimeError(
+                    "HiCache V3 divergence: load COMPLETE "
+                    f"{record.node_ids} has no local ack"
+                )
+            ack = queue.pop(idx)
+            ack.finish_event.synchronize()
+        for ack_id in record.node_ids:
+            entry = self.ongoing_load_back.pop(ack_id, None)
+            if entry is None:
+                raise RuntimeError(
+                    f"HiCache V3 divergence: load COMPLETE for unknown "
+                    f"load-back {ack_id}"
+                )
+            if entry.pinned_mamba_slots is not None:
+                self.req_to_token_pool.mamba_allocator.unpin_slots(
+                    entry.pinned_mamba_slots
+                )
+            self.dec_lock_ref(entry.node, entry.lock_params)
+            self.dec_host_lock_ref(entry.node, entry.host_lock_params)
+        if self.metrics_collector is not None:
+            self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+            if ack.timing_enabled:
+                duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                self.metrics_collector.observe_load_back_duration(duration_ms / 1000.0)
+        return (tuple(record.node_ids), int(getattr(ack, "num_tokens", 0)))
 
     def _track_write_through_node(
         self,
@@ -2149,21 +2299,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         local_prepare_ok = True
         success = False
         try:
+            # V3 fail-stop: reservation outcomes are a pure function of
+            # mirrored state, so exceptions raise loud on every rank (no
+            # consensus exists anymore to keep a degraded rank in step) and
+            # a False `succeeded` is rank-symmetric by construction.
             for comp in self._components_tuple:
-                try:
-                    prep = comp.prepare_load_back(
-                        best_match_node,
-                        req=req,
-                        allow_evict=not multi_rank,
-                    )
-                except Exception:
-                    if not multi_rank:
-                        raise
-                    logger.exception(
-                        "HiCache %s load reservation failed on this rank",
-                        comp.component_type,
-                    )
-                    prep = PrepareLoadBackResult(succeeded=False)
+                prep = comp.prepare_load_back(
+                    best_match_node,
+                    req=req,
+                    allow_evict=not multi_rank,
+                )
                 preps[comp.component_type] = prep
                 local_prepare_ok = local_prepare_ok and prep.succeeded
             success = self._load_back_transfers(
@@ -2205,32 +2350,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         host_anchor_params: Optional[DecLockRefParams],
     ) -> bool:
         kv_tokens = len(kv_xfer.host_indices)
-        multi_rank_build = self.tp_world_size > 1 or self.pp_size > 1
-        # Build aux transfers, keyed per component. A one-rank failure here
-        # (e.g. a component assert) must still reach the consensus below, or
-        # the other ranks block in it forever.
+        # Build aux transfers, keyed per component. V3 fail-stop: build
+        # exceptions raise on every rank (mirrored inputs) — the V2 "degrade
+        # locally and let the consensus reject the group" path is deleted.
         comp_xfers: dict[ComponentType, list] = {}
         sidecar_xfers: list = []
-        try:
-            if local_prepare_ok:
-                for comp in self._components_tuple:
-                    if comp.component_type == BASE_COMPONENT_TYPE:
-                        continue
-                    t = comp.build_hicache_transfers(
-                        best_match_node, CacheTransferPhase.LOAD_BACK, req=req
-                    )
-                    if t:
-                        comp_xfers[comp.component_type] = t
-            sidecar_xfers = self._build_sidecar_transfers(
-                CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
-            )
-        except Exception:
-            if not multi_rank_build:
-                raise
-            logger.exception("HiCache load transfer build failed on this rank")
-            local_prepare_ok = False
-            comp_xfers = {}
-            sidecar_xfers = []
+        if local_prepare_ok:
+            for comp in self._components_tuple:
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                t = comp.build_hicache_transfers(
+                    best_match_node, CacheTransferPhase.LOAD_BACK, req=req
+                )
+                if t:
+                    comp_xfers[comp.component_type] = t
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
+        )
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
@@ -2260,38 +2396,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         aux_xfers.extend(sidecar_xfers)
         reservation = None
         if local_ok:
-            # Multi-rank promotion deliberately does not evict. Coordinated
-            # victim selection is a separate transaction.
-            try:
-                reservation = self.cache_controller.reserve_load(
-                    host_indices=kv_xfer.host_indices,
-                    node_id=best_match_node.id,
-                    extra_pools=aux_xfers or None,
-                    allow_evict=not multi_rank,
-                )
-            except Exception:
-                if not multi_rank:
-                    raise
-                logger.exception("HiCache load reservation failed on this rank")
+            # Multi-rank promotion deliberately does not evict inside the
+            # reservation (rank-0-published evictions keep host headroom;
+            # device headroom is the scheduler's mirrored eviction).
+            reservation = self.cache_controller.reserve_load(
+                host_indices=kv_xfer.host_indices,
+                node_id=best_match_node.id,
+                extra_pools=aux_xfers or None,
+                allow_evict=not multi_rank,
+            )
             local_ok = reservation is not None
 
-        try:
-            group_succeeded = self._all_ranks_succeeded(
-                local_ok,
-                opcode=_HICACHE_OP_LOAD,
-                node_id=best_match_node.id,
-                tokens=kv_tokens,
-            )
-        except Exception:
-            if reservation is not None:
-                try:
-                    self.cache_controller.abort_load(reservation)
-                except Exception:
-                    logger.exception("Failed to abort HiCache load reservation")
-            raise
-        if not group_succeeded:
-            if reservation is not None:
-                self.cache_controller.abort_load(reservation)
+        # V3: no load-initiation consensus. Every input to local_ok is
+        # mirrored state (thresholds, quota, mirrored allocators), so every
+        # rank computes the same verdict without communication; an
+        # asymmetric reservation failure is state divergence and surfaces
+        # as a fail-stop (CRC / NCCL fault), never a negotiated demote.
+        if not local_ok:
             return False
         assert reservation is not None
 
@@ -3109,27 +3230,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # Every rank must enter the all_reduce below; ongoing_write_through can
-        # diverge across ranks (e.g. write_backup returning 0 on a subset).
-        finish_count = 0
-        if self.pp_rank == 0:
-            for ack in cc.ack_write_queue:
-                if not ack.finish_event.query():
-                    break
-                finish_count += 1
-
-        finish_count = self._fingerprinted_check_reduce(
-            finish_count, opcode=_HICACHE_OP_WRITE_CHECK
-        )
-
-        # Process completed acks
-        while finish_count > 0:
-            if not cc.ack_write_queue:
-                logger.error(
-                    "HiCache writing_check: reduced finish_count exceeds the "
-                    "local ack queue (rank desync); dropping the remainder."
-                )
-                break
+        # V3: single-rank local poll only (multi-rank completion is
+        # record-driven — rank 0 publishes COMPLETEs, peers apply them; this
+        # method must never run per-step at TP/PP>1).
+        assert self.hicache_authority is None
+        while cc.ack_write_queue and cc.ack_write_queue[0].finish_event.query():
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
@@ -3138,35 +3243,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 else:
                     logger.error(
                         "HiCache writing_check: ack %d has no ongoing "
-                        "write-through entry (rank desync).",
+                        "write-through entry.",
                         ack_id,
                     )
-            finish_count -= 1
 
     def loading_check(self) -> None:
-        """Poll load-back completions."""
+        """Poll load-back completions (single-rank local poll only; see
+        writing_check)."""
         cc = self.cache_controller
         if cc is None:
             return
-        # Every rank must enter the all_reduce below; ongoing_load_back can
-        # diverge across ranks.
-        finish_count = 0
-        if self.pp_rank == 0:
-            for ack in cc.ack_load_queue:
-                if not ack.finish_event.query():
-                    break
-                finish_count += 1
-        finish_count = self._fingerprinted_check_reduce(
-            finish_count, opcode=_HICACHE_OP_LOAD_CHECK
-        )
-
-        while finish_count > 0:
-            if not cc.ack_load_queue:
-                logger.error(
-                    "HiCache loading_check: reduced finish_count exceeds the "
-                    "local ack queue (rank desync); dropping the remainder."
-                )
-                break
+        assert self.hicache_authority is None
+        while cc.ack_load_queue and cc.ack_load_queue[0].finish_event.query():
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
@@ -3192,7 +3280,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.metrics_collector.observe_load_back_duration(
                         duration_ms / 1000.0
                     )
-            finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -3258,8 +3345,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
-        # Reap the previous round's PP-sync sends before issuing new ones.
-        self._drain_async_work()
+        if self.hicache_authority is not None:
+            # V3: completions are record-driven. Rank 0 polls its own CUDA
+            # events and publishes at the request-broadcast hook; peers apply
+            # there. Nothing to do on the per-step path (and nothing here may
+            # ever enter a collective).
+            return
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
@@ -3271,6 +3362,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
+        if self.hicache_authority is not None:
+            # V3: acks are record-driven; a forced local flush on one rank
+            # would desynchronize lock state. In-flight ops drain through the
+            # normal publish/apply cycle.
+            return
         self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
