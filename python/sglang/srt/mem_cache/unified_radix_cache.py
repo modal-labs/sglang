@@ -1634,6 +1634,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         device eviction keeps making progress instead of leaving its KV
         unevictable until host space frees up."""
 
+        # B2 (V3): at multi-rank these frees mutate the dedup host pool on
+        # the scheduler thread OUTSIDE the record stream -- rank-0 free-list
+        # order then diverges from peers' broadcast-ordered replay and the
+        # next PLACE fails the CRC check. Skip the subtree drop; device
+        # eviction proceeds without it (safe degradation) until this is
+        # routed through an EVICT record.
+        if self.hicache_authority is not None:
+            return False
+
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.

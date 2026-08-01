@@ -344,11 +344,6 @@ class HiCacheAuthority:
                 else:
                     self._stalled.append(intent)
                 return
-            if intent.fence_event is not None:
-                torch.get_device_module().current_stream().wait_event(
-                    intent.fence_event
-                )
-            self.controller.commit_write(reservation)
             pool_counts = tuple(
                 (str(t.name), int(len(t.host_indices)))
                 for t in (intent.extra_pools or ())
@@ -367,6 +362,15 @@ class HiCacheAuthority:
                     pool_counts=pool_counts,
                 )
             )
+        # Outside the lock (M1): the DMA launch is the expensive part and
+        # touches no allocator state; holding the lock here stalls the
+        # scheduler's publish hook (and with it the whole TP group's
+        # broadcast) for multi-ms per intent during write bursts.
+        if intent.fence_event is not None:
+            torch.get_device_module().current_stream().wait_event(
+                intent.fence_event
+            )
+        self.controller.commit_write(reservation)
 
     def _poll_write_acks(self) -> None:
         with self._lock:
@@ -385,6 +389,14 @@ class HiCacheAuthority:
     # ---- rank-0 publish hook (scheduler thread, pre-broadcast) --------------
 
     def build_publish_batch(self) -> Optional[HiCacheRecordBatch]:
+        # B1 fail-stop: a dead worker silently stalls every pending write on
+        # all ranks (locks never release). Crash rank 0 loudly; NCCL
+        # propagates to peers within a step.
+        if self._worker is not None and not self._worker.is_alive():
+            raise RuntimeError(
+                "HiCache authority worker died (fail-stop); see prior "
+                "worker traceback."
+            )
         """Drain emitted records (bounded), add load COMPLETEs and watermark
         EVICTs, self-apply everything in seq order, and return the wire
         batch. Holding the lock across the whole build keeps worker emissions
