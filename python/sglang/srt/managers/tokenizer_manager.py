@@ -1233,7 +1233,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # every rank sorts the waiting queue on identical keys.
                 arrival_stamp=(
                     obj.received_time
-                    if getattr(obj, "received_time", None)
+                    if getattr(obj, "received_time", None) is not None
                     else time.perf_counter()
                 ),
                 sampling_params=sampling_params,

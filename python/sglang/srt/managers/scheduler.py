@@ -2679,7 +2679,10 @@ class Scheduler(
                     0, len(r.origin_input_ids) - r.num_matched_prefix_tokens
                 )
             )
-            r_vtime = r.time_stats.wait_queue_entry_time + slope_s * r_uncached
+            # Rank-identical vtime base (arrival_stamp), matching the sort
+            # key: a rank-local base here flips the work-ahead comparison at
+            # jitter boundaries -> divergent 429 aborts when armed.
+            r_vtime = SchedulePolicy.virtual_arrival_time(r, slope_s)
             if r_vtime <= virtual_arrival:
                 work_ahead += r_uncached
 
