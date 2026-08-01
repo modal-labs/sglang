@@ -2078,31 +2078,53 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
-            # Outcome-level TP canonicalization (greedy). The accept decision
-            # derives from TWO rank-local inputs: the target argmax AND the
-            # draft's proposed candidates — both computed by TP forwards
-            # whose numerics are not bitwise-identical across ranks. Syncing
-            # either input alone is insufficient (observed live: one-page
-            # committed-length divergence persisted with target_predict
-            # synced). Broadcast the full decision from rank 0 — the same
-            # contract _sync_dflash_sampling_results enforces for the
-            # stochastic branch — and re-derive the dependents.
+            # NO outcome broadcast on the greedy path (revert of 594ade477).
+            # The verify pipeline is TP-symmetric BY CONSTRUCTION: target
+            # logits are vocab-parallel and all-gathered (each vocab shard is
+            # computed exactly once and shared), and both draft samplers
+            # all-gather per-shard maxima with deterministic tie selection —
+            # so accept_len/bonus/out_tokens are already identical across
+            # ranks whenever upstream batch state is healthy, and the
+            # broadcasts were value-no-ops. When upstream CPU state HAS
+            # diverged (mamba insert/alloc doors), batch composition differs
+            # across ranks and the broadcasts — row-indexed by batch position
+            # with no identity check — commit rank 0's tokens into the WRONG
+            # REQUESTS on peer ranks: cross-request KV contamination observed
+            # live as prompt-fragment/<|sep|> output corruption. Fail closed
+            # to rank-local (self-consistent) outcomes and ALARM instead.
             _tp_group = _get_dflash_sampling_tp_group()
-            if int(_tp_group.world_size) > 1:
-                self._ensure_accept_bonus_buffers(bs)
-                assert self._sampling_outcome_buf is not None
-                _sync_dflash_sampling_results(
-                    accept_len,
-                    bonus,
-                    tp_group=_tp_group,
-                    outcome_buffer=self._sampling_outcome_buf,
+            if int(_tp_group.world_size) > 1 and _tp_group.cpu_group is not None:
+                # Sampled 1-in-16: composition divergence is persistent once
+                # seeded, so sampling still catches it within ~a second while
+                # keeping the per-step gloo cost negligible. crc32, not
+                # hash(): str hashing is per-process salted.
+                self._batch_identity_probe_tick = (
+                    getattr(self, "_batch_identity_probe_tick", 0) + 1
                 )
-                _tp_group.broadcast(out_tokens, src=0)
-                commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                if new_seq_lens is not None:
-                    new_seq_lens = prefix_lens + commit_lens.to(
-                        prefix_lens.dtype
+                if self._batch_identity_probe_tick % 16 == 0:
+                    import zlib
+
+                    import torch.distributed as _dist
+
+                    _rid_hash = zlib.crc32(
+                        "|".join(r.rid for r in batch.reqs).encode()
                     )
+                    _probe_min = torch.tensor([bs, _rid_hash], dtype=torch.int64)
+                    _probe_max = _probe_min.clone()
+                    _dist.all_reduce(
+                        _probe_min, op=_dist.ReduceOp.MIN, group=_tp_group.cpu_group
+                    )
+                    _dist.all_reduce(
+                        _probe_max, op=_dist.ReduceOp.MAX, group=_tp_group.cpu_group
+                    )
+                    if not torch.equal(_probe_min, _probe_max):
+                        logger.error(
+                            "DFLASH verify batch identity diverged across TP "
+                            "ranks (min=%s max=%s [bs, rid_hash]); rank-local "
+                            "outcomes stay authoritative (self-consistent).",
+                            _probe_min.tolist(),
+                            _probe_max.tolist(),
+                        )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

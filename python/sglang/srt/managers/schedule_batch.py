@@ -2760,6 +2760,55 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def _mamba_lazy_alloc_consensus(self, statuses: List[int]) -> List[int]:
+        """TP-symmetrize per-req mamba slot-alloc outcomes (fail closed).
+
+        The lazy ping-pong alloc result is otherwise a RANK-LOCAL input to
+        the radix insert/skip decision (batch_result_processor keys
+        ``mamba_lazy_is_insert`` off it): one rank failing an alloc while
+        the others succeed silently diverges the per-rank radix trees --
+        observed live as the one-page HiCache write-fingerprint desyncs.
+        MIN+MAX-reduce ``[bs, rid_crc, status...]`` on the TP CPU group:
+        a slot only counts if EVERY rank allocated it; callers free their
+        slot when the consensus demotes them. A header mismatch (batch
+        composition already diverged) keeps rank-local statuses on every
+        rank symmetrically and alarms. Callers skip the collective when no
+        req attempted an alloc -- symmetric under the lockstep-occupancy
+        invariant this consensus maintains.
+        """
+        import zlib
+
+        import torch.distributed as _dist
+
+        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        if is_dp_attention_enabled():
+            return statuses
+        group = get_tp_group()
+        if int(group.world_size) <= 1 or group.cpu_group is None:
+            return statuses
+        if len(statuses) > 512:
+            return statuses
+        rid_crc = zlib.crc32("|".join(r.rid for r in self.reqs).encode())
+        vec = [len(self.reqs), rid_crc] + statuses
+        t_min = torch.tensor(vec, dtype=torch.int64)
+        t_max = t_min.clone()
+        _dist.all_reduce(t_min, op=_dist.ReduceOp.MIN, group=group.cpu_group)
+        _dist.all_reduce(t_max, op=_dist.ReduceOp.MAX, group=group.cpu_group)
+        if int(t_min[0]) != int(t_max[0]) or int(t_min[1]) != int(t_max[1]):
+            logger.error(
+                "Mamba lazy-alloc consensus: batch identity diverged across "
+                "TP ranks (bs %s vs %s, rid_crc %s vs %s); keeping rank-local "
+                "alloc outcomes.",
+                int(t_min[0]),
+                int(t_max[0]),
+                int(t_min[1]),
+                int(t_max[1]),
+            )
+            return statuses
+        return [int(v) for v in t_min[2:].tolist()]
+
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
 
@@ -2770,26 +2819,45 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_lazy_post_decode_at_boundary.
         """
         pool = self.req_to_token_pool
+        # Two-phase: attempt allocs rank-locally, then TP-symmetrize the
+        # outcomes before committing (a rank-local failure that other ranks
+        # don't share would silently diverge the radix trees downstream).
+        statuses: List[int] = []
+        pending: List[tuple] = []  # (batch_idx, req, other_idx, new_slot)
+        attempted = False
         for i, req in enumerate(self.reqs):
             buf = req.mamba_ping_pong_track_buffer
             assert buf is not None
             # Skip reqs not at a track boundary
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
+                statuses.append(1)
                 continue
             other_idx = 1 - req.mamba_next_track_idx
             if buf[other_idx].item() != -1:
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
+                statuses.append(1)
                 continue
+            attempted = True
             if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                 new_slot = None
             else:
                 # No evict-retry: a transient slot is not worth evicting a
                 # cached checkpoint for; on failure tracking degrades in place.
                 new_slot = pool.mamba_allocator.alloc(1)
+            statuses.append(1 if new_slot is not None else 0)
             if new_slot is not None:
-                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
-                req.mamba_next_track_idx = other_idx
+                pending.append((i, req, other_idx, new_slot))
+        if attempted:
+            statuses = self._mamba_lazy_alloc_consensus(statuses)
+        for i, req, other_idx, new_slot in pending:
+            if statuses[i] == 0:
+                # Some rank failed this alloc: give the slot back so every
+                # rank degrades identically (tracking continues in place).
+                pool.mamba_allocator.free(new_slot)
+                continue
+            pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
+            req.mamba_next_track_idx = other_idx
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -2803,8 +2871,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         copy (forward isolation restores batch fields).
         """
         pool = self.req_to_token_pool
-        track_positions: List[int] = []
-        for req in self.reqs:
+        # Two-phase like mamba_lazy_prealloc_at_boundary: rank-local alloc
+        # attempts, TP consensus, then commit -- the chosen track position
+        # feeds the verify scatter AND the downstream radix insert decision,
+        # so it must be identical on every rank.
+        statuses: List[int] = []
+        # (batch_idx, req, other_idx, new_slot|None, had_pending)
+        candidates: List[tuple] = []
+        attempted = False
+        for i, req in enumerate(self.reqs):
             buf = req.mamba_ping_pong_track_buffer
             assert buf is not None
             if not mamba_lazy_spec_in_window(
@@ -2812,18 +2887,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ):
                 # No crossing reachable: the scatter mask stays -1, the
                 # position is never written.
-                track_positions.append(req.mamba_next_track_idx)
+                statuses.append(1)
+                candidates.append(None)
                 continue
             other_idx = 1 - req.mamba_next_track_idx
-            has_pending = buf[other_idx].item() != -1
-            if not has_pending:
+            had_pending = buf[other_idx].item() != -1
+            new_slot = None
+            if not had_pending:
+                attempted = True
                 if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                     new_slot = None
                 else:
                     # No evict-retry: a transient slot is not worth
                     # evicting a cached checkpoint for.
                     new_slot = pool.mamba_allocator.alloc(1)
-                if new_slot is not None:
+                statuses.append(1 if new_slot is not None else 0)
+            else:
+                statuses.append(1)
+            candidates.append((i, req, other_idx, new_slot, had_pending))
+        if attempted:
+            statuses = self._mamba_lazy_alloc_consensus(statuses)
+        track_positions: List[int] = []
+        for i, req in enumerate(self.reqs):
+            cand = candidates[i]
+            if cand is None:
+                track_positions.append(req.mamba_next_track_idx)
+                continue
+            _, _, other_idx, new_slot, had_pending = cand
+            has_pending = had_pending
+            if new_slot is not None:
+                if statuses[i] == 0:
+                    # Some rank failed this alloc: release ours so every
+                    # rank scatters in place into the keep slot.
+                    pool.mamba_allocator.free(new_slot)
+                else:
                     pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                     has_pending = True
             # On failure the verify scatters in place into the keep slot.

@@ -1808,11 +1808,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             entry = entry_map.get(pool_name)
             if entry is not None and component_type in self.components:
                 targets.append((component_type, entry.host_pool))
-        for component_type, pool in targets:
-            capacity = getattr(pool, "size", 0)
+        # Consensus on the trigger input: the "determinism follows from
+        # mirrored trees" assumption above is exactly what an upstream insert
+        # divergence violates -- rank-local free fractions then fire
+        # evictions on different rounds per rank and cross-pair the write
+        # collectives. MIN-reduce `available` (this preflight is already a
+        # lockstep site) so every rank triggers off the same, most
+        # pessimistic value.
+        sized = [
+            (component_type, pool, getattr(pool, "size", 0))
+            for component_type, pool in targets
+        ]
+        availables = [
+            pool.available_size() if capacity > 0 else 0
+            for _, pool, capacity in sized
+        ]
+        if self.tp_world_size > 1 and availables:
+            avail_t = torch.tensor(availables, dtype=torch.int64)
+            self._all_reduce(avail_t, torch.distributed.ReduceOp.MIN)
+            availables = [int(v) for v in avail_t.tolist()]
+        for (component_type, pool, capacity), available in zip(sized, availables):
             if capacity <= 0:
                 continue
-            available = pool.available_size()
             if available >= self._host_evict_trigger_ratio * capacity:
                 continue
             need = max(1, int(self._host_evict_batch_ratio * capacity))
