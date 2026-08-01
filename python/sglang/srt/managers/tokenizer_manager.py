@@ -1229,6 +1229,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
+                # Stamped once here; TP schedulers consume it verbatim so
+                # every rank sorts the waiting queue on identical keys.
+                arrival_stamp=(
+                    obj.received_time
+                    if getattr(obj, "received_time", None)
+                    else time.perf_counter()
+                ),
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,

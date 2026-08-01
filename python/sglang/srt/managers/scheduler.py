@@ -2278,6 +2278,10 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
+            # Rank-identical ordering stamp from the tokenizer manager (the
+            # rank-local wait_queue_entry_time re-stamp must never feed sort
+            # keys — it seeded cross-rank batch-composition divergence).
+            req.arrival_stamp = getattr(recv_req, "arrival_stamp", None)
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:

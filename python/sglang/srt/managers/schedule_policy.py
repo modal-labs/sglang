@@ -347,11 +347,21 @@ class SchedulePolicy:
     def virtual_arrival_time(r: Req, slope_s_per_token: float) -> float:
         """openrouter_slo sort key: FCFS arrival handicapped by 1 slope-unit per
         uncached token — exactly the extra TTFT allowance the SLO line
-        (base + slope * tokens) grants for that token, and no more."""
-        return (
-            r.time_stats.wait_queue_entry_time
-            + slope_s_per_token * SchedulePolicy.update_min_uncached_seen(r)
+        (base + slope * tokens) grants for that token, and no more.
+
+        The arrival base MUST be rank-identical: it prefers the tokenizer
+        manager's broadcast ``arrival_stamp`` (same CLOCK_MONOTONIC domain).
+        ``wait_queue_entry_time`` is stamped rank-locally AFTER the request
+        broadcast — sub-ms cross-rank jitter there flipped queue order and
+        seeded TP batch-composition divergence (2026-08-01). The fallback
+        also means retraction re-queues (which re-stamp
+        wait_queue_entry_time) no longer perturb ordering."""
+        base = (
+            r.arrival_stamp
+            if getattr(r, "arrival_stamp", None) is not None
+            else r.time_stats.wait_queue_entry_time
         )
+        return base + slope_s_per_token * SchedulePolicy.update_min_uncached_seen(r)
 
     @staticmethod
     def _sort_by_openrouter_slo(
@@ -373,6 +383,10 @@ class SchedulePolicy:
                 r.rid in temporary_deprioritized,
                 SchedulePolicy.virtual_arrival_time(r, slope_s_per_token),
                 -r.num_matched_prefix_tokens,
+                # Rank-symmetric total order: without a deterministic final
+                # tie-break, exact key ties resolve by pre-sort list order,
+                # which diverges once any upstream perturbation slips in.
+                r.rid,
             )
         )
 

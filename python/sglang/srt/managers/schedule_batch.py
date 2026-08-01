@@ -765,6 +765,11 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        # Tokenizer-manager arrival stamp (broadcast verbatim; identical on
+        # every TP rank). Scheduler ordering keys must prefer this over any
+        # rank-locally stamped time_stats field, and must never re-stamp it
+        # (e.g. on retraction re-queue).
+        self.arrival_stamp: Optional[float] = None
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded

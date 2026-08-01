@@ -980,6 +980,13 @@ class EmbeddingReqInput:
     # Propagates trace context via Engine.encode/async_encode
     external_trace_header: Optional[Dict[str, Any]] = None
     received_time: Optional[float] = None
+    # Arrival stamp for scheduler ordering, taken ONCE in the tokenizer
+    # manager (CLOCK_MONOTONIC domain) and broadcast verbatim to every TP
+    # rank. Schedulers must NOT re-stamp: rank-local stamps fed the
+    # openrouter_slo sort key and flipped queue order across ranks (the
+    # batch-composition divergence seed, 2026-08-01). Deliberately not named
+    # *_time: ReqTimeStats pickling rewrites *time fields per-rank.
+    arrival_stamp: Optional[float] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
