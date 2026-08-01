@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
 import threading
 from functools import wraps
 from typing import Optional
@@ -23,6 +24,48 @@ _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
+_pagecache_dropped = False
+
+
+def drop_configured_pagecache() -> None:
+    """Drop page cache for SGLANG_DROP_PAGECACHE_PATHS before pinning pools.
+
+    Under runc the model-weights read (~1 TB) leaves the host page cache
+    full right as the host pools pin ~800 GiB of unreclaimable memory;
+    kernel reclaim can lose that race and the OOM killer fires (observed
+    on a 1.5 TiB host). The weights are already resident on GPU — their
+    cache is dead weight, so advise it out before the first allocation.
+    gVisor bounds its own cache, so this stays a no-op there unless set.
+    """
+    global _pagecache_dropped
+    if _pagecache_dropped:
+        return
+    _pagecache_dropped = True
+    roots = os.environ.get("SGLANG_DROP_PAGECACHE_PATHS", "")
+    for root in filter(None, roots.split(":")):
+        if os.path.isfile(root):
+            files = [root]
+        elif os.path.isdir(root):
+            files = [
+                os.path.join(dirpath, name)
+                for dirpath, _dirnames, filenames in os.walk(root)
+                for name in filenames
+            ]
+        else:
+            continue
+        dropped = 0
+        for path in files:
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+                dropped += 1
+            except OSError:
+                continue
+        logger.info("HiCache pagecache drop: root=%s files=%d", root, dropped)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
@@ -141,6 +184,7 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
+        drop_configured_pagecache()
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
