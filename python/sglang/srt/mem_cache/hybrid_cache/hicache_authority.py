@@ -196,6 +196,11 @@ class HiCacheAuthority:
         self._outbox: deque = deque()  # worker/scheduler emitted records
         self._stash: dict = {}  # rank 0: seq -> HybridWriteReservation
         self._stalled: deque = deque()  # intents awaiting an eviction round
+        # Node ids whose intents are parked: children of a STALLED parent
+        # must stall behind it, or a child PLACE publishes before its
+        # parent's and transiently breaks the parent-backuped-first
+        # invariant loadback asserts on.
+        self._stalled_nodes: set = set()
         self._failed_nodes: set = set()
         self._skip_streak = 0
         # seqs whose load bookkeeping already ran on rank 0 (with the ack).
@@ -304,8 +309,16 @@ class HiCacheAuthority:
         self._seq += 1
         return self._seq
 
+    _FAILED_NODES_CAP = 4096
+
     def _cancel_intent(self, intent: WriteIntent) -> None:
         self._failed_nodes.add(intent.node_id)
+        if len(self._failed_nodes) > self._FAILED_NODES_CAP:
+            # Ids are monotonic; dependents of old failures have long since
+            # been cancelled or re-enqueued. Trim the oldest half.
+            self._failed_nodes = set(
+                sorted(self._failed_nodes)[self._FAILED_NODES_CAP // 2 :]
+            )
         self._emit(
             CacheRecord(
                 kind=RECORD_COMPLETE,
@@ -321,6 +334,12 @@ class HiCacheAuthority:
         with self._lock:
             if any(p in self._failed_nodes for p in intent.parent_ids):
                 self._cancel_intent(intent)
+                return
+            if any(p in self._stalled_nodes for p in intent.parent_ids):
+                # Parent parked awaiting eviction: park behind it (FIFO in
+                # _stalled preserves parent-before-child on resubmission).
+                self._stalled.append(intent)
+                self._stalled_nodes.add(intent.node_id)
                 return
             reservation = self.controller.reserve_write(
                 intent.kv_device,
@@ -343,6 +362,7 @@ class HiCacheAuthority:
                     self._cancel_intent(intent)
                 else:
                     self._stalled.append(intent)
+                    self._stalled_nodes.add(intent.node_id)
                 return
             pool_counts = tuple(
                 (str(t.name), int(len(t.host_indices)))
@@ -459,7 +479,9 @@ class HiCacheAuthority:
                 )
             )
         while self._stalled:
-            self._intents.put(self._stalled.popleft())
+            _re = self._stalled.popleft()
+            self._stalled_nodes.discard(_re.node_id)
+            self._intents.put(_re)
         return records
 
     # ---- apply (every rank; rank 0 self-applies at build) -------------------

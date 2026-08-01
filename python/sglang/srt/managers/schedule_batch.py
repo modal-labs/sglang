@@ -2836,7 +2836,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
-            new_slot = self._mamba_alloc_or_fail_stop(1)
+            # Opportunistic boundary slot: degrade in place on failure —
+            # never evict a cached checkpoint for a transient slot (V2
+            # semantics; rank-symmetric because mirrored allocators fail
+            # identically). Fail-stop stays reserved for REQUIRED allocs.
+            new_slot = (
+                None
+                if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get()
+                else pool.mamba_allocator.alloc(1)
+            )
+            if new_slot is None:
+                continue
             pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
             req.mamba_next_track_idx = other_idx
 
@@ -2869,10 +2879,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions.append(req.mamba_next_track_idx)
                 continue
             other_idx = 1 - req.mamba_next_track_idx
-            if buf[other_idx].item() == -1:
-                new_slot = self._mamba_alloc_or_fail_stop(1)
-                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
-            track_positions.append(other_idx)
+            has_pending = buf[other_idx].item() != -1
+            if not has_pending:
+                new_slot = (
+                    None
+                    if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get()
+                    else pool.mamba_allocator.alloc(1)
+                )
+                if new_slot is not None:
+                    pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
+                    has_pending = True
+            # On failure the verify scatters in place into the keep slot
+            # (V2 degrade semantics, rank-symmetric via deterministic
+            # allocators).
+            track_positions.append(
+                other_idx if has_pending else req.mamba_next_track_idx
+            )
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):

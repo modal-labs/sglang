@@ -552,6 +552,50 @@ def test_peer_paths_have_no_collectives():
           "request_receiver must carry and apply record batches")
 
 
+# ---- (7) write-intent fence must cover the SCHEDULER stream -------------------
+#
+# Root-cause pin for the 2026-08-01 zx-codeword cross (conv 98 answered conv
+# 103's codeword after a full-prefix hit): V2 launched the write-through D2H
+# from the scheduler thread, so `start_event.record()` landed on the
+# scheduler's current stream and the D2H was program-ordered AFTER every
+# schedule-stream kernel that materializes the checkpoint's content
+# (MambaCheckpointPool.store_from_active int8 quantize-copy, the
+# donate `mamba_pool.copy_from`). V3 moved the launch to the authority
+# worker thread (hicache_authority._process_intent, M1) whose current stream
+# is NOT the scheduler stream; the only ordering it applies is
+# `wait_event(intent.fence_event)`, and `_hicache_enqueue_write` passes the
+# bare `_latest_forward_done_event` (forward-stream only). A repair/write
+# enqueued in the same scheduler pass that materialized the checkpoint
+# (unified_radix_cache._insert_helper re-attach -> _maybe_repair_mamba_backup)
+# then races the schedule-stream copy: the D2H can freeze the ckpt slot's
+# PREVIOUS TENANT -- another conversation's checkpoint -- into this node's
+# host mamba. Silent (mamba content is never checksummed), sticky (host
+# state), rank-0 only (peers commit at apply time on the scheduler stream).
+#
+# Contract pinned here (fails until the fix lands): the enqueue must fence
+# the scheduler stream behind the in-flight forward (fence_state_read) and
+# record its OWN event on the scheduler's current stream, passing THAT as
+# the intent fence -- restoring V2's ordering.
+
+
+def test_write_intent_fence_covers_schedule_stream():
+    src, node = _method_node(
+        CACHE_PATH, "UnifiedRadixCache", "_hicache_enqueue_write"
+    )
+    segment = ast.get_source_segment(src, node)
+    check(
+        "fence_state_read" in segment and ".record(" in segment,
+        "_hicache_enqueue_write must record a scheduler-stream fence event "
+        "(fence_state_read() + Event().record() on the current stream) and "
+        "pass it as WriteIntent.fence_event; passing only "
+        "_latest_forward_done_event orders the rank-0 worker's D2H behind "
+        "the forward but NOT behind schedule-stream checkpoint "
+        "materialization (int8 store_from_active / donate copy_from), so "
+        "the D2H can persist the ckpt slot's previous tenant -- another "
+        "conversation's mamba state -- into this node's host checkpoint.",
+    )
+
+
 # ---- run ----------------------------------------------------------------------
 
 if __name__ == "__main__":

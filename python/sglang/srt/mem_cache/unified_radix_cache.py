@@ -2029,6 +2029,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             "comp_xfers": comp_xfers,
         }
         if authority.is_rank0:
+            # The intent fence must dominate EVERY producer of the state
+            # being backed up, not just the forward: checkpoint
+            # materialization (int8 store_from_active, donate copy_from)
+            # runs on the SCHEDULER stream, and the worker launches the D2H
+            # on its own stream. V2's inline transaction got scheduler-
+            # stream program order for free; recording the fence here (after
+            # fence_state_read) restores exactly that ordering. Without it,
+            # the D2H can read a checkpoint slot before its materialization
+            # kernel writes it and freeze the slot's PREVIOUS tenant into
+            # this node's host copy (live: conv-98-answers-as-conv-103).
+            self.fence_state_read()
+            _fence = torch.get_device_module().Event()
+            _fence.record()
             authority.submit_write_intent(
                 WriteIntent(
                     node_id=node.id,
@@ -2037,7 +2050,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     extra_pools=aux_xfers,
                     kv_len=len(device_value),
                     parent_ids=tuple(parent_ids),
-                    fence_event=getattr(self, "_latest_forward_done_event", None),
+                    fence_event=_fence,
                 )
             )
         # Queued, not yet committed: report the queued size so the parent
