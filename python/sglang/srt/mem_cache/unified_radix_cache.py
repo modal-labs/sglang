@@ -285,6 +285,11 @@ _HICACHE_OP_LOAD = 2
 _HICACHE_OP_WRITE_CHECK = 3
 _HICACHE_OP_LOAD_CHECK = 4
 _HICACHE_OP_WATERMARK = 6
+# Mamba-only repair writes reuse the WRITE transaction but carry their own
+# opcode: a rank that classifies the same node as a normal write while
+# another classifies it as a repair must fingerprint-mismatch (fail closed),
+# not silently agree on tokens=0.
+_HICACHE_OP_WRITE_MAMBA_REPAIR = 7
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -1360,6 +1365,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
+        elif not result.mamba_exist:
+            # The walk's _inc_hit_count ran BEFORE commit_insert_component_data
+            # re-attached this node's device mamba state (mamba_exist=False =>
+            # freshly attached), so the repair check must re-run here or a
+            # recompute-and-reinsert never restores the lost host checkpoint.
+            # mamba_exist=True nodes were already checked during the walk.
+            self._maybe_repair_mamba_backup(target_node, params.chunked)
         return result
 
     def _insert_helper_host(
@@ -1868,10 +1880,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 evicted,
             )
 
-    def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
-        """Backup a node's data from device to host (D->H)."""
+    def write_backup(
+        self,
+        node: UnifiedTreeNode,
+        write_back: bool = False,
+        mamba_only: bool = False,
+    ) -> int:
+        """Backup a node's data from device to host (D->H).
+
+        mamba_only: repair op for a node whose Full KV is already backuped but
+        whose host mamba checkpoint was evicted (or never landed) — ships an
+        empty KV payload plus the mamba transfer through the same reservation/
+        consensus/ack machinery. Returns the number of mamba states committed
+        (0 on failure); the regular path returns KV tokens committed.
+        """
         if self.cache_controller is None:
             return 0
+        if mamba_only:
+            assert not write_back
+            # These conditions are mirrored tree state (lockstep host eviction,
+            # consensus-gated pending ids), so returning early here is
+            # rank-symmetric — the same assumption the parent-recursion early
+            # return below already makes.
+            if (
+                not node.backuped
+                or node.write_through_pending_id is not None
+                or ComponentType.MAMBA not in self.components
+                or node.component_data[ComponentType.MAMBA].value is None
+            ):
+                return 0
 
         multi_rank = self.tp_world_size > 1 or self.pp_size > 1
         if write_back and multi_rank:
@@ -1906,6 +1943,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         reservation = None
         try:
             device_value = node.component_data[BASE_COMPONENT_TYPE].value
+            if mamba_only:
+                # Empty KV payload: reserve_write allocates zero host slots and
+                # the D2H kernels/loaders early-out on length==0, so the op
+                # rides the regular write queue and ack path unchanged.
+                device_value = (
+                    device_value[:0]
+                    if device_value is not None
+                    else torch.empty((0,), dtype=torch.int64, device=self.device)
+                )
             kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
             # Build aux transfers, keyed per component.
@@ -1913,9 +1959,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for comp in self._components_tuple:
                 if comp.component_type == BASE_COMPONENT_TYPE:
                     continue
+                if mamba_only and comp.component_type != ComponentType.MAMBA:
+                    continue
                 t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
                 if t:
                     comp_xfers[comp.component_type] = t
+            if mamba_only and not comp_xfers:
+                # Guarded above; raising (not returning) keeps a rank whose
+                # local build unexpectedly fails inside the consensus below.
+                raise RuntimeError(
+                    f"mamba-only backup for node {node.id} built no mamba transfer"
+                )
             sidecar_xfers = self._build_sidecar_transfers(
                 CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
             )
@@ -1951,7 +2005,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             group_succeeded = (
                 self._all_ranks_succeeded(
                     reservation is not None,
-                    opcode=_HICACHE_OP_WRITE,
+                    opcode=(
+                        _HICACHE_OP_WRITE_MAMBA_REPAIR
+                        if mamba_only
+                        else _HICACHE_OP_WRITE
+                    ),
                     node_id=node.id,
                     tokens=kv_tokens,
                 )
@@ -1973,12 +2031,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return 0
 
         host_indices = self.cache_controller.commit_write(reservation)
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
-        self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
-            node,
-            CacheTransferPhase.BACKUP_HOST,
-            transfers=[kv_xfer],
-        )
+        if not mamba_only:
+            # Full commit unconditionally overwrites host_value; committing
+            # the empty KV payload of a repair op would clobber the node's
+            # existing Full backup with a zero-length tensor.
+            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+            self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=[kv_xfer],
+            )
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 node,
@@ -1990,6 +2052,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
         self._track_write_through_node(node, lock_params)
+        if mamba_only:
+            # len(host_indices) == 0 by construction; report the mamba states
+            # shipped so success stays distinguishable from failure.
+            return sum(
+                len(t.host_indices)
+                for t in comp_xfers.get(ComponentType.MAMBA, ())
+                if t.host_indices is not None
+            )
         return len(host_indices)
 
     def _track_write_through_node(
@@ -2342,6 +2412,45 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return transfers
 
+    def _mamba_backup_missing(self, node: UnifiedTreeNode) -> bool:
+        """True when a node needs a mamba-only backup repair: Full KV is on
+        host but the mamba checkpoint is not, while a device mamba state
+        exists to re-ship. Residency source is component_data[MAMBA]
+        .host_value — set by the BACKUP_HOST commit and cleared by
+        MambaComponent.evict_component(HOST), both lockstep across ranks.
+        The pending-id check bounds repairs to one in-flight op per node."""
+        if ComponentType.MAMBA not in self.components:
+            return False
+        if node is self.root_node or node.evicted or not node.backuped:
+            return False
+        if node.write_through_pending_id is not None:
+            return False
+        cd = node.component_data[ComponentType.MAMBA]
+        return cd.value is not None and cd.host_value is None
+
+    def _maybe_repair_mamba_backup(
+        self, node: UnifiedTreeNode, chunked: bool = False
+    ) -> None:
+        """Schedule a mamba-only write-through for a KV-backuped node whose
+        host mamba checkpoint was evicted. Without this, such a node is
+        permanently L2-unreachable: the write-through trigger's done-check
+        (node.backuped) is KV-only, so no path ever re-ships the mamba state,
+        and matches on it clamp/drop once the device state evicts again.
+        Gating mirrors _inc_hit_count so repair fires at rank-symmetric
+        sites over mirrored state only."""
+        if node.evicted or chunked:
+            return
+        if (
+            self.cache_controller is None
+            or self.cache_controller.write_policy == "write_back"
+        ):
+            return
+        if node.hit_count < self.write_through_threshold:
+            return
+        if not self._mamba_backup_missing(node):
+            return
+        self.write_backup(node, mamba_only=True)
+
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
         if node.evicted or chunked:
@@ -2358,6 +2467,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             and node.hit_count >= self.write_through_threshold
         ):
             self.write_backup(node)
+        else:
+            self._maybe_repair_mamba_backup(node, chunked)
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
         if (
