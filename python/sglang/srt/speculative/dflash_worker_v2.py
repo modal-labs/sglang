@@ -1995,7 +1995,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         # so probe rounds pair across ranks even if branch selection
         # were to diverge.
         _probe_group = _get_dflash_sampling_tp_group()
-        _identity_diverged = False
         if int(_probe_group.world_size) > 1 and _probe_group.cpu_group is not None:
             self._batch_identity_probe_tick = (
                 getattr(self, "_batch_identity_probe_tick", 0) + 1
@@ -2017,7 +2016,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     _probe_max, op=_dist.ReduceOp.MAX, group=_probe_group.cpu_group
                 )
                 if not torch.equal(_probe_min, _probe_max):
-                    _identity_diverged = True
                     logger.error(
                         "DFLASH verify batch identity diverged across TP "
                         "ranks (min=%s max=%s [bs, rid_hash]); rank-local "

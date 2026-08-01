@@ -2813,7 +2813,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         t_max = t_min.clone()
         _dist.all_reduce(t_min, op=_dist.ReduceOp.MIN, group=group.cpu_group)
         _dist.all_reduce(t_max, op=_dist.ReduceOp.MAX, group=group.cpu_group)
-        if not torch.equal(t_min, t_max):
+        # HEADER-ONLY comparison: the statuses payload legitimately differs
+        # across ranks in exactly the event this consensus exists for (one
+        # rank's alloc fails); only bs/rid_crc define batch identity.
+        if int(t_min[0]) != int(t_max[0]) or int(t_min[1]) != int(t_max[1]):
             logger.error(
                 "Mamba lazy-alloc consensus: batch identity diverged across "
                 "TP ranks (bs %s vs %s, rid_crc %s vs %s); keeping rank-local "
