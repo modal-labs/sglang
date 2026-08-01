@@ -2019,19 +2019,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
-            # Greedy verify consumes a rank-local argmax over hidden states
-            # that are not bitwise-deterministic across TP ranks (MoE combine
-            # ordering): one near-tie logit diverges accept lengths →
-            # committed sequence lengths → radix tree shape (observed live as
-            # a one-page node-length disagreement in the HiCache write
-            # consensus). The stochastic branch canonicalizes its outcome for
-            # exactly this reason; greedy must too. Broadcasting rank 0's
-            # target_predict canonicalizes every derived quantity
-            # (accept_len, bonus, out_tokens, new_seq_lens, kv_committed_len)
-            # across all three sub-paths at one insert point.
-            _greedy_tp_group = _get_dflash_sampling_tp_group()
-            if int(_greedy_tp_group.world_size) > 1:
-                _greedy_tp_group.broadcast(target_predict, src=0)
             if self._use_triton_accept_bonus:
                 try:
                     (
@@ -2090,6 +2077,32 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+            # Outcome-level TP canonicalization (greedy). The accept decision
+            # derives from TWO rank-local inputs: the target argmax AND the
+            # draft's proposed candidates — both computed by TP forwards
+            # whose numerics are not bitwise-identical across ranks. Syncing
+            # either input alone is insufficient (observed live: one-page
+            # committed-length divergence persisted with target_predict
+            # synced). Broadcast the full decision from rank 0 — the same
+            # contract _sync_dflash_sampling_results enforces for the
+            # stochastic branch — and re-derive the dependents.
+            _tp_group = _get_dflash_sampling_tp_group()
+            if int(_tp_group.world_size) > 1:
+                self._ensure_accept_bonus_buffers(bs)
+                assert self._sampling_outcome_buf is not None
+                _sync_dflash_sampling_results(
+                    accept_len,
+                    bonus,
+                    tp_group=_tp_group,
+                    outcome_buffer=self._sampling_outcome_buf,
+                )
+                _tp_group.broadcast(out_tokens, src=0)
+                commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                if new_seq_lens is not None:
+                    new_seq_lens = prefix_lens + commit_lens.to(
+                        prefix_lens.dtype
+                    )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
