@@ -2877,7 +2877,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             statuses.append(1 if new_slot is not None else 0)
             if new_slot is not None:
                 pending.append((i, req, other_idx, new_slot))
-        if attempted:
+        # UNGATED: 'attempted' derives from rank-local batch members; under
+        # membership divergence a gated collective desyncs the COUNT of
+        # collectives per rank (gloo shape mispair = silent hang, the worst
+        # failure mode this file has). Two fixed-width gloo reduces per
+        # prepare pass (~0.1ms) buy count-symmetry unconditionally.
+        if statuses:
             statuses = self._mamba_lazy_alloc_consensus(statuses)
         for i, req, other_idx, new_slot in pending:
             if statuses[i] == 0:
@@ -2936,7 +2941,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 statuses.append(1)
             candidates.append((i, req, other_idx, new_slot, had_pending))
-        if attempted:
+        # UNGATED: 'attempted' derives from rank-local batch members; under
+        # membership divergence a gated collective desyncs the COUNT of
+        # collectives per rank (gloo shape mispair = silent hang, the worst
+        # failure mode this file has). Two fixed-width gloo reduces per
+        # prepare pass (~0.1ms) buy count-symmetry unconditionally.
+        if statuses:
             statuses = self._mamba_lazy_alloc_consensus(statuses)
         track_positions: List[int] = []
         for i, req in enumerate(self.reqs):
