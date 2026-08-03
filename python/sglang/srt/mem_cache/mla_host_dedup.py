@@ -368,17 +368,23 @@ class MLAHostDedupBroadcaster:
         group = create_custom_parallel_group(
             group_ranks=list(group_ranks), backend="nccl"
         )
+        broadcaster = cls(device_pool, group, src_global_rank=group_ranks[0])
         # NCCL allocates this communicator's device buffers lazily at its
         # FIRST collective — which for this group is the first host-tier
         # loadback, potentially hours into serving on a ~full device. That
         # ~10 MiB cudaCalloc then fails (ncclUnhandledCudaError), poisoning
         # the group and every later loadback. Pay the allocation here, at
-        # build time, while boot memory is still free. All participants
-        # reach build() in lockstep (world collective), so this is safe.
-        warmup = torch.zeros(1, dtype=torch.uint8, device=device_pool.device)
-        torch.distributed.broadcast(warmup, src=group_ranks[0], group=group)
+        # build time, while boot memory is still free — with a production-
+        # sized payload so every size-dependent NCCL path allocates now.
+        # All participants reach build() in lockstep (world collective).
+        warm = broadcaster.kv_staging[: cls.CHUNK_TOKENS * device_pool.kv_cache_dim]
+        torch.distributed.broadcast(warm, src=group_ranks[0], group=group)
+        if broadcaster.idx_staging is not None:
+            torch.distributed.broadcast(
+                broadcaster.idx_staging, src=group_ranks[0], group=group
+            )
         torch.cuda.synchronize(device_pool.device)
-        return cls(device_pool, group, src_global_rank=group_ranks[0])
+        return broadcaster
 
     def prepare_broadcast(
         self, device_indices: torch.Tensor, load_stream
