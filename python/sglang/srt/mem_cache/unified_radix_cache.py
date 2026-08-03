@@ -2326,10 +2326,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # consensus exists anymore to keep a degraded rank in step) and
             # a False `succeeded` is rank-symmetric by construction.
             for comp in self._components_tuple:
+                # Mirrored-tree LRU eviction is a pure function of mirrored
+                # state (the same property prefill-time eviction already
+                # relies on at TP8), so it stays rank-symmetric.
                 prep = comp.prepare_load_back(
                     best_match_node,
                     req=req,
-                    allow_evict=not multi_rank,
+                    allow_evict=True,
                 )
                 preps[comp.component_type] = prep
                 local_prepare_ok = local_prepare_ok and prep.succeeded
@@ -2404,7 +2407,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             or (mem_quota is not None and kv_tokens > mem_quota + lock_delta)
         )
         multi_rank = self.tp_world_size > 1 or self.pp_size > 1
-        if local_ok and not multi_rank:
+        if local_ok:
+            # Device headroom must be made HERE: the scheduler's mirrored
+            # eviction runs after load_back in admission order, so at
+            # radix steady state (free list ~0) a load without this
+            # preflight can never allocate — the host tier degrades to a
+            # write-only pool served off eviction crumbs (~0.7% of cached
+            # tokens in prod). evict() is deterministic on mirrored state,
+            # so the outcome stays rank-symmetric at any rank count.
             if self.supports_swa():
                 avail = self.token_to_kv_pool_allocator.full_available_size()
             else:
@@ -2435,6 +2445,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # asymmetric reservation failure is state divergence and surfaces
         # as a fail-stop (CRC / NCCL fault), never a negotiated demote.
         if not local_ok:
+            self.load_back_rejects = getattr(self, "load_back_rejects", 0) + 1
+            logger.warning(
+                "HiCache load_back rejected (total=%d): kv_tokens=%d "
+                "prepare_ok=%s reservation=%s — served as cache miss",
+                self.load_back_rejects,
+                kv_tokens,
+                local_prepare_ok,
+                reservation is not None,
+            )
             return False
         assert reservation is not None
 
