@@ -1004,6 +1004,7 @@ def safetensors_weights_iterator(
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -1035,6 +1036,7 @@ def fastsafetensors_weights_iterator(
         "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
     )
 
+    drop_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
     for f_list in tqdm(
         weight_files_sub_lists,
         desc="Loading safetensors using Fastsafetensor loader",
@@ -1059,6 +1061,22 @@ def fastsafetensors_weights_iterator(
                 pass
         finally:
             loader.close()
+        if drop_cache_after_load and rank < len(f_list):
+            # rank_file_map above assigns each rank exactly one distinct file
+            # per round, so dropping our own file cannot evict pages another
+            # rank still needs. Dropping per round keeps the checkpoint's page
+            # cache footprint to ~one shard per rank instead of accumulating
+            # the full checkpoint until the post-load sweep. The fadvise page
+            # walk (~2-6 s/shard) runs on a single background worker so it
+            # overlaps the next round's network reads instead of extending
+            # the load; the pre-pin barrier catches any straggler pages.
+            if drop_executor is None:
+                drop_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="drop-cache"
+                )
+            drop_executor.submit(_drop_file_cache_after_load, f_list[rank])
+    if drop_executor is not None:
+        drop_executor.shutdown(wait=False)
 
 
 def multi_thread_safetensors_weights_iterator(

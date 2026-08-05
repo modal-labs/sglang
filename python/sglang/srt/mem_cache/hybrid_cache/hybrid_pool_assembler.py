@@ -32,6 +32,10 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     mla_dedup_rank_and_size,
     maybe_prebuild_mla_host_dedup,
 )
+from sglang.srt.mem_cache.pool_host.base import (
+    cgroup_mem_snapshot,
+    drop_configured_pagecache,
+)
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
@@ -707,6 +711,14 @@ def build_hybrid_mamba_stack(
             time.perf_counter() - prebuild_start,
         )
 
+    # Pre-pin page-cache check (measure -> maybe sweep -> cross-rank
+    # barrier), run here so every rank hits it at the same aligned point —
+    # fresh off the prebuild collective, before any pool pins physical
+    # memory. Its once-per-process guard turns the legacy call inside the
+    # host-pool constructors into a no-op. The model path is the default
+    # sweep target; SGLANG_DROP_PAGECACHE_PATHS overrides.
+    drop_configured_pagecache(default_roots=server_args.model_path)
+
     target_pool_start = time.perf_counter()
     if server_args.enable_mla_hicache_host_dedup:
         logger.info(
@@ -727,7 +739,7 @@ def build_hybrid_mamba_stack(
     if server_args.enable_mla_hicache_host_dedup:
         logger.info(
             "HiCache startup phase=target_host_pool state=done rank=%d/%d "
-            "role=%s elapsed_s=%.3f physical_gib=%.2f slots=%d",
+            "role=%s elapsed_s=%.3f physical_gib=%.2f slots=%d %s",
             dedup_rank,
             dedup_tp_size,
             "receiver" if mla_is_dummy else "owner",
@@ -735,6 +747,7 @@ def build_hybrid_mamba_stack(
             (0 if mla_is_dummy else kv_host_pool.size * kv_host_pool.size_per_token)
             / (1024**3),
             kv_host_pool.size,
+            cgroup_mem_snapshot(),
         )
     mamba_ratio, mamba_size = _get_mamba_host_sizing(server_args)
     mamba_pool_start = time.perf_counter()
@@ -756,12 +769,13 @@ def build_hybrid_mamba_stack(
     if server_args.enable_mla_hicache_host_dedup:
         logger.info(
             "HiCache startup phase=mamba_host_pool state=done rank=%d/%d "
-            "role=rank_local elapsed_s=%.3f physical_gib=%.2f slots=%d",
+            "role=rank_local elapsed_s=%.3f physical_gib=%.2f slots=%d %s",
             dedup_rank,
             dedup_tp_size,
             time.perf_counter() - mamba_pool_start,
             mamba_host_pool.size * mamba_host_pool.size_per_token / (1024**3),
             mamba_host_pool.size,
+            cgroup_mem_snapshot(),
         )
     entries = [
         build_pool_entry(

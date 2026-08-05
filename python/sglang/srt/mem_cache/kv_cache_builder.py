@@ -35,6 +35,7 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.pool_host.base import cgroup_mem_snapshot
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import get_parallel
@@ -224,12 +225,13 @@ def maybe_register_hicache_draft(
     if draft_pool_start is not None:
         logger.info(
             "HiCache startup phase=draft_host_pool state=done rank=%d/%d "
-            "role=rank_local elapsed_s=%.3f physical_gib=%.2f slots=%d",
+            "role=rank_local elapsed_s=%.3f physical_gib=%.2f slots=%d %s",
             dedup_rank,
             dedup_tp_size,
             time.perf_counter() - draft_pool_start,
             draft_host_pool.size * draft_host_pool.size_per_token / (1024**3),
             draft_host_pool.size,
+            cgroup_mem_snapshot(),
         )
 
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)

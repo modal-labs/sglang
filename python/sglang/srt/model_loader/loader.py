@@ -646,6 +646,7 @@ class DefaultModelLoader(BaseModelLoader):
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(

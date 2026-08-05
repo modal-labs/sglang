@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 import os
+import time
 import threading
 from functools import wraps
 from typing import Optional
@@ -25,37 +26,134 @@ _is_hip = is_hip()
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
+
+def cgroup_mem_snapshot() -> str:
+    """Container memory usage vs its cgroup-v2 budget, for phase logging.
+
+    memory.current is charged usage; memory.peak is the kernel-tracked high
+    watermark (the number that decides whether pool pinning fits inside the
+    reservation on a pressured host). Returns a log-line suffix; empty
+    string when the cgroup files are unavailable (v1, non-Linux).
+    """
+    parts = []
+    for name, label in (("memory.current", "mem_current_gib"),
+                        ("memory.peak", "mem_peak_gib")):
+        try:
+            with open(f"/sys/fs/cgroup/{name}") as f:
+                raw = f.read().strip()
+            if raw.isdigit():
+                parts.append(f"{label}={int(raw) / 1024**3:.1f}")
+        except OSError:
+            pass
+    # Under runc /proc/meminfo is the PHYSICAL HOST — useless for budget
+    # decisions (see the MemTotal incident) but exactly right here: memory
+    # outside our cgroup (volumefs caches, other tenants) is what a
+    # host-level OOM kill responds to, and our cgroup counters can't see it.
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kib = int(line.split()[1])
+                    parts.append(f"host_avail_gib={kib / 1024**2:.0f}")
+                    break
+    except (OSError, ValueError):
+        pass
+    return " ".join(parts)
+
+
 _pagecache_dropped = False
 
 
-def drop_configured_pagecache() -> None:
-    """Drop page cache for SGLANG_DROP_PAGECACHE_PATHS before pinning pools.
+def _all_ranks_barrier() -> None:
+    """Hold every rank until all have finished the pre-pin cache check/sweep.
 
-    Under runc the model-weights read (~1 TB) leaves the host page cache
-    full right as the host pools pin ~800 GiB of unreclaimable memory;
-    kernel reclaim can lose that race and the OOM killer fires (observed
-    on a 1.5 TiB host). The weights are already resident on GPU — their
-    cache is dead weight, so advise it out before the first allocation.
-    gVisor bounds its own cache, so this stays a no-op there unless set.
+    Must be reached UNCONDITIONALLY by every rank that runs the check:
+    memory.stat is container-wide and shrinking concurrently, so ranks near
+    the threshold can legitimately disagree on sweep-vs-skip — a barrier
+    gated on that decision would deadlock the boot. CPU (gloo) group: this
+    is a host-memory ordering point, no GPU involvement, ~ms when ranks are
+    aligned (they arrive fresh off the nccl_prebuild collective)."""
+    try:
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            return
+        from sglang.srt.distributed.parallel_state import get_world_group
+
+        world = get_world_group()
+        if world.world_size <= 1:
+            return
+        torch.distributed.barrier(group=world.cpu_group)
+    except Exception:
+        logger.warning(
+            "HiCache pagecache barrier: cross-rank sync skipped", exc_info=True
+        )
+
+
+def _cgroup_file_cache_bytes() -> int | None:
+    """Charged page-cache bytes from cgroup-v2 memory.stat ('file' row)."""
+    try:
+        with open("/sys/fs/cgroup/memory.stat") as f:
+            for line in f:
+                if line.startswith("file "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def drop_configured_pagecache(default_roots: str = "") -> None:
+    """Pre-pin barrier: sweep checkpoint page cache, then sync all ranks.
+
+    Roots come from SGLANG_DROP_PAGECACHE_PATHS when set (override for
+    exotic layouts), else from ``default_roots`` — the caller passes the
+    model path it already knows, so deployments need no env config.
+
+    The sweep runs unconditionally, but the loader's per-shard drop
+    (--weight-loader-drop-cache-after-load) keeps checkpoint page cache
+    transient, so fadvise normally walks near-empty mappings: cost is
+    proportional to RESIDENT bytes only (measured ~10 GiB residual ->
+    seconds), partitioned across ranks (files[rank::world], mirroring
+    loader file ownership). If the loader-side drop ever under-delivers,
+    the same sweep clears the backlog before pinning — pinning ~800 GiB of
+    unreclaimable pools on top of surviving cache loses the reclaim race
+    and OOMs the rank — and the logged before/after/elapsed makes the
+    regression loud instead of silent (the historic unconditional sweep
+    burned ~6.5 min/boot for weeks unnoticed because it logged nothing).
+    The trailing cross-rank barrier means no rank starts pinning until
+    every rank's sweep has returned.
     """
     global _pagecache_dropped
     if _pagecache_dropped:
         return
     _pagecache_dropped = True
-    roots = os.environ.get("SGLANG_DROP_PAGECACHE_PATHS", "")
+    roots = os.environ.get("SGLANG_DROP_PAGECACHE_PATHS", "") or default_roots
+    if not roots:
+        return
+
+    file_cache = _cgroup_file_cache_bytes()
+    rank, world = 0, 1
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world = torch.distributed.get_world_size()
+    except Exception:
+        pass
+
+    start = time.perf_counter()
     for root in filter(None, roots.split(":")):
         if os.path.isfile(root):
             files = [root]
         elif os.path.isdir(root):
-            files = [
+            files = sorted(
                 os.path.join(dirpath, name)
                 for dirpath, _dirnames, filenames in os.walk(root)
                 for name in filenames
-            ]
+            )
         else:
             continue
         dropped = 0
-        for path in files:
+        for path in files[rank::world]:
             try:
                 fd = os.open(path, os.O_RDONLY)
                 try:
@@ -65,7 +163,22 @@ def drop_configured_pagecache() -> None:
                 dropped += 1
             except OSError:
                 continue
-        logger.info("HiCache pagecache drop: root=%s files=%d", root, dropped)
+        logger.info(
+            "HiCache pagecache barrier: files=%d rank=%d/%d "
+            "file_cache_before_gib=%s file_cache_after_gib=%s elapsed_s=%.1f",
+            dropped,
+            rank,
+            world,
+            f"{file_cache / 1024**3:.1f}" if file_cache is not None else "?",
+            (
+                f"{after / 1024**3:.1f}"
+                if (after := _cgroup_file_cache_bytes()) is not None
+                else "?"
+            ),
+            time.perf_counter() - start,
+        )
+    # No rank starts pinning until every rank's sweep has returned.
+    _all_ranks_barrier()
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
