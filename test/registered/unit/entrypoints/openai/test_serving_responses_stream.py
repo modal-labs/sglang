@@ -138,6 +138,76 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         ]
         self.assertIn("function_call", added_kinds)
 
+    def test_max_reasoning_effort_survives_sdk_typed_events(self):
+        # sglang accepts reasoning.effort="max", but openai==2.6.1's typed
+        # streaming events only allow minimal|low|medium|high. The echoed
+        # effort must be clamped, not crash the stream after the 200 headers.
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            reasoning={"effort": "max"},
+        )
+        fixture = _StreamFixture(serving, request)
+        events = fixture.run([_engine_chunk("Hello", 1, finish=True)])
+
+        types = event_types(events)
+        self.assertEqual(types[0], "response.created")
+        self.assertEqual(types[1], "response.in_progress")
+        self.assertEqual(types[-1], "response.completed")
+
+        created = event_payloads(events)[0]
+        self.assertEqual(created["response"]["reasoning"]["effort"], "high")
+        completed = find_completed_event(events)
+        self.assertEqual(completed["response"]["reasoning"]["effort"], "high")
+
+    def test_none_reasoning_effort_is_dropped_from_sdk_typed_events(self):
+        # "none" has no openai==2.6.1 ReasoningEffort equivalent at all, so
+        # the echoed reasoning field is dropped rather than clamped.
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            reasoning={"effort": "none"},
+        )
+        fixture = _StreamFixture(serving, request)
+        events = fixture.run([_engine_chunk("Hello", 1, finish=True)])
+
+        types = event_types(events)
+        self.assertEqual(types[0], "response.created")
+        self.assertEqual(types[-1], "response.completed")
+
+        created = event_payloads(events)[0]
+        self.assertIsNone(created["response"]["reasoning"]["effort"])
+
+    def test_sdk_tier_reasoning_effort_is_echoed_unchanged(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            reasoning={"effort": "low"},
+        )
+        fixture = _StreamFixture(serving, request)
+        events = fixture.run([_engine_chunk("Hello", 1, finish=True)])
+
+        created = event_payloads(events)[0]
+        self.assertEqual(created["response"]["reasoning"]["effort"], "low")
+
     def test_final_output_preserves_text_tool_text_order(self):
         from sglang.srt.function_call.core_types import (
             StreamingParseResult,

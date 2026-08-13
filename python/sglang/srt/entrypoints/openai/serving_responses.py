@@ -120,6 +120,31 @@ def _should_emit_normal_text_as_message(
     return bool(text) and not (any_tool_call_in_progress and not text.strip())
 
 
+# The streaming Response* event models validate echoed fields against the
+# pinned openai==2.6.1 SDK types, whose ReasoningEffort Literal only covers
+# minimal|low|medium|high. sglang accepts and advertises additional tiers
+# (none/xhigh/max), so clamp or drop the echoed effort here instead of
+# letting pydantic abort the SSE stream after the 200 headers.
+_SDK_REASONING_EFFORT_TIERS = frozenset({"minimal", "low", "medium", "high"})
+
+
+def _sanitize_response_dict_for_sdk_events(d: dict) -> dict:
+    """Make a ResponsesResponse dict safe for openai==2.6.1 typed events."""
+    # The streaming Response* event models echo ``tools`` through a
+    # narrower OpenAI SDK Tool union; strip it to avoid pydantic
+    # validation failures on extended tool types.
+    d["tools"] = []
+    reasoning = d.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort is not None and effort not in _SDK_REASONING_EFFORT_TIERS:
+            if effort in ("xhigh", "max"):
+                d["reasoning"] = {**reasoning, "effort": "high"}
+            else:
+                d["reasoning"] = {**reasoning, "effort": None}
+    return d
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -1442,15 +1467,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         current_item_id = f"item_{random_uuid()}"
         sent_output_item_added = False
 
-        initial_response = ResponsesResponse.from_request(
-            request,
-            sampling_params,
-            model_name=model_name,
-            created_time=created_time,
-            output=[],
-            status="in_progress",
-            usage=None,
-        ).model_dump()
+        initial_response = _sanitize_response_dict_for_sdk_events(
+            ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name=model_name,
+                created_time=created_time,
+                output=[],
+                status="in_progress",
+                usage=None,
+            ).model_dump()
+        )
         yield _send_event(
             openai_responses_types.ResponseCreatedEvent(
                 type="response.created",
@@ -1824,9 +1851,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             created_time=created_time,
         )
         # Convert final_response to the format expected by ResponseCompletedEvent
-        response_dict = final_response.model_dump()
-        # OpenAI SDK's Tool union may not know extended types; drop echo.
-        response_dict["tools"] = []
+        response_dict = _sanitize_response_dict_for_sdk_events(
+            final_response.model_dump()
+        )
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
@@ -1866,14 +1893,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 f"data: {event.model_dump_json(indent=None)}\n\n"
             )
 
-        # The streaming Response* event models echo ``tools`` through a
-        # narrower OpenAI SDK Tool union; strip it to avoid pydantic
-        # validation failures on extended tool types.
-        def _sanitize_response_dict(d: dict) -> dict:
-            d["tools"] = []
-            return d
-
-        initial_response = _sanitize_response_dict(
+        initial_response = _sanitize_response_dict_for_sdk_events(
             ResponsesResponse.from_request(
                 request,
                 sampling_params,
@@ -2364,7 +2384,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
         except Exception:
             logger.exception("Error while streaming /v1/responses")
-            failed = _sanitize_response_dict(
+            failed = _sanitize_response_dict_for_sdk_events(
                 ResponsesResponse.from_request(
                     request,
                     sampling_params,
@@ -2421,7 +2441,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if stored is None or stored.status != "cancelled":
                     self.response_store[final_response.id] = final_response
 
-        response_dict = _sanitize_response_dict(final_response.model_dump())
+        response_dict = _sanitize_response_dict_for_sdk_events(
+            final_response.model_dump()
+        )
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
