@@ -756,6 +756,13 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
+        # A PD prefill role never runs TARGET_VERIFY, so skip the verify-only
+        # allocations entirely: per-draft-token state snapshots
+        # (speculative_num_draft_tokens=None => the pool skips
+        # SpeculativeState/intermediate_ssm) and the ReplaySSM ring
+        # (enable_linear_replayssm_spec=False => no ring). The mamba budget
+        # solve applies the matching exemption (see _handle_max_mamba_cache).
+        is_pd_prefill = self.server_args.disaggregation_mode == "prefill"
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=self.server_args.max_mamba_cache_size,
@@ -773,7 +780,11 @@ class KVCacheConfigurator:
             ),
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
             enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            speculative_num_draft_tokens=(
+                None
+                if is_pd_prefill
+                else self.server_args.max_speculative_num_draft_tokens
+            ),
             speculative_eagle_topk=self.server_args.speculative_eagle_topk,
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
@@ -785,7 +796,8 @@ class KVCacheConfigurator:
             # other mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
             # flag set stays byte-identical to flag-off.
             enable_linear_replayssm_spec=(
-                self.server_args.enable_linear_replayssm_spec
+                not is_pd_prefill
+                and self.server_args.enable_linear_replayssm_spec
                 and (
                     self.hybrid_gdn_config is not None
                     or kimi_linear_config(self.model_config) is not None
@@ -1792,13 +1804,24 @@ class KVCacheConfigurator:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        # A PD prefill role never runs TARGET_VERIFY, so both verify-time
+        # charges below (the intermediate_ssm scratch and the ReplaySSM ring)
+        # are dead weight there. Exempt the role from BOTH so the whole mamba
+        # budget goes to persistent slots; _build_hybrid_req_pool skips the
+        # matching allocations for the same reason.
+        is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        verify_spec_dec = has_spec_dec and not is_pd_prefill
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
-        replayssm_active = self.server_args.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None
-            or kimi_linear_config(self.model_config) is not None
+        replayssm_active = (
+            self.server_args.enable_linear_replayssm_spec
+            and not is_pd_prefill
+            and (
+                self.hybrid_gdn_config is not None
+                or kimi_linear_config(self.model_config) is not None
+            )
         )
         # The ReplaySSM ring is allocated per slot but is not part of
         # mamba_cache_per_req, so the solve must charge it too or num_slots is
@@ -1825,7 +1848,7 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
             # (no intermediate_ssm allocated).
-            if has_spec_dec and not replayssm_active:
+            if verify_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests // self.ps.attn_dp_size,
@@ -1849,7 +1872,7 @@ class KVCacheConfigurator:
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
-            if has_spec_dec and not replayssm_active:
+            if verify_spec_dec and not replayssm_active:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * (server_args.max_mamba_cache_size + 1)
@@ -1871,7 +1894,7 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec and not replayssm_active:
+            if verify_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget

@@ -389,7 +389,13 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_req = 1
-        if mr.spec_algorithm.is_speculative():
+        if (
+            mr.spec_algorithm.is_speculative()
+            # A PD prefill role never runs TARGET_VERIFY, and its mamba pool
+            # has no verify scratch (see kv_cache_configurator's prefill-role
+            # exemption) — warm up the default mode instead.
+            and mr.server_args.disaggregation_mode != "prefill"
+        ):
             if mr.is_draft_worker:
                 assert (
                     mr.spec_algorithm.supports_target_verify_for_draft()
