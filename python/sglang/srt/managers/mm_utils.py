@@ -1813,7 +1813,9 @@ def get_new_expanded_mm_items(original_mm_items):
                     new_item.model_specific_data.pop(
                         PRECOMPUTED_FEATURE_HASHES_KEY, None
                     )
-                    if precomputed_hashes is not None:
+                    if precomputed_hashes is not None and (
+                        precomputed_hashes[i] is not None
+                    ):
                         new_item.set_hash(precomputed_hashes[i])
                     else:
                         new_item.hash = None
@@ -1909,8 +1911,26 @@ def get_new_expanded_mm_items(original_mm_items):
                     expanded_mm_items.append(item)
 
         else:
+            # Streaming GPU processors emit a per-image feature list (with
+            # matching production-time hashes) even for single-image requests,
+            # which never reach the bundled split above.
+            _adopt_streamed_single_feature(item)
             expanded_mm_items.append(item)
     return expanded_mm_items
+
+
+def _adopt_streamed_single_feature(item) -> None:
+    hashes = item.model_specific_data.pop(PRECOMPUTED_FEATURE_HASHES_KEY, None)
+    if hashes is None:
+        return
+    if (
+        len(hashes) == 1
+        and isinstance(item.feature, (list, tuple))
+        and len(item.feature) == 1
+    ):
+        item.feature = item.feature[0]
+        if hashes[0] is not None:
+            item.set_hash(hashes[0])
 
 
 class ShmPointerMMData:

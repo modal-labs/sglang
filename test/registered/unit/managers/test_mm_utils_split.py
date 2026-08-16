@@ -212,6 +212,41 @@ class TestPerItemFeatureListSplit(CustomTestCase):
         for o in out:
             self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, o.model_specific_data)
 
+    def test_single_image_list_feature_unwrapped(self):
+        # Single-image requests never reach the bundled split; the streamed
+        # per-image list (and its hash) must still be adopted.
+        sentinel = object()
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 5)],
+            feature=[sentinel],
+            model_specific_data={
+                "image_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                PRECOMPUTED_FEATURE_HASHES_KEY: [42],
+            },
+        )
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 1)
+        self.assertIs(out[0].feature, sentinel)
+        self.assertEqual(out[0].hash, 42)
+        self.assertIsNotNone(out[0].pad_value)
+        self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, out[0].model_specific_data)
+
+    def test_single_image_skipped_hash_still_unwrapped(self):
+        sentinel = object()
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 5)],
+            feature=[sentinel],
+            model_specific_data={PRECOMPUTED_FEATURE_HASHES_KEY: [None]},
+        )
+        out = get_new_expanded_mm_items([item])
+
+        self.assertIs(out[0].feature, sentinel)
+        self.assertIsNone(out[0].hash)
+        self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, out[0].model_specific_data)
+
     def test_list_length_mismatch_keeps_bundle(self):
         # A list feature that does not match the offset count cannot be
         # attributed per image; the bundle must pass through unsplit rather

@@ -390,10 +390,9 @@ class MMFeatureStreamSink:
             return processor._wrap_tensor_for_cuda_ipc(patches)
         return patches.cpu()
 
-    def hash_list(self, count: int) -> Optional[list]:
-        if len(self._hashes) != count:
-            return None
-        return [self._hashes[index] for index in range(count)]
+    def hash_list(self, count: int) -> list:
+        # Entries are None when hashing is skipped; consumers must handle it.
+        return [self._hashes.get(index) for index in range(count)]
 
 
 # ---------------------------------------------------------------------------
@@ -520,9 +519,7 @@ class KimiGPUProcessorWrapper:
             "image_grid_thw": grid_thws,
         }
         if feature_sink is not None:
-            hashes = feature_sink.hash_list(len(images))
-            if hashes is not None:
-                ret[PRECOMPUTED_FEATURE_HASHES_KEY] = hashes
+            ret[PRECOMPUTED_FEATURE_HASHES_KEY] = feature_sink.hash_list(len(images))
         return ret
 
     def _cpu_call(self, text, images, **kwargs):

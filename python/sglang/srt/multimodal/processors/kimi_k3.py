@@ -264,9 +264,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             "image_grid_thw": grid_thws,
         }
         if feature_sink is not None:
-            hashes = feature_sink.hash_list(len(images))
-            if hashes is not None:
-                ret[PRECOMPUTED_FEATURE_HASHES_KEY] = hashes
+            ret[PRECOMPUTED_FEATURE_HASHES_KEY] = feature_sink.hash_list(len(images))
         return ret
 
     def _cpu_call(self, text, images, original_input_ids=None, **kwargs):
