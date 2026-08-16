@@ -942,6 +942,11 @@ class Envs:
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
+    # Upper bound on the fp32 pixel bytes a single GPU image-preprocessing
+    # sub-batch may hold. Groups larger than this are processed in chunks so a
+    # many-image request cannot spike tokenizer-side GPU memory.
+    SGLANG_MM_GPU_PREPROCESS_CHUNK_BYTES = EnvInt(512 * 1024 * 1024)
+
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     # Reuse the mapping for the already-allocated bounded CUDA IPC pool. This

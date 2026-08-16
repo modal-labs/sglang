@@ -31,6 +31,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.utils.cuda_ipc_transport_utils import PRECOMPUTED_FEATURE_HASHES_KEY
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_server_args
@@ -1761,19 +1762,41 @@ def get_new_expanded_mm_items(original_mm_items):
                 )
                 slice_indices = [0] + cumulative.tolist()
 
-                feature_len = _get_length(item.feature)
-                if feature_len is None:
-                    feature_len = _get_length(item.precomputed_embeddings)
-                if feature_len is None or slice_indices[-1] != feature_len:
-                    expanded_mm_items.append(item)
-                    continue
+                # Streaming GPU processors emit one entry per image (already
+                # transport-wrapped) instead of a request-wide concat, so the
+                # per-item feature is taken by element rather than by patch
+                # slice. Grid-derived boundaries still shape model data.
+                feature_is_per_item = isinstance(item.feature, (list, tuple))
+                if feature_is_per_item:
+                    if len(item.feature) != num_items:
+                        expanded_mm_items.append(item)
+                        continue
+                else:
+                    feature_len = _get_length(item.feature)
+                    if feature_len is None:
+                        feature_len = _get_length(item.precomputed_embeddings)
+                    if feature_len is None or slice_indices[-1] != feature_len:
+                        expanded_mm_items.append(item)
+                        continue
 
-                total_feature_len = feature_len
+                precomputed_hashes = item.model_specific_data.get(
+                    PRECOMPUTED_FEATURE_HASHES_KEY
+                )
+                if precomputed_hashes is not None and len(precomputed_hashes) != (
+                    num_items
+                ):
+                    precomputed_hashes = None
+
+                total_feature_len = slice_indices[-1]
                 for i in range(num_items):
                     start, end = slice_indices[i], slice_indices[i + 1]
                     new_item = copy.copy(item)
                     if item.feature is not None:
-                        new_item.feature = _slice_value(item.feature, start, end)
+                        new_item.feature = (
+                            item.feature[i]
+                            if feature_is_per_item
+                            else _slice_value(item.feature, start, end)
+                        )
                     if item.precomputed_embeddings is not None:
                         new_item.precomputed_embeddings = _slice_value(
                             item.precomputed_embeddings, start, end
@@ -1787,7 +1810,13 @@ def get_new_expanded_mm_items(original_mm_items):
                         num_items=num_items,
                         total_feature_len=total_feature_len,
                     )
-                    new_item.hash = None
+                    new_item.model_specific_data.pop(
+                        PRECOMPUTED_FEATURE_HASHES_KEY, None
+                    )
+                    if precomputed_hashes is not None:
+                        new_item.set_hash(precomputed_hashes[i])
+                    else:
+                        new_item.hash = None
                     expanded_mm_items.append(new_item)
 
             elif item.is_video():

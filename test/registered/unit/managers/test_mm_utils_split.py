@@ -18,6 +18,7 @@ import torch
 
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.utils.cuda_ipc_transport_utils import PRECOMPUTED_FEATURE_HASHES_KEY
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -135,6 +136,87 @@ class TestGetNewExpandedMMItems(CustomTestCase):
             feature=torch.arange(18, dtype=torch.float32).reshape(6, 3),
             model_specific_data={"image_grid_hws": [[2, 3]]},
         )
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 1)
+        self.assertIs(out[0], item)
+
+
+class TestPerItemFeatureListSplit(CustomTestCase):
+    """Streaming GPU processors emit ``feature`` as a per-image list (already
+    transport-wrapped, so the elements may be arbitrary objects) plus optional
+    per-image content hashes computed at production time. Expansion must take
+    elements by index — never by patch slice — assign the precomputed hashes,
+    and strip the carrier key from the split items."""
+
+    def _bundled_list_item(self, hashes=None, feature=None, num_images=2):
+        model_specific_data = {
+            # prod over rows -> [6, 4] patches; boundaries shape model data.
+            "image_grid_thw": torch.tensor([[1, 2, 3], [1, 4, 1]], dtype=torch.long)[
+                :num_images
+            ],
+        }
+        if hashes is not None:
+            model_specific_data[PRECOMPUTED_FEATURE_HASHES_KEY] = hashes
+        if feature is None:
+            feature = [object() for _ in range(num_images)]
+        return MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 5), (5, 10)][:num_images],
+            feature=feature,
+            model_specific_data=model_specific_data,
+        )
+
+    def test_list_feature_splits_by_element(self):
+        sentinel_a, sentinel_b = object(), object()
+        item = self._bundled_list_item(feature=[sentinel_a, sentinel_b])
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 2)
+        # Bare elements — not one-element lists, not slices.
+        self.assertIs(out[0].feature, sentinel_a)
+        self.assertIs(out[1].feature, sentinel_b)
+        self.assertEqual(out[0].offsets, [(0, 5)])
+        self.assertEqual(out[1].offsets, [(5, 10)])
+        self.assertTrue(all(o.hash is None for o in out))
+
+    def test_precomputed_hashes_assigned_and_stripped(self):
+        item = self._bundled_list_item(hashes=[111, 222])
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual([o.hash for o in out], [111, 222])
+        # set_hash also derives the pad value, so set_pad_value later no-ops
+        # instead of trying to hash an already-wrapped feature.
+        self.assertTrue(all(o.pad_value is not None for o in out))
+        for o in out:
+            self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, o.model_specific_data)
+
+    def test_precomputed_hashes_with_tensor_feature(self):
+        # Hash preservation is independent of the feature container: the
+        # legacy concatenated-tensor path takes them too.
+        feature = torch.arange(30, dtype=torch.float32).reshape(10, 3)
+        item = self._bundled_list_item(hashes=[7, 8], feature=feature)
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 2)
+        self.assertTrue(torch.equal(out[0].feature, feature[0:6]))
+        self.assertTrue(torch.equal(out[1].feature, feature[6:10]))
+        self.assertEqual([o.hash for o in out], [7, 8])
+
+    def test_wrong_length_hashes_ignored(self):
+        item = self._bundled_list_item(hashes=[111])
+        out = get_new_expanded_mm_items([item])
+
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(o.hash is None for o in out))
+        for o in out:
+            self.assertNotIn(PRECOMPUTED_FEATURE_HASHES_KEY, o.model_specific_data)
+
+    def test_list_length_mismatch_keeps_bundle(self):
+        # A list feature that does not match the offset count cannot be
+        # attributed per image; the bundle must pass through unsplit rather
+        # than mis-assign features.
+        item = self._bundled_list_item(feature=[object()])
         out = get_new_expanded_mm_items([item])
 
         self.assertEqual(len(out), 1)

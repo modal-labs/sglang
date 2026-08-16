@@ -29,6 +29,12 @@ DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY = (
     "_sglang_defer_cuda_ipc_feature_reconstruction"
 )
 
+# Processors that stream per-image features into the transport at production
+# time carry the matching per-image content hashes under this key (a list with
+# one entry per bundled item), so item expansion can preserve them instead of
+# re-hashing an already-wrapped feature.
+PRECOMPUTED_FEATURE_HASHES_KEY = "_sglang_precomputed_feature_hashes"
+
 
 def get_mm_feature_pool_size_per_worker(
     total_pool_size: int, tokenizer_worker_num: int

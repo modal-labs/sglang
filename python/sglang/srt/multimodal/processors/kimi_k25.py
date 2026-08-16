@@ -1,7 +1,7 @@
 import math
 import re
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
@@ -22,6 +23,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    PRECOMPUTED_FEATURE_HASHES_KEY,
 )
 
 # ---------------------------------------------------------------------------
@@ -252,18 +254,34 @@ def _gpu_preprocess_images(
         [Union[torch.Tensor, Image.Image]], torch.Tensor
     ] = _default_to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    per_image_sink: Optional[Callable[[int, torch.Tensor], Any]] = None,
+    chunk_bytes: Optional[int] = None,
+) -> tuple[list, torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
 
-    Groups images with the same target padded size for batch processing.
+    Groups images with the same target padded size for batch processing, and
+    bounds peak GPU memory in two ways:
+
+    - Groups are processed in sub-batches of at most ``chunk_bytes`` of fp32
+      pixel data, so a many-image request never materializes one giant
+      resize/patchify batch.
+    - Each image's patch tensor is handed to ``per_image_sink`` as soon as it
+      is produced. A sink that moves the tensor off-GPU (IPC pool copy or
+      ``.cpu()``) keeps peak usage at one sub-batch plus one image, however
+      many images the request carries. Without a sink, the per-image tensor
+      itself is kept.
+
+    Returns a per-image list of sink outputs (patch tensors when no sink is
+    given) and the stacked ``grid_thws``. Callers that need the legacy
+    request-wide concat can ``torch.cat`` the returned list, at the cost of
+    the doubled peak this signature exists to avoid.
     """
     n = len(images)
     if n == 0:
-        device = image_scale.device
-        return (
-            torch.empty(0, 3, patch_size, patch_size, device=device),
-            torch.empty(0, 3, dtype=torch.int64),
-        )
+        return [], torch.empty(0, 3, dtype=torch.int64)
+
+    if chunk_bytes is None:
+        chunk_bytes = envs.SGLANG_MM_GPU_PREPROCESS_CHUNK_BYTES.get()
 
     groups = defaultdict(list)
     for idx, (image, config) in enumerate(zip(images, resize_configs)):
@@ -273,26 +291,38 @@ def _gpu_preprocess_images(
         target_w = config["new_width"]
         groups[(target_h, target_w, padded_h, padded_w)].append((idx, image, config))
 
-    all_patches = [None] * n
+    all_entries = [None] * n
     all_grids = [None] * n
 
+    def emit(idx: int, patches: torch.Tensor) -> None:
+        all_entries[idx] = per_image_sink(idx, patches) if per_image_sink else patches
+
     for (target_h, target_w, padded_h, padded_w), group in groups.items():
-        if len(group) == 1:
-            idx, image, config = group[0]
-            patches = _process_single_image(
-                image,
-                config,
-                image_scale,
-                image_bias,
-                patch_size,
-                to_chw=to_chw,
-                post_resize=post_resize,
-            )
-            all_patches[idx] = patches
-            all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
-        else:
+        # fp32 working set per image in this group (resize output and the
+        # patchify result are both this size).
+        per_image_bytes = padded_h * padded_w * 3 * 4
+        images_per_chunk = max(1, chunk_bytes // max(per_image_bytes, 1))
+
+        for chunk_start in range(0, len(group), images_per_chunk):
+            chunk = group[chunk_start : chunk_start + images_per_chunk]
+            if len(chunk) == 1:
+                idx, image, config = chunk[0]
+                patches = _process_single_image(
+                    image,
+                    config,
+                    image_scale,
+                    image_bias,
+                    patch_size,
+                    to_chw=to_chw,
+                    post_resize=post_resize,
+                )
+                emit(idx, patches)
+                del patches
+                all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
+                continue
+
             indexed_images = []
-            for idx, image, _ in group:
+            for idx, image, _ in chunk:
                 indexed_images.append((idx, to_chw(image)))
 
             # One NaViT target group can include several original resolutions.
@@ -300,12 +330,14 @@ def _gpu_preprocess_images(
             # bicubic launches for common multi-image requests without padding
             # random-size inputs to a larger source resolution.
             resized = _resize_images_by_source_shape(indexed_images, target_h, target_w)
+            del indexed_images
             if post_resize is not None:
                 # Runs before the concat: a hook may change the channel count
                 # (K3 composites RGBA onto a background, returning RGB), and
                 # mixed 3/4-channel sources cannot be concatenated first.
                 resized = [post_resize(part) for part in resized]
             batch = torch.cat(resized, dim=0)
+            del resized
 
             T = 1
             gh, gw = padded_h // patch_size, padded_w // patch_size
@@ -319,13 +351,49 @@ def _gpu_preprocess_images(
             )
 
             grid = (T, gh, gw)
-            for i, (idx, _, _) in enumerate(group):
-                all_patches[idx] = batch[i]
+            for i, (idx, _, _) in enumerate(chunk):
+                # `batch[i]` is a view pinning the whole sub-batch storage;
+                # clone so the sink owns exactly one image and the sub-batch
+                # can be freed before the next chunk is processed.
+                emit(idx, batch[i].clone())
                 all_grids[idx] = grid
+            del batch
 
-    pixel_values = torch.cat(all_patches, dim=0)
     grid_thws = torch.tensor(all_grids, dtype=torch.int64)
-    return pixel_values, grid_thws
+    return all_entries, grid_thws
+
+
+class MMFeatureStreamSink:
+    """Per-request sink: hash and transport-wrap each image feature as it is
+    produced, so the request-wide patch set never resides on the GPU at once.
+
+    The hash is computed on the freshly produced GPU tensor (same bytes and
+    same algorithm as the post-split ``set_pad_value`` path it replaces, so
+    radix-cache keys are unchanged). The tensor is then either copied into the
+    bounded CUDA-IPC pool (falling back to ``.cpu()`` when the pool is full,
+    exactly like the per-item wrap it replaces) or moved to host memory for
+    non-IPC transports. Either way the GPU copy is dropped before the next
+    image is processed.
+    """
+
+    def __init__(self, sglang_processor):
+        self._sglang_processor = sglang_processor
+        self._hashes: dict[int, int] = {}
+
+    def __call__(self, index: int, patches: torch.Tensor):
+        from sglang.srt.managers.mm_utils import hash_feature
+
+        if not envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            self._hashes[index] = hash_feature(patches)
+        processor = self._sglang_processor
+        if getattr(processor, "use_cuda_ipc", False):
+            return processor._wrap_tensor_for_cuda_ipc(patches)
+        return patches.cpu()
+
+    def hash_list(self, count: int) -> Optional[list]:
+        if len(self._hashes) != count:
+            return None
+        return [self._hashes[index] for index in range(count)]
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +448,10 @@ class KimiGPUProcessorWrapper:
         # process_mm_data passes images via kwargs["images"]
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
+        feature_sink = kwargs.pop("sglang_feature_sink", None)
 
         if images and torch.cuda.is_available():
-            return self._gpu_call(text, images, original_input_ids)
+            return self._gpu_call(text, images, original_input_ids, feature_sink)
         return self._cpu_call(text, images, **kwargs)
 
     def _prepare_input_ids(self, input_text, resize_configs, original_input_ids):
@@ -402,7 +471,7 @@ class KimiGPUProcessorWrapper:
             "input_ids"
         ]
 
-    def _gpu_call(self, text, images, original_input_ids=None):
+    def _gpu_call(self, text, images, original_input_ids=None, feature_sink=None):
         """Bypass HF KimiK25VisionProcessor.preprocess entirely -- use GPU ops."""
         input_text = text[0] if isinstance(text, list) else text
 
@@ -429,19 +498,32 @@ class KimiGPUProcessorWrapper:
             input_text, resize_configs, original_input_ids
         )
 
-        # 3. GPU image preprocessing
+        # 3. GPU image preprocessing. With a sink, each image is hashed and
+        # handed to the transport as it is produced; "pixel_values" is then a
+        # per-image list rather than a request-wide concat, so peak GPU usage
+        # stays bounded regardless of the request's image count.
         image_scale, image_bias = self._get_gpu_norm_tensors()
         pixel_values, grid_thws = _gpu_preprocess_images(
-            images, resize_configs, image_scale, image_bias, self._patch_size
+            images,
+            resize_configs,
+            image_scale,
+            image_bias,
+            self._patch_size,
+            per_image_sink=feature_sink,
         )
 
-        return {
+        ret = {
             "input_ids": input_ids,
             "pixel_values": pixel_values,
             # Use SGL-standard key so get_new_expanded_mm_items() can split
             # per-image for cache granularity (it looks up 'image_grid_thw').
             "image_grid_thw": grid_thws,
         }
+        if feature_sink is not None:
+            hashes = feature_sink.hash_list(len(images))
+            if hashes is not None:
+                ret[PRECOMPUTED_FEATURE_HASHES_KEY] = hashes
+        return ret
 
     def _cpu_call(self, text, images, **kwargs):
         """Fallback: token expansion + medias kwarg -> original HF processor."""
@@ -554,10 +636,14 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 f"expected {expected_image_count}, loaded {len(base_output.images)}"
             )
 
+        # Stream each image's feature (hash -> transport wrap -> free) as it is
+        # produced, bounding the tokenizer process's GPU footprint regardless
+        # of the request's image count or resolution.
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
             sglang_original_input_ids=base_output.input_ids,
+            sglang_feature_sink=MMFeatureStreamSink(self),
         )
 
         # K2.5/K2.7 encoder-DP assigns an image to exactly one TP rank. Keep
