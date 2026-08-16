@@ -122,5 +122,46 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
                 _StubProcessor._load_single_item(b"image", Modality.IMAGE)
 
 
+class TestCorruptImageBytesAreClientErrors(CustomTestCase):
+    """Decode-time corruption of client bytes must be ValueError (-> 400).
+
+    A large-enough PNG spans multiple IDAT chunks; ``Image.open`` only parses up
+    to the first, so corruption in a later chunk surfaces during the eager
+    ``img.load()`` as ``SyntaxError("broken PNG file")`` — not
+    ``UnidentifiedImageError``. Truncation surfaces as ``OSError``.
+    """
+
+    @staticmethod
+    def _multi_idat_png() -> bytes:
+        rng = np.random.RandomState(0)
+        noise = Image.fromarray(
+            (rng.rand(512, 512, 3) * 255).astype(np.uint8)
+        )
+        buf = io.BytesIO()
+        noise.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_corrupt_png_chunk_is_a_client_error(self):
+        import struct
+
+        png = bytearray(self._multi_idat_png())
+        offset, idat_offsets = 8, []
+        while offset < len(png):
+            length = struct.unpack(">I", png[offset : offset + 4])[0]
+            if bytes(png[offset + 4 : offset + 8]) == b"IDAT":
+                idat_offsets.append(offset)
+            offset += 12 + length
+        self.assertGreater(len(idat_offsets), 1, "test needs a multi-IDAT PNG")
+        png[idat_offsets[1] : idat_offsets[1] + 8] = b"\x00" * 8
+
+        with self.assertRaisesRegex(ValueError, "broken PNG file"):
+            _StubProcessor._load_single_item(bytes(png), Modality.IMAGE)
+
+    def test_truncated_png_is_a_client_error(self):
+        png = self._multi_idat_png()
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            _StubProcessor._load_single_item(png[: len(png) // 2], Modality.IMAGE)
+
+
 if __name__ == "__main__":
     unittest.main()

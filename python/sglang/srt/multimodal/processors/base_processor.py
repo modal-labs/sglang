@@ -649,8 +649,10 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except (ValueError, OSError, requests.RequestException) as e:
+        except (ValueError, OSError, SyntaxError, requests.RequestException) as e:
             # Invalid or unavailable user-provided media -> 400, not 500.
+            # SyntaxError: PIL's PNG decoder raises it for corrupt chunk
+            # structure past the sniffed header ("broken PNG file").
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
