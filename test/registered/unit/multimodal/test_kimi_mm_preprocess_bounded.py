@@ -93,8 +93,13 @@ def _legacy_reference(images, resize_configs, scale, bias, to_chw, post_resize=N
         if len(group) == 1:
             idx, image, config = group[0]
             all_patches[idx] = _process_single_image(
-                image, config, scale, bias, PATCH_SIZE,
-                to_chw=to_chw, post_resize=post_resize,
+                image,
+                config,
+                scale,
+                bias,
+                PATCH_SIZE,
+                to_chw=to_chw,
+                post_resize=post_resize,
             )
             all_grids[idx] = _grid_thw_from_resize_config(config, PATCH_SIZE)
             continue
@@ -115,8 +120,14 @@ def _legacy_reference(images, resize_configs, scale, bias, to_chw, post_resize=N
 
 def _run_new(images, configs, scale, bias, to_chw, post_resize=None, **kwargs):
     entries, grids = _gpu_preprocess_images(
-        images, configs, scale, bias, PATCH_SIZE,
-        to_chw=to_chw, post_resize=post_resize, **kwargs,
+        images,
+        configs,
+        scale,
+        bias,
+        PATCH_SIZE,
+        to_chw=to_chw,
+        post_resize=post_resize,
+        **kwargs,
     )
     return entries, grids
 
@@ -156,11 +167,17 @@ def test_parity_single_group_chunked():
     )
     per_image_bytes = (
         (configs[0]["new_height"] + configs[0]["pad_height"])
-        * (configs[0]["new_width"] + configs[0]["pad_width"]) * 3 * 4
+        * (configs[0]["new_width"] + configs[0]["pad_width"])
+        * 3
+        * 4
     )
     # Force sub-batches of exactly 2 images.
     entries, grids = _run_new(
-        images, configs, scale, bias, _default_to_cuda_chw,
+        images,
+        configs,
+        scale,
+        bias,
+        _default_to_cuda_chw,
         chunk_bytes=2 * per_image_bytes,
     )
 
@@ -191,7 +208,12 @@ def test_parity_k3_rgba_compositing():
         images, configs, scale, bias, _k3_to_cuda_chw, post_resize=post
     )
     entries, grids = _run_new(
-        images, configs, scale, bias, _k3_to_cuda_chw, post_resize=post,
+        images,
+        configs,
+        scale,
+        bias,
+        _k3_to_cuda_chw,
+        post_resize=post,
         chunk_bytes=1,  # one image per sub-batch: the strictest chunking
     )
 
@@ -230,9 +252,7 @@ def test_sink_receives_every_image_in_order():
     assert all(not entry.is_cuda for entry in entries)
 
     # Sink outputs are stored by original index: parity per image.
-    reference, _ = _legacy_reference(
-        images, configs, scale, bias, _default_to_cuda_chw
-    )
+    reference, _ = _legacy_reference(images, configs, scale, bias, _default_to_cuda_chw)
     assert torch.equal(torch.cat([e.cuda() for e in entries], dim=0), reference)
 
 
@@ -251,9 +271,7 @@ def test_stream_sink_hashes_match_legacy_split():
     hashes = sink.hash_list(len(images))
     assert hashes is not None and all(not e.is_cuda for e in entries)
 
-    reference, _ = _legacy_reference(
-        images, configs, scale, bias, _default_to_cuda_chw
-    )
+    reference, _ = _legacy_reference(images, configs, scale, bias, _default_to_cuda_chw)
     patches_per_image = [int(torch.prod(g).item()) for g in grids]
     start = 0
     for i, count in enumerate(patches_per_image):
@@ -292,7 +310,11 @@ def test_peak_memory_bounded_vs_legacy():
     )
     bounded_peak = measure(
         lambda: _run_new(
-            images, configs, scale, bias, _default_to_cuda_chw,
+            images,
+            configs,
+            scale,
+            bias,
+            _default_to_cuda_chw,
             per_image_sink=lambda index, patches: patches.cpu(),
             chunk_bytes=chunk_bytes,
         )
