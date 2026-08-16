@@ -139,7 +139,7 @@ class MambaComponent(TreeComponent):
             and getattr(_ongoing, "pinned_mamba_slots", None) is not None
         )
         mamba_value = last_node.component_data[self.component_type].value
-        if mamba_load_in_flight and mamba_value is not None:
+        if mamba_load_in_flight and mamba_value is not None and not params.repoint_only:
             self._mamba_inflight_match_drops = (
                 getattr(self, "_mamba_inflight_match_drops", 0) + 1
             )
@@ -179,10 +179,11 @@ class MambaComponent(TreeComponent):
             result = result._replace(
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
             )
-        elif cd.value is None and cd.host_value is None and (
-            last_node is not self.cache.root_node
-        ) and (
-            result.full_kv_hit_length > 0 or result.device_indices.numel() > 0
+        elif (
+            cd.value is None
+            and cd.host_value is None
+            and (last_node is not self.cache.root_node)
+            and (result.full_kv_hit_length > 0 or result.device_indices.numel() > 0)
         ):
             # Mamba state is gone from BOTH tiers (device state pruned/evicted
             # and host backup evicted) while the Full KV prefix is still

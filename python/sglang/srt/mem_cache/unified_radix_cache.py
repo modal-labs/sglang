@@ -922,8 +922,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        # Match prefix. repoint_only: this re-match only re-points the request's
+        # token table at canonical tree KV (no CoW, no load-back), and insert has
+        # already freed the request's own KV for the overlapped span — the mamba
+        # in-flight-load match drop must not zero it (prod crash:
+        # "AssertionError: new_prefix_len=64, len(new_indices)=0").
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=radix_key, repoint_only=True)
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -1832,9 +1838,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return self._hicache_enqueue_write(
                 node,
                 opcode=(
-                    _HICACHE_OP_WRITE_MAMBA_REPAIR
-                    if mamba_only
-                    else _HICACHE_OP_WRITE
+                    _HICACHE_OP_WRITE_MAMBA_REPAIR if mamba_only else _HICACHE_OP_WRITE
                 ),
             )
         if mamba_only:

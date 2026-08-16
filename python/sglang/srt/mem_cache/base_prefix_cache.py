@@ -48,6 +48,13 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Set by cache_unfinished_req's post-insert re-match, which only re-points
+    # the request's token table at the tree's canonical KV. It never CoWs
+    # mamba state and never builds a load-back, so match-drop heuristics that
+    # protect those two paths must not fire: insert has already counted the
+    # full overlap and freed the request's own KV for it, and a dropped
+    # re-match breaks the new_prefix_len <= len(new_indices) invariant.
+    repoint_only: bool = False
 
 
 @dataclasses.dataclass
