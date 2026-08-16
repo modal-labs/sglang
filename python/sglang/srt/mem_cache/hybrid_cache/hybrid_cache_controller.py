@@ -443,6 +443,16 @@ class HybridCacheController(BaseHiCacheController):
         *,
         allow_evict: bool = False,
     ) -> Optional[HybridWriteReservation]:
+        # HiCache V3 mirrors rank 0's allocator call sequence on every rank,
+        # and the host free lists are order-sensitive FIFOs (alloc pops the
+        # front, free rejoins at the back). An alloc-then-rollback on a failed
+        # reservation therefore rotates rank 0's free list with no record on
+        # the wire, and the next successful PLACE fail-stops every peer on the
+        # kv_crc check. With allow_evict=False the pools only mutate under the
+        # caller's lock, so availability prechecks are exact: predict failure
+        # up front and return without touching any pool.
+        if not allow_evict and not self._can_reserve_write(device_indices, extra_pools):
+            return None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -467,6 +477,39 @@ class HybridCacheController(BaseHiCacheController):
             priority=priority,
             pool_reservation=pool_reservation,
         )
+
+    def _can_reserve_write(
+        self,
+        device_indices: torch.Tensor,
+        extra_pools: Optional[list[PoolTransfer]],
+    ) -> bool:
+        """Exact failure prediction for the no-evict reservation path.
+
+        Mirrors the allocation demands of ``reserve_write`` +
+        ``_reserve_pool_transfers(alloc_host=True)`` against each pool's
+        ``available_size()`` without allocating. Demands on the same pool are
+        summed so multi-transfer reservations are predicted exactly.
+        """
+        if self.mem_pool_host.available_size() < len(device_indices):
+            return False
+        if not extra_pools:
+            return True
+        needs: dict[str, int] = {}
+        for pool in extra_pools:
+            entry = self.mem_pool_host.entry_map.get(pool.name)
+            if entry is None:
+                # _reserve_pool_transfers fails on an unknown pool; predict it.
+                return False
+            if pool.indices_from_pool is not None:
+                continue
+            if pool.host_indices is not None or pool.device_indices is None:
+                continue
+            needs[pool.name] = needs.get(pool.name, 0) + len(pool.device_indices)
+        for name, need in needs.items():
+            entry = self.mem_pool_host.entry_map[name]
+            if entry.host_pool.available_size() < need:
+                return False
+        return True
 
     def commit_write(self, reservation: HybridWriteReservation) -> torch.Tensor:
         self.write_queue.append(
@@ -804,16 +847,11 @@ class HybridCacheController(BaseHiCacheController):
             pool_names={PoolName.MAMBA},
         )
 
-    def _record_mla_rank_local_load(
-        self, state: Optional[list[PoolTransfer]]
-    ) -> None:
+    def _record_mla_rank_local_load(self, state: Optional[list[PoolTransfer]]) -> None:
         for transfer in state or []:
             if transfer.host_indices is not None and transfer.host_indices.is_cuda:
                 transfer.host_indices.record_stream(self.load_stream)
-            if (
-                transfer.device_indices is not None
-                and transfer.device_indices.is_cuda
-            ):
+            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
                 transfer.device_indices.record_stream(self.load_stream)
 
     def _record_transfer_indices_on_stream(
