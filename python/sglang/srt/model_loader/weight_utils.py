@@ -1047,7 +1047,23 @@ def fastsafetensors_weights_iterator(
         # fails at open ("Error opening file"). nogds reads via O_DIRECT + a host bounce
         # buffer instead. Env-gated so the GDS default is preserved off-sandbox.
         nogds = os.environ.get("SGLANG_FASTSAFETENSORS_NOGDS", "0") == "1"
-        loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+        # Bounce-buffer sizing dominates nogds throughput on sandboxed runtimes
+        # (gVisor syscall overhead amortizes with larger reads); keep the
+        # library defaults unless overridden. Note SafeTensorsFileLoader takes
+        # these only as constructor kwargs — the FASTSAFETENSORS_CONFIG file
+        # env only configures the separate unified-loader API and is ignored
+        # on this path.
+        bbuf_size_kb = int(
+            os.environ.get("SGLANG_FASTSAFETENSORS_BBUF_SIZE_KB", 16 * 1024)
+        )
+        max_threads = int(os.environ.get("SGLANG_FASTSAFETENSORS_MAX_THREADS", 16))
+        loader = SafeTensorsFileLoader(
+            pg,
+            device,
+            bbuf_size_kb=bbuf_size_kb,
+            max_threads=max_threads,
+            nogds=nogds,
+        )
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
