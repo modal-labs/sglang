@@ -3520,6 +3520,76 @@ class UnifiedRadixCacheSuite:
         )
         self._release_ongoing_load_back_locks(cache)
 
+    def test_load_back_reservation_allows_eviction_at_any_rank_count(self):
+        # Extra device pools (mamba, ...) have no preflight eviction; the
+        # reservation itself must be allowed to evict at every rank count.
+        # With allow_evict=False at TP>1, a radix-steady-state pool (free
+        # list ~0) rejects every load-back carrying a checkpoint and the
+        # match degrades to a full re-prefill.
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+
+        for world_size in (1, 8):
+            req = self._make_req(req_to_token_pool)
+            with mock.patch.object(
+                cache, "tp_world_size", world_size
+            ), mock.patch.object(
+                cache.cache_controller, "reserve_load", return_value=None
+            ) as reserve_mock:
+                loaded = cache.load_back(leaf, req=req)
+            self.assertFalse(loaded)
+            self.assertTrue(reserve_mock.called)
+            self.assertTrue(
+                reserve_mock.call_args.kwargs["allow_evict"],
+                f"reserve_load must allow eviction at world_size={world_size}",
+            )
+            self._release_ongoing_load_back_locks(cache)
+
+    def test_load_back_evicts_saturated_mamba_pool(self):
+        # Steady-state repro of the prod reject storm: the mamba device
+        # allocator's free list is empty (all capacity raw-held or owned by
+        # cached tree nodes). The load-back reservation must reclaim a slot
+        # via the registered device evict fn instead of rejecting the load.
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+        self.assertTrue(leaf.backuped)
+
+        req = self._make_req(req_to_token_pool)
+
+        # Leave exactly zero free slots; the only reclaimable capacity is a
+        # checkpoint held by a cached (evictable) tree node.
+        mamba_alloc = req_to_token_pool.mamba_allocator
+        free_slots = mamba_alloc.available_size()
+        self.assertGreater(free_slots, 0)
+        hog = mamba_alloc.alloc(free_slots)
+        self.assertIsNotNone(hog)
+        self.assertEqual(mamba_alloc.available_size(), 0)
+
+        try:
+            loaded = cache.load_back(leaf, req=req)
+            self.assertTrue(loaded)
+        finally:
+            mamba_alloc.free(hog)
+        self._release_ongoing_load_back_locks(cache)
+
     def test_load_back_abort_keeps_preexisting_mamba_slot(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

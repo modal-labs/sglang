@@ -2410,7 +2410,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             (kv_tokens < self.load_back_threshold and not comp_xfers)
             or (mem_quota is not None and kv_tokens > mem_quota + lock_delta)
         )
-        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
         if local_ok:
             # Device headroom must be made HERE: the scheduler's mirrored
             # eviction runs after load_back in admission order, so at
@@ -2432,14 +2431,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         aux_xfers.extend(sidecar_xfers)
         reservation = None
         if local_ok:
-            # Multi-rank promotion deliberately does not evict inside the
-            # reservation (rank-0-published evictions keep host headroom;
-            # device headroom is the scheduler's mirrored eviction).
+            # allow_evict covers the EXTRA device pools (mamba, ...): the KV
+            # preflight above only sizes the full-KV pool, so at radix steady
+            # state (free lists ~0) an extra pool without an evict path can
+            # never allocate and every load with a checkpoint degrades to a
+            # full re-prefill. The registered device evict fns route through
+            # the same deterministic mirrored eviction as the KV preflight
+            # (cache.evict on mirrored state), so the outcome stays
+            # rank-symmetric at any rank count; an asymmetric result is state
+            # divergence and fail-stops, same as every other verdict here.
             reservation = self.cache_controller.reserve_load(
                 host_indices=kv_xfer.host_indices,
                 node_id=best_match_node.id,
                 extra_pools=aux_xfers or None,
-                allow_evict=not multi_rank,
+                allow_evict=True,
             )
             local_ok = reservation is not None
 

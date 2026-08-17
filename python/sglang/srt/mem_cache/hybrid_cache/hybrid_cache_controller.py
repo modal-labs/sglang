@@ -652,6 +652,10 @@ class HybridCacheController(BaseHiCacheController):
         else:
             device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
+                logger.warning(
+                    "HiCache load reservation shortfall: pool=KV requested=%d",
+                    len(host_indices),
+                )
                 return None
             primary_free_fn = full_allocator.free
 
@@ -1172,6 +1176,15 @@ class HybridCacheController(BaseHiCacheController):
                     evict_fn(size)
                     indices = alloc_fn(size)
                 if indices is None:
+                    logger.warning(
+                        "HiCache pool reservation shortfall: pool=%s "
+                        "requested=%d alloc_host=%s allow_evict=%s evictable=%s",
+                        pool.name,
+                        size,
+                        alloc_host,
+                        allow_evict,
+                        evict_fn is not None,
+                    )
                     rollback_allocated()
                     return None
                 attribute = "host_indices" if alloc_host else "device_indices"
