@@ -126,13 +126,20 @@ def faulthandler_dump_engine_processes(settle_secs: float = 3.0) -> None:
             )
         except OSError:
             logger.exception("Failed to signal PID %s for faulthandler dump.", proc.pid)
+            continue
+        # Serialize the dumps: every target writes to the same container log
+        # fd, and faulthandler emits each frame as several small write()s, so
+        # concurrent dumps interleave into an unreadable shuffle (observed on
+        # the first prod capture). One second per process keeps each dump
+        # contiguous; this path only runs on an already-terminal container.
+        time.sleep(1.0)
     try:
         faulthandler.dump_traceback(all_threads=True)
     except Exception:
         logger.exception("faulthandler self-dump failed.")
     if procs and settle_secs > 0:
-        # Give the targets a moment to flush their stacks before any
-        # follow-on diagnostics or shutdown truncates the log.
+        # Give the last target a moment to flush before any follow-on
+        # diagnostics or shutdown truncates the log.
         time.sleep(settle_secs)
 
 
