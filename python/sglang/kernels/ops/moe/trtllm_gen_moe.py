@@ -386,8 +386,15 @@ _RC5_LAUNCHER_SHA256 = (
 )
 
 
+@cache_once
 def moe_source() -> str:
-    """Resolve the build source: explicit env wins, else pool-if-configured."""
+    """Resolve the build source: explicit env wins, else pool-if-configured.
+
+    Cached: env and image contents are fixed for the process lifetime, and
+    this is reached from every MoE layer forward via _resolve_activation_type
+    (prod stack sampling put the uncached filesystem probes at a double-digit
+    percent of scheduler CPU time under gVisor).
+    """
     value = (envs.SGLANG_TRTLLM_GEN_MOE_SOURCE.get() or "").strip().lower()
     if value in ("pool", "flashinfer"):
         return value
@@ -411,7 +418,10 @@ def _resolve_activation_type(activation_type: int) -> int:
     return activation_type
 
 
+@cache_once
 def cubin_pool_dir() -> Optional[pathlib.Path]:
+    # Cached: the pool ships in the image and cannot appear or vanish at
+    # runtime; see moe_source() for the hot-path cost rationale.
     p = envs.SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL.get()
     if not p:
         return None
@@ -476,7 +486,10 @@ def _flashinfer_native_available() -> bool:
     )
 
 
+@cache_once
 def available() -> bool:
+    # Cached: called as a guard from every SiTU MoE layer forward
+    # (mxfp4 apply); the underlying artifacts are image-constant.
     if moe_source() == "flashinfer":
         return _flashinfer_native_available()
     pool = cubin_pool_dir()
@@ -659,9 +672,11 @@ def _jit_flashinfer_native_module() -> Module:
 
     cpp_files = [_fi_source(s) for s in _SOURCES if s.endswith(".cpp")]
     cuda_files = [
-        str(_RC5_LAUNCHER)
-        if s == "csrc/trtllm_fused_moe_kernel_launcher.cu"
-        else _fi_source(s)
+        (
+            str(_RC5_LAUNCHER)
+            if s == "csrc/trtllm_fused_moe_kernel_launcher.cu"
+            else _fi_source(s)
+        )
         for s in _SOURCES
         if s.endswith(".cu")
     ]
