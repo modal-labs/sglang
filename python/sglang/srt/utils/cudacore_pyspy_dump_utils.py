@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import platform
+import signal
 import subprocess
 import time
 from errno import ENXIO
@@ -27,6 +29,10 @@ from typing import List
 import psutil
 
 logger = logging.getLogger(__name__)
+
+# Signal used to request an in-process faulthandler stack dump from engine
+# subprocesses. Chosen because nothing else in sglang claims it.
+FAULTHANDLER_DUMP_SIGNAL = signal.SIGUSR2
 
 
 def _resolve_cuda_coredump_pipe_path(proc: psutil.Process) -> Path:
@@ -58,6 +64,14 @@ def _is_sglang_scheduler_process(proc: psutil.Process) -> bool:
     return proc_title.startswith("sglang::scheduler")
 
 
+def _is_sglang_engine_subprocess(proc: psutil.Process) -> bool:
+    try:
+        proc_title = " ".join(proc.cmdline())
+    except (psutil.Error, OSError):
+        return False
+    return proc_title.startswith(("sglang::scheduler", "sglang::detokenizer"))
+
+
 def collect_scheduler_processes() -> List[psutil.Process]:
     current = psutil.Process()
     return [
@@ -65,6 +79,61 @@ def collect_scheduler_processes() -> List[psutil.Process]:
         for proc in current.children(recursive=True)
         if _is_sglang_scheduler_process(proc)
     ]
+
+
+def collect_engine_subprocesses() -> List[psutil.Process]:
+    current = psutil.Process()
+    return [
+        proc
+        for proc in current.children(recursive=True)
+        if _is_sglang_engine_subprocess(proc)
+    ]
+
+
+def enable_faulthandler_signal_dump() -> None:
+    """Arm this process to dump all thread stacks to stderr on
+    FAULTHANDLER_DUMP_SIGNAL.
+
+    faulthandler's handler is C code that walks thread states directly, so it
+    produces stacks even when every Python thread is deadlocked or a C
+    extension holds the GIL — the exact situations where py-spy (blocked by
+    ptrace restrictions under gVisor) and normal Python signal handlers
+    cannot help.
+    """
+    try:
+        faulthandler.register(FAULTHANDLER_DUMP_SIGNAL, all_threads=True, chain=False)
+    except (AttributeError, ValueError, OSError):
+        # Non-main interpreter / unsupported platform: diagnostics only,
+        # never fatal.
+        logger.exception("Failed to register faulthandler dump signal.")
+
+
+def faulthandler_dump_engine_processes(settle_secs: float = 3.0) -> None:
+    """Request in-process stack dumps from every scheduler and detokenizer
+    subprocess (see enable_faulthandler_signal_dump), then dump this
+    process's own threads. Each target writes to its own stderr, which lands
+    in the shared container log."""
+    procs = collect_engine_subprocesses()
+    if not procs:
+        logger.error("No sglang engine subprocesses found for faulthandler dump.")
+    for proc in procs:
+        try:
+            os.kill(proc.pid, FAULTHANDLER_DUMP_SIGNAL)
+            logger.error(
+                "Requested faulthandler stack dump from PID %s (signal %s).",
+                proc.pid,
+                FAULTHANDLER_DUMP_SIGNAL,
+            )
+        except OSError:
+            logger.exception("Failed to signal PID %s for faulthandler dump.", proc.pid)
+    try:
+        faulthandler.dump_traceback(all_threads=True)
+    except Exception:
+        logger.exception("faulthandler self-dump failed.")
+    if procs and settle_secs > 0:
+        # Give the targets a moment to flush their stacks before any
+        # follow-on diagnostics or shutdown truncates the log.
+        time.sleep(settle_secs)
 
 
 def pyspy_dump_schedulers(scheduler_only=False):

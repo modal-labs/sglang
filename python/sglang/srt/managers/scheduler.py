@@ -269,6 +269,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.cudacore_pyspy_dump_utils import enable_faulthandler_signal_dump
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -2680,9 +2681,7 @@ class Scheduler(
             r_uncached = (
                 r.min_uncached_seen
                 if r.min_uncached_seen is not None
-                else max(
-                    0, len(r.origin_input_ids) - r.num_matched_prefix_tokens
-                )
+                else max(0, len(r.origin_input_ids) - r.num_matched_prefix_tokens)
             )
             # Rank-identical vtime base (arrival_stamp), matching the sort
             # key: a rank-local base here flips the work-ahead comparison at
@@ -4840,6 +4839,7 @@ def configure_scheduler_process(
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
+    enable_faulthandler_signal_dump()
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)

@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     ignore_external_stop_signals,
     kill_itself_when_parent_died,
 )
+from sglang.srt.utils.cudacore_pyspy_dump_utils import enable_faulthandler_signal_dump
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -522,6 +523,7 @@ def run_detokenizer_process(
     ignore_external_stop_signals()
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
+    enable_faulthandler_signal_dump()
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 

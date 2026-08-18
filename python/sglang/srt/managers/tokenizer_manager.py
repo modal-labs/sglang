@@ -127,6 +127,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
+    faulthandler_dump_engine_processes,
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
@@ -2764,6 +2765,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "Sleeping 5 seconds before crash diagnostics to let GPU activity settle."
             )
             time.sleep(5)
+
+            # Signal-driven in-process dumps first: they work where py-spy
+            # cannot (ptrace blocked under gVisor) and even when the target
+            # threads are deadlocked.
+            faulthandler_dump_engine_processes()
 
             scheduler_procs = collect_scheduler_processes()
             if scheduler_procs:
