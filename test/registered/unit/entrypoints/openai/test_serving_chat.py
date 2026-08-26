@@ -41,6 +41,7 @@ class _MockTokenizerManager:
 
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
+        self.model_config.get_default_sampling_params.return_value = {}
         self.server_args = Mock(
             enable_cache_report=False,
             tool_call_parser="hermes",
@@ -642,6 +643,33 @@ class ServingChatTestCase(unittest.TestCase):
             )
             with self.subTest(field=field):
                 self.assertIn(field, self.chat._validate_request(request))
+
+    def test_kimi_k3_defaults_top_p_to_moonshot_contract(self):
+        base = {
+            "model": "x",
+            "messages": [{"role": "user", "content": "Answer."}],
+        }
+
+        def top_p_for(request, encoding_spec, model_generation_config):
+            self.chat.chat_encoding_spec = encoding_spec
+            self.chat.default_sampling_params = model_generation_config
+            with patch.object(self.chat, "_process_messages") as proc_mock:
+                proc_mock.return_value = MessageProcessingResult(
+                    "Answer.", [1, 2, 3], None, None, [], [], None
+                )
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+            return adapted.sampling_params["top_p"]
+
+        self.assertEqual(top_p_for(ChatCompletionRequest(**base), "kimi_k3", {}), 0.95)
+        self.assertEqual(
+            top_p_for(ChatCompletionRequest(**base, top_p=1.0), "kimi_k3", {}), 1.0
+        )
+        self.assertEqual(
+            top_p_for(ChatCompletionRequest(**base), "kimi_k3", {"top_p": 0.99}), 0.99
+        )
+        self.assertEqual(top_p_for(ChatCompletionRequest(**base), None, {}), 1.0)
 
     def test_kimi_k3_rejects_disabled_thinking_controls(self):
         self.chat.chat_encoding_spec = "kimi_k3"

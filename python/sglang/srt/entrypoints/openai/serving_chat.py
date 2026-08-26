@@ -89,6 +89,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Moonshot's K3 API fixes top_p at 0.95. The checkpoint ships no sampling fields
+# in generation_config.json, so a request that omits top_p would otherwise fall
+# back to the OpenAI default of 1.0 and sample off-contract.
+KIMI_K3_DEFAULT_TOP_P = 0.95
+
 
 def dump_kimi_k3_template_value(value: Any) -> Any:
     """Serialize a K3 template value without materializing omitted defaults."""
@@ -823,6 +828,12 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
+        if (
+            self.chat_encoding_spec == "kimi_k3"
+            and request.top_p is None
+            and "top_p" not in self.default_sampling_params
+        ):
+            sampling_params["top_p"] = KIMI_K3_DEFAULT_TOP_P
 
         # Handle single vs multiple requests
         if request.input_ids is not None:
