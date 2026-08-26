@@ -683,10 +683,10 @@ class OpenAIServingChat(OpenAIServingBase):
             return "Messages cannot be empty."
 
         if self.chat_encoding_spec == "kimi_k3":
-            validation_error = self._validate_kimi_k3_sampling_params(request)
+            validation_error = self._validate_kimi_k3_reasoning_effort(request)
             if validation_error:
                 return validation_error
-            validation_error = self._validate_kimi_k3_reasoning_effort(request)
+            validation_error = self._validate_kimi_k3_sampling_params(request)
             if validation_error:
                 return validation_error
 
@@ -748,18 +748,11 @@ class OpenAIServingChat(OpenAIServingBase):
     def _validate_kimi_k3_sampling_params(
         self, request: ChatCompletionRequest
     ) -> Optional[str]:
-        """Validate the K3 sampling envelope used by target-only verification."""
-        thinking = (request.chat_template_kwargs or {}).get("thinking")
-        if thinking is None:
-            thinking = self._get_reasoning_from_request(request)
+        """Validate the K3 sampling envelope used by target-only verification.
 
-        template_kwargs = request.chat_template_kwargs or {}
-        if not thinking:
-            if template_kwargs.get("preserve_thinking") is True:
-                return "Kimi K3 preserve_thinking=true is invalid when thinking=false."
-            if template_kwargs.get("thinking_effort") is not None:
-                return "Kimi K3 thinking_effort must be omitted when thinking=false."
-
+        Requests that disable thinking never reach here; they are rejected by
+        ``_validate_kimi_k3_reasoning_effort``.
+        """
         if request.temperature is not None and not (0.0 <= request.temperature <= 1.0):
             return "Kimi K3 temperature must be within [0.0, 1.0]."
         if request.top_p is not None and not (0.95 <= request.top_p <= 1.0):
@@ -786,6 +779,20 @@ class OpenAIServingChat(OpenAIServingBase):
         defaulting to "max".
         """
         template_kwargs = request.chat_template_kwargs or {}
+        supported = ", ".join(repr(tier) for tier in KIMI_K3_THINKING_EFFORTS)
+
+        # Every disable spelling converges here: ``thinking={"type":"disabled"}``
+        # and ``reasoning_effort="none"`` are both normalized into these keys by
+        # ChatCompletionRequest.normalize_reasoning_inputs.
+        if False in (
+            template_kwargs.get("thinking"),
+            template_kwargs.get("enable_thinking"),
+        ):
+            return (
+                "Kimi K3 always reasons and cannot disable thinking. Omit the "
+                f"thinking controls, or pass a reasoning_effort of {supported}."
+            )
+
         # chat_template_kwargs.reasoning_effort is promoted onto the request
         # later, in _convert_to_internal_request.
         candidates = (
@@ -793,17 +800,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ("reasoning_effort", request.reasoning_effort),
             ("thinking_effort", template_kwargs.get("thinking_effort")),
         )
-        supported = ", ".join(repr(tier) for tier in KIMI_K3_THINKING_EFFORTS)
         for field, value in candidates:
             if value is None:
                 continue
-            if value == "none":
-                # Generically this disables thinking, which K3 has no way to do.
-                return (
-                    f"Kimi K3 always reasons and cannot disable thinking; "
-                    f"{field}='none' is not supported. Omit the field to use "
-                    f"the default, or pass one of {supported}."
-                )
             if value not in KIMI_K3_THINKING_EFFORTS:
                 return (
                     f"Kimi K3 does not support {field}={value!r}; "

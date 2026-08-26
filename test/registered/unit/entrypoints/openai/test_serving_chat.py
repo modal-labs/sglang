@@ -589,46 +589,35 @@ class ServingChatTestCase(unittest.TestCase):
             "messages": [{"role": "user", "content": "Answer."}],
         }
 
-        for thinking in (False, True):
-            thinking_config = {"type": "enabled" if thinking else "disabled"}
-            omitted = ChatCompletionRequest(**base, thinking=thinking_config)
-            with self.subTest(thinking=thinking, case="omitted"):
-                self.assertIsNone(self.chat._validate_request(omitted))
+        omitted = ChatCompletionRequest(**base, thinking={"type": "enabled"})
+        self.assertIsNone(self.chat._validate_request(omitted))
 
-        for thinking, field, value in (
-            (True, "temperature", 0.0),
-            (True, "temperature", 0.6),
-            (True, "temperature", 1.0),
-            (True, "top_p", 0.95),
-            (True, "top_p", 1.0),
-            (False, "temperature", 0.0),
-            (False, "temperature", 0.6),
-            (False, "temperature", 1.0),
-            (False, "top_p", 0.95),
-            (False, "top_p", 1.0),
+        for field, value in (
+            ("temperature", 0.0),
+            ("temperature", 0.6),
+            ("temperature", 1.0),
+            ("top_p", 0.95),
+            ("top_p", 1.0),
         ):
             request = ChatCompletionRequest(
                 **base,
-                thinking={"type": "enabled" if thinking else "disabled"},
+                thinking={"type": "enabled"},
                 **{field: value},
             )
-            with self.subTest(thinking=thinking, field=field, value=value):
+            with self.subTest(field=field, value=value):
                 self.assertIsNone(self.chat._validate_request(request))
 
-        for thinking, field, value in (
-            (True, "temperature", -0.1),
-            (True, "temperature", 1.1),
-            (True, "top_p", 0.8),
-            (False, "temperature", -0.1),
-            (False, "temperature", 1.1),
-            (False, "top_p", 0.8),
+        for field, value in (
+            ("temperature", -0.1),
+            ("temperature", 1.1),
+            ("top_p", 0.8),
         ):
             request = ChatCompletionRequest(
                 **base,
-                thinking={"type": "enabled" if thinking else "disabled"},
+                thinking={"type": "enabled"},
                 **{field: value},
             )
-            with self.subTest(thinking=thinking, field=field, value=value):
+            with self.subTest(field=field, value=value):
                 self.assertIn(field, self.chat._validate_request(request))
 
         for field, value in (
@@ -687,13 +676,20 @@ class ServingChatTestCase(unittest.TestCase):
                     )
                 )
 
-        # "none" generically disables thinking; K3 always reasons.
-        self.assertIn(
-            "cannot disable thinking",
-            self.chat._validate_request(
-                ChatCompletionRequest(**base, reasoning_effort="none")
-            ),
-        )
+        # Every spelling that turns thinking off; K3 always reasons.
+        for disabling in (
+            {"reasoning_effort": "none"},
+            {"thinking": {"type": "disabled"}},
+            {"chat_template_kwargs": {"thinking": False}},
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        ):
+            with self.subTest(**disabling):
+                self.assertIn(
+                    "cannot disable thinking",
+                    self.chat._validate_request(
+                        ChatCompletionRequest(**base, **disabling)
+                    ),
+                )
 
         for effort in ("medium", "minimal", "xhigh", 0.5):
             with self.subTest(effort=effort, supported=False):
@@ -730,13 +726,16 @@ class ServingChatTestCase(unittest.TestCase):
             "model": "x",
             "messages": [{"role": "user", "content": "Answer."}],
         }
-        for kwargs, expected_error in (
-            ({"thinking": False, "preserve_thinking": True}, "preserve_thinking"),
-            ({"thinking": False, "thinking_effort": "max"}, "thinking_effort"),
+        for kwargs in (
+            {"thinking": False},
+            {"thinking": False, "preserve_thinking": True},
+            {"thinking": False, "thinking_effort": "max"},
         ):
             request = ChatCompletionRequest(**base, chat_template_kwargs=kwargs)
             with self.subTest(kwargs=kwargs):
-                self.assertIn(expected_error, self.chat._validate_request(request))
+                self.assertIn(
+                    "cannot disable thinking", self.chat._validate_request(request)
+                )
 
     def test_kimi_k3_accepts_draft7_tool_schema_id_fragments(self):
         self.chat.chat_encoding_spec = "kimi_k3"
