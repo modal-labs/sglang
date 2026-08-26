@@ -671,6 +671,50 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertEqual(top_p_for(ChatCompletionRequest(**base), None, {}), 1.0)
 
+    def test_kimi_k3_rejects_unsupported_reasoning_effort(self):
+        base = {
+            "model": "x",
+            "messages": [{"role": "user", "content": "Answer."}],
+        }
+
+        self.chat.chat_encoding_spec = "kimi_k3"
+        for effort in ("low", "high", "max", "none", None):
+            with self.subTest(effort=effort, supported=True):
+                self.assertIsNone(
+                    self.chat._validate_request(
+                        ChatCompletionRequest(**base, reasoning_effort=effort)
+                    )
+                )
+
+        for effort in ("medium", "minimal", "xhigh", 0.5):
+            with self.subTest(effort=effort, supported=False):
+                error = self.chat._validate_request(
+                    ChatCompletionRequest(**base, reasoning_effort=effort)
+                )
+                self.assertIn("reasoning_effort", error)
+                self.assertIn(repr(effort), error)
+
+        # chat_template_kwargs bypasses reasoning_effort; both spellings reach
+        # the encoder, which asserts rather than degrading gracefully.
+        for kwargs in (
+            {"thinking": True, "reasoning_effort": "medium"},
+            {"thinking": True, "thinking_effort": "medium"},
+        ):
+            with self.subTest(chat_template_kwargs=kwargs):
+                self.assertIn(
+                    "medium",
+                    self.chat._validate_request(
+                        ChatCompletionRequest(**base, chat_template_kwargs=kwargs)
+                    ),
+                )
+
+        self.chat.chat_encoding_spec = None
+        self.assertIsNone(
+            self.chat._validate_request(
+                ChatCompletionRequest(**base, reasoning_effort="medium")
+            )
+        )
+
     def test_kimi_k3_rejects_disabled_thinking_controls(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         base = {

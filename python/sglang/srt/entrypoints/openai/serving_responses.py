@@ -11,7 +11,15 @@ import re
 import time
 from contextlib import AsyncExitStack
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Iterator,
+    Optional,
+    Union,
+)
 
 import jinja2
 import openai.types.responses as openai_responses_types
@@ -571,7 +579,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
-            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
+            reasoning_effort=self._requested_reasoning_effort(request),
             chat_template_kwargs=request.chat_template_kwargs,
         )
 
@@ -725,6 +733,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.response_store[response.id] = response
 
         return response
+
+    def _requested_reasoning_effort(self, request: ResponsesRequest) -> Optional[Any]:
+        """The effort the client actually asked for.
+
+        ``ResponseReasoningParam.effort`` defaults to ``"medium"``, so a client
+        that sends ``reasoning`` for its summary alone is indistinguishable
+        downstream from one that explicitly asked for a tier K3 does not
+        implement. Drop the unset default so only a deliberate choice is
+        forwarded -- and rejected.
+        """
+        reasoning = request.reasoning
+        if reasoning is None:
+            return None
+        if (
+            self.chat_encoding_spec == "kimi_k3"
+            and "effort" not in reasoning.model_fields_set
+        ):
+            return None
+        return reasoning.effort
 
     @staticmethod
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
@@ -1216,7 +1243,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             }
         if msg_type in ("function_call_output", "custom_tool_call_output"):
             output = message.get("output", "")
-            if isinstance(output, list):
+            # ``ResponseCustomToolCallOutputParam.output`` is typed ``Iterable``,
+            # so pydantic hands back a lazy ``ValidatorIterator`` rather than the
+            # ``list`` that ``function_call_output``'s ``List`` type produces.
+            # Iterating anything iterable instead would shred strings and models.
+            if isinstance(output, (list, tuple, Iterator)):
                 # Preserve multimodal tool results as content parts; flattening
                 # to text silently discards images returned by tools.
                 output = [
@@ -1269,6 +1300,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
         if msg_type == "reasoning":
+
             def _collect(parts):
                 out: list[str] = []
                 for entry in parts or []:
@@ -2403,11 +2435,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="function_call",
                 id=state["item_id"],
                 status="completed",
-                **(
-                    {"namespace": state["namespace"]}
-                    if state.get("namespace")
-                    else {}
-                ),
+                **({"namespace": state["namespace"]} if state.get("namespace") else {}),
             )
             events = [
                 _send_event(

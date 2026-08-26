@@ -94,6 +94,10 @@ logger = logging.getLogger(__name__)
 # back to the OpenAI default of 1.0 and sample off-contract.
 KIMI_K3_DEFAULT_TOP_P = 0.95
 
+# encoding_k3 asserts on anything outside this set; "none" is handled at the
+# protocol level by disabling thinking instead of picking a tier.
+KIMI_K3_THINKING_EFFORTS = ("low", "high", "max")
+
 
 def dump_kimi_k3_template_value(value: Any) -> Any:
     """Serialize a K3 template value without materializing omitted defaults."""
@@ -681,6 +685,9 @@ class OpenAIServingChat(OpenAIServingBase):
             validation_error = self._validate_kimi_k3_sampling_params(request)
             if validation_error:
                 return validation_error
+            validation_error = self._validate_kimi_k3_reasoning_effort(request)
+            if validation_error:
+                return validation_error
 
         all_tools = self._collect_tools(request) or []
 
@@ -762,6 +769,35 @@ class OpenAIServingChat(OpenAIServingBase):
             return "Kimi K3 frequency_penalty must be 0."
         if request.n != 1:
             return "Kimi K3 n must be 1."
+        return None
+
+    def _validate_kimi_k3_reasoning_effort(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        """Reject effort tiers K3 cannot honor instead of silently dropping them.
+
+        The OpenAI schema accepts seven tiers plus floats, but K3 implements
+        three. Forwarding an unsupported tier makes the encoder raise, so it
+        used to be dropped with a warning and the request answered at the
+        encoder default -- a 200 that quietly ignores what the caller asked for.
+        """
+        template_kwargs = request.chat_template_kwargs or {}
+        # chat_template_kwargs.reasoning_effort is promoted onto the request
+        # later, in _convert_to_internal_request.
+        candidates = (
+            ("reasoning_effort", template_kwargs.get("reasoning_effort")),
+            ("reasoning_effort", request.reasoning_effort),
+            ("thinking_effort", template_kwargs.get("thinking_effort")),
+        )
+        supported = ", ".join(repr(tier) for tier in KIMI_K3_THINKING_EFFORTS)
+        for field, value in candidates:
+            if value is None or value == "none":
+                continue
+            if value not in KIMI_K3_THINKING_EFFORTS:
+                return (
+                    f"Kimi K3 does not support {field}={value!r}; "
+                    f"supported values are {supported}."
+                )
         return None
 
     def _validate_tool_schema(self, schema: object) -> None:
@@ -1126,21 +1162,14 @@ class OpenAIServingChat(OpenAIServingBase):
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
             template_kwargs["image_prompts"] = ["<|media_pad|>"] * len(image_data)
-            # encoding_k3 accepts thinking_effort in {low, high, max} and
-            # asserts on anything else; "none" is handled at the protocol
-            # level by disabling thinking.
+            # "none" is handled at the protocol level by disabling thinking;
+            # unsupported tiers are rejected by _validate_kimi_k3_reasoning_effort
+            # before reaching here.
             if (
-                request.reasoning_effort is not None
+                request.reasoning_effort in KIMI_K3_THINKING_EFFORTS
                 and "thinking_effort" not in template_kwargs
             ):
-                if request.reasoning_effort in ("low", "high", "max"):
-                    template_kwargs["thinking_effort"] = request.reasoning_effort
-                elif request.reasoning_effort != "none":
-                    logger.warning(
-                        "Kimi K3 supports thinking_effort low/high/max; ignoring "
-                        "reasoning_effort=%r.",
-                        request.reasoning_effort,
-                    )
+                template_kwargs["thinking_effort"] = request.reasoning_effort
 
             forced_tool_choice = request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice

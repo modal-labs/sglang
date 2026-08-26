@@ -9,6 +9,7 @@ of silently dropping them (issues #33867 / #34927).
 """
 
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
@@ -135,13 +136,36 @@ class TestAgentMessage(CustomTestCase):
             }
         )
         self.assertNotIn(blob, message["content"])
-        self.assertIn("[encrypted agent message content unavailable]", message["content"])
+        self.assertIn(
+            "[encrypted agent message content unavailable]", message["content"]
+        )
 
     def test_empty_agent_message_drops(self):
         message = OpenAIServingResponses._normalize_response_message_for_chat(
             {"type": "agent_message", "author": "/root/agent_a", "content": []}
         )
         self.assertIsNone(message)
+
+
+class TestReasoningEffortForwarding(CustomTestCase):
+    """``reasoning.effort`` defaults to "medium", which K3 cannot honor."""
+
+    @staticmethod
+    def _effort(reasoning, encoding_spec):
+        request = ResponsesRequest(model="test-model", input="hi", reasoning=reasoning)
+        return OpenAIServingResponses._requested_reasoning_effort(
+            SimpleNamespace(chat_encoding_spec=encoding_spec), request
+        )
+
+    def test_unset_effort_is_not_forwarded_for_kimi_k3(self):
+        self.assertIsNone(self._effort({"summary": "auto"}, "kimi_k3"))
+
+    def test_explicit_effort_is_forwarded_for_kimi_k3(self):
+        self.assertEqual(self._effort({"effort": "medium"}, "kimi_k3"), "medium")
+        self.assertEqual(self._effort({"effort": "high"}, "kimi_k3"), "high")
+
+    def test_other_models_keep_the_protocol_default(self):
+        self.assertEqual(self._effort({"summary": "auto"}, None), "medium")
 
 
 class TestToolOutputContentParts(CustomTestCase):
@@ -183,6 +207,38 @@ class TestToolOutputContentParts(CustomTestCase):
             self.assertEqual(parts[0], {"type": "text", "text": "screenshot:"})
             self.assertEqual(parts[1]["type"], "image_url")
             self.assertEqual(parts[1]["image_url"]["url"], data_url)
+
+    def test_iterator_shaped_custom_tool_output_is_normalized(self):
+        # ResponseCustomToolCallOutputParam.output is typed Iterable, so
+        # pydantic yields a lazy iterator rather than the list that
+        # function_call_output produces.
+        data_url = "data:image/png;base64,iVBORw0KGgo="
+        message = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": iter(
+                    [
+                        {"type": "input_text", "text": "screenshot:"},
+                        {"type": "input_image", "image_url": data_url},
+                    ]
+                ),
+            }
+        )
+        parts = message["content"]
+        self.assertIsInstance(parts, list)
+        self.assertEqual(parts[0], {"type": "text", "text": "screenshot:"})
+        self.assertEqual(parts[1]["image_url"]["url"], data_url)
+
+    def test_string_output_is_not_shredded(self):
+        message = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": "patch applied",
+            }
+        )
+        self.assertEqual(message["content"], "patch applied")
 
 
 if __name__ == "__main__":
