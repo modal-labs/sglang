@@ -678,13 +678,22 @@ class ServingChatTestCase(unittest.TestCase):
         }
 
         self.chat.chat_encoding_spec = "kimi_k3"
-        for effort in ("low", "high", "max", "none", None):
+        # None is omission, which Moonshot documents as valid (defaults to max).
+        for effort in ("low", "high", "max", None):
             with self.subTest(effort=effort, supported=True):
                 self.assertIsNone(
                     self.chat._validate_request(
                         ChatCompletionRequest(**base, reasoning_effort=effort)
                     )
                 )
+
+        # "none" generically disables thinking; K3 always reasons.
+        self.assertIn(
+            "cannot disable thinking",
+            self.chat._validate_request(
+                ChatCompletionRequest(**base, reasoning_effort="none")
+            ),
+        )
 
         for effort in ("medium", "minimal", "xhigh", 0.5):
             with self.subTest(effort=effort, supported=False):

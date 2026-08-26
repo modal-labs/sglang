@@ -94,8 +94,9 @@ logger = logging.getLogger(__name__)
 # back to the OpenAI default of 1.0 and sample off-contract.
 KIMI_K3_DEFAULT_TOP_P = 0.95
 
-# encoding_k3 asserts on anything outside this set; "none" is handled at the
-# protocol level by disabling thinking instead of picking a tier.
+# The only tiers Moonshot documents, and the only ones encoding_k3 accepts.
+# "none" is absent deliberately: K3 always reasons, so there is no tier that
+# turns thinking off.
 KIMI_K3_THINKING_EFFORTS = ("low", "high", "max")
 
 
@@ -780,6 +781,9 @@ class OpenAIServingChat(OpenAIServingBase):
         three. Forwarding an unsupported tier makes the encoder raise, so it
         used to be dropped with a warning and the request answered at the
         encoder default -- a 200 that quietly ignores what the caller asked for.
+
+        Omitting the field stays valid; Moonshot documents it as optional and
+        defaulting to "max".
         """
         template_kwargs = request.chat_template_kwargs or {}
         # chat_template_kwargs.reasoning_effort is promoted onto the request
@@ -791,8 +795,15 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         supported = ", ".join(repr(tier) for tier in KIMI_K3_THINKING_EFFORTS)
         for field, value in candidates:
-            if value is None or value == "none":
+            if value is None:
                 continue
+            if value == "none":
+                # Generically this disables thinking, which K3 has no way to do.
+                return (
+                    f"Kimi K3 always reasons and cannot disable thinking; "
+                    f"{field}='none' is not supported. Omit the field to use "
+                    f"the default, or pass one of {supported}."
+                )
             if value not in KIMI_K3_THINKING_EFFORTS:
                 return (
                     f"Kimi K3 does not support {field}={value!r}; "
@@ -1162,9 +1173,8 @@ class OpenAIServingChat(OpenAIServingBase):
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
             template_kwargs["image_prompts"] = ["<|media_pad|>"] * len(image_data)
-            # "none" is handled at the protocol level by disabling thinking;
-            # unsupported tiers are rejected by _validate_kimi_k3_reasoning_effort
-            # before reaching here.
+            # Unsupported tiers, including "none", are rejected by
+            # _validate_kimi_k3_reasoning_effort before reaching here.
             if (
                 request.reasoning_effort in KIMI_K3_THINKING_EFFORTS
                 and "thinking_effort" not in template_kwargs
