@@ -171,6 +171,32 @@ class TestReasoningEffortForwarding(CustomTestCase):
     def test_other_models_keep_the_protocol_default(self):
         self.assertEqual(self._effort({"summary": "auto"}, None), "medium")
 
+    @staticmethod
+    def _chat_inputs(encoding_spec, **kwargs):
+        request = ResponsesRequest(model="test-model", input="hi", **kwargs)
+        serving = SimpleNamespace(chat_encoding_spec=encoding_spec)
+        serving._requested_reasoning_effort = (
+            lambda req: OpenAIServingResponses._requested_reasoning_effort(serving, req)
+        )
+        return OpenAIServingResponses._chat_reasoning_inputs(serving, request)
+
+    def test_template_kwargs_effort_is_promoted_onto_the_request(self):
+        # _convert_to_internal_request does the promotion on the chat path only.
+        effort, template_kwargs = self._chat_inputs(
+            "kimi_k3", chat_template_kwargs={"reasoning_effort": "high"}
+        )
+        self.assertEqual(effort, "high")
+        self.assertIsNone(template_kwargs)
+
+    def test_other_template_kwargs_are_left_alone(self):
+        effort, template_kwargs = self._chat_inputs(
+            "kimi_k3",
+            reasoning={"effort": "low"},
+            chat_template_kwargs={"thinking_effort": "high"},
+        )
+        self.assertEqual(effort, "low")
+        self.assertEqual(template_kwargs, {"thinking_effort": "high"})
+
     def test_explicit_unsupported_effort_is_rejected(self):
         # /v1/responses skips OpenAIServingBase.handle_request, so an explicit
         # tier only 400s because _make_request validates the derived request.

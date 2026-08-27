@@ -566,6 +566,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        effort, template_kwargs = self._chat_reasoning_inputs(request)
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -580,8 +581,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
-            reasoning_effort=self._requested_reasoning_effort(request),
-            chat_template_kwargs=request.chat_template_kwargs,
+            reasoning_effort=effort,
+            chat_template_kwargs=template_kwargs,
         )
 
         # /v1/responses does not run OpenAIServingBase.handle_request, so the
@@ -758,6 +759,21 @@ class OpenAIServingResponses(OpenAIServingChat):
         ):
             return None
         return reasoning.effort
+
+    def _chat_reasoning_inputs(
+        self, request: ResponsesRequest
+    ) -> tuple[Optional[Any], Optional[dict]]:
+        """The effort and template kwargs for the derived chat request.
+
+        ``chat_template_kwargs.reasoning_effort`` is promoted onto the request
+        in ``_convert_to_internal_request``, which the Responses path skips, so
+        the raw key would otherwise reach ``apply_chat_template`` unmapped.
+        """
+        template_kwargs = dict(request.chat_template_kwargs or {})
+        effort = template_kwargs.pop("reasoning_effort", None)
+        if effort is None:
+            effort = self._requested_reasoning_effort(request)
+        return effort, template_kwargs or None
 
     @staticmethod
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
