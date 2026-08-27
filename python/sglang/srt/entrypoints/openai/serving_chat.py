@@ -797,6 +797,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
         return None
 
+    def _apply_kimi_k3_top_p_default(
+        self, sampling_params: Dict[str, Any], requested_top_p: Optional[float]
+    ) -> None:
+        """Supply Moonshot's fixed top_p when nothing else does."""
+        if (
+            self.chat_encoding_spec == "kimi_k3"
+            and requested_top_p is None
+            and "top_p" not in self.default_sampling_params
+        ):
+            sampling_params["top_p"] = KIMI_K3_DEFAULT_TOP_P
+
     def _validate_tool_schema(self, schema: object) -> None:
         """Validate K3 tool schemas without rejecting legacy Draft 7 IDs."""
         if self.chat_encoding_spec != "kimi_k3":
@@ -861,12 +872,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
-        if (
-            self.chat_encoding_spec == "kimi_k3"
-            and request.top_p is None
-            and "top_p" not in self.default_sampling_params
-        ):
-            sampling_params["top_p"] = KIMI_K3_DEFAULT_TOP_P
+        self._apply_kimi_k3_top_p_default(sampling_params, request.top_p)
 
         # Handle single vs multiple requests
         if request.input_ids is not None:

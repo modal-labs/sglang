@@ -11,7 +11,11 @@ of silently dropping them (issues #33867 / #34927).
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ResponsesRequest,
+)
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -166,6 +170,46 @@ class TestReasoningEffortForwarding(CustomTestCase):
 
     def test_other_models_keep_the_protocol_default(self):
         self.assertEqual(self._effort({"summary": "auto"}, None), "medium")
+
+    def test_explicit_unsupported_effort_is_rejected(self):
+        # /v1/responses skips OpenAIServingBase.handle_request, so an explicit
+        # tier only 400s because _make_request validates the derived request.
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort=self._effort({"effort": "medium"}, "kimi_k3"),
+        )
+        error = OpenAIServingChat._validate_kimi_k3_reasoning_effort(
+            SimpleNamespace(), chat_request
+        )
+        self.assertIn("'medium'", error)
+
+
+class TestKimiK3TopPDefault(CustomTestCase):
+    @staticmethod
+    def _top_p(encoding_spec, requested_top_p, default_sampling_params, current=1.0):
+        sampling_params = {"top_p": current}
+        OpenAIServingChat._apply_kimi_k3_top_p_default(
+            SimpleNamespace(
+                chat_encoding_spec=encoding_spec,
+                default_sampling_params=default_sampling_params,
+            ),
+            sampling_params,
+            requested_top_p,
+        )
+        return sampling_params["top_p"]
+
+    def test_omitted_top_p_falls_back_to_moonshot_default(self):
+        self.assertEqual(self._top_p("kimi_k3", None, {}), 0.95)
+
+    def test_request_and_checkpoint_values_win(self):
+        self.assertEqual(self._top_p("kimi_k3", 1.0, {}), 1.0)
+        self.assertEqual(
+            self._top_p("kimi_k3", None, {"top_p": 0.99}, current=0.99), 0.99
+        )
+
+    def test_other_models_are_untouched(self):
+        self.assertEqual(self._top_p(None, None, {}), 1.0)
 
 
 class TestToolOutputContentParts(CustomTestCase):

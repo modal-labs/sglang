@@ -392,6 +392,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    self._apply_kimi_k3_top_p_default(sampling_params, request.top_p)
 
                     if (
                         processed_messages is not None
@@ -582,6 +583,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_effort=self._requested_reasoning_effort(request),
             chat_template_kwargs=request.chat_template_kwargs,
         )
+
+        # /v1/responses does not run OpenAIServingBase.handle_request, so the
+        # chat-side effort validation only fires if invoked here.
+        if self.chat_encoding_spec == "kimi_k3":
+            validation_error = self._validate_kimi_k3_reasoning_effort(chat_request)
+            if validation_error:
+                raise ValueError(validation_error)
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
