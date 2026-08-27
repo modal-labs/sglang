@@ -392,7 +392,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
-                    self._apply_kimi_k3_top_p_default(sampling_params, request.top_p)
+                    self._apply_kimi_k3_sampling_defaults(
+                        sampling_params, request.top_p, request.temperature
+                    )
 
                     if (
                         processed_messages is not None
@@ -586,9 +588,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         # /v1/responses does not run OpenAIServingBase.handle_request, so the
-        # chat-side effort validation only fires if invoked here.
+        # chat-side K3 validation only fires if invoked here.
         if self.chat_encoding_spec == "kimi_k3":
-            validation_error = self._validate_kimi_k3_reasoning_effort(chat_request)
+            validation_error = self._validate_kimi_k3_reasoning_effort(
+                chat_request
+            ) or self._validate_kimi_k3_sampling_envelope(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                n=1,
+            )
             if validation_error:
                 raise ValueError(validation_error)
 

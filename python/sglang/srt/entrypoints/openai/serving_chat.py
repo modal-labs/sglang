@@ -89,9 +89,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Moonshot fixes top_p at 0.95, and the checkpoint's generation_config.json
-# carries no sampling fields to supply it.
+# Moonshot fixes top_p at 0.95 and temperature at 1.0, and the checkpoint's
+# generation_config.json carries no sampling fields to supply them.
 KIMI_K3_DEFAULT_TOP_P = 0.95
+KIMI_K3_DEFAULT_TEMPERATURE = 1.0
 
 # The tiers encoding_k3 accepts. K3 always reasons, so there is no "none".
 KIMI_K3_THINKING_EFFORTS = ("low", "high", "max")
@@ -746,15 +747,32 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest
     ) -> Optional[str]:
         """Validate the K3 sampling envelope used by target-only verification."""
-        if request.temperature is not None and not (0.0 <= request.temperature <= 1.0):
+        return self._validate_kimi_k3_sampling_envelope(
+            temperature=request.temperature,
+            top_p=request.top_p,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            n=request.n,
+        )
+
+    def _validate_kimi_k3_sampling_envelope(
+        self,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        presence_penalty: float,
+        frequency_penalty: float,
+        n: int,
+    ) -> Optional[str]:
+        """Validate the K3 sampling envelope for either OpenAI surface."""
+        if temperature is not None and not (0.0 <= temperature <= 1.0):
             return "Kimi K3 temperature must be within [0.0, 1.0]."
-        if request.top_p is not None and not (0.95 <= request.top_p <= 1.0):
+        if top_p is not None and not (0.95 <= top_p <= 1.0):
             return "Kimi K3 top_p must be within [0.95, 1.0]."
-        if request.presence_penalty != 0:
+        if presence_penalty != 0:
             return "Kimi K3 presence_penalty must be 0."
-        if request.frequency_penalty != 0:
+        if frequency_penalty != 0:
             return "Kimi K3 frequency_penalty must be 0."
-        if request.n != 1:
+        if n != 1:
             return "Kimi K3 n must be 1."
         return None
 
@@ -797,16 +815,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
         return None
 
-    def _apply_kimi_k3_top_p_default(
-        self, sampling_params: Dict[str, Any], requested_top_p: Optional[float]
+    def _apply_kimi_k3_sampling_defaults(
+        self,
+        sampling_params: Dict[str, Any],
+        requested_top_p: Optional[float],
+        requested_temperature: Optional[float],
     ) -> None:
-        """Supply Moonshot's fixed top_p when nothing else does."""
-        if (
-            self.chat_encoding_spec == "kimi_k3"
-            and requested_top_p is None
-            and "top_p" not in self.default_sampling_params
-        ):
+        """Supply Moonshot's fixed sampling values when nothing else does."""
+        if self.chat_encoding_spec != "kimi_k3":
+            return
+        if requested_top_p is None and "top_p" not in self.default_sampling_params:
             sampling_params["top_p"] = KIMI_K3_DEFAULT_TOP_P
+        if (
+            requested_temperature is None
+            and "temperature" not in self.default_sampling_params
+        ):
+            sampling_params["temperature"] = KIMI_K3_DEFAULT_TEMPERATURE
 
     def _validate_tool_schema(self, schema: object) -> None:
         """Validate K3 tool schemas without rejecting legacy Draft 7 IDs."""
@@ -872,7 +896,9 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
-        self._apply_kimi_k3_top_p_default(sampling_params, request.top_p)
+        self._apply_kimi_k3_sampling_defaults(
+            sampling_params, request.top_p, request.temperature
+        )
 
         # Handle single vs multiple requests
         if request.input_ids is not None:

@@ -211,31 +211,55 @@ class TestReasoningEffortForwarding(CustomTestCase):
         self.assertIn("'medium'", error)
 
 
-class TestKimiK3TopPDefault(CustomTestCase):
+class TestKimiK3SamplingDefaults(CustomTestCase):
     @staticmethod
-    def _top_p(encoding_spec, requested_top_p, default_sampling_params, current=1.0):
-        sampling_params = {"top_p": current}
-        OpenAIServingChat._apply_kimi_k3_top_p_default(
+    def _params(
+        encoding_spec,
+        requested_top_p=None,
+        requested_temperature=None,
+        default_sampling_params=None,
+        current=None,
+    ):
+        sampling_params = dict(current or {"top_p": 1.0, "temperature": 0.7})
+        OpenAIServingChat._apply_kimi_k3_sampling_defaults(
             SimpleNamespace(
                 chat_encoding_spec=encoding_spec,
-                default_sampling_params=default_sampling_params,
+                default_sampling_params=default_sampling_params or {},
             ),
             sampling_params,
             requested_top_p,
+            requested_temperature,
         )
-        return sampling_params["top_p"]
+        return sampling_params
 
-    def test_omitted_top_p_falls_back_to_moonshot_default(self):
-        self.assertEqual(self._top_p("kimi_k3", None, {}), 0.95)
+    def test_omitted_values_fall_back_to_moonshot_defaults(self):
+        params = self._params("kimi_k3")
+        self.assertEqual(params["top_p"], 0.95)
+        self.assertEqual(params["temperature"], 1.0)
 
-    def test_request_and_checkpoint_values_win(self):
-        self.assertEqual(self._top_p("kimi_k3", 1.0, {}), 1.0)
-        self.assertEqual(
-            self._top_p("kimi_k3", None, {"top_p": 0.99}, current=0.99), 0.99
+    def test_request_values_win(self):
+        params = self._params(
+            "kimi_k3",
+            requested_top_p=1.0,
+            requested_temperature=0.5,
+            current={"top_p": 1.0, "temperature": 0.5},
         )
+        self.assertEqual(params["top_p"], 1.0)
+        self.assertEqual(params["temperature"], 0.5)
+
+    def test_checkpoint_values_win(self):
+        params = self._params(
+            "kimi_k3",
+            default_sampling_params={"top_p": 0.99, "temperature": 0.8},
+            current={"top_p": 0.99, "temperature": 0.8},
+        )
+        self.assertEqual(params["top_p"], 0.99)
+        self.assertEqual(params["temperature"], 0.8)
 
     def test_other_models_are_untouched(self):
-        self.assertEqual(self._top_p(None, None, {}), 1.0)
+        params = self._params(None)
+        self.assertEqual(params["top_p"], 1.0)
+        self.assertEqual(params["temperature"], 0.7)
 
 
 class TestToolOutputContentParts(CustomTestCase):
