@@ -89,14 +89,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Moonshot's K3 API fixes top_p at 0.95. The checkpoint ships no sampling fields
-# in generation_config.json, so a request that omits top_p would otherwise fall
-# back to the OpenAI default of 1.0 and sample off-contract.
+# Moonshot fixes top_p at 0.95, and the checkpoint's generation_config.json
+# carries no sampling fields to supply it.
 KIMI_K3_DEFAULT_TOP_P = 0.95
 
-# The only tiers Moonshot documents, and the only ones encoding_k3 accepts.
-# "none" is absent deliberately: K3 always reasons, so there is no tier that
-# turns thinking off.
+# The tiers encoding_k3 accepts. K3 always reasons, so there is no "none".
 KIMI_K3_THINKING_EFFORTS = ("low", "high", "max")
 
 
@@ -748,11 +745,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _validate_kimi_k3_sampling_params(
         self, request: ChatCompletionRequest
     ) -> Optional[str]:
-        """Validate the K3 sampling envelope used by target-only verification.
-
-        Requests that disable thinking never reach here; they are rejected by
-        ``_validate_kimi_k3_reasoning_effort``.
-        """
+        """Validate the K3 sampling envelope used by target-only verification."""
         if request.temperature is not None and not (0.0 <= request.temperature <= 1.0):
             return "Kimi K3 temperature must be within [0.0, 1.0]."
         if request.top_p is not None and not (0.95 <= request.top_p <= 1.0):
@@ -770,20 +763,14 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Optional[str]:
         """Reject effort tiers K3 cannot honor instead of silently dropping them.
 
-        The OpenAI schema accepts seven tiers plus floats, but K3 implements
-        three. Forwarding an unsupported tier makes the encoder raise, so it
-        used to be dropped with a warning and the request answered at the
-        encoder default -- a 200 that quietly ignores what the caller asked for.
-
         Omitting the field stays valid; Moonshot documents it as optional and
         defaulting to "max".
         """
         template_kwargs = request.chat_template_kwargs or {}
         supported = ", ".join(repr(tier) for tier in KIMI_K3_THINKING_EFFORTS)
 
-        # Every disable spelling converges here: ``thinking={"type":"disabled"}``
-        # and ``reasoning_effort="none"`` are both normalized into these keys by
-        # ChatCompletionRequest.normalize_reasoning_inputs.
+        # normalize_reasoning_inputs funnels every disable spelling into these
+        # keys, including thinking={"type":"disabled"} and reasoning_effort="none".
         if False in (
             template_kwargs.get("thinking"),
             template_kwargs.get("enable_thinking"),

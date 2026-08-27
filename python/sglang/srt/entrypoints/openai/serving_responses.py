@@ -738,10 +738,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         """The effort the client actually asked for.
 
         ``ResponseReasoningParam.effort`` defaults to ``"medium"``, so a client
-        that sends ``reasoning`` for its summary alone is indistinguishable
-        downstream from one that explicitly asked for a tier K3 does not
-        implement. Drop the unset default so only a deliberate choice is
-        forwarded -- and rejected.
+        that sends ``reasoning`` for its summary alone would otherwise look like
+        one explicitly asking for a tier K3 does not implement.
         """
         reasoning = request.reasoning
         if reasoning is None:
@@ -1243,10 +1241,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             }
         if msg_type in ("function_call_output", "custom_tool_call_output"):
             output = message.get("output", "")
-            # ``ResponseCustomToolCallOutputParam.output`` is typed ``Iterable``,
-            # so pydantic hands back a lazy ``ValidatorIterator`` rather than the
-            # ``list`` that ``function_call_output``'s ``List`` type produces.
-            # Iterating anything iterable instead would shred strings and models.
+            # custom_tool_call_output's ``output`` is typed ``Iterable``, so
+            # pydantic yields a lazy ``ValidatorIterator`` rather than a list.
             if isinstance(output, (list, tuple, Iterator)):
                 # Preserve multimodal tool results as content parts; flattening
                 # to text silently discards images returned by tools.

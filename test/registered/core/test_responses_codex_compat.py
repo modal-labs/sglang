@@ -210,21 +210,30 @@ class TestToolOutputContentParts(CustomTestCase):
 
     def test_iterator_shaped_custom_tool_output_is_normalized(self):
         # ResponseCustomToolCallOutputParam.output is typed Iterable, so
-        # pydantic yields a lazy iterator rather than the list that
-        # function_call_output produces.
+        # pydantic yields a lazy ValidatorIterator rather than the list that
+        # function_call_output produces. Round-trip through ResponsesRequest so
+        # the real pydantic type is exercised, not a stand-in.
         data_url = "data:image/png;base64,iVBORw0KGgo="
-        message = OpenAIServingResponses._normalize_response_message_for_chat(
-            {
-                "type": "custom_tool_call_output",
-                "call_id": "call_1",
-                "output": iter(
-                    [
+        request = ResponsesRequest(
+            model="test-model",
+            input=[
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": [
                         {"type": "input_text", "text": "screenshot:"},
-                        {"type": "input_image", "image_url": data_url},
-                    ]
-                ),
-            }
+                        {
+                            "type": "input_image",
+                            "image_url": data_url,
+                            "detail": "auto",
+                        },
+                    ],
+                }
+            ],
         )
+        item = request.input[0]
+        self.assertNotIsInstance(item["output"], list)
+        message = OpenAIServingResponses._normalize_response_message_for_chat(item)
         parts = message["content"]
         self.assertIsInstance(parts, list)
         self.assertEqual(parts[0], {"type": "text", "text": "screenshot:"})
