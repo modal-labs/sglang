@@ -210,6 +210,25 @@ class TestReasoningEffortForwarding(CustomTestCase):
         )
         self.assertIn("'medium'", error)
 
+    def test_server_default_template_kwargs_are_validated(self):
+        # default_chat_template_kwargs merge in _process_messages, after
+        # _validate_request has already run.
+        serving = SimpleNamespace(
+            chat_encoding_spec="kimi_k3",
+            default_chat_template_kwargs={"thinking_effort": "medium"},
+        )
+        serving._validate_kimi_k3_reasoning_effort = (
+            lambda req: OpenAIServingChat._validate_kimi_k3_reasoning_effort(
+                serving, req
+            )
+        )
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+        with self.assertRaises(ValueError) as ctx:
+            OpenAIServingChat._process_messages(serving, request, False)
+        self.assertIn("'medium'", str(ctx.exception))
+
 
 class TestKimiK3SamplingDefaults(CustomTestCase):
     @staticmethod

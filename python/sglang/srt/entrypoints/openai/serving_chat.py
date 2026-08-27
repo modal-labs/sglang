@@ -1003,6 +1003,12 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+            # Server defaults land after _validate_request, so re-check them
+            # rather than let an unsupported tier reach the encoder assert.
+            if self.chat_encoding_spec == "kimi_k3":
+                validation_error = self._validate_kimi_k3_reasoning_effort(request)
+                if validation_error:
+                    raise ValueError(validation_error)
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
