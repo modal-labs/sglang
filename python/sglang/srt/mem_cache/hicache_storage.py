@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Set
@@ -434,6 +435,23 @@ class HiCacheFile(HiCacheStorage):
             ),
         )
 
+        # Parallel IO for batch operations. Small per-page files over latent
+        # filesystems (network FUSE, object-store mounts) are per-file
+        # round-trip bound, so reads/writes scale with concurrency until
+        # bandwidth saturates. io_threads <= 1 preserves sequential behavior.
+        io_threads_raw = None
+        if storage_config.extra_config:
+            io_threads_raw = storage_config.extra_config.get("io_threads")
+        self.io_threads = int(io_threads_raw) if io_threads_raw is not None else 32
+        self._io_pool = (
+            ThreadPoolExecutor(
+                max_workers=self.io_threads,
+                thread_name_prefix="hicache-file-io",
+            )
+            if self.io_threads > 1
+            else None
+        )
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
@@ -492,11 +510,12 @@ class HiCacheFile(HiCacheStorage):
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
+        locations = target_locations or [None] * len(keys)
+        if self._io_pool is not None and len(keys) > 1:
+            return list(self._io_pool.map(self.get, keys, locations))
         return [
             self.get(key, target_location)
-            for key, target_location in zip(
-                keys, target_locations or [None] * len(keys)
-            )
+            for key, target_location in zip(keys, locations)
         ]
 
     def set(
@@ -555,6 +574,10 @@ class HiCacheFile(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        if self._io_pool is not None and len(keys) > 1:
+            # Attempt all writes even if some fail; per-key errors are logged
+            # inside set() and False entries are reported to the caller.
+            return all(self._io_pool.map(self.set, keys, values))
         for key, value in zip(keys, values):
             if not self.set(key, value):
                 return False
