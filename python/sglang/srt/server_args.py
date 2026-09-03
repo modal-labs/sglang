@@ -1321,7 +1321,7 @@ class ServerArgs:
         (
             "Opt in to a shared early-overload gate for OpenAI generation and "
             "Anthropic Messages endpoints. When this many HTTP requests are "
-            "active in one tokenizer worker, new requests receive HTTP 429 "
+            "active in one tokenizer worker, new requests receive HTTP 503 "
             "before request parsing or scheduler enqueue. A streaming request "
             "holds its slot until its final SSE body is sent. Unset disables "
             "this HTTP admission gate."

@@ -66,7 +66,7 @@ def _overload_response(path: str) -> ORJSONResponse:
         content = {
             "type": "error",
             "error": {
-                "type": "rate_limit_error",
+                "type": "overloaded_error",
                 "message": message,
             },
         }
@@ -74,13 +74,13 @@ def _overload_response(path: str) -> ORJSONResponse:
         content = {
             "error": {
                 "message": message,
-                "type": "rate_limit_error",
+                "type": "server_error",
                 "param": None,
-                "code": "rate_limit_exceeded",
+                "code": "service_unavailable",
             }
         }
     return ORJSONResponse(
-        status_code=HTTPStatus.TOO_MANY_REQUESTS,
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
         headers={"Retry-After": "1"},
         content=content,
     )
@@ -91,7 +91,7 @@ class APIEarlyRejectMiddleware:
 
     A permit is held until the ASGI application finishes sending the response
     body. This includes the complete lifetime of an SSE stream, so an overload
-    response is a real HTTP 429 rather than an error event inside an HTTP 200
+    response is a real HTTP 503 rather than an error event inside an HTTP 200
     stream.
     """
 
