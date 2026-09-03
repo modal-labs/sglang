@@ -3553,8 +3553,7 @@ class ServerArgs:
             and self.api_early_reject_max_concurrency <= 0
         ):
             raise ValueError(
-                "--api-early-reject-max-concurrency must be positive "
-                "when configured"
+                "--api-early-reject-max-concurrency must be positive " "when configured"
             )
 
         if self.model_path.lower() in ["none", "dummy"]:
