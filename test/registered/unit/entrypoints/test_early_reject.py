@@ -126,14 +126,14 @@ async def _test_rejects_before_streaming_http_200(path):
     await app.entered.wait()
 
     rejected = await _invoke(middleware, scope)
-    assert _status(rejected) == 429
+    assert _status(rejected) == 503
     assert _headers(rejected)[b"retry-after"] == b"1"
     payload = json.loads(_body(rejected))
     if path == "/v1/messages":
         assert payload == {
             "type": "error",
             "error": {
-                "type": "rate_limit_error",
+                "type": "overloaded_error",
                 "message": (
                     "The server is at its configured concurrent request limit. "
                     "Please retry shortly."
@@ -141,7 +141,8 @@ async def _test_rejects_before_streaming_http_200(path):
             },
         }
     else:
-        assert payload["error"]["code"] == "rate_limit_exceeded"
+        assert payload["error"]["type"] == "server_error"
+        assert payload["error"]["code"] == "service_unavailable"
     assert app.calls == 1
 
     app.release.set()
@@ -164,7 +165,7 @@ async def _test_rejects_while_non_streaming_request_is_active(path):
 
     first = asyncio.create_task(_invoke(middleware, scope))
     await app.entered.wait()
-    assert _status(await _invoke(middleware, scope)) == 429
+    assert _status(await _invoke(middleware, scope)) == 503
 
     app.release.set()
     assert _status(await first) == 200
@@ -191,7 +192,7 @@ async def _test_openai_and_anthropic_share_one_budget(active_path, rejected_path
     await app.entered.wait()
 
     rejected = await _invoke(middleware, _scope(rejected_path, gate))
-    assert _status(rejected) == 429
+    assert _status(rejected) == 503
     assert app.calls == 1
 
     app.release.set()
@@ -293,7 +294,7 @@ def test_authentication_runs_before_the_saturated_gate():
             app,
             _scope("/v1/messages", gate, authorization="Bearer secret"),
         )
-        assert _status(authorized) == 429
+        assert _status(authorized) == 503
         assert gate.active_requests == 1
         await gate.release()
 
