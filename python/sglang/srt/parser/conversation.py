@@ -420,7 +420,9 @@ class Conversation:
         """Append a new message."""
         self.messages.append([role, message])
 
-    def append_image(self, image: str, detail: Literal["auto", "low", "high"]):
+    def append_image(
+        self, image: str, detail: Literal["auto", "low", "high", "original"]
+    ):
         """Append a new image."""
         self.image_data.append(ImageData(url=image, detail=detail))
 

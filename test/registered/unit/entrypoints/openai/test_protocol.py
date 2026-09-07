@@ -862,6 +862,48 @@ class TestValidationEdgeCases(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
+    def test_image_detail_accepts_openai_values(self):
+        """image_url.detail accepts every value in the OpenAI spec"""
+        for detail in ("auto", "low", "high", "original"):
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,AAAA",
+                                    "detail": detail,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            )
+            self.assertEqual(request.messages[0].content[0].image_url.detail, detail)
+
+    def test_image_detail_rejects_unknown_value(self):
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,AAAA",
+                                    "detail": "medium",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            )
+
 
 class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
