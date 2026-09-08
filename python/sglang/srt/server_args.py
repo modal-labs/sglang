@@ -858,6 +858,7 @@ class ServerArgs:
                 "priority",
                 "routing-key",
                 "openrouter_slo",
+                "hrrn",
             ],
         ),
         NS("schedule"),

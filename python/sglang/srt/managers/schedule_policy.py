@@ -149,6 +149,7 @@ class CacheAwarePolicy(Enum):
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
     OPENROUTER_SLO = "openrouter_slo"  # FCFS handicapped by uncached tokens
+    HRRN = "hrrn"  # highest response ratio next, token-based aging
 
 
 class CacheAgnosticPolicy(Enum):
@@ -182,7 +183,10 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(
-        self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
+        self,
+        waiting_queue: List[Req],
+        running_batch: Optional[ScheduleBatch] = None,
+        processed_tokens: int = 0,
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -221,6 +225,10 @@ class SchedulePolicy:
                     temporary_deprioritized,
                     get_server_args().slo_ttft_slope_ms_per_uncached_token / 1000.0,
                 )
+            elif policy == CacheAwarePolicy.HRRN:
+                SchedulePolicy._sort_by_hrrn(
+                    waiting_queue, temporary_deprioritized, processed_tokens
+                )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -242,7 +250,7 @@ class SchedulePolicy:
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
-            self.policy in (CacheAwarePolicy.LPM, CacheAwarePolicy.OPENROUTER_SLO)
+            self.policy in (CacheAwarePolicy.LPM, CacheAwarePolicy.OPENROUTER_SLO, CacheAwarePolicy.HRRN)
             and len(waiting_queue) > 128
         ):
             # Turn off the expensive prefix matching and sorting when the #queue is large.
@@ -389,6 +397,48 @@ class SchedulePolicy:
                 r.rid,
             )
         )
+
+    @staticmethod
+    def _uncached_len(r: Req) -> int:
+        """Number of tokens that must actually be prefilled for this req
+        (all cache levels — device + host via hicache — counted as cached)."""
+        return max(0, len(r.origin_input_ids) - r.num_matched_prefix_tokens)
+
+    @staticmethod
+    def _sort_by_hrrn(
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        processed_tokens: int,
+    ) -> None:
+        """Highest Response Ratio Next, with token-based aging.
+
+        Equivalence with classic HRRN when throughput is constant:
+            ratio = 1 + wait_sec / est_prefill_time
+                  = 1 + (processed_tokens - arrival_processed_tokens) / uncached
+
+        Caller (Scheduler) contract:
+          - Maintain a monotonically increasing counter of prefill tokens processed so far
+            (accumulate batch.extend_num_tokens per forward). Pass it in as `processed_tokens`.
+          - Snapshot `req.arrival_processed_tokens = counter` when the req enters waiting_queue
+            (pop_bootstrapped for disagg prefill, _add_request_to_queue for unified).
+
+        Call sites that omit `processed_tokens` (dllm, disagg decode)
+        degrade to rid-lexicographic order; those queues carry no prefill work.
+        """
+
+        def _key(r: Req):
+            rid = r.rid
+            if rid in temporary_deprioritized:
+                return (float("inf"), rid)
+            uncached = SchedulePolicy._uncached_len(r)
+            if uncached <= 0:
+                # No prefill work; drain immediately.
+                return (-float("inf"), rid)
+            waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
+            ratio_delta = waited_tokens / uncached
+            return (-ratio_delta, rid)
+
+        waiting_queue.sort(key=_key)
 
     @staticmethod
     def _sort_by_dfs_weight(
