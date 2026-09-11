@@ -387,6 +387,7 @@ class Scheduler(
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.reevaluate_batch_full = envs.SGLANG_SCHEDULER_REEVALUATE_BATCH_FULL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
@@ -3103,8 +3104,15 @@ class Scheduler(
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
+        if (
+            self.reevaluate_batch_full
+            or self.enable_priority_preemption
+            or self.is_hybrid_swa
+        ):
+            # A latched flag is otherwise only cleared when the running batch
+            # shrinks, so a rejection that no longer holds (budget moved, queue
+            # re-sorted, request aborted) stalls the queue until an unrelated
+            # finish. The pass re-derives it; PrefillAdder still enforces limits.
             running_batch.batch_is_full = False
 
         if (

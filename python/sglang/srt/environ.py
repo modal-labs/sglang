@@ -418,6 +418,9 @@ class Envs:
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
+    # Clear batch_is_full at the start of every prefill pass; 0 keeps it latched
+    # until a running request finishes.
+    SGLANG_SCHEDULER_REEVALUATE_BATCH_FULL = EnvBool(True)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
