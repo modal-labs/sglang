@@ -23,6 +23,11 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.observability.metrics_collector import (
+    SupportedKwargsFilter,
+    TokenizerMetricsCollector,
+    filter_supported_kwargs,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -107,6 +112,9 @@ class _Sim:
         self.collector = _RecordingCollector()
         self.tm = object.__new__(TokenizerManager)
         self.tm.metrics_collector = self.collector
+        self.tm._finished_request_kwargs_filter = SupportedKwargsFilter(
+            self.collector.observe_one_finished_request
+        )
         self.tm.enable_priority_scheduling = False
         self.tm.disaggregation_mode = DisaggregationMode.NULL
 
@@ -401,6 +409,108 @@ class TestDecodeThroughputFirstToken(CustomTestCase):
             self.assertAlmostEqual(
                 req.time_stats.get_decode_throughput(len(req.output_ids)), 7.0
             )
+
+
+class _FakeMetric:
+    instances = []
+
+    def __init__(self, name, documentation, labelnames, buckets=None):
+        self.name = name
+        self.labelnames = list(labelnames)
+        self.observed = []
+        _FakeMetric.instances.append(self)
+
+    def labels(self, **kwargs):
+        assert set(kwargs) == set(self.labelnames), (self.name, kwargs)
+        self._last = kwargs
+        return self
+
+    def observe(self, v):
+        self.observed.append((self._last, v))
+
+    def inc(self, *a):
+        pass
+
+
+class _Collector(TokenizerMetricsCollector):
+    _counter_cls = _FakeMetric
+    _histogram_cls = _FakeMetric
+
+
+class TestTokenizerCollectorCompat(CustomTestCase):
+    """Custom-collector API compatibility and reserved-label protection."""
+
+    def setUp(self):
+        _FakeMetric.instances = []
+        self.server_args = SimpleNamespace(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        )
+
+    def test_reserved_is_streaming_label_rejected_at_construction(self):
+        with self.assertRaisesRegex(ValueError, "is_streaming"):
+            _Collector(
+                server_args=self.server_args,
+                labels={"model_name": "m", "is_streaming": "x"},
+            )
+
+    def test_builtin_collector_gets_decode_throughput_labels(self):
+        c = _Collector(server_args=self.server_args, labels={"model_name": "m"})
+        self.assertEqual(
+            c.histogram_decode_throughput.labelnames, ["model_name", "is_streaming"]
+        )
+        c.observe_one_finished_request(
+            {"model_name": "m"},
+            3,
+            5,
+            0,
+            1.0,
+            False,
+            is_streaming=True,
+            decode_throughput=42.0,
+        )
+        self.assertEqual(
+            c.histogram_decode_throughput.observed,
+            [({"model_name": "m", "is_streaming": "true"}, 42.0)],
+        )
+
+    def test_old_collector_signature_is_tolerated(self):
+        class Old(_Collector):
+            def __init__(self, server_args=None, labels=None):
+                super().__init__(server_args=server_args, labels=labels)
+                self.seen = []
+
+            def observe_one_finished_request(
+                self,
+                labels,
+                prompt_tokens,
+                generation_tokens,
+                cached_tokens,
+                e2e_latency,
+                has_grammar,
+                cached_tokens_details=None,
+            ):
+                self.seen.append((labels, generation_tokens))
+
+        kwargs = filter_supported_kwargs(
+            Old.__init__,
+            dict(bucket_decode_throughput=[1.0], labels={"model_name": "m"}),
+        )
+        self.assertEqual(kwargs, {"labels": {"model_name": "m"}})
+        c = Old(server_args=self.server_args, **kwargs)
+        flt = SupportedKwargsFilter(c.observe_one_finished_request)
+        extra = flt(dict(spec_verify_ct=0, is_streaming=True, decode_throughput=1.0))
+        self.assertEqual(extra, {})
+        c.observe_one_finished_request(
+            {"model_name": "m"}, 3, 5, 0, 1.0, False, None, **extra
+        )
+        self.assertEqual(c.seen, [({"model_name": "m"}, 5)])
+
+    def test_var_kwargs_collector_receives_everything(self):
+        def observe(labels, *args, **kwargs):
+            pass
+
+        payload = dict(spec_verify_ct=1, is_streaming=False, decode_throughput=2.0)
+        self.assertEqual(SupportedKwargsFilter(observe)(payload), payload)
 
 
 if __name__ == "__main__":

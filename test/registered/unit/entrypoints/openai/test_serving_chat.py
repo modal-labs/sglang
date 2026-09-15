@@ -48,6 +48,9 @@ class _MockTokenizerManager:
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
+            return_input_ids=False,
+            return_output_ids=False,
+            incremental_streaming_output=False,
         )
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -2050,6 +2053,76 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def _stream_with_ids(self, chunks_in, **req_kwargs):
+        async def _gen():
+            for c in chunks_in:
+                yield c
+
+        self.tm.generate_request.return_value = _gen()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            **req_kwargs,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+        return self._run_chat_stream(adapted_request, req)
+
+    @staticmethod
+    def _abort_chunk(status_code=None, output_ids=()):
+        finish_reason = {"type": "abort", "message": "Generation aborted."}
+        if status_code is not None:
+            finish_reason["status_code"] = status_code
+        return {
+            "text": "",
+            "meta_info": {
+                "id": "chatcmpl-abort",
+                "prompt_tokens": 3,
+                "completion_tokens": len(output_ids),
+                "cached_tokens": 0,
+                "finish_reason": finish_reason,
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "prompt_token_ids": [1, 2, 3],
+            "output_ids": list(output_ids),
+            "index": 0,
+        }
+
+    def test_streaming_system_abort_keeps_usage_and_drops_ids(self):
+        """A status-bearing abort emits error -> usage -> [DONE], no sglext ids."""
+        chunks = self._stream_with_ids(
+            [self._abort_chunk(HTTPStatus.INTERNAL_SERVER_ERROR, [7, 8])],
+            stream_options={"include_usage": True},
+            return_input_ids=True,
+            return_output_ids=True,
+        )
+        parsed = self._parse_chunks(chunks)
+        self.assertIn("error", parsed[0])
+        self.assertTrue(any(p.get("usage") for p in parsed[1:]))
+        self.assertFalse(any("sglext" in p for p in parsed))
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def test_streaming_graceful_first_chunk_abort_returns_ids(self):
+        """A graceful abort before any token still returns the opted-in ids."""
+        chunks = self._stream_with_ids(
+            [self._abort_chunk(None, [])],
+            return_input_ids=True,
+            return_output_ids=True,
+        )
+        sglext = [p["sglext"] for p in self._parse_chunks(chunks) if "sglext" in p]
+        self.assertEqual(len(sglext), 1)
+        self.assertEqual(sglext[0]["input_ids"], [1, 2, 3])
+        self.assertEqual(sglext[0]["output_ids"], [[]])
 
     def test_slow_validation_error_after_keepalive_is_encoded_as_sse(self):
         async def _mock_generate_error():

@@ -16,12 +16,23 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Union,
+)
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -212,6 +223,66 @@ def resolve_collector_class(
     if not stat_loggers:
         return default_cls
     return stat_loggers.get(role, default_cls)
+
+
+class SupportedKwargsFilter:
+    """Drops keyword arguments that `func` cannot accept.
+
+    Lets collector subclasses registered via `ServerArgs.stat_loggers` that
+    predate a new keyword (e.g. an older `__init__` or
+    `observe_one_finished_request` signature) keep working; a `**kwargs`
+    parameter accepts everything. The signature is inspected once; dropped
+    keys are logged once so the missing observation is visible, not silent.
+    """
+
+    def __init__(self, func: Callable):
+        self._name = getattr(func, "__qualname__", repr(func))
+        self._accepted: Optional[Set[str]] = None
+        self._warned = False
+        try:
+            params = list(inspect.signature(func).parameters.values())
+        except (TypeError, ValueError):
+            return
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+            return
+        self._accepted = {
+            p.name
+            for p in params
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        }
+
+    def __call__(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        if self._accepted is None:
+            return kwargs
+        dropped = [k for k in kwargs if k not in self._accepted]
+        if not dropped:
+            return kwargs
+        if not self._warned:
+            self._warned = True
+            logger.warning(
+                "%s does not accept %s; dropping (older collector API).",
+                self._name,
+                ", ".join(sorted(dropped)),
+            )
+        return {k: v for k, v in kwargs.items() if k in self._accepted}
+
+
+def filter_supported_kwargs(func: Callable, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    return SupportedKwargsFilter(func)(kwargs)
+
+
+def check_reserved_metric_labels(
+    labels: Dict[str, str], reserved: Iterable[str], *, metric_group: str
+) -> None:
+    """Reject configured labels that collide with a label the collector
+    appends itself (would otherwise produce a duplicate Prometheus label name
+    and let the configured value silently override the built-in one)."""
+    clash = sorted(set(labels) & set(reserved))
+    if clash:
+        raise ValueError(
+            f"{metric_group} metric label(s) {clash} are reserved by SGLang and "
+            "cannot be set via --extra-metric-labels / custom labels."
+        )
 
 
 class _StatLoggerDIMixin:
@@ -1373,13 +1444,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
             for pool, value in stats.hicache_host_pool_used_slots.items():
-                self.hicache_host_pool_used_slots.labels(
-                    **self.labels, pool=pool
-                ).set(value)
+                self.hicache_host_pool_used_slots.labels(**self.labels, pool=pool).set(
+                    value
+                )
             for pool, value in stats.hicache_host_pool_total_slots.items():
-                self.hicache_host_pool_total_slots.labels(
-                    **self.labels, pool=pool
-                ).set(value)
+                self.hicache_host_pool_total_slots.labels(**self.labels, pool=pool).set(
+                    value
+                )
 
         # Streaming session metrics
         if self.enable_streaming_session:
@@ -1453,6 +1524,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
+    # Label names this collector appends to some of its own metrics.
+    RESERVED_LABELS = ("stream", "is_streaming", "cache_source")
+
     def __init__(
         self,
         server_args: Optional[ServerArgs] = None,
@@ -1470,6 +1544,9 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
+        check_reserved_metric_labels(
+            self.labels, self.RESERVED_LABELS, metric_group="Tokenizer"
+        )
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",

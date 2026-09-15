@@ -97,7 +97,9 @@ from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
+    SupportedKwargsFilter,
     TokenizerMetricsCollector,
+    filter_supported_kwargs,
     resolve_collector_class,
 )
 from sglang.srt.observability.req_time_stats import (
@@ -609,10 +611,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.metrics_collector = tokenizer_collector_cls(
                 server_args=self.server_args,
                 labels=labels,
-                bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
-                bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
-                bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
-                bucket_decode_throughput=self.server_args.bucket_decode_throughput,
+                **filter_supported_kwargs(
+                    tokenizer_collector_cls.__init__,
+                    dict(
+                        bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
+                        bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
+                        bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
+                        bucket_decode_throughput=self.server_args.bucket_decode_throughput,
+                    ),
+                ),
+            )
+            self._finished_request_kwargs_filter = SupportedKwargsFilter(
+                self.metrics_collector.observe_one_finished_request
             )
 
             start_cpu_monitor_thread("tokenizer")
@@ -2599,11 +2609,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
                 cached_tokens_details,
-                spec_verify_ct=spec_verify_ct,
-                is_streaming=getattr(state.obj, "stream", False),
-                decode_throughput=state.time_stats.get_decode_throughput(
-                    completion_tokens,
-                    recv_obj.time_stats[i] if recv_obj.time_stats is not None else None,
+                **self._finished_request_kwargs_filter(
+                    dict(
+                        spec_verify_ct=spec_verify_ct,
+                        is_streaming=getattr(state.obj, "stream", False),
+                        decode_throughput=state.time_stats.get_decode_throughput(
+                            completion_tokens,
+                            (
+                                recv_obj.time_stats[i]
+                                if recv_obj.time_stats is not None
+                                else None
+                            ),
+                        ),
+                    )
                 ),
             )
 

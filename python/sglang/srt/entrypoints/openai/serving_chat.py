@@ -27,10 +27,6 @@ from jsonschema import Draft7Validator, Draft202012Validator, SchemaError
 from jsonschema.validators import validator_for
 
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
-from sglang.srt.entrypoints.sse_keepalive import (
-    prime_sse_stream,
-    stream_sse_with_keepalives,
-)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
@@ -65,6 +61,10 @@ from sglang.srt.entrypoints.openai.utils import (
     process_routed_experts_from_ret,
     should_include_usage,
     to_openai_style_logprobs,
+)
+from sglang.srt.entrypoints.sse_keepalive import (
+    prime_sse_stream,
+    stream_sse_with_keepalives,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -1588,6 +1588,9 @@ class OpenAIServingChat(OpenAIServingBase):
         video_tokens = {}
         input_ids: Optional[List[int]] = None
         output_ids: Dict[int, List[int]] = {}
+        # Set on a status-bearing (system-error) abort; suppresses the sglext
+        # token-id event so nothing buffered is emitted after the error chunk.
+        errored = False
 
         stream_started = False
         try:
@@ -1626,16 +1629,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
+                # Graceful aborts (no status_code) finalize like a normal stop and
+                # may be the only chunk carrying the ids, so capture from them too;
+                # system-error aborts set `errored` below and never emit ids.
                 if return_input_ids and input_ids is None:
                     # The prompt is the full, shared prompt (same across choices
                     # and constant across chunks), so capture it once.
                     chunk_input_ids = content.get("prompt_token_ids")
-                    if chunk_input_ids is not None and finish_reason_type != "abort":
+                    if chunk_input_ids is not None:
                         input_ids = list(chunk_input_ids)
 
                 if return_output_ids:
                     chunk_output_ids = content.get("output_ids")
-                    if chunk_output_ids is not None and finish_reason_type != "abort":
+                    if chunk_output_ids is not None:
                         if (
                             self.tokenizer_manager.server_args.incremental_streaming_output
                         ):
@@ -1678,11 +1684,8 @@ class OpenAIServingChat(OpenAIServingBase):
                             code.value,
                         )
                         yield f"data: {error}\n\n"
-                        # Terminate the stream immediately: skip finalization so
-                        # no buffered event (e.g. sglext.output_ids) is emitted
-                        # after the error.
-                        yield "data: [DONE]\n\n"
-                        return
+                        errored = True
+                        break
                     finish_reasons[index] = finish_reason
 
                 # First chunk with role
@@ -1775,11 +1778,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
             sglext_input_ids = None
-            if return_input_ids and input_ids:
+            if return_input_ids and not errored and input_ids is not None:
                 sglext_input_ids = list(input_ids)
 
             sglext_output_ids = None
-            if return_output_ids and output_ids:
+            if return_output_ids and not errored and output_ids:
+                # Zero-token choices are represented as [] (same as non-stream).
                 sglext_output_ids = [
                     list(output_ids.get(i, [])) for i in range(request.n)
                 ]
