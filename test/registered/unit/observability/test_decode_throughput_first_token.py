@@ -340,6 +340,18 @@ class TestDecodeThroughputFirstToken(CustomTestCase):
         sched.completion_time = 1.5
         self.assertAlmostEqual(stats.get_decode_throughput(11, sched), 20.0)
 
+    def test_api_side_fallback_when_scheduler_stamps_incomplete(self):
+        # Diffusion (dLLM) decoding stamps completion_time but never token one.
+        stats = rts.APIServerReqTimeStats()
+        stats.first_token_time = 1.0
+        stats.finished_time = 2.0
+        sched = rts.SchedulerReqTimeStats()
+        sched.set_completion_time(2.0)
+        self.assertEqual(sched.first_token_time, 0.0)
+        self.assertAlmostEqual(stats.get_decode_throughput(10, sched), 9.0)
+        meta = stats.convert_to_output_meta_info(sched, 10)
+        self.assertAlmostEqual(meta["decode_throughput"], 9.0)
+
 
 if __name__ == "__main__":
     unittest.main()
