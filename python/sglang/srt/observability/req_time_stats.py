@@ -80,6 +80,12 @@ def convert_time_cross_thread(
     return time_value + old_diff - new_diff
 
 
+def _decode_throughput(completion_tokens: int, decode_latency: float) -> float:
+    if decode_latency > 0.0 and completion_tokens > 1:
+        return (completion_tokens - 1) / decode_latency
+    return 0.0
+
+
 @dataclass
 class RequestStageConfig:
     """Configuration for a request pipeline stage.
@@ -465,13 +471,22 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_decode_latency(self):
         return self.finished_time - self.first_token_time
 
-    def get_decode_throughput(self, completion_tokens: int) -> float:
+    def get_decode_throughput(
+        self, completion_tokens: int, scheduler_time_stats=None
+    ) -> float:
+        """Decode tokens per second, excluding the first (prefill-sampled) token.
+
+        Prefers the scheduler's own first-token / completion stamps: the API
+        server only sees output batches, which the scheduler withholds for
+        non-streaming requests (force-stream interval) and for streaming
+        requests with ``stream_interval > 1``, so the API-side
+        ``first_token_time`` is not when token one was sampled.
+        """
+        if scheduler_time_stats is not None:
+            return scheduler_time_stats.get_decode_throughput(completion_tokens)
         if self.first_token_time <= 0.0:
             return 0.0
-        decode_latency = self.get_decode_latency()
-        if decode_latency > 0.0 and completion_tokens > 1:
-            return (completion_tokens - 1) / decode_latency
-        return 0.0
+        return _decode_throughput(completion_tokens, self.get_decode_latency())
 
     def get_response_sent_to_client_realtime(self):
         return convert_time_to_realtime(self.response_sent_to_client_time)
@@ -497,7 +512,9 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 self.finished_time
             )
 
-        decode_throughput = self.get_decode_throughput(completion_tokens)
+        decode_throughput = self.get_decode_throughput(
+            completion_tokens, scheduler_time_stats
+        )
         if decode_throughput > 0.0:
             meta_info["decode_throughput"] = decode_throughput
         return meta_info
@@ -598,6 +615,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     wait_queue_entry_time: float = 0.0
     forward_entry_time: float = 0.0
     prefill_finished_time: float = 0.0
+    # When the first output token became available on this scheduler: the
+    # first prefill (last chunk) finish, or the prebuilt finish on a PD decode
+    # node. Stamped once; retraction/re-prefill never moves it.
+    first_token_time: float = 0.0
     completion_time: float = 0.0
 
     # prefill node, get by time.perf_counter()
@@ -642,7 +663,25 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+        # Unset (0.0) stamps must not be shipped: __setstate__ rebases every
+        # "*time" key onto the receiver's clock and would turn 0.0 into garbage.
+        if self.first_token_time > 0.0:
+            state["first_token_time"] = self.first_token_time
+        if self.completion_time > 0.0:
+            state["completion_time"] = self.completion_time
         return state
+
+    def get_decode_latency(self) -> float:
+        if self.first_token_time <= 0.0 or self.completion_time <= 0.0:
+            return 0.0
+        return self.completion_time - self.first_token_time
+
+    def get_decode_throughput(self, completion_tokens: int) -> float:
+        return _decode_throughput(completion_tokens, self.get_decode_latency())
+
+    def set_first_token_time(self, ts=None):
+        if self.first_token_time == 0.0:
+            self.first_token_time = ts or time.perf_counter()
 
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
@@ -716,6 +755,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.wait_queue_entry_time = 0.0
         self.forward_entry_time = 0.0
         self.prefill_finished_time = 0.0
+        self.first_token_time = 0.0
         self.completion_time = 0.0
         self.prefill_transfer_queue_entry_time = 0.0
         self.prefill_kv_transfer_finish_time = 0.0
@@ -795,6 +835,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.prefill_finished_time == 0.0:
             self.prefill_finished_time = ts
             self.last_prefill_finished_time = ts
+            self.set_first_token_time(ts)
 
             stage = RequestStage.PREFILL_FORWARD
             self.observe_per_stage_req_latency(stage, ts - self.last_forward_entry_time)
@@ -1027,6 +1068,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_decode_prebuilt_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.decode_prebuilt_finish_time = ts
+        self.set_first_token_time(ts)
 
         stage = RequestStage.DECODE_FAKE_OUTPUT
         self.observe_per_stage_req_latency(stage, ts - self.last_forward_entry_time)

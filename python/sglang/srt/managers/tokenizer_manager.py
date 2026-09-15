@@ -2602,7 +2602,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
                 decode_throughput=state.time_stats.get_decode_throughput(
-                    completion_tokens
+                    completion_tokens,
+                    recv_obj.time_stats[i] if recv_obj.time_stats is not None else None,
                 ),
             )
 
