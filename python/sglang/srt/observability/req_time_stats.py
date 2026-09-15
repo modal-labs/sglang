@@ -352,7 +352,8 @@ class ReqTimeStatsBase:
                 state["trace_ctx"] = TraceNullContext()
 
         for key in state.keys():
-            if key.endswith("time"):
+            # 0.0 is the "never stamped" sentinel and must not be rebased.
+            if key.endswith("time") and state[key] != 0.0:
                 state[key] = convert_time_cross_thread(
                     state[key],
                     state["diff_realtime_monotonic"],

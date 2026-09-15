@@ -370,6 +370,22 @@ class TestDecodeThroughputFirstToken(CustomTestCase):
         self.assertAlmostEqual(
             received.forward_entry_time - received.wait_queue_entry_time, 1.0
         )
+        # Unset stamps (e.g. prefill_finished_time on a PD decode node) stay
+        # 0.0 through both hops whichever way the clock anchors differ.
+        for d1, d2 in ((-5.0, 3.0), (5.0, -3.0), (-5.0, -9.0)):
+            pd = rts.SchedulerReqTimeStats(disagg_mode=rts.DisaggregationMode.DECODE)
+            pd.enable_metrics = True
+            pd.wait_queue_entry_time = 1001.0
+            pd.forward_entry_time = 1002.0
+            pd.first_token_time = 1003.0
+            pd.completion_time = 1004.0
+            with mock.patch.object(rts, "global_diff_realtime_monotonic", base + d1):
+                wire = pickle.dumps(pickle.loads(pickle.dumps(pd)))
+            with mock.patch.object(rts, "global_diff_realtime_monotonic", base + d2):
+                got = pickle.loads(wire)
+            self.assertEqual(got.prefill_finished_time, 0.0)
+            self.assertAlmostEqual(got.get_decode_latency(), 1.0)
+            self.assertNotIn("prefill_finished_time", got.convert_to_output_meta_info())
         # Metrics disabled on the scheduler: nothing is shipped at either hop.
         off = rts.SchedulerReqTimeStats()
         off.forward_entry_time = 1002.0
