@@ -69,6 +69,13 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
     return backend
 
 
+def _resolve_prefix_chunk_kv_proj_dtype(backend, q: torch.Tensor) -> torch.dtype:
+    """Dtype the cached-prefix latents are fetched in before ``kv_b_proj``:
+    the backend's declared projection-input dtype, else ``q.dtype``."""
+    proj_dtype = getattr(backend, "prefix_chunk_kv_proj_dtype", None)
+    return q.dtype if proj_dtype is None else proj_dtype(q)
+
+
 def _forward_dsa_indexer_for_mha(
     indexer,
     *,
@@ -539,10 +546,11 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
+        # kv_b_proj needs the model dtype; q may already be FP8 for backends
+        # that quantize it up front, so the backend declares the fetch dtype.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
-        kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+        kv_a_dtype = _resolve_prefix_chunk_kv_proj_dtype(backend, q)
 
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
@@ -566,8 +574,11 @@ class DeepseekMHAForwardMixin:
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
-            if pack_fn is not None:
-                k, v = pack_fn(k_nope, k_pe, v)
+            packed = (
+                pack_fn(self.attn_mha, k_nope, k_pe, v) if pack_fn is not None else None
+            )
+            if packed is not None:
+                k, v = packed
             else:
                 k = torch.empty(
                     (

@@ -289,14 +289,23 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
         return q_fp8, k_fp8, v_fp8
 
+    def prefix_chunk_kv_proj_dtype(self, q: torch.Tensor) -> torch.dtype:
+        # q is already FP8 (prepare_prefill_qkv); kv_b_proj needs BF16 input.
+        return torch.bfloat16
+
     def pack_prefix_chunk_kv(
         self,
+        layer: RadixAttention,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Pack strided ``k_nope``+``k_pe`` into contig FP8 K and quantize
         strided ``v`` into contig FP8 V in a single kernel.
+
+        Unit-scale quantization, matching ``prepare_prefill_qkv``: the
+        TokenSpeed prefill kernel takes no K/V descales, so ``layer``'s
+        checkpoint scales are intentionally not applied here.
         """
         return mla_kv_pack_quantize_fp8(
             k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()

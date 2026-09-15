@@ -114,6 +114,22 @@ class HybridAttnBackend(AttentionBackend):
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
 
+    def prefix_chunk_kv_proj_dtype(self, q: torch.Tensor) -> torch.dtype:
+        proj_dtype = getattr(self.prefill_backend, "prefix_chunk_kv_proj_dtype", None)
+        return q.dtype if proj_dtype is None else proj_dtype(q)
+
+    def pack_prefix_chunk_kv(
+        self,
+        layer: RadixAttention,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        pack = getattr(self.prefill_backend, "pack_prefix_chunk_kv", None)
+        if pack is not None:
+            return pack(layer, k_nope, k_pe, v)
+        return None
+
     def forward(
         self,
         q: Optional[torch.Tensor] = None,  # For full attention

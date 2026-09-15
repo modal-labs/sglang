@@ -966,6 +966,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
 
+    def prefix_chunk_kv_proj_dtype(self, q: torch.Tensor) -> torch.dtype:
+        proj_dtype = getattr(self.full_attn_backend, "prefix_chunk_kv_proj_dtype", None)
+        return q.dtype if proj_dtype is None else proj_dtype(q)
+
+    def pack_prefix_chunk_kv(
+        self,
+        layer: RadixAttention,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        pack = getattr(self.full_attn_backend, "pack_prefix_chunk_kv", None)
+        if pack is not None:
+            return pack(layer, k_nope, k_pe, v)
+        return None
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)

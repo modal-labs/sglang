@@ -12,10 +12,12 @@ _parallel_override.__enter__()
 
 from sglang.kernels.ops.attention.utils import get_num_page_per_block_flashmla
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
+    _quantize_fp8_qkv,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
@@ -1431,6 +1433,61 @@ class TestTRTLLMMLA(CustomTestCase):
                     torch.testing.assert_close(
                         input_data, output_data, rtol=1e-5, atol=1e-6
                     )
+
+    def test_pack_prefix_chunk_kv_applies_layer_kv_scales(self):
+        """The fused chunk-KV pack must quantize with the layer's checkpoint
+        K/V scales and _quantize_fp8_qkv must still report them for the
+        already-fp8 tensors, matching the unfused scaled_fp8_quant path."""
+        config = self._merge_config({"kv_cache_dtype": torch.float8_e4m3fn})
+        _, _, backend, _, layer = self._create_model_components(config, is_prefill=True)
+        k_scale, v_scale = 0.5, 2.0
+        layer.k_scale = torch.tensor(k_scale, device=config["device"])
+        layer.v_scale = torch.tensor(v_scale, device=config["device"])
+        layer.k_scale_float = k_scale
+        layer.v_scale_float = v_scale
+
+        torch.manual_seed(config["seed_qkv"])
+        s, h = 37, config["num_attention_heads"]
+        k_nope = torch.randn(
+            s, h, config["qk_nope_head_dim"], device="cuda", dtype=torch.bfloat16
+        )
+        k_pe = torch.randn(
+            s, 1, config["qk_rope_head_dim"], device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            s, h, config["prefill_v_head_dim"], device="cuda", dtype=torch.bfloat16
+        )
+        q = torch.randn(
+            s, h, config["prefill_head_dim"], device="cuda", dtype=torch.bfloat16
+        )
+
+        with envs.SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK.override(False):
+            self.assertIsNone(backend.pack_prefix_chunk_kv(layer, k_nope, k_pe, v))
+        with envs.SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK.override(True):
+            packed = backend.pack_prefix_chunk_kv(layer, k_nope, k_pe, v)
+        self.assertIsNotNone(packed)
+        k_fused, v_fused = packed
+        self.assertEqual(k_fused.dtype, torch.float8_e4m3fn)
+        self.assertEqual(v_fused.dtype, torch.float8_e4m3fn)
+
+        k_ref = torch.cat([k_nope, k_pe.expand(-1, h, -1)], dim=-1)
+        _, k_unfused, v_unfused, ks_unfused, vs_unfused = _quantize_fp8_qkv(
+            q, k_ref, v, layer
+        )
+        self.assertEqual((ks_unfused, vs_unfused), (k_scale, v_scale))
+        torch.testing.assert_close(
+            k_fused.float(), k_unfused.float(), atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            v_fused.float(), v_unfused.float(), atol=0.0, rtol=0.0
+        )
+
+        _, k_same, v_same, ks_fused, vs_fused = _quantize_fp8_qkv(
+            q, k_fused, v_fused, layer
+        )
+        self.assertIs(k_same, k_fused)
+        self.assertIs(v_same, v_fused)
+        self.assertEqual((ks_fused, vs_fused), (k_scale, v_scale))
 
 
 if __name__ == "__main__":

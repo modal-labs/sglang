@@ -690,6 +690,11 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # TRT-LLM MLA chunked-prefix (MHA_CHUNKED_KV) path: pack K (nope|rope) and
+    # quantize K/V to FP8 in one kernel instead of cat + two casts. Applies to
+    # the TRT-LLM MLA chunked-prefix prefill, including backends that delegate
+    # prefill to it (e.g. cutedsl_mla decode with trtllm_mla prefill).
+    SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # TRT-LLM MLA fp8 target-verify path: write the KV rows with the fused
