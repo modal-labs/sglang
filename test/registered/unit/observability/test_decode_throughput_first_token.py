@@ -10,12 +10,14 @@ the batches the streamer actually emits.
 import asyncio
 import pickle
 import unittest
+from array import array
 from types import SimpleNamespace
 from typing import List, Optional
 from unittest import mock
 
 import sglang.srt.observability.req_time_stats as rts
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.mixin import scheduler as dllm_sched
 from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
@@ -340,17 +342,65 @@ class TestDecodeThroughputFirstToken(CustomTestCase):
         sched.completion_time = 1.5
         self.assertAlmostEqual(stats.get_decode_throughput(11, sched), 20.0)
 
-    def test_api_side_fallback_when_scheduler_stamps_incomplete(self):
-        # Diffusion (dLLM) decoding stamps completion_time but never token one.
+    def test_incomplete_scheduler_stamps_not_observed(self):
+        # Scheduler stats present but token one never stamped: the interval is
+        # unknown, so do not substitute the delivery-skewed API-side stamps.
         stats = rts.APIServerReqTimeStats()
         stats.first_token_time = 1.0
-        stats.finished_time = 2.0
+        stats.finished_time = 1.000001
         sched = rts.SchedulerReqTimeStats()
         sched.set_completion_time(2.0)
         self.assertEqual(sched.first_token_time, 0.0)
-        self.assertAlmostEqual(stats.get_decode_throughput(10, sched), 9.0)
-        meta = stats.convert_to_output_meta_info(sched, 10)
-        self.assertAlmostEqual(meta["decode_throughput"], 9.0)
+        self.assertEqual(stats.get_decode_throughput(10, sched), 0.0)
+        self.assertNotIn(
+            "decode_throughput", stats.convert_to_output_meta_info(sched, 10)
+        )
+
+    def test_dllm_scheduler_stamps_first_token(self):
+        """process_batch_result_dllm stamps token one on the first emitted block."""
+        clock = [100.0]
+        with mock.patch.object(
+            rts.time, "perf_counter", lambda: clock[0]
+        ), mock.patch.object(dllm_sched, "release_kv_cache"):
+            req = _FakeReq("dllm", stream=False, stream_interval=None)
+            req.full_untruncated_fill_ids = array("q", [0] * 11)
+            req.extend_range = SimpleNamespace(end=7)
+            req.update_finish_state = lambda new_accepted_len: None
+            self_ns = SimpleNamespace(
+                dllm_config=SimpleNamespace(
+                    first_done_first_out_mode=False, block_size=4
+                ),
+                token_to_kv_pool_allocator=mock.Mock(),
+                metrics_reporter=mock.Mock(num_generated_tokens=0),
+                output_streamer=mock.Mock(),
+                tree_cache=None,
+            )
+            batch = mock.Mock(reqs=[req], batch_size=lambda: 1, return_logprob=False)
+
+            def step(ids):
+                return SimpleNamespace(
+                    copy_done=None,
+                    next_token_ids=[mock.Mock(tolist=lambda: ids)],
+                    accept_length_per_req_cpu=None,
+                    dllm_algo_state=None,
+                    can_run_cuda_graph=False,
+                )
+
+            dllm_sched.SchedulerDllmMixin.process_batch_result_dllm(
+                self_ns, batch, step([11, 12, 13, 14])
+            )
+            self.assertEqual(req.time_stats.first_token_time, 100.0)
+            clock[0] = 101.0
+            req.extend_range.end = 11
+            req._finished = True
+            dllm_sched.SchedulerDllmMixin.process_batch_result_dllm(
+                self_ns, batch, step([15, 16, 17, 18])
+            )
+            self.assertEqual(req.time_stats.first_token_time, 100.0)
+            self.assertEqual(req.time_stats.completion_time, 101.0)
+            self.assertAlmostEqual(
+                req.time_stats.get_decode_throughput(len(req.output_ids)), 7.0
+            )
 
 
 if __name__ == "__main__":

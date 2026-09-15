@@ -480,14 +480,12 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         server only sees output batches, which the scheduler withholds for
         non-streaming requests (force-stream interval) and for streaming
         requests with ``stream_interval > 1``, so the API-side
-        ``first_token_time`` is not when token one was sampled. Falls back to
-        the API-side stamps when the scheduler did not stamp both ends (e.g.
-        diffusion decoding, which never passes through the token-one setters).
+        ``first_token_time`` is not when token one was sampled. When scheduler
+        stats are present but incomplete, the interval is unknown and 0.0 (not
+        observed) is returned rather than the delivery-skewed API-side value;
+        the API-side stamps are used only when no scheduler stats exist.
         """
-        if (
-            scheduler_time_stats is not None
-            and scheduler_time_stats.get_decode_latency() > 0.0
-        ):
+        if scheduler_time_stats is not None:
             return scheduler_time_stats.get_decode_throughput(completion_tokens)
         if self.first_token_time <= 0.0:
             return 0.0

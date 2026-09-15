@@ -99,6 +99,7 @@ class SchedulerDllmMixin:
                     self.metrics_reporter.num_generated_tokens += new_tokens
 
                     req.output_ids.extend(next_token_ids)
+                    req.time_stats.set_first_token_time()
                     req.update_finish_state(new_accepted_len=new_tokens)
 
                     if req.finished():
@@ -140,6 +141,7 @@ class SchedulerDllmMixin:
 
                 self.metrics_reporter.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
+                req.time_stats.set_first_token_time()
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
 
                 if req.finished():
