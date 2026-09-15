@@ -140,5 +140,99 @@ class TestDefaultBackend(unittest.TestCase):
         )
 
 
+class _BoundRecordingMetric:
+    def __init__(self, metric, labels):
+        self.metric = metric
+        self.labels = labels
+
+    def inc(self, value=1):
+        self.metric.increments.append((self.labels, value))
+
+    def observe(self, value):
+        self.metric.observations.append((self.labels, value))
+
+    def set(self, value):
+        self.metric.sets.append((self.labels, value))
+
+
+class _RecordingMetric:
+    """Small prometheus_client-compatible metric that preserves labels."""
+
+    def __init__(self, *args, name=None, labelnames=(), **kwargs):
+        self.name = name if name is not None else args[0]
+        self.labelnames = tuple(labelnames)
+        self.kwargs = kwargs
+        self.increments = []
+        self.observations = []
+        self.sets = []
+
+    def labels(self, *values, **labels):
+        if values:
+            labels = dict(zip(self.labelnames, values, strict=True))
+        return _BoundRecordingMetric(self, labels)
+
+
+class _RecordingTokenizerMetricsCollector(TokenizerMetricsCollector):
+    _counter_cls = _RecordingMetric
+    _gauge_cls = _RecordingMetric
+    _histogram_cls = _RecordingMetric
+
+
+class _BucketStubArgs(_StubArgs):
+    prompt_tokens_buckets = None
+    generation_tokens_buckets = None
+
+
+class TestDecodeThroughputHistogram(unittest.TestCase):
+
+    def _make_collector(self, labels, **kwargs):
+        return _RecordingTokenizerMetricsCollector(
+            server_args=_BucketStubArgs(), labels=labels, **kwargs
+        )
+
+    def test_observed_when_positive(self):
+        labels = {"model_name": "test"}
+        collector = self._make_collector(labels)
+
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=10,
+            generation_tokens=50,
+            cached_tokens=0,
+            e2e_latency=2.0,
+            has_grammar=False,
+            is_streaming=True,
+            decode_throughput=32.5,
+        )
+
+        self.assertEqual(
+            collector.histogram_decode_throughput.observations,
+            [({**labels, "is_streaming": "true"}, 32.5)],
+        )
+
+    def test_skipped_when_undefined(self):
+        labels = {"model_name": "test"}
+        collector = self._make_collector(labels)
+
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=10,
+            generation_tokens=1,
+            cached_tokens=0,
+            e2e_latency=0.5,
+            has_grammar=False,
+        )
+
+        self.assertEqual(collector.histogram_decode_throughput.observations, [])
+
+    def test_bucket_override_plumbed_through(self):
+        labels = {"model_name": "test"}
+        collector = self._make_collector(labels, bucket_decode_throughput=[10.0, 100.0])
+
+        self.assertEqual(
+            collector.histogram_decode_throughput.kwargs["buckets"], [10.0, 100.0]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

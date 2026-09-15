@@ -1460,6 +1460,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         bucket_time_to_first_token: Optional[List[float]] = None,
         bucket_inter_token_latency: Optional[List[float]] = None,
         bucket_e2e_request_latency: Optional[List[float]] = None,
+        bucket_decode_throughput: Optional[List[float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
@@ -1655,6 +1656,36 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 8.000,
             ]
 
+        if bucket_decode_throughput is None:
+            bucket_decode_throughput = [
+                1,
+                2,
+                5,
+                10,
+                15,
+                20,
+                25,
+                30,
+                40,
+                50,
+                60,
+                80,
+                100,
+                125,
+                150,
+                200,
+                250,
+                300,
+                400,
+                500,
+                750,
+                1000,
+                1500,
+                2000,
+                3000,
+                5000,
+            ]
+
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
@@ -1677,6 +1708,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_e2e_request_latency,
         )
 
+        self.histogram_decode_throughput = Histogram(
+            name="sglang:decode_throughput",
+            documentation="Histogram of per-request decode throughput in tokens per second.",
+            labelnames=list(labels.keys()) + ["is_streaming"],
+            buckets=bucket_decode_throughput,
+        )
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -1687,6 +1725,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         has_grammar: bool,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         spec_verify_ct: int = 0,
+        is_streaming: bool = False,
+        decode_throughput: float = 0.0,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
@@ -1722,6 +1762,14 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
+        if decode_throughput > 0.0:
+            stream_labels = {
+                **labels,
+                "is_streaming": "true" if is_streaming else "false",
+            }
+            self.histogram_decode_throughput.labels(**stream_labels).observe(
+                float(decode_throughput)
+            )
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
         self.uncached_prompt_tokens_histogram.labels(**labels).observe(
             float(prompt_tokens - cached_tokens)
