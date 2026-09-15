@@ -174,6 +174,21 @@ class TRTLLMMLADecodeMetadata:
     global_seq_lens_k: Optional[torch.Tensor] = None
 
 
+def _verify_fused_kv_write_enabled(fused_decode_gate: bool, token_to_kv_pool) -> bool:
+    """Whether the fp8 target-verify path may use the fused set_kv + concat_q kernel.
+
+    The fused kernel writes at out_cache_loc directly, so the pool's
+    set_mla_kv_buffer must do no logical->device translation (HiSparse pools
+    expose translate_loc_to_hisparse_device; unified MLA is excluded at the
+    call site).
+    """
+    return bool(
+        fused_decode_gate
+        and not hasattr(token_to_kv_pool, "translate_loc_to_hisparse_device")
+        and envs.SGLANG_TRTLLM_MLA_VERIFY_FUSED_KV_WRITE.get()
+    )
+
+
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     """TRTLLM MLA attention kernel from flashinfer."""
 
@@ -312,6 +327,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
             and can_use_set_mla_kv_concat_q_fp8()
+        )
+        self._verify_fused_kv_write = _verify_fused_kv_write_enabled(
+            self._fused_set_kv_concat_q_fp8, model_runner.token_to_kv_pool
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -630,6 +648,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._decode_dense_loc = dst
         else:
             self._decode_dense_loc = None
+
+    def _resolve_fused_write_loc(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """Write loc for the fused fp8 KV scatter, or None when this batch is
+        not covered by it.
+
+        Captured decode refills `_decode_dense_loc` out of the graph, and the
+        captured kernel must read that buffer. Eager decode on a unified pool
+        has no such buffer, and the caller falls back to the unfused path.
+        """
+        if self._decode_dense_loc is not None:
+            return self._decode_dense_loc
+        return None if self._unified_mla else forward_batch.out_cache_loc
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -1031,13 +1063,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
                 if save_kv_cache and self._fused_set_kv_concat_q_fp8:
-                    loc = (
-                        self._decode_dense_loc
-                        if self._decode_dense_loc is not None
-                        else (
-                            None if self._unified_mla else forward_batch.out_cache_loc
-                        )
-                    )
+                    loc = self._resolve_fused_write_loc(forward_batch)
                     if loc is not None:
                         # Fused: bf16->fp8 quantize + KV scatter + q concat
                         # in one launch; None when not covered.
@@ -1206,14 +1232,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
+        fused_fp8_query = None
         if (
             self.data_type == torch.float8_e4m3fn
         ) and forward_batch.forward_mode.is_target_verify():
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
-                )
+                if save_kv_cache and self._verify_fused_kv_write:
+                    loc = self._resolve_fused_write_loc(forward_batch)
+                    if loc is not None:
+                        # Fused: bf16->fp8 quantize + KV scatter + q concat
+                        # in one launch; None when not covered.
+                        fused_fp8_query = self._set_kv_and_concat_q_fp8_fused(
+                            layer=layer,
+                            loc=loc,
+                            q=q,
+                            q_rope=q_rope,
+                            k=k,
+                            k_rope=k_rope,
+                        )
+                if fused_fp8_query is None:
+                    q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -1228,8 +1269,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             merge_query = False
 
-        # Save KV cache if requested
-        if save_kv_cache:
+        # Save KV cache if requested (the fused fp8 path already wrote it)
+        if save_kv_cache and fused_fp8_query is None:
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
@@ -1238,8 +1279,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         # TODO refactor to avoid code duplication
-        # Prepare query tensor inline
-        if merge_query:
+        # Prepare query tensor inline (already built when the fused fp8 path
+        # ran)
+        if fused_fp8_query is not None:
+            q = fused_fp8_query
+        elif merge_query:
             # For FP16 path, we merge the query and rope parts into a single tensor
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(

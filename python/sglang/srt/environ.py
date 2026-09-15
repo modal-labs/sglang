@@ -692,6 +692,9 @@ class Envs:
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # TRT-LLM MLA fp8 target-verify path: write the KV rows with the fused
+    # quantize + KV scatter + q concat kernel already used for decode.
+    SGLANG_TRTLLM_MLA_VERIFY_FUSED_KV_WRITE = EnvBool(False)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
