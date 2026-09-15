@@ -952,6 +952,13 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Kimi-K3 image prompts: expand the media framing directly on the
+    # renderer's token ids instead of decode(ids) -> encode(text,
+    # allowed_special="all") over the whole prompt, and expand the placeholders
+    # with the vectorized (np.split) helper. Off keeps the retokenize path and
+    # the per-token expansion loop, under which user text spelling a control
+    # token (e.g. "<|sep|>") collapses into that control token.
+    SGLANG_K3_MM_USE_RENDERED_INPUT_IDS = EnvBool(False)
 
     # Upper bound on the fp32 pixel bytes a single GPU image-preprocessing
     # sub-batch may hold. Groups larger than this are processed in chunks so a

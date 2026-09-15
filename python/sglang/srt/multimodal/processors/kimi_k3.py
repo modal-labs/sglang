@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -93,6 +94,54 @@ def _expand_k3_image_prompt_token_ids(
         image_index += 1
 
     return torch.tensor(output, dtype=torch.long).unsqueeze(0)
+
+
+def _expand_k3_image_prompt_token_ids_vectorized(
+    input_ids: Union[List[int], torch.Tensor],
+    image_token_id: int,
+    image_token_counts: List[int],
+    image_sizes: List[tuple[int, int]],
+    tokenizer,
+) -> torch.Tensor:
+    """Same contract as :func:`_expand_k3_image_prompt_token_ids`, splitting
+    the prompt at the placeholders instead of walking it token by token."""
+    if len(image_token_counts) != len(image_sizes):
+        raise ValueError("Expected one original size for each K3 image.")
+
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.detach().flatten().cpu().numpy()
+    input_ids = np.asarray(input_ids, dtype=np.int64)
+
+    placeholder_positions = np.flatnonzero(input_ids == image_token_id)
+    if len(placeholder_positions) != len(image_token_counts):
+        raise ValueError(
+            f"Expected {len(image_token_counts)} image placeholder token(s), "
+            f"found {len(placeholder_positions)}."
+        )
+
+    media_end = _encode_k3_special_tokens(tokenizer, "<|media_end|>")
+    text_spans = np.split(input_ids, placeholder_positions + 1)
+    output = []
+    for image_index, span in enumerate(text_spans[:-1]):
+        output.extend(span[:-1].tolist())
+        width, height = image_sizes[image_index]
+        output.extend(
+            _encode_k3_special_tokens(
+                tokenizer,
+                f"<|media_begin|>image {width}x{height}<|media_content|>",
+            )
+        )
+        output.extend([image_token_id] * image_token_counts[image_index])
+        output.extend(media_end)
+    output.extend(text_spans[-1].tolist())
+
+    return torch.tensor(output, dtype=torch.long).unsqueeze(0)
+
+
+def _select_k3_prompt_token_id_expander():
+    if envs.SGLANG_K3_MM_USE_RENDERED_INPUT_IDS.get():
+        return _expand_k3_image_prompt_token_ids_vectorized
+    return _expand_k3_image_prompt_token_ids
 
 
 def _expand_k3_image_prompt_text(
@@ -202,7 +251,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             original_input_ids = _encode_k3_special_tokens(
                 self._hf_processor.tokenizer, input_text
             )
-        return _expand_k3_image_prompt_token_ids(
+        return _select_k3_prompt_token_id_expander()(
             original_input_ids,
             self._image_token_id,
             image_token_counts,
@@ -359,6 +408,11 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 image_data=image_data,
                 multimodal_tokens=self.mm_tokens,
                 discard_alpha_channel=False,
+                input_ids=(
+                    input_text
+                    if envs.SGLANG_K3_MM_USE_RENDERED_INPUT_IDS.get()
+                    else None
+                ),
             )
         else:
             base_output = await self.load_mm_data(
@@ -420,7 +474,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 "Expected one original image size for each K3 encoder grid."
             )
         output.input_ids = (
-            _expand_k3_image_prompt_token_ids(
+            _select_k3_prompt_token_id_expander()(
                 prompt,
                 self.mm_tokens.image_token_id,
                 counts,
