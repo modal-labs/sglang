@@ -1058,6 +1058,21 @@ class Envs:
 
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Kimi tiktoken: memoize per-message chat-segment encodes across requests so a
+    # multi-turn follow-up only re-encodes its new messages.
+    # Unit: CHARACTERS of message text, not tokens (~4 chars/token for K3
+    # English, so a 100k-token history is ~400k chars). The budget is PER
+    # TOKENIZER INSTANCE; an API container holds 4 (tokenizer manager, mm
+    # processor, and its 2 worker clones), each warming independently. It must
+    # exceed the full reusable history of the sessions you want to hit,
+    # otherwise every turn misses and the cache is pure overhead. Recommended
+    # production-scale value: 32000000 (used by the release replays).
+    # 0 (default) disables. Independent of SGLANG_KIMI_ENCODE_FAST_PATH.
+    SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS = EnvInt(0)
+    # Kimi-K3 tiktoken: stateless _encode_text_piece fast path (dict lookup for
+    # exact special tokens, encode_ordinary for short literal-free text).
+    # Independent of SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS; either may be set alone.
+    SGLANG_KIMI_ENCODE_FAST_PATH = EnvBool(False)
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
