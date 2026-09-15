@@ -186,13 +186,20 @@ class _Sim:
         if payload is None:
             return
         self.delivered_batches += 1
-        # Cross the scheduler -> tokenizer process boundary: pickle round-trip
-        # under a different realtime/monotonic offset, like a second process.
+        # Cross the scheduler -> detokenizer -> tokenizer process boundaries
+        # (default SGLANG_USE_PICKLE_IPC: the detokenizer unpickles and
+        # re-pickles the stats), each process with its own clock offset.
         wire = pickle.dumps(unwrap_from_pickle(payload.time_stats))
         with mock.patch.object(
             rts,
             "global_diff_realtime_monotonic",
             rts.global_diff_realtime_monotonic + 7.0,
+        ):
+            wire = pickle.dumps(pickle.loads(wire))
+        with mock.patch.object(
+            rts,
+            "global_diff_realtime_monotonic",
+            rts.global_diff_realtime_monotonic + 11.0,
         ):
             time_stats = pickle.loads(wire)
         # The tokenizer's clock reads later than the scheduler's stamp; the
@@ -339,6 +346,35 @@ class TestDecodeThroughputFirstToken(CustomTestCase):
         self.assertEqual(received.first_token_time, 0.0)
         self.assertEqual(received.completion_time, 0.0)
         self.assertEqual(received.get_decode_throughput(10), 0.0)
+
+    def test_stamps_survive_detokenizer_relay(self):
+        # With pickle IPC the detokenizer unpickles the scheduler stats and
+        # pickles them again for the tokenizer; the relayed copy has no
+        # collector but must still carry the stamps.
+        stats = rts.SchedulerReqTimeStats()
+        stats.enable_metrics = True
+        stats.wait_queue_entry_time = 1001.0
+        stats.forward_entry_time = 1002.0
+        stats.prefill_finished_time = 1003.0
+        stats.first_token_time = 1003.0
+        stats.completion_time = 1004.0
+        base = rts.global_diff_realtime_monotonic
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", base + 7.0):
+            relayed = pickle.loads(pickle.dumps(stats))
+            self.assertFalse(relayed.enable_metrics)
+            wire = pickle.dumps(relayed)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", base + 11.0):
+            received = pickle.loads(wire)
+        self.assertAlmostEqual(received.get_decode_latency(), 1.0)
+        self.assertAlmostEqual(received.get_decode_throughput(11), 10.0)
+        self.assertAlmostEqual(
+            received.forward_entry_time - received.wait_queue_entry_time, 1.0
+        )
+        # Metrics disabled on the scheduler: nothing is shipped at either hop.
+        off = rts.SchedulerReqTimeStats()
+        off.forward_entry_time = 1002.0
+        self.assertEqual(off.__getstate__(), {})
+        self.assertEqual(pickle.loads(pickle.dumps(off)).__getstate__(), {})
 
     def test_api_side_fallback_without_scheduler_stats(self):
         stats = rts.APIServerReqTimeStats()

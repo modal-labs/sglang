@@ -655,12 +655,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
+    # True on a deserialized copy (detokenizer/tokenizer side). Such a copy has
+    # no metrics collector but must keep re-serializing its stamps when it is
+    # relayed again (scheduler -> detokenizer -> tokenizer with pickle IPC).
+    relayed: bool = False
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not self.enable_metrics:
+        if not (self.enable_metrics or self.relayed):
             return {}
 
         state = {
+            "relayed": True,
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
