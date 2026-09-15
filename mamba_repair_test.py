@@ -26,7 +26,9 @@ import torch
 
 REPO = Path(__file__).resolve().parent
 CACHE_PATH = REPO / "python/sglang/srt/mem_cache/unified_radix_cache.py"
-MAMBA_PATH = REPO / "python/sglang/srt/mem_cache/unified_cache_components/mamba_component.py"
+MAMBA_PATH = (
+    REPO / "python/sglang/srt/mem_cache/unified_cache_components/mamba_component.py"
+)
 
 PASSED = 0
 
@@ -62,7 +64,9 @@ def _extract_methods(path: Path, class_name: str, names, namespace):
         segment = textwrap.dedent(ast.get_source_segment(source, node))
         local_ns = dict(namespace)
         exec(
-            compile("from __future__ import annotations\n" + segment, str(path), "exec"),
+            compile(
+                "from __future__ import annotations\n" + segment, str(path), "exec"
+            ),
             local_ns,
         )
         result[name] = local_ns[name]
@@ -98,8 +102,16 @@ class CacheTransferPhase(enum.Enum):
 
 
 class PoolTransfer:
-    def __init__(self, name, host_indices=None, device_indices=None, keys=None,
-                 hit_policy=None, nodes_to_load=None, indices_from_pool=None):
+    def __init__(
+        self,
+        name,
+        host_indices=None,
+        device_indices=None,
+        keys=None,
+        hit_policy=None,
+        nodes_to_load=None,
+        indices_from_pool=None,
+    ):
         self.name = name
         self.host_indices = host_indices
         self.device_indices = device_indices
@@ -246,23 +258,35 @@ def test_predicate_truth_table():
 
     # Host mamba present -> no repair.
     node = make_node(cache, kv_backuped=True, mamba_device=True, mamba_host=True)
-    check(not cache._mamba_backup_missing(node), "predicate: host-resident must be False")
+    check(
+        not cache._mamba_backup_missing(node), "predicate: host-resident must be False"
+    )
 
     # KV not backuped -> normal write-through owns this node.
     node = make_node(cache, kv_backuped=False, mamba_device=True, mamba_host=False)
-    check(not cache._mamba_backup_missing(node), "predicate: unbackuped KV must be False")
+    check(
+        not cache._mamba_backup_missing(node), "predicate: unbackuped KV must be False"
+    )
 
     # No device mamba state to re-ship.
     node = make_node(cache, kv_backuped=True, mamba_device=False, mamba_host=False)
-    check(not cache._mamba_backup_missing(node), "predicate: no device state must be False")
+    check(
+        not cache._mamba_backup_missing(node),
+        "predicate: no device state must be False",
+    )
 
     # Device-evicted node (nothing to read for the D2H copy).
     node = make_node(cache, kv_backuped=True, mamba_device=True, mamba_host=False)
     node.component_data[ComponentType.FULL].value = None
-    check(not cache._mamba_backup_missing(node), "predicate: evicted node must be False")
+    check(
+        not cache._mamba_backup_missing(node), "predicate: evicted node must be False"
+    )
 
     # Root node excluded.
-    check(not cache._mamba_backup_missing(cache.root_node), "predicate: root must be False")
+    check(
+        not cache._mamba_backup_missing(cache.root_node),
+        "predicate: root must be False",
+    )
 
     # In-flight write-through op excluded (bounded: one repair per node).
     node = make_node(
@@ -273,7 +297,9 @@ def test_predicate_truth_table():
     # No MAMBA component configured -> never fires.
     cache_no_mamba = make_cache()
     del cache_no_mamba.components[ComponentType.MAMBA]
-    node = make_node(cache_no_mamba, kv_backuped=True, mamba_device=True, mamba_host=False)
+    node = make_node(
+        cache_no_mamba, kv_backuped=True, mamba_device=True, mamba_host=False
+    )
     check(
         not cache_no_mamba._mamba_backup_missing(node),
         "predicate: no mamba component must be False",
@@ -307,8 +333,10 @@ def test_host_eviction_clears_marker():
     cd = node.component_data[ComponentType.MAMBA]
     check(cd.host_value is None, "host eviction must clear the residency marker")
     check(host_freed == 1, "host eviction must report freed slot count")
-    check(len(freed) == 1 and torch.equal(freed[0], host_value),
-          "host eviction must return the slot to the host pool")
+    check(
+        len(freed) == 1 and torch.equal(freed[0], host_value),
+        "host eviction must return the slot to the host pool",
+    )
     check(not host_lru.in_list(node), "host eviction must detach node from host LRU")
 
     # The cleared marker makes the repair predicate observable.
@@ -328,8 +356,10 @@ def test_host_eviction_clears_marker():
     types.MethodType(MAMBA_METHODS["evict_component"], comp2)(
         node2, target=EvictLayer.HOST
     )
-    check(cache._mamba_backup_missing(node2),
-          "post-eviction: predicate must flip True (repair reachable)")
+    check(
+        cache._mamba_backup_missing(node2),
+        "post-eviction: predicate must flip True (repair reachable)",
+    )
 
 
 # ---- (c) mamba-only op shape ------------------------------------------------
@@ -342,16 +372,21 @@ class FakeController:
         self.committed_ops = []
         self.aborted = []
 
-    def reserve_write(self, device_indices, node_id=-1, extra_pools=None, *,
-                      allow_evict=False, priority=None):
+    def reserve_write(
+        self,
+        device_indices,
+        node_id=-1,
+        extra_pools=None,
+        *,
+        allow_evict=False,
+        priority=None,
+    ):
         # Mirror _reserve_pool_transfers: allocate host slots per extra pool.
         for pool in extra_pools or []:
             if pool.host_indices is None and pool.device_indices is not None:
                 pool.host_indices = torch.tensor([7] * len(pool.device_indices))
         return SimpleNamespace(
-            host_indices=torch.empty(
-                (len(device_indices),), dtype=torch.int64
-            ),
+            host_indices=torch.empty((len(device_indices),), dtype=torch.int64),
             device_indices=device_indices,
             node_id=node_id,
             extra_pools=list(extra_pools or []),
@@ -448,8 +483,10 @@ def test_mamba_only_op_shape():
         fd.host_value is not None and len(fd.host_value) == 3,
         "existing KV host backup must be untouched",
     )
-    check(node.write_through_pending_id == node.id,
-          "op must be tracked in the write-through ack machinery")
+    check(
+        node.write_through_pending_id == node.id,
+        "op must be tracked in the write-through ack machinery",
+    )
     check(node.id in cache.ongoing_write_through, "ongoing op must be registered")
 
 
@@ -458,19 +495,26 @@ def test_mamba_only_guards():
 
     # Not backuped -> refuse (normal write-through owns it).
     node = make_node(cache, kv_backuped=False, mamba_device=True, mamba_host=False)
-    check(cache.write_backup(node, mamba_only=True) == 0,
-          "mamba-only on unbackuped node must return 0")
+    check(
+        cache.write_backup(node, mamba_only=True) == 0,
+        "mamba-only on unbackuped node must return 0",
+    )
 
     # No device mamba state -> refuse.
     node = make_node(cache, kv_backuped=True, mamba_device=False, mamba_host=False)
-    check(cache.write_backup(node, mamba_only=True) == 0,
-          "mamba-only without device state must return 0")
+    check(
+        cache.write_backup(node, mamba_only=True) == 0,
+        "mamba-only without device state must return 0",
+    )
 
     # Pending op -> refuse (no double-scheduling).
-    node = make_node(cache, kv_backuped=True, mamba_device=True, mamba_host=False,
-                     pending=99)
-    check(cache.write_backup(node, mamba_only=True) == 0,
-          "mamba-only with in-flight op must return 0")
+    node = make_node(
+        cache, kv_backuped=True, mamba_device=True, mamba_host=False, pending=99
+    )
+    check(
+        cache.write_backup(node, mamba_only=True) == 0,
+        "mamba-only with in-flight op must return 0",
+    )
     check(not controller.committed_ops, "guard failures must not commit ops")
 
 
@@ -546,8 +590,10 @@ def test_inc_hit_count_routes_repair():
 def test_ast_wiring():
     source, wb = _method_node(CACHE_PATH, "UnifiedRadixCache", "write_backup")
     names = {n.id for n in ast.walk(wb) if isinstance(n, ast.Name)}
-    check("_HICACHE_OP_WRITE_MAMBA_REPAIR" in names,
-          "write_backup consensus must use the distinct repair opcode")
+    check(
+        "_HICACHE_OP_WRITE_MAMBA_REPAIR" in names,
+        "write_backup consensus must use the distinct repair opcode",
+    )
 
     _, insert = _method_node(CACHE_PATH, "UnifiedRadixCache", "_insert_helper")
     repair_calls = [
@@ -557,8 +603,10 @@ def test_ast_wiring():
         and isinstance(n.func, ast.Attribute)
         and n.func.attr == "_maybe_repair_mamba_backup"
     ]
-    check(len(repair_calls) == 1,
-          "_insert_helper must schedule the repair for reused target nodes")
+    check(
+        len(repair_calls) == 1,
+        "_insert_helper must schedule the repair for reused target nodes",
+    )
 
     # No new collective shapes: write_backup must not call _all_reduce directly.
     reduce_calls = [
@@ -568,8 +616,10 @@ def test_ast_wiring():
         and isinstance(n.func, ast.Attribute)
         and n.func.attr in ("_all_reduce", "all_reduce")
     ]
-    check(not reduce_calls,
-          "write_backup must only use the existing fingerprinted consensus")
+    check(
+        not reduce_calls,
+        "write_backup must only use the existing fingerprinted consensus",
+    )
 
 
 if __name__ == "__main__":

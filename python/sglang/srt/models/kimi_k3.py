@@ -3540,8 +3540,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             rank_zero_error = tp_group.broadcast_object(rank_zero_error, src=0)
         if rank_zero_error is not None:
             raise RuntimeError(
-                "K3 KDA Triton precompile failed on TP rank 0: "
-                f"{rank_zero_error}"
+                "K3 KDA Triton precompile failed on TP rank 0: " f"{rank_zero_error}"
             )
 
         peer_error = None
@@ -3549,16 +3548,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             try:
                 precompile_k3_triton_prefill_kernels(**kwargs)
             except Exception as exc:
-                peer_error = (
-                    f"rank={parallel.tp_rank} {type(exc).__name__}: {exc}"
-                )
+                peer_error = f"rank={parallel.tp_rank} {type(exc).__name__}: {exc}"
         if parallel.tp_size > 1:
             peer_errors = tp_group.all_gather_object(peer_error)
             peer_errors = [error for error in peer_errors if error is not None]
             if peer_errors:
                 raise RuntimeError(
-                    "K3 KDA Triton artifact load failed: "
-                    + "; ".join(peer_errors)
+                    "K3 KDA Triton artifact load failed: " + "; ".join(peer_errors)
                 )
 
         if benchmarked is not None:

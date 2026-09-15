@@ -116,9 +116,7 @@ def test_runtime_libraries_are_preloaded_globally(
     assert cute_aot_cache._preload_runtime_libraries(enable_tvm_ffi) == tuple(
         str(path) for path in paths
     )
-    assert calls == [
-        (str(path), cute_aot_cache.ctypes.RTLD_GLOBAL) for path in paths
-    ]
+    assert calls == [(str(path), cute_aot_cache.ctypes.RTLD_GLOBAL) for path in paths]
     assert len(cute_aot_cache._runtime_library_handles) == len(paths)
 
     # The same ABI mode is prepared once per process.

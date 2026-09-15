@@ -29,8 +29,8 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     estimate_mamba_host_pool_bytes,
     estimate_mla_host_pool_bytes,
     is_mla_dedup_dummy_rank,
-    mla_dedup_rank_and_size,
     maybe_prebuild_mla_host_dedup,
+    mla_dedup_rank_and_size,
 )
 from sglang.srt.mem_cache.pool_host.base import (
     cgroup_mem_snapshot,

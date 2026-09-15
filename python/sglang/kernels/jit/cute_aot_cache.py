@@ -334,9 +334,7 @@ def _preload_runtime_libraries(enable_tvm_ffi: bool) -> tuple[str, ...]:
     import cutlass.cute as cute
 
     loaded: list[str] = []
-    for raw_path in cute.runtime.find_runtime_libraries(
-        enable_tvm_ffi=enable_tvm_ffi
-    ):
+    for raw_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=enable_tvm_ffi):
         path = Path(raw_path)
         if not path.is_file():
             continue

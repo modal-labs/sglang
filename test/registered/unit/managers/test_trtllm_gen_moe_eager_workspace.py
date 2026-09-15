@@ -71,9 +71,7 @@ def test_one_arena_is_allocated_and_shared_by_target_and_draft():
             _TEST_WORKSPACE_BYTES
         ),
         envs.SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N.override(_TEST_MAX_TILE_N),
-        patch(
-            "sglang.srt.managers.tp_worker.torch.empty", return_value=arena
-        ) as empty,
+        patch("sglang.srt.managers.tp_worker.torch.empty", return_value=arena) as empty,
     ):
         result = worker.init_trtllm_gen_moe_eager_workspace(
             additional_model_runners=[draft]
@@ -97,9 +95,7 @@ def test_one_arena_is_allocated_and_shared_by_target_and_draft():
         (0, _TEST_MAX_TILE_N),
     ],
 )
-def test_workspace_and_tactic_cap_must_be_enabled_together(
-    workspace_bytes, max_tile_n
-):
+def test_workspace_and_tactic_cap_must_be_enabled_together(workspace_bytes, max_tile_n):
     worker = _worker(_FakeRunner(compatible_method_count=1))
 
     with (

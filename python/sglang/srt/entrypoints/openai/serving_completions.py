@@ -276,10 +276,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
                 # Handle logprobs
                 logprobs = None
-                if (
-                    request.logprobs is not None
-                    and finish_reason_type != "abort"
-                ):
+                if request.logprobs is not None and finish_reason_type != "abort":
                     # The first chunk and echo is enabled.
                     if is_first_chunk and request.echo:
                         input_token_logprobs = content["meta_info"][

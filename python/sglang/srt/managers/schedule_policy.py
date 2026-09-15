@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
+import contextlib
 import os
 import random
 from collections import Counter, defaultdict
-import contextlib
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
@@ -1195,9 +1195,7 @@ class PrefillAdder:
             and self.tree_cache.is_tree_cache()
         )
         with self._lock_node(req.last_node), (
-            self._lock_node(best_match)
-            if lock_best_match
-            else contextlib.nullcontext()
+            self._lock_node(best_match) if lock_best_match else contextlib.nullcontext()
         ):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
@@ -1255,9 +1253,7 @@ class PrefillAdder:
                     req.mamba_cow_src_index = None
                     req.mamba_needs_clear = True
                 else:
-                    req.prefix_indices = torch.cat(
-                        [req.prefix_indices, new_indices]
-                    )
+                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 

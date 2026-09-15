@@ -280,7 +280,9 @@ def _unregister_ptr(ptr: int) -> None:
         err = cudart.cudaGetErrorString(rc) if rc != 0 else ""
     if rc != 0:
         # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
-        logger.warning("cudaHostUnregister failed (rc=%d, %s) for ptr=%#x", rc, err, ptr)
+        logger.warning(
+            "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x", rc, err, ptr
+        )
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:

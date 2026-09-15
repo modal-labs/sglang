@@ -632,9 +632,7 @@ class ModelRunner:
         """Bind one process-local eager arena to this runner's compatible MoEs."""
         methods = self.get_trtllm_gen_moe_eager_workspace_methods()
         for method in methods:
-            method.bind_trtllm_gen_eager_workspace(
-                workspace, max_tile_n=max_tile_n
-            )
+            method.bind_trtllm_gen_eager_workspace(workspace, max_tile_n=max_tile_n)
         if methods:
             # Runner-level ownership keeps the allocation alive independently
             # of any individual layer and makes reload/lifecycle behavior clear.

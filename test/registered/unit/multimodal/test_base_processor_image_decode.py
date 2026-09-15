@@ -134,9 +134,7 @@ class TestCorruptImageBytesAreClientErrors(CustomTestCase):
     @staticmethod
     def _multi_idat_png() -> bytes:
         rng = np.random.RandomState(0)
-        noise = Image.fromarray(
-            (rng.rand(512, 512, 3) * 255).astype(np.uint8)
-        )
+        noise = Image.fromarray((rng.rand(512, 512, 3) * 255).astype(np.uint8))
         buf = io.BytesIO()
         noise.save(buf, format="PNG")
         return buf.getvalue()

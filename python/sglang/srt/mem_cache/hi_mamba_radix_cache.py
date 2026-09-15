@@ -417,9 +417,7 @@ class HiMambaRadixCache(MambaRadixCache):
         request_mamba_rows = (
             len(last_hit_node.mamba_host_value) if needs_request_slot else 0
         )
-        mamba_tree_rows = sum(
-            len(n.mamba_host_value) for n in mamba_restore_nodes
-        )
+        mamba_tree_rows = sum(len(n.mamba_host_value) for n in mamba_restore_nodes)
         try:
             if not skip_local_load:
                 if needs_request_slot and request_mamba_rows != 1:
@@ -501,9 +499,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if reservation is not None:
                 self.cache_controller.abort_load(reservation)
             if owns_pending_request_indices:
-                self.req_to_token_pool.mamba_allocator.free(
-                    pending_request_indices
-                )
+                self.req_to_token_pool.mamba_allocator.free(pending_request_indices)
             self.dec_lock_ref(ancestor_node)
             raise
 
@@ -511,9 +507,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if reservation is not None:
                 self.cache_controller.abort_load(reservation)
             if owns_pending_request_indices:
-                self.req_to_token_pool.mamba_allocator.free(
-                    pending_request_indices
-                )
+                self.req_to_token_pool.mamba_allocator.free(pending_request_indices)
             self.dec_lock_ref(ancestor_node)
             if reserve_error is not None:
                 raise reserve_error
@@ -1282,8 +1276,7 @@ class HiMambaRadixCache(MambaRadixCache):
         events.
         """
         return (
-            node.id in self.ongoing_write_through
-            or node.id in self.ongoing_load_back
+            node.id in self.ongoing_write_through or node.id in self.ongoing_load_back
         )
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:

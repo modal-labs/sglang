@@ -70,6 +70,10 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.early_reject import (
+    APIEarlyRejectMiddleware,
+    configure_api_early_reject,
+)
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -82,10 +86,6 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
-from sglang.srt.entrypoints.early_reject import (
-    APIEarlyRejectMiddleware,
-    configure_api_early_reject,
-)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,

@@ -112,9 +112,7 @@ class TestChunkedHostRegister(unittest.TestCase):
         registered = sorted(fake.registered)
         self.assertEqual(len(registered), 3)
         self.assertEqual(registered[0][0], 0x10000)
-        self.assertEqual(
-            sum(size for _, size in registered), int(2.5 * 1024**3)
-        )
+        self.assertEqual(sum(size for _, size in registered), int(2.5 * 1024**3))
         for (ptr, size), (next_ptr, _) in zip(registered, registered[1:]):
             self.assertEqual(ptr + size, next_ptr)
 

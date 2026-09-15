@@ -5,6 +5,9 @@
 import unittest
 
 from sglang.srt.speculative.dflash_utils import compute_dflash_draft_ring_geometry
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 WINDOW = 4096
 BLOCK = 16

@@ -210,9 +210,7 @@ def enforce_dedup_draft_host_budget(
     _, tp_size = mla_dedup_rank_and_size()
     # All three allocator implementations preallocate CPU bookkeeping:
     # target/draft use uint8+int64+bool (10 B/slot), Mamba uint8+int64.
-    allocator_metadata_bytes = (
-        target_tokens * 10 + mamba_tokens * 9 + draft_tokens * 10
-    )
+    allocator_metadata_bytes = target_tokens * 10 + mamba_tokens * 9 + draft_tokens * 10
     rank_local = {
         "allocator_metadata": allocator_metadata_bytes,
         "draft": draft_bytes,
@@ -290,9 +288,7 @@ def require_mla_host_dedup_supported(
         )
     _, size = mla_dedup_rank_and_size()
     if size <= 1:
-        raise ValueError(
-            "--enable-mla-hicache-host-dedup requires attention TP > 1."
-        )
+        raise ValueError("--enable-mla-hicache-host-dedup requires attention TP > 1.")
 
 
 def is_mla_dedup_dummy_rank(

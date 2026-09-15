@@ -16,6 +16,9 @@ from sglang.srt.layers.k3_target_fp8 import (
     moe_front_role,
     rebind_weight_aliases,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestK3TargetFP8Accounting(unittest.TestCase):

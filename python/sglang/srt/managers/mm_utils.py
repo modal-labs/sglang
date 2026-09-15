@@ -31,11 +31,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
-from sglang.srt.utils.cuda_ipc_transport_utils import PRECOMPUTED_FEATURE_HASHES_KEY
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import flatten_nested_list, is_hip, is_npu, print_warning_once
+from sglang.srt.utils.cuda_ipc_transport_utils import PRECOMPUTED_FEATURE_HASHES_KEY
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 

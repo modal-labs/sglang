@@ -1040,9 +1040,7 @@ class SchedulerMetricsReporter:
             pool_total["kv"] = host_total
             pool_used["kv"] = self.stats.hicache_host_used_tokens
 
-        cache_controller = getattr(
-            self.scheduler.tree_cache, "cache_controller", None
-        )
+        cache_controller = getattr(self.scheduler.tree_cache, "cache_controller", None)
         draft_pool = getattr(cache_controller, "mem_pool_host_draft", None)
         if draft_pool is not None:
             draft_total = getattr(draft_pool, "logical_size", draft_pool.size)

@@ -994,9 +994,7 @@ class HiCacheController:
 
                 rank_local_start = self._mla_trace_event(trace)
                 self._load_mla_rank_local_layer(rank_local_state, i)
-                self._finish_mla_trace_phase(
-                    trace, "rank_local_h2d", rank_local_start
-                )
+                self._finish_mla_trace_phase(trace, "rank_local_h2d", rank_local_start)
 
                 # H2D, staging gather, NCCL broadcast, and receiver scatter are
                 # all enqueued on load_stream.  Recording the layer event below

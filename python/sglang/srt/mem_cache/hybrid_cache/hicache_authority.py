@@ -154,7 +154,7 @@ def fold_crc(crc: int, record: CacheRecord, observed: tuple) -> int:
     return zlib.crc32(repr(observed).encode(), crc)
 
 
-_ACTIVE_AUTHORITY: Optional["weakref.ref"] = None
+_ACTIVE_AUTHORITY: Optional[weakref.ref] = None
 
 
 def note_batch_identity(tick: int, bs: int, rid_crc: int) -> None:
@@ -176,7 +176,7 @@ class HiCacheAuthority:
         self,
         *,
         cache: Any,
-        controller: "HybridCacheController",
+        controller: HybridCacheController,
         is_rank0: bool,
         device: Any = None,
         max_records_per_step: int = MAX_RECORDS_PER_STEP,
@@ -387,9 +387,7 @@ class HiCacheAuthority:
         # scheduler's publish hook (and with it the whole TP group's
         # broadcast) for multi-ms per intent during write bursts.
         if intent.fence_event is not None:
-            torch.get_device_module().current_stream().wait_event(
-                intent.fence_event
-            )
+            torch.get_device_module().current_stream().wait_event(intent.fence_event)
         self.controller.commit_write(reservation)
 
     def _poll_write_acks(self) -> None:

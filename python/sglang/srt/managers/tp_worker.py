@@ -374,9 +374,7 @@ class TpModelWorker(BaseTpWorker):
         workspace_bytes = envs.SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES.get()
         max_tile_n = envs.SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N.get()
         if workspace_bytes < 0:
-            raise ValueError(
-                "SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES must be >= 0"
-            )
+            raise ValueError("SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES must be >= 0")
         if max_tile_n < 0:
             raise ValueError("SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N must be >= 0")
         if (workspace_bytes == 0) != (max_tile_n == 0):
@@ -454,16 +452,12 @@ class TpModelWorker(BaseTpWorker):
             device = torch.device(device_type, primary.gpu_id)
             # Intentionally no OOM fallback: when the deployment opts in, KV
             # sizing must observe this exact active reservation.
-            workspace = torch.empty(
-                workspace_bytes, dtype=torch.uint8, device=device
-            )
+            workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
             self.trtllm_gen_moe_eager_workspace = workspace
             self.trtllm_gen_moe_eager_workspace_max_tile_n = max_tile_n
 
         bound_count = sum(
-            runner.init_trtllm_gen_moe_eager_workspace(
-                workspace, max_tile_n=max_tile_n
-            )
+            runner.init_trtllm_gen_moe_eager_workspace(workspace, max_tile_n=max_tile_n)
             for runner in unique_runners
         )
         if bound_count != compatible_count:

@@ -26,9 +26,7 @@ from types import SimpleNamespace
 import torch
 
 REPO = Path(__file__).resolve().parent
-AUTHORITY_PATH = (
-    REPO / "python/sglang/srt/mem_cache/hybrid_cache/hicache_authority.py"
-)
+AUTHORITY_PATH = REPO / "python/sglang/srt/mem_cache/hybrid_cache/hicache_authority.py"
 CACHE_PATH = REPO / "python/sglang/srt/mem_cache/unified_radix_cache.py"
 SCHEDULE_BATCH_PATH = REPO / "python/sglang/srt/managers/schedule_batch.py"
 RECEIVER_PATH = (
@@ -94,8 +92,15 @@ class FakeController:
         self.fail_reservations = fail_reservations
         self._next_host = 0
 
-    def reserve_write(self, device_indices, node_id=-1, extra_pools=None, *,
-                      allow_evict=False, priority=None):
+    def reserve_write(
+        self,
+        device_indices,
+        node_id=-1,
+        extra_pools=None,
+        *,
+        allow_evict=False,
+        priority=None,
+    ):
         if self.fail_reservations > 0:
             self.fail_reservations -= 1
             return None
@@ -106,7 +111,9 @@ class FakeController:
             if pool.host_indices is None and pool.device_indices is not None:
                 pool.host_indices = torch.tensor([7] * len(pool.device_indices))
         return SimpleNamespace(
-            host_indices=host, device_indices=device_indices, node_id=node_id,
+            host_indices=host,
+            device_indices=device_indices,
+            node_id=node_id,
             extra_pools=list(extra_pools or []),
         )
 
@@ -178,14 +185,22 @@ def make_batch(records, base_crc=0):
 def test_apply_ordering_and_idempotence():
     authority, cache = make_peer_authority()
     records = [
-        CacheRecord(kind=RECORD_PLACE, seq=1, op=OP_WRITE, node_id=10, kv_len=4,
-                    kv_crc=indices_crc([0, 1, 2, 3])),
+        CacheRecord(
+            kind=RECORD_PLACE,
+            seq=1,
+            op=OP_WRITE,
+            node_id=10,
+            kv_len=4,
+            kv_crc=indices_crc([0, 1, 2, 3]),
+        ),
         CacheRecord(kind=RECORD_COMPLETE, seq=2, op=OP_WRITE, node_ids=(10,)),
     ]
     batch = make_batch(records)
     authority.apply_batch(batch)
-    check(cache.applied == [("place", 1, False), ("write_complete", 2, True)],
-          "records must apply in seq order with peer semantics")
+    check(
+        cache.applied == [("place", 1, False), ("write_complete", 2, True)],
+        "records must apply in seq order with peer semantics",
+    )
     check(authority._applied_seq == 2, "applied seq must advance")
 
     # Idempotence: redelivery of the same batch is a no-op and does not
@@ -211,8 +226,14 @@ def test_apply_ordering_and_idempotence():
 def test_crc_mismatch_raises():
     authority, cache = make_peer_authority()
     records = [
-        CacheRecord(kind=RECORD_PLACE, seq=1, op=OP_WRITE, node_id=3, kv_len=2,
-                    kv_crc=indices_crc([5, 6])),
+        CacheRecord(
+            kind=RECORD_PLACE,
+            seq=1,
+            op=OP_WRITE,
+            node_id=3,
+            kv_len=2,
+            kv_crc=indices_crc([5, 6]),
+        ),
     ]
     batch = make_batch(records)
     batch.crc_after ^= 0xDEADBEEF  # tamper
@@ -269,33 +290,52 @@ def test_worker_drains_intents_and_publishes():
     )
     try:
         authority.submit_write_intent(
-            WriteIntent(node_id=42, op=OP_WRITE,
-                        kv_device=torch.arange(4), extra_pools=None, kv_len=4)
+            WriteIntent(
+                node_id=42,
+                op=OP_WRITE,
+                kv_device=torch.arange(4),
+                extra_pools=None,
+                kv_len=4,
+            )
         )
-        check(wait_until(lambda: len(controller.committed) == 1),
-              "worker must reserve+commit the intent")
+        check(
+            wait_until(lambda: len(controller.committed) == 1),
+            "worker must reserve+commit the intent",
+        )
         # PLACE first, then the COMPLETE from the (instantly fired) ack.
-        check(wait_until(lambda: len(authority._outbox) >= 2),
-              "worker must emit PLACE and COMPLETE records")
+        check(
+            wait_until(lambda: len(authority._outbox) >= 2),
+            "worker must emit PLACE and COMPLETE records",
+        )
         batch = authority.build_publish_batch()
         check(batch is not None, "publish batch must carry the records")
         kinds = [r.kind for r in batch.records]
-        check(kinds[0] == RECORD_PLACE and RECORD_COMPLETE in kinds,
-              "PLACE must precede its COMPLETE in the stream")
+        check(
+            kinds[0] == RECORD_PLACE and RECORD_COMPLETE in kinds,
+            "PLACE must precede its COMPLETE in the stream",
+        )
         place = batch.records[0]
-        check(place.node_id == 42 and place.kv_len == 4,
-              "PLACE must name the node and placement size")
-        check(place.kv_crc == indices_crc(controller.committed[0].host_indices),
-              "PLACE must carry the exact host-index CRC")
+        check(
+            place.node_id == 42 and place.kv_len == 4,
+            "PLACE must name the node and placement size",
+        )
+        check(
+            place.kv_crc == indices_crc(controller.committed[0].host_indices),
+            "PLACE must carry the exact host-index CRC",
+        )
         # Rank 0 self-applied at build (stash consumed, tree updated).
-        check(("place", place.seq, True) in cache.applied,
-              "rank 0 must self-apply the PLACE with its stashed reservation")
+        check(
+            ("place", place.seq, True) in cache.applied,
+            "rank 0 must self-apply the PLACE with its stashed reservation",
+        )
         check(place.seq not in authority._stash, "stash must be consumed")
         # A peer applying the same batch converges to the same CRC.
         peer, peer_cache = make_peer_authority()
         peer.apply_batch(batch)
-        check(peer._crc == authority._crc,
-              "peer CRC must converge with rank 0 after applying the batch")
+        check(
+            peer._crc == authority._crc,
+            "peer CRC must converge with rank 0 after applying the batch",
+        )
     finally:
         authority.shutdown()
 
@@ -311,27 +351,31 @@ def test_worker_cancels_exhausted_intent():
     )
     try:
         authority.submit_write_intent(
-            WriteIntent(node_id=7, op=OP_WRITE,
-                        kv_device=torch.arange(2), extra_pools=None, kv_len=2)
+            WriteIntent(
+                node_id=7,
+                op=OP_WRITE,
+                kv_device=torch.arange(2),
+                extra_pools=None,
+                kv_len=2,
+            )
         )
         # Drive the retry loop: each build re-submits stalled intents.
         for _ in range(20):
             authority.build_publish_batch()
-            if any(
-                r.kind == RECORD_COMPLETE and not r.ok
-                for r in [a for a in []]
-            ):
+            if any(r.kind == RECORD_COMPLETE and not r.ok for r in [a for a in []]):
                 break
-            done = any(
-                item[0] == "write_complete" for item in cache.applied
-            )
+            done = any(item[0] == "write_complete" for item in cache.applied)
             if done:
                 break
             time.sleep(0.05)
-        check(any(item[0] == "write_complete" for item in cache.applied),
-              "exhausted intent must be cancelled via COMPLETE ok=False")
-        check(7 in authority._failed_nodes,
-              "failed node must be remembered to cancel dependent children")
+        check(
+            any(item[0] == "write_complete" for item in cache.applied),
+            "exhausted intent must be cancelled via COMPLETE ok=False",
+        )
+        check(
+            7 in authority._failed_nodes,
+            "failed node must be remembered to cancel dependent children",
+        )
     finally:
         authority.shutdown()
 
@@ -343,11 +387,13 @@ def _method_node(path: Path, class_name: str, method_name: str):
     source = path.read_text()
     tree = ast.parse(source)
     cls = next(
-        node for node in tree.body
+        node
+        for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == class_name
     )
     method = next(
-        node for node in cls.body
+        node
+        for node in cls.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name == method_name
     )
@@ -427,8 +473,10 @@ def test_mamba_fail_stop():
     batch = make_alloc_batch(free_slots=[], evictable=5, evict_replenishes=True)
     slot = batch._mamba_alloc_or_fail_stop(1)
     check(int(slot[0]) == 99, "evictable-idle must be reclaimed before failing")
-    check(len(batch._evict_calls) == 1 and batch._evict_calls[0].mamba_num == 1,
-          "eviction must target the mamba component with the needed count")
+    check(
+        len(batch._evict_calls) == 1 and batch._evict_calls[0].mamba_num == 1,
+        "eviction must target the mamba component with the needed count",
+    )
 
     # Genuinely exhausted (no evictable): fail-stop raise, loud message.
     batch = make_alloc_batch(free_slots=[], evictable=0, evict_replenishes=False)
@@ -505,8 +553,10 @@ def test_peer_paths_have_no_collectives():
     for name in peer_methods:
         _, node = _method_node(CACHE_PATH, "UnifiedRadixCache", name)
         uses = _collective_uses(node)
-        check(not uses,
-              f"UnifiedRadixCache.{name} must not call collectives, found {uses}")
+        check(
+            not uses,
+            f"UnifiedRadixCache.{name} must not call collectives, found {uses}",
+        )
 
     # The whole authority module is collective-free by construction.
     tree = ast.parse(AUTHORITY_PATH.read_text())
@@ -516,8 +566,10 @@ def test_peer_paths_have_no_collectives():
     # The V2 mamba consensus is gone from schedule_batch, and the lazy-alloc
     # paths are collective-free.
     sb_source = SCHEDULE_BATCH_PATH.read_text()
-    check("_mamba_lazy_alloc_consensus" not in sb_source,
-          "_mamba_lazy_alloc_consensus must be deleted")
+    check(
+        "_mamba_lazy_alloc_consensus" not in sb_source,
+        "_mamba_lazy_alloc_consensus must be deleted",
+    )
     for name in (
         "_mamba_alloc_or_fail_stop",
         "mamba_lazy_prealloc_at_boundary",
@@ -528,7 +580,9 @@ def test_peer_paths_have_no_collectives():
         check(not uses, f"ScheduleBatch.{name} must be collective-free, got {uses}")
 
     # The DFLASH identity probe no longer owns a collective.
-    dflash_source = (REPO / "python/sglang/srt/speculative/dflash_worker_v2.py").read_text()
+    dflash_source = (
+        REPO / "python/sglang/srt/speculative/dflash_worker_v2.py"
+    ).read_text()
     tree = ast.parse(dflash_source)
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -539,17 +593,21 @@ def test_peer_paths_have_no_collectives():
                     and "_batch_identity_probe_tick" in ast.dump(node)
                 ):
                     check(False, "DFLASH identity probe must not all_reduce")
-    check("note_batch_identity" in dflash_source,
-          "DFLASH probe must publish identity via the authority mailbox")
+    check(
+        "note_batch_identity" in dflash_source,
+        "DFLASH probe must publish identity via the authority mailbox",
+    )
 
     # The publication carrier: request_receiver appends/extracts the record
     # batch around the EXISTING broadcast_pyobj (allowed), and peers apply
     # via bus.apply_batch only.
     receiver_source = RECEIVER_PATH.read_text()
-    check("HiCacheRecordBatch" in receiver_source
-          and "build_publish_batch" in receiver_source
-          and "apply_batch" in receiver_source,
-          "request_receiver must carry and apply record batches")
+    check(
+        "HiCacheRecordBatch" in receiver_source
+        and "build_publish_batch" in receiver_source
+        and "apply_batch" in receiver_source,
+        "request_receiver must carry and apply record batches",
+    )
 
 
 # ---- (7) write-intent fence must cover the SCHEDULER stream -------------------
@@ -579,9 +637,7 @@ def test_peer_paths_have_no_collectives():
 
 
 def test_write_intent_fence_covers_schedule_stream():
-    src, node = _method_node(
-        CACHE_PATH, "UnifiedRadixCache", "_hicache_enqueue_write"
-    )
+    src, node = _method_node(CACHE_PATH, "UnifiedRadixCache", "_hicache_enqueue_write")
     segment = ast.get_source_segment(src, node)
     check(
         "fence_state_read" in segment and ".record(" in segment,

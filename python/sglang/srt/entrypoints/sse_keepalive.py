@@ -1,4 +1,4 @@
-"""Opt-in SSE comment keep-alives for long-running streaming requests."""
+"""Opt-in SSE comment keep-alive messages for long-running streaming requests."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ SSE_KEEPALIVE_COMMENT = ": keep-alive\n\n"
 
 
 def sse_keepalive_interval() -> float:
-    """Return the configured interval, or zero when keep-alives are disabled."""
+    """Return the configured interval, or zero when the keep-alive is disabled."""
     return _normalize_interval(envs.SGLANG_SSE_KEEPALIVE_INTERVAL.get())
 
 
@@ -45,9 +45,9 @@ async def prime_sse_stream(
 ) -> PrimedSSEStream[_T]:
     """Wait for an immediate first item while retaining a long-running await.
 
-    With keep-alives disabled this preserves the historical behavior: the
+    With keep-alive disabled this preserves the historical behavior: the
     caller receives the first item (or exception) before committing HTTP 200.
-    With keep-alives enabled, immediate validation errors still retain their
+    With keep-alive enabled, immediate validation errors still retain their
     HTTP status, while requests that take longer than one interval can start
     an SSE response with a comment instead of waiting indefinitely.
     """

@@ -24,6 +24,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.jit.cute_aot_cache import (
+    install_flashinfer_mla_decode_aot_cache,
+)
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
@@ -34,9 +37,6 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
-)
-from sglang.kernels.jit.cute_aot_cache import (
-    install_flashinfer_mla_decode_aot_cache,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (

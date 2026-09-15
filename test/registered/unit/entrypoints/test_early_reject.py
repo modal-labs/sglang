@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,9 @@ from sglang.srt.entrypoints.early_reject import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.auth import add_api_key_middleware
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 GENERATION_PATHS = [
     "/v1/chat/completions",
@@ -318,3 +322,7 @@ def test_api_early_reject_limit_is_exposed_on_cli():
         ["--model-path", "dummy", "--api-early-reject-max-concurrency", "16"]
     )
     assert args.api_early_reject_max_concurrency == 16
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

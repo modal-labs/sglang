@@ -256,9 +256,7 @@ class TestHostMambaWatermark(unittest.TestCase):
         ) as logs:
             self.assertEqual(cache.write_backup(node99), 1)
         _drain_writes(cache)
-        self.assertTrue(
-            any("host watermark eviction" in line for line in logs.output)
-        )
+        self.assertTrue(any("host watermark eviction" in line for line in logs.output))
         self.assertEqual(cache.mamba_pool_host.available_size(), 6)
         for node in leaves[:5]:
             self.assertIsNone(node.mamba_host_value)

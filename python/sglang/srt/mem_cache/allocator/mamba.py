@@ -111,9 +111,7 @@ class MambaSlotAllocator:
                 self.free_slots = torch.cat(
                     (
                         self.free_slots,
-                        torch.tensor(
-                            release, dtype=torch.int64, device=self.device
-                        ),
+                        torch.tensor(release, dtype=torch.int64, device=self.device),
                     )
                 )
 
@@ -128,9 +126,7 @@ class MambaSlotAllocator:
                 keep = [int(s) for s in slots if int(s) not in self._pinned]
                 if not keep:
                     return
-                free_index = torch.tensor(
-                    keep, dtype=torch.int64, device=self.device
-                )
+                free_index = torch.tensor(keep, dtype=torch.int64, device=self.device)
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):

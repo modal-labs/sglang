@@ -3,8 +3,8 @@ from __future__ import annotations
 import abc
 import logging
 import os
-import time
 import threading
+import time
 from functools import wraps
 from typing import Optional
 
@@ -36,8 +36,10 @@ def cgroup_mem_snapshot() -> str:
     string when the cgroup files are unavailable (v1, non-Linux).
     """
     parts = []
-    for name, label in (("memory.current", "mem_current_gib"),
-                        ("memory.peak", "mem_peak_gib")):
+    for name, label in (
+        ("memory.current", "mem_current_gib"),
+        ("memory.peak", "mem_peak_gib"),
+    ):
         try:
             with open(f"/sys/fs/cgroup/{name}") as f:
                 raw = f.read().strip()
@@ -179,6 +181,7 @@ def drop_configured_pagecache(default_roots: str = "") -> None:
         )
     # No rank starts pinning until every rank's sweep has returned.
     _all_ranks_barrier()
+
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 

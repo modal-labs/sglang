@@ -9,7 +9,6 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
-
 #include <sgl_kernel/ptx/addr.cuh>
 #include <sgl_kernel/ptx/mbarrier.cuh>
 #include <sgl_kernel/ptx/sync.cuh>
@@ -33,7 +32,7 @@ struct AttnResTMAParams {
   const bf16_t* __restrict__ cw;          // [H] score norm * proj weight
   const bf16_t* __restrict__ ow;          // [H] out norm weight
   bf16_t* __restrict__ out;               // [T, H]
-  fp8_e4m3_t* __restrict__ out_fp8;        // optional [T, H], unit scale
+  fp8_e4m3_t* __restrict__ out_fp8;       // optional [T, H], unit scale
   // Fused bank write (nullptr = off): per-token destination of the prefix
   // row snapshot, bank row nvb (strided by stride_bm like the read rows).
   // The kernel never reads row nvb, so the write races with nothing.
@@ -137,17 +136,11 @@ SGL_DEVICE float2 mul_f32x2(float2 a, float2 b) {
   return reinterpret_cast<const float2&>(result);
 }
 
-template <
-    int64_t kDim_,
-    uint32_t kNumBankRows_,
-    uint32_t kChunkRows_,
-    uint32_t kConsumerRegs_,
-    bool kEmitStaticFP8_>
-SGL_DEVICE void
-KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerRegs_, kEmitStaticFP8_>::forward(
+template <int64_t kDim_, uint32_t kNumBankRows_, uint32_t kChunkRows_, uint32_t kConsumerRegs_, bool kEmitStaticFP8_>
+SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerRegs_, kEmitStaticFP8_>::forward(
     const AttnResTMAParams& params, Smem* smem) {
   using namespace device;
-  using row_vec_t = AlignedVector<bf16x2_t, kVecElems / 2>;  // 16 bytes
+  using row_vec_t = AlignedVector<bf16x2_t, kVecElems / 2>;      // 16 bytes
   using fp8_vec_t = AlignedVector<fp8x2_e4m3_t, kVecElems / 2>;  // 8 bytes
   const auto tx = threadIdx.x;
   const auto warp_id = tx / kWarpThreads;
@@ -411,10 +404,7 @@ KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerRegs_, kEmitStati
       const float2 scale2 = make_float2(scale, scale);
 
       auto* out_ptr = params.out + static_cast<int64_t>(token) * kDim;
-      auto* out_fp8_ptr =
-          kEmitStaticFP8
-              ? params.out_fp8 + static_cast<int64_t>(token) * kDim
-              : nullptr;
+      auto* out_fp8_ptr = kEmitStaticFP8 ? params.out_fp8 + static_cast<int64_t>(token) * kDim : nullptr;
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
         const auto tile = si * kNumGroups + group;
@@ -433,8 +423,7 @@ KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerRegs_, kEmitStati
           out_vec[j] = rounded;
           if constexpr (kEmitStaticFP8) {
             const auto rounded_f32 = cast<float2>(rounded);
-            out_fp8_vec[j] = deepseek_v4::fp8::pack_fp8(
-                rounded_f32.x, rounded_f32.y);
+            out_fp8_vec[j] = deepseek_v4::fp8::pack_fp8(rounded_f32.x, rounded_f32.y);
           }
         }
         const auto row_vid = tile * (kTile / kVecElems) + tid_in_group;
@@ -600,8 +589,7 @@ template <
 struct AttnResFusedTmaKernel {
   using KernelFn = void (*)(const AttnResTMAParams);
   template <uint32_t kNvb>
-  using Trait =
-      KimiK3AttnResTrait<kDim, kNvb, kChunkRows, kConsumerRegs, kEmitStaticFP8>;
+  using Trait = KimiK3AttnResTrait<kDim, kNvb, kChunkRows, kConsumerRegs, kEmitStaticFP8>;
   static constexpr uint32_t kNumThreads = Trait<1>::kNumThreads;
   static constexpr size_t kSmemBytes = sizeof(typename Trait<1>::Smem);
   // kOccupancy copies of the smem ring must fit one SM (228KB on SM100).
@@ -649,10 +637,7 @@ struct AttnResFusedTmaKernel {
         kEmitStaticFP8 == out_fp8.has_value(),
         "attn_res_fused_tma: compiled dual-output mode and out_fp8 presence disagree");
     if constexpr (kEmitStaticFP8) {
-      TensorMatcher({T_, H_})
-          .with_dtype<fp8_e4m3_t>()
-          .with_device(device)
-          .verify(out_fp8.value());
+      TensorMatcher({T_, H_}).with_dtype<fp8_e4m3_t>().with_device(device).verify(out_fp8.value());
     }
 
     const auto num_tokens = static_cast<int64_t>(T_.unwrap());

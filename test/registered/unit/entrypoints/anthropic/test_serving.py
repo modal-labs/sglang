@@ -1454,9 +1454,7 @@ class TestAnthropicServing(unittest.TestCase):
 
     def test_kimi_thinking_history_does_not_require_reasoning_detector(self):
         """Kimi's native encoder consumes structured reasoning directly."""
-        serving = AnthropicServing(
-            _FakeOpenAIServingChat(chat_encoding_spec="kimi_k3")
-        )
+        serving = AnthropicServing(_FakeOpenAIServingChat(chat_encoding_spec="kimi_k3"))
         request = self._anthropic_request(
             stream=False,
             messages=[

@@ -80,10 +80,7 @@ def get_hicache_draft_kv_pool(
     enable_hierarchical_cache: bool,
 ):
     """Return the concrete draft pool that will receive a mirrored L2 cache."""
-    if (
-        not enable_hierarchical_cache
-        or getattr(draft_worker, "use_draft_ring", False)
-    ):
+    if not enable_hierarchical_cache or getattr(draft_worker, "use_draft_ring", False):
         return None
 
     pool = get_draft_kv_pool(
@@ -93,10 +90,7 @@ def get_hicache_draft_kv_pool(
     )
     if pool is None:
         return None
-    if (
-        server_args.enable_mla_hicache_host_dedup
-        and not spec_algorithm.is_dflash()
-    ):
+    if server_args.enable_mla_hicache_host_dedup and not spec_algorithm.is_dflash():
         raise ValueError(
             "MLA HiCache host dedup draft mirroring is currently validated only "
             "for non-ring DFlash, whose draft pool shares the target global KV "
