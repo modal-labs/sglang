@@ -193,6 +193,7 @@ async def run(args):
                 path = "/v1/chat/completions"
             else:
                 # Different prefixes and ragged input lengths exercise partial DCP pages.
+                # Native output_ids need no logprobs; DFlash rejects return_logprob.
                 facts = (
                     f"Record {case}: a copper key opens the blue door. "
                     "The red door stays closed. "
@@ -201,8 +202,6 @@ async def run(args):
                     "rid": rid,
                     "text": facts
                     + "\nWrite 80 numbered sentences explaining these records.",
-                    "return_logprob": True,
-                    "logprob_start_len": -1,
                     "sampling_params": {
                         "temperature": 0,
                         "sampling_seed": case,
