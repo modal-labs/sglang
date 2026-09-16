@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 from utils import (
     collect_stream_events,
@@ -279,3 +280,70 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StreamOwnershipTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_close_propagates_before_generation_and_after_content(self):
+        for harmony in (False, True):
+            for after_content in (False, True):
+                with self.subTest(harmony=harmony, after_content=after_content):
+                    serving = make_serving()
+                    serving.reasoning_parser = None
+                    serving.tool_call_parser = None
+                    request = ResponsesRequest(
+                        model="x", input="hi", stream=True, store=False
+                    )
+                    context = SimpleNamespace(
+                        is_expecting_start=lambda: False,
+                        parser=SimpleNamespace(
+                            last_content_delta="Hello",
+                            current_channel="final",
+                            current_recipient=None,
+                        ),
+                    )
+
+                    class Generation:
+                        started = False
+                        closed = False
+
+                        def __aiter__(self):
+                            return self
+
+                        async def __anext__(self):
+                            self.started = True
+                            return context if harmony else _engine_chunk("Hello", 1)
+
+                        async def aclose(self):
+                            self.closed = True
+
+                    generation = Generation()
+                    kwargs = dict(
+                        request=request,
+                        sampling_params={},
+                        result_generator=generation,
+                        model_name="x",
+                        tokenizer=Mock(),
+                        request_metadata=RequestResponseMetadata(
+                            request_id=request.request_id
+                        ),
+                    )
+                    if harmony:
+                        stream = serving.responses_stream_generator(
+                            context=context, **kwargs
+                        )
+                    else:
+                        stream = serving.responses_stream_generator_non_harmony(
+                            **kwargs
+                        )
+                    for _ in range(20):
+                        event = await anext(stream)
+                        if (
+                            not after_content
+                            or "event: response.output_text.delta" in event
+                        ):
+                            break
+                    else:
+                        self.fail("formatter did not produce a content event")
+                    self.assertEqual(generation.started, after_content)
+                    await stream.aclose()
+                    self.assertTrue(generation.closed)

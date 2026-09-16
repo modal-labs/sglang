@@ -82,6 +82,7 @@ async def coordinated_turn(request, decode_generator, prefill_task, abort_decode
     iterator = decode_generator.__aiter__()
     next_output = None
     completed = False
+    decode_aborted = False
     try:
         while True:
             next_output = asyncio.create_task(anext(iterator))
@@ -96,9 +97,18 @@ async def coordinated_turn(request, decode_generator, prefill_task, abort_decode
             try:
                 output = await next_output
             except StopAsyncIteration:
-                completed = True
+                completed = not decode_aborted
                 break
             next_output = None
+            # Streaming scheduler errors are yielded as terminal abort outputs,
+            # not raised. An exhausted D iterator therefore does not by itself
+            # prove P transferred successfully.
+            finish_reason = (
+                (output.get("meta_info") or {}).get("finish_reason") or {}
+                if isinstance(output, dict)
+                else {}
+            )
+            decode_aborted |= finish_reason.get("type") == "abort"
             yield output
     finally:
         if next_output is not None and not next_output.done():

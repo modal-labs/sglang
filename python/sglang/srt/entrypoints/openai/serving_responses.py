@@ -323,10 +323,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                         self._make_request_with_harmony(request, prev_response)
                     )
                 else:
-                    messages, request_prompts, engine_prompts = (
-                        await self.request_conversion_executor.run(
-                            self._make_request_with_harmony, request, prev_response
-                        )
+                    (
+                        messages,
+                        request_prompts,
+                        engine_prompts,
+                    ) = await self.request_conversion_executor.run(
+                        self._make_request_with_harmony, request, prev_response
                     )
             else:
                 (
@@ -355,8 +357,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         ):
             return self.create_error_response(
-                "MCP tool server is not supported in background mode and "
-                "streaming mode"
+                "MCP tool server is not supported in background mode and streaming mode"
             )
 
         # Schedule the request and get the result generator
@@ -550,16 +551,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
             try:
-                result: Union[ORJSONResponse, ResponsesResponse] = (
-                    await self.responses_full_generator(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                    )
+                result: Union[
+                    ORJSONResponse, ResponsesResponse
+                ] = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
                 )
                 return result
             except Exception as e:
@@ -634,7 +635,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         if request.tool_choice != "auto":
             raise NotImplementedError(
-                "Only 'auto' tool_choice is supported in " "response API"
+                "Only 'auto' tool_choice is supported in response API"
             )
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
@@ -1597,9 +1598,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]
                 del prev_msgs[prev_final_msg_idx + 1 :]
                 for msg in recent_turn_msgs:
-                    if (
-                        hasattr(msg, "channel") and msg.channel != "analysis"
-                    ):  # type: ignore[union-attr]
+                    if hasattr(msg, "channel") and msg.channel != "analysis":  # type: ignore[union-attr]
                         prev_msgs.append(msg)
             messages.extend(prev_msgs)
         # Append the new input.
@@ -1735,9 +1734,39 @@ class OpenAIServingResponses(OpenAIServingChat):
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
-        # TODO:
-        # 1. Handle disconnect
+        """Close the engine iterator when the SSE consumer leaves."""
+        formatter = self._responses_stream_generator(
+            request,
+            sampling_params,
+            result_generator,
+            context,
+            model_name,
+            tokenizer,
+            request_metadata,
+            created_time,
+        )
+        try:
+            async for event in formatter:
+                yield event
+        finally:
+            try:
+                await formatter.aclose()
+            finally:
+                close = getattr(result_generator, "aclose", None)
+                if close is not None:
+                    await close()
 
+    async def _responses_stream_generator(
+        self,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        result_generator: AsyncIterator[StreamingHarmonyContext],
+        context: StreamingHarmonyContext,
+        model_name: str,
+        tokenizer: Any,
+        request_metadata: RequestResponseMetadata,
+        created_time: Optional[int] = None,
+    ) -> AsyncGenerator[str, None]:
         created_time = created_time or int(time.time())
 
         sequence_number = 0
@@ -1751,8 +1780,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Get event type from the event's type field if it exists
             event_type = getattr(event, "type", "unknown")
             return (
-                f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
             )
 
         current_content_index = 0
@@ -1787,7 +1815,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         async for ctx in result_generator:
-
             # Only process context objects that implement the `is_expecting_start()` method,
             # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
             # Contexts without this method are skipped, as they do not represent a new turn
@@ -2166,6 +2193,37 @@ class OpenAIServingResponses(OpenAIServingChat):
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
+        """Close the engine iterator when the SSE consumer leaves."""
+        formatter = self._responses_stream_generator_non_harmony(
+            request,
+            sampling_params,
+            result_generator,
+            model_name,
+            tokenizer,
+            request_metadata,
+            created_time,
+        )
+        try:
+            async for event in formatter:
+                yield event
+        finally:
+            try:
+                await formatter.aclose()
+            finally:
+                close = getattr(result_generator, "aclose", None)
+                if close is not None:
+                    await close()
+
+    async def _responses_stream_generator_non_harmony(
+        self,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        result_generator: AsyncIterator[Any],
+        model_name: str,
+        tokenizer: Any,
+        request_metadata: RequestResponseMetadata,
+        created_time: Optional[int] = None,
+    ) -> AsyncGenerator[str, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
         and function-call parsers; leftover text becomes
@@ -2182,8 +2240,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             event_type = getattr(event, "type", "unknown")
             return (
-                f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
             )
 
         initial_response = _sanitize_response_dict_for_sdk_events(
@@ -2877,7 +2934,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 generator = coordinated_turn(
                     adapted_request,
-                    self.tokenizer_manager.generate_request(adapted_request, raw_request),
+                    self.tokenizer_manager.generate_request(
+                        adapted_request, raw_request
+                    ),
                     prefill_task,
                     self.tokenizer_manager.abort_request,
                 )

@@ -172,6 +172,34 @@ class LifecycleTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outputs, [1, 2])
 
+    async def test_streaming_scheduler_abort_cancels_prefill_and_preserves_output(self):
+        for status_code in (400, 500, 503):
+            with self.subTest(status_code=status_code):
+                output = {
+                    "text": "",
+                    "meta_info": {
+                        "finish_reason": {
+                            "type": "abort",
+                            "status_code": status_code,
+                            "message": "scheduler rejected request",
+                        }
+                    },
+                }
+
+                async def decode():
+                    yield output
+
+                prefill = asyncio.create_task(asyncio.Event().wait())
+                aborted = []
+                outputs = await self.collect(
+                    module.coordinated_turn(
+                        Request(), decode(), prefill, aborted.append
+                    )
+                )
+                self.assertEqual(outputs, [output])
+                self.assertTrue(prefill.cancelled())
+                self.assertEqual(aborted, ["resp_test"])
+
     async def collect(self, gen):
         return [item async for item in gen]
 

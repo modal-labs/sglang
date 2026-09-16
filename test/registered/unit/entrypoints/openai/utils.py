@@ -46,6 +46,8 @@ class MockTokenizerManager:
         )
         self.server_args = Mock(
             enable_cache_report=False,
+            request_conversion_concurrency=0,
+            responses_prefill_url=None,
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             tokenizer_metrics_allowed_custom_labels=None,
