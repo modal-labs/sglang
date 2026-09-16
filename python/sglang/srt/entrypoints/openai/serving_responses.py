@@ -603,7 +603,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 raise ValueError(validation_error)
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-        processed_messages = self._process_messages(chat_request, is_multimodal)
+        if self.request_conversion_executor is not None:
+            processed_messages = await self.request_conversion_executor.run(
+                self._process_messages, chat_request, is_multimodal
+            )
+        else:
+            processed_messages = self._process_messages(chat_request, is_multimodal)
         processed_messages.skip_special_tokens = chat_request.skip_special_tokens
 
         if is_multimodal:
@@ -2847,9 +2852,32 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         while True:
             # Generate using SGLang's tokenizer manager
-            generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            )
+            prefill_url = self.tokenizer_manager.server_args.responses_prefill_url
+            if prefill_url:
+                from sglang.srt.entrypoints.openai.pd_responses import (
+                    coordinated_turn,
+                    prepare_prefill_turn,
+                    run_prefill,
+                )
+
+                payload = prepare_prefill_turn(
+                    adapted_request,
+                    prefill_url,
+                    self.tokenizer_manager.server_args.disaggregation_bootstrap_port,
+                )
+                prefill_task = asyncio.create_task(
+                    run_prefill(prefill_url, payload, timeout=1800)
+                )
+                generator = coordinated_turn(
+                    adapted_request,
+                    self.tokenizer_manager.generate_request(adapted_request, raw_request),
+                    prefill_task,
+                    self.tokenizer_manager.abort_request,
+                )
+            else:
+                generator = self.tokenizer_manager.generate_request(
+                    adapted_request, raw_request
+                )
 
             async for res in generator:
                 context.append_output(res)

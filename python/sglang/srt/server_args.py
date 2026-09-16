@@ -798,6 +798,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    responses_prefill_url: A[
+        Optional[str],
+        "Trusted prefill worker origin for native Responses on a fixed PD decode worker.",
+        NS("disagg"),
+    ] = None
     request_conversion_concurrency: A[
         int,
         "Maximum concurrent CPU request conversions across OpenAI handlers; zero keeps synchronous conversion.",
@@ -8793,6 +8798,22 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        if self.responses_prefill_url:
+            if self.disaggregation_mode != "decode":
+                raise ValueError("responses_prefill_url requires a PD decode worker")
+            from urllib.parse import urlsplit
+
+            origin = urlsplit(self.responses_prefill_url)
+            if (
+                origin.scheme not in ("http", "https")
+                or not origin.hostname
+                or origin.username is not None
+                or origin.password is not None
+                or origin.path not in ("", "/")
+                or origin.query
+                or origin.fragment
+            ):
+                raise ValueError("responses_prefill_url must be an HTTP worker origin")
         if self.request_conversion_concurrency < 0:
             raise ValueError("request_conversion_concurrency must be nonnegative")
         if self.short_prefill_token_threshold < 0:
