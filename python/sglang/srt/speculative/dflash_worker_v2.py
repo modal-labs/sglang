@@ -108,6 +108,41 @@ def _sync_dflash_sampling_results(
     bonus.copy_(outcome[:, 1])
 
 
+def _sync_dflash_selector_draft(
+    draft_next: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    q_rows: torch.Tensor,
+    *,
+    tp_sync: SpecTpSync,
+    pack_buffer: torch.Tensor,
+) -> None:
+    """Broadcast rank 0's stochastic selector block before it feeds verify.
+
+    Tokens, candidate ids and the selector q rows are packed into one int32
+    buffer (q bit-cast) so the sync is a single collective.
+    """
+    if not tp_sync.enabled(SpecTpSyncSite.DFLASH_DRAFT_SAMPLE):
+        return
+    bs, gamma, top_k = candidate_ids.shape
+    if q_rows.dtype != torch.float32:
+        raise ValueError("DFlash selector q rows must be float32")
+    if pack_buffer.dtype != torch.int32 or tuple(pack_buffer.shape[1:]) != (
+        gamma,
+        1 + 2 * top_k,
+    ):
+        raise ValueError(
+            "DFlash selector pack buffer must be int32 [max_bs, gamma, 1+2*top_k]"
+        )
+    buf = pack_buffer[:bs]
+    buf[:, :, 0].copy_(draft_next)
+    buf[:, :, 1 : 1 + top_k].copy_(candidate_ids)
+    buf[:, :, 1 + top_k :].copy_(q_rows.view(torch.int32))
+    tp_sync.sync(SpecTpSyncSite.DFLASH_DRAFT_SAMPLE, buf)
+    draft_next.copy_(buf[:, :, 0])
+    candidate_ids.copy_(buf[:, :, 1 : 1 + top_k])
+    q_rows.copy_(buf[:, :, 1 + top_k :].view(torch.float32))
+
+
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
@@ -273,6 +308,9 @@ class _SelectorDraftSampler:
         self.block_size = int(block_size)
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
+        self.sync_buf = torch.empty(
+            (max_bs, gamma, 1 + 2 * top_k), dtype=torch.int32, device=device
+        )
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
@@ -566,6 +604,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._selector_sync_buf: Optional[torch.Tensor] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
@@ -1399,9 +1438,37 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs=bs, sampling_info=sampling_info, device=device
             ),
         )
+        tokens = tokens.view(bs, num_pred)
         if not _is_all_greedy(sampling_info):
+            tokens = tokens.contiguous()
+            candidate_ids = candidate_ids.contiguous()
+            q_rows = q_rows.contiguous()
+            pack_shape = (num_pred, 1 + 2 * candidate_ids.shape[-1])
+            if (
+                self._selector_sync_buf is None
+                or self._selector_sync_buf.shape[0] < bs
+                or tuple(self._selector_sync_buf.shape[1:]) != pack_shape
+            ):
+                existing_bs = (
+                    0
+                    if self._selector_sync_buf is None
+                    else self._selector_sync_buf.shape[0]
+                )
+                max_bs = max(bs, existing_bs)
+                self._selector_sync_buf = torch.empty(
+                    (max_bs, *pack_shape),
+                    dtype=torch.int32,
+                    device=device,
+                )
+            _sync_dflash_selector_draft(
+                tokens,
+                candidate_ids,
+                q_rows,
+                tp_sync=self._tp_sync,
+                pack_buffer=self._selector_sync_buf,
+            )
             self._selector_sample = (candidate_ids, q_rows)
-        return tokens.view(bs, num_pred)
+        return tokens
 
     def _selector_sampling_accept(
         self,
@@ -2496,6 +2563,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
             if self.selector is not None and not _is_all_greedy(batch.sampling_info):
+                _sync_dflash_selector_draft(
+                    draft_next,
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                    tp_sync=self._tp_sync,
+                    pack_buffer=self._draft_sampler.sync_buf,
+                )
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
