@@ -391,10 +391,12 @@ class BaseRunner(ABC):
         num_tokens_per_req = 1
         if (
             mr.spec_algorithm.is_speculative()
-            # A PD prefill role never runs TARGET_VERIFY, and its mamba pool
-            # has no verify scratch (see kv_cache_configurator's prefill-role
-            # exemption) — warm up the default mode instead.
-            and mr.server_args.disaggregation_mode != "prefill"
+            # A PD prefill target never verifies and has no verify scratch.
+            # Keep the draft runner's normal speculative warmup unchanged.
+            and not (
+                mr.server_args.disaggregation_mode == "prefill"
+                and not mr.is_draft_worker
+            )
         ):
             if mr.is_draft_worker:
                 assert (
