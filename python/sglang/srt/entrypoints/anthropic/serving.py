@@ -762,7 +762,9 @@ class AnthropicServing:
         received_time = monotonic_time()
 
         # Validate
-        error_msg = self.openai_serving_chat._validate_request(chat_request)
+        error_msg = await self._run_conversion(
+            self.openai_serving_chat._validate_request, chat_request
+        )
         if error_msg:
             return self._error_response(
                 status_code=400,
@@ -815,7 +817,9 @@ class AnthropicServing:
         received_time = monotonic_time()
 
         # Validate
-        error_msg = self.openai_serving_chat._validate_request(chat_request)
+        error_msg = await self._run_conversion(
+            self.openai_serving_chat._validate_request, chat_request
+        )
         if error_msg:
             return self._error_response(
                 status_code=400,

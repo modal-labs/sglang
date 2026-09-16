@@ -88,7 +88,12 @@ class OpenAIServingBase(ABC):
 
         try:
             # Validate request
-            error_msg = self._validate_request(request)
+            if self.request_conversion_executor is None:
+                error_msg = self._validate_request(request)
+            else:
+                error_msg = await self.request_conversion_executor.run(
+                    self._validate_request, request
+                )
             if error_msg:
                 return self.create_error_response(error_msg)
 

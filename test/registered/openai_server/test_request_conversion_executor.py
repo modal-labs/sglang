@@ -1,7 +1,10 @@
+import ast
 import asyncio
 import importlib.util
 import threading
 import unittest
+from time import monotonic
+from types import SimpleNamespace
 from pathlib import Path
 
 path = (
@@ -64,6 +67,48 @@ class ConversionTest(unittest.IsolatedAsyncioTestCase):
             await task
         executor._slots.release()
         self.assertEqual(await asyncio.wait_for(executor.run(lambda: 3), 1), 3)
+
+    async def test_handler_offloads_schema_validation_and_preserves_error(self):
+        # Execute the actual frontend method without loading GPU dependencies.
+        source = path.with_name("serving_base.py")
+        tree = ast.parse(source.read_text())
+        klass = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "OpenAIServingBase"
+        )
+        method = next(
+            n
+            for n in klass.body
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "handle_request"
+        )
+        unit = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                method,
+            ],
+            type_ignores=[],
+        )
+        scope = {"monotonic_time": monotonic}
+        exec(compile(ast.fix_missing_locations(unit), str(source), "exec"), scope)
+        main_thread = threading.get_ident()
+        visited = []
+
+        def validate(request):
+            visited.append(threading.get_ident())
+            return "invalid schema"
+
+        handler = SimpleNamespace(
+            request_conversion_executor=module.RequestConversionExecutor(1),
+            _validate_request=validate,
+            create_error_response=lambda message: {"error": message},
+        )
+        result = await scope["handle_request"](handler, object(), None)
+        self.assertEqual(result, {"error": "invalid schema"})
+        self.assertEqual(len(visited), 1)
+        self.assertNotEqual(visited[0], main_thread)
 
     def test_invalid_concurrency(self):
         with self.assertRaises(ValueError):
