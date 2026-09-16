@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.decode_backfill import DecodeBackfillBudget
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -336,6 +338,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
+        # Experimental, explicit opt-in; default reservation ordering is unchanged.
+        self._backfill = (
+            DecodeBackfillBudget()
+            if os.environ.get("SGLANG_DECODE_BOUNDED_BACKFILL") == "1"
+            else None
+        )
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
         self._ensure_retry_count: Dict[str, int] = {}
@@ -968,6 +976,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
+        # Restrict the experiment to the no-prefix-cache full-KV path.
+        # Radix matching acquires locks and needs separate skip-path validation.
+        backfill = self._backfill
+        if (
+            uses_swa_tail_prealloc
+            or self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            or self.scheduler.enable_hisparse
+            or self.scheduler.enable_priority_scheduling
+            or rids_to_check is not None
+        ):
+            backfill = None
+        if backfill is not None:
+            first_ready = next(
+                (
+                    entry.req.rid
+                    for j, entry in enumerate(self.queue)
+                    if j not in indices_to_remove and entry.waiting_for_input
+                ),
+                None,
+            )
+            backfill.begin(first_ready)
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1031,6 +1061,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
+            if backfill is not None and not backfill.allows(
+                decode_req.req.rid, required_tokens_for_request
+            ):
+                continue
+
             if (
                 max(
                     required_tokens_for_request,
@@ -1046,6 +1081,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if backfill is not None and backfill.blocked(
+                    decode_req.req.rid, required_tokens_for_request
+                ):
+                    continue
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
@@ -1076,6 +1115,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            if backfill is not None:
+                backfill.admitted(decode_req.req.rid, required_tokens_for_request)
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)

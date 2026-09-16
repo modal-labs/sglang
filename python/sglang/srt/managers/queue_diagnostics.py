@@ -102,4 +102,14 @@ def snapshot(scheduler):
         if scheduler.chunked_req is not None
         else None
     )
+    prealloc = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+    backfill = getattr(prealloc, "_backfill", None)
+    if backfill is not None:
+        result["decode_backfill"] = {
+            "head": backfill.head,
+            "demand": backfill.demand,
+            "remaining": backfill.remaining,
+            "total_admitted": backfill.total_admitted,
+            "total_tokens": backfill.total_tokens,
+        }
     return result
