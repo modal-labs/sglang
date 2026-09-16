@@ -333,6 +333,11 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
+    # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
+    # it under live traffic isolates where ranks actually diverge. Comma
+    # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
+    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-6".
+    SGLANG_SPEC_TP_SYNC = EnvStr("all")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
