@@ -798,6 +798,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    request_conversion_concurrency: A[
+        int,
+        "Maximum concurrent CPU request conversions across OpenAI handlers; zero keeps synchronous conversion.",
+        NS("schedule"),
+    ] = 0
     short_prefill_token_threshold: A[
         int,
         "Opt-in short-prefill protection: maximum uncached tokens in the queue head. Zero disables.",
@@ -8788,6 +8793,8 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        if self.request_conversion_concurrency < 0:
+            raise ValueError("request_conversion_concurrency must be nonnegative")
         if self.short_prefill_token_threshold < 0:
             raise ValueError("short_prefill_token_threshold must be nonnegative")
         if self.short_prefill_token_threshold > 0:

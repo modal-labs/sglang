@@ -28,6 +28,14 @@ class OpenAIServingBase(ABC):
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        concurrency = tokenizer_manager.server_args.request_conversion_concurrency
+        if concurrency > 0 and not hasattr(tokenizer_manager, "request_conversion_executor"):
+            from sglang.srt.entrypoints.openai.request_conversion import RequestConversionExecutor
+
+            tokenizer_manager.request_conversion_executor = RequestConversionExecutor(concurrency)
+        self.request_conversion_executor = getattr(
+            tokenizer_manager, "request_conversion_executor", None
+        )
         self.allowed_custom_labels = (
             set(
                 self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
@@ -90,9 +98,14 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
-            )
+            if self.request_conversion_executor is None:
+                adapted_request, processed_request = self._convert_to_internal_request(
+                    request, raw_request
+                )
+            else:
+                adapted_request, processed_request = await self.request_conversion_executor.run(
+                    self._convert_to_internal_request, request, raw_request
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
