@@ -9,6 +9,7 @@ model_family: kimi_k3
 from __future__ import annotations
 
 import base64
+import json
 import os
 import shutil
 import struct
@@ -30,7 +31,32 @@ MODEL_REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 MODEL_PATH = MODEL_NAME
 DFLASH_VOLUME_NAME = "dflash_spec"
 DFLASH_MOUNT_PATH = "/dflash"
-SPECULATIVE_DRAFT_MODEL_PATH = f"{DFLASH_MOUNT_PATH}/k3-instinct-v5-epoch1"
+# DFlash2 draft (architectures: ["DFlash2DraftModel"]); the engine selects the
+# DFlash2 path from the checkpoint config. The chosen step is copied into an
+# immutable versioned dir on dflash_spec at ship time and pinned here.
+# v1 rollback: f"{DFLASH_MOUNT_PATH}/k3-instinct-v5-epoch1", fp8 + static scheme.
+DFLASH2_PINNED_STEP = "draft-step-14500"  # newest complete on the training volume at 2026-09-16 03:35Z
+DFLASH2_TARGET_CONFIG_SHA256 = (
+    "2a5cb51c92f3b64e68f7670042e4d8cfff0acd4bcf1e3c5f7190d69609381de6"
+)
+DFLASH2_REQUIRED_FILES = ("config.json", "dflash_checkpoint.json", "model.safetensors")
+# Evaluation override (read at deploy time, never set in prod): K3_DFLASH2_VOLUME
+# mounts that volume read-only at DFLASH2_EVAL_MOUNT_PATH (optionally from
+# K3_DFLASH2_VOLUME_ENV) and K3_DFLASH2_PATH points the draft at a dir inside
+# the container. The completeness check below runs on whichever path is active.
+DFLASH2_EVAL_VOLUME_NAME = os.environ.get("K3_DFLASH2_VOLUME")
+DFLASH2_EVAL_VOLUME_ENV = os.environ.get("K3_DFLASH2_VOLUME_ENV")
+DFLASH2_EVAL_MOUNT_PATH = "/dflash2-eval"
+DFLASH2_TRAINING_SUBDIR = (
+    "outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-1"
+)
+SPECULATIVE_DRAFT_MODEL_PATH = os.environ.get(
+    "K3_DFLASH2_PATH",
+    f"{DFLASH2_EVAL_MOUNT_PATH}/{DFLASH2_TRAINING_SUBDIR}/{DFLASH2_PINNED_STEP}"
+    if DFLASH2_EVAL_VOLUME_NAME
+    else f"{DFLASH_MOUNT_PATH}/k3-instinct-v5-dflash2/{DFLASH2_PINNED_STEP}",
+)
+DRAFT_QUANTIZATION = "unquant"
 LOAD_FORMAT = "fastsafetensors"
 DRAFT_LOAD_FORMAT = "safetensors"
 
@@ -110,6 +136,15 @@ jit_cache = modal.Volume.from_name(
     create_if_missing=True,
 )
 dflash_volume = modal.Volume.from_name(DFLASH_VOLUME_NAME)
+server_volumes = {
+    HF_CACHE_PATH: hf_cache,
+    JIT_CACHE_MOUNT_PATH: jit_cache,
+    DFLASH_MOUNT_PATH: dflash_volume.with_mount_options(read_only=True),
+}
+if DFLASH2_EVAL_VOLUME_NAME:
+    server_volumes[DFLASH2_EVAL_MOUNT_PATH] = modal.Volume.from_name(
+        DFLASH2_EVAL_VOLUME_NAME, environment_name=DFLASH2_EVAL_VOLUME_ENV
+    ).with_mount_options(read_only=True)
 
 BASE_RUNTIME_ENV = {
     "SYNC_TOKEN_IDS_ACROSS_TP": "1",
@@ -266,8 +301,7 @@ EXTRA_SERVER_ARGS = {
     "--speculative-eagle-topk": "1",
     "--speculative-draft-attention-backend": "trtllm_mha",
     "--speculative-draft-kv-cache-dtype": DRAFT_KV_CACHE_DTYPE,
-    "--speculative-draft-model-quantization": "fp8",
-    "--speculative-draft-fp8-activation-scheme": "static",
+    "--speculative-draft-model-quantization": DRAFT_QUANTIZATION,
     "--reasoning-parser": "kimi_k3",
     "--tool-call-parser": "kimi_k3",
     "--stream-response-default-include-usage": "",
@@ -382,6 +416,49 @@ def terminate_unhealthy_container() -> None:
 app = modal.App(name="kimi-k3-fast")
 
 
+def check_dflash2_checkpoint(draft_path: str) -> None:
+    """Fail fast if the pinned DFlash2 checkpoint dir is incomplete or rotated away."""
+    if "<PINNED>" in draft_path:
+        raise RuntimeError(
+            f"DFlash2 draft step not pinned: {draft_path} (fill in DFLASH2_PINNED_STEP)"
+        )
+    root = Path(draft_path)
+    if not root.is_dir():
+        raise RuntimeError(
+            f"DFlash2 draft dir missing: {draft_path} (rotated away or volume not mounted)"
+        )
+    missing = [name for name in DFLASH2_REQUIRED_FILES if not (root / name).is_file()]
+    if missing:
+        raise RuntimeError(f"DFlash2 draft dir {draft_path} incomplete, missing {missing}")
+    weights = root / "model.safetensors"
+    with weights.open("rb") as handle:
+        (header_len,) = struct.unpack("<Q", handle.read(8))
+        header = json.loads(handle.read(header_len))
+    expected_size = 8 + header_len + max(
+        entry["data_offsets"][1]
+        for name, entry in header.items()
+        if name != "__metadata__"
+    )
+    actual_size = weights.stat().st_size
+    if actual_size != expected_size:
+        raise RuntimeError(
+            f"DFlash2 model.safetensors truncated: {actual_size} B on disk, "
+            f"header declares {expected_size} B"
+        )
+    config = json.loads((root / "config.json").read_text())
+    if config.get("architectures") != ["DFlash2DraftModel"]:
+        raise RuntimeError(
+            f"DFlash2 draft config.json architectures={config.get('architectures')!r}"
+        )
+    meta = json.loads((root / "dflash_checkpoint.json").read_text())
+    sha = meta.get("target_config_sha256")
+    if sha != DFLASH2_TARGET_CONFIG_SHA256:
+        raise RuntimeError(
+            f"DFlash2 target_config_sha256 {sha!r} != pinned {DFLASH2_TARGET_CONFIG_SHA256!r}"
+        )
+    print(f"DFlash2 draft checkpoint OK: {draft_path} (target_config_sha256={sha[:12]})")
+
+
 def seed_prebuilt_jit(jit_cache_path: str) -> None:
     """Copy the image-baked module into the volume cache if absent."""
     src = Path(PREBUILT_JIT_IMAGE_DIR) / PREBUILT_JIT_MODULE
@@ -399,11 +476,7 @@ def seed_prebuilt_jit(jit_cache_path: str) -> None:
     gpu=GPU,
     cpu=CPU,
     memory=MEMORY_MIB,
-    volumes={
-        HF_CACHE_PATH: hf_cache,
-        JIT_CACHE_MOUNT_PATH: jit_cache,
-        DFLASH_MOUNT_PATH: dflash_volume.with_mount_options(read_only=True),
-    },
+    volumes=server_volumes,
     min_containers=63,
     target_concurrency=TARGET_CONCURRENCY,
     scaledown_window=10 * MINUTES,
@@ -426,6 +499,7 @@ class Server:
         )
 
         seed_prebuilt_jit(JIT_CACHE_PATH)
+        check_dflash2_checkpoint(SPECULATIVE_DRAFT_MODEL_PATH)
         started = time.monotonic()
 
         print(

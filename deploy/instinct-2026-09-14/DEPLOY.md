@@ -64,6 +64,37 @@ Flags-only rollback (keep c10d0d215, drop the 5 env lines) leaves the dev levers
 values; at 462ade71f that configuration was == `release/2026-09-14` behavior, greedy-identical 36/36
 in every A/B arm.
 
+## DFlash2 draft (kimi-k3-sglang #40 — not deployable until RELEASE_SHA contains #27)
+
+`serve.py` points the draft at `/dflash/k3-instinct-v5-dflash2/draft-step-14500` (`DFLASH2_PINNED_STEP`) on the
+existing `dflash_spec` mount (`DFlash2DraftModel`), `--speculative-draft-model-quantization unquant`
+(no fp8 activation-scheme arg). The v1 draft dir stays in place.
+
+- Pinned step: `draft-step-14500` was the newest complete checkpoint on `dflash-experimental`
+  (env `cust-instinct`, `outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-1`)
+  at 2026-09-16 03:35Z: `model.safetensors` 5,677,368,712 B == safetensors header, 96 tensors,
+  `architectures == ["DFlash2DraftModel"]`, `target_config_sha256 == 2a5cb51c…`. Measured numbers
+  in #27 are on draft-step-13750 (same target hash); 14500 is validated by the integration arm.
+- Evaluation (integration arm, no copy to `dflash_spec`): deploy with
+  `K3_DFLASH2_VOLUME=dflash-experimental K3_DFLASH2_VOLUME_ENV=cust-instinct modal deploy serve.py`.
+  The volume is mounted read-only at `/dflash2-eval` and the draft path defaults to
+  `/dflash2-eval/outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-1/draft-step-14500`
+  (override with `K3_DFLASH2_PATH=<dir>`). The boot check runs on the active path. Prod never sets
+  these variables.
+- Ship procedure: (1) copy `draft-step-14500` from the training volume into the immutable dir
+  `k3-instinct-v5-dflash2/draft-step-14500` on `dflash_spec` (steps rotate on the training volume;
+  12000 disappeared once — until the copy exists the boot check fails fast); (2) bump
+  `DFLASH2_PINNED_STEP` if a newer step is chosen; (3) integration lane advances `RELEASE_SHA` +
+  `rel0914.bundle` to a dev head containing #27.
+- Boot: `check_dflash2_checkpoint` runs before the engine starts and aborts the container with a
+  `RuntimeError` if the dir is missing/incomplete, `model.safetensors` is truncated (size != safetensors header), `architectures`
+  is not `["DFlash2DraftModel"]`, or `target_config_sha256` != the pinned value. Expect
+  `DFlash2 draft checkpoint OK: ...` then `DFLASH selector decode (greedy + sampling) folded into the
+  draft cuda graph` on every rank; `/metrics` weighted accept length ≈ 4.3 (v1: ≈ 3.4).
+- Rollback to v1 (engine may stay): `SPECULATIVE_DRAFT_MODEL_PATH = f"{DFLASH_MOUNT_PATH}/k3-instinct-v5-epoch1"`,
+  `DRAFT_QUANTIZATION = "fp8"` + restore `"--speculative-draft-fp8-activation-scheme": "static"`,
+  drop the `check_dflash2_checkpoint` call; redeploy.
+
 ## Not verified
 
 - A B300:8 container boot with the image warmup turn (#516 is CI-green, not container-tested).
