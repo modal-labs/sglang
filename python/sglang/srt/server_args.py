@@ -798,6 +798,21 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    short_prefill_token_threshold: A[
+        int,
+        "Opt-in short-prefill protection: maximum uncached tokens in the queue head. Zero disables.",
+        NS("schedule"),
+    ] = 0
+    short_prefill_chunk_size: A[
+        int,
+        "Maximum continuing-chunk tokens when short-prefill protection activates.",
+        NS("schedule"),
+    ] = 4096
+    short_prefill_max_tokens: A[
+        int,
+        "Maximum total chunk-token budget when short-prefill protection activates.",
+        NS("schedule"),
+    ] = 6144
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -8772,6 +8787,18 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        if self.short_prefill_token_threshold < 0:
+            raise ValueError("short_prefill_token_threshold must be nonnegative")
+        if self.short_prefill_token_threshold > 0:
+            if self.chunked_prefill_size <= 0 or self.enable_dynamic_chunking:
+                raise ValueError("short-prefill protection requires static chunked prefill")
+            if not 0 < self.short_prefill_chunk_size < self.short_prefill_max_tokens:
+                raise ValueError("short-prefill chunk size must be positive and below its batch budget")
+            if self.short_prefill_token_threshold > self.short_prefill_max_tokens - self.short_prefill_chunk_size:
+                raise ValueError("short-prefill batch budget must leave room for the eligible head")
+            if self.short_prefill_chunk_size % self.page_size:
+                raise ValueError("short_prefill_chunk_size must be divisible by page_size")
 
         # Check pdmux
         if self.enable_pdmux:

@@ -3183,7 +3183,19 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if self.server_args.short_prefill_token_threshold > 0:
+                from sglang.srt.managers.short_prefill import add_chunk_with_short_prefill_budget
+
+                self.chunked_req = add_chunk_with_short_prefill_budget(
+                    adder,
+                    self.chunked_req,
+                    self.waiting_queue,
+                    threshold=self.server_args.short_prefill_token_threshold,
+                    chunk_size=self.server_args.short_prefill_chunk_size,
+                    batch_size=self.server_args.short_prefill_max_tokens,
+                )
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
             running_loras = {
