@@ -35,7 +35,7 @@ DFLASH_MOUNT_PATH = "/dflash"
 # DFlash2 path from the checkpoint config. The chosen step is copied into an
 # immutable versioned dir on dflash_spec at ship time and pinned here.
 # v1 rollback: f"{DFLASH_MOUNT_PATH}/k3-instinct-v5-epoch1", fp8 + static scheme.
-DFLASH2_PINNED_STEP = "draft-step-16000"  # previous pin: draft-step-14500 (kept on dflash_spec as fallback)
+DFLASH2_PINNED_STEP = "draft-epoch-2"  # final checkpoint of the run
 DFLASH2_TARGET_CONFIG_SHA256 = (
     "2a5cb51c92f3b64e68f7670042e4d8cfff0acd4bcf1e3c5f7190d69609381de6"
 )
@@ -48,8 +48,8 @@ DFLASH2_EVAL_VOLUME_NAME = os.environ.get("K3_DFLASH2_VOLUME")
 DFLASH2_EVAL_VOLUME_ENV = os.environ.get("K3_DFLASH2_VOLUME_ENV")
 DFLASH2_EVAL_MOUNT_PATH = "/dflash2-eval"
 DFLASH2_TRAINING_SUBDIR = (
-    "outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-1"
-)
+    "outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-0"
+)  # draft-epoch-2 lives under trainer-0; the draft-step-* checkpoints are under trainer-1
 SPECULATIVE_DRAFT_MODEL_PATH = os.environ.get(
     "K3_DFLASH2_PATH",
     f"{DFLASH2_EVAL_MOUNT_PATH}/{DFLASH2_TRAINING_SUBDIR}/{DFLASH2_PINNED_STEP}"

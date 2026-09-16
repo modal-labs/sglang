@@ -69,28 +69,32 @@ the dev levers at their default-off values; at 462ade71f the 5-flags-off configu
 `release/2026-09-14` behavior, greedy-identical 36/36 in every A/B arm, and on 741f05e61 the flags-off
 parity leg was 36/36 identical to prod with Δp50 +0 ms.
 
-## DFlash2 draft (kimi-k3-sglang #27 + #40 + #48 step-16000 pin, all in RELEASE_SHA 3ccb60f5b)
+## DFlash2 draft (kimi-k3-sglang #27 + #40 + #48 step-16000 pin, all in RELEASE_SHA 3ccb60f5b; draft-epoch-2 pin)
 
-`serve.py` points the draft at `/dflash/k3-instinct-v5-dflash2/draft-step-16000` (`DFLASH2_PINNED_STEP`) on the
+`serve.py` points the draft at `/dflash/k3-instinct-v5-dflash2/draft-epoch-2` (`DFLASH2_PINNED_STEP`) on the
 existing `dflash_spec` mount (`DFlash2DraftModel`), `--speculative-draft-model-quantization unquant`
 (no fp8 activation-scheme arg). The v1 draft dir stays in place.
 
-- Pinned step: `draft-step-16000` (supplied 2026-09-16 ~06:55Z) on `dflash-experimental`
-  (env `cust-instinct`, `outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-1`).
-  Same `target_config_sha256 == 2a5cb51c…` pin; the copy step below validates architecture, target hash
-  and safetensors length. Previous pin `draft-step-14500` (5,677,368,712 B, 96 tensors) stays in its
-  immutable dir as the fallback (`DFLASH2_PINNED_STEP = "draft-step-14500"`). Measured numbers in #27
-  are on draft-step-13750; 14500 was validated by the integration arm. **16000 is not yet validated** —
-  this pin ships only after the same-box p24 comparison (36-row greedy + 15-min replay: accept length,
-  TPOT, TTFT, errors) is posted on its PR and reads BETTER or SAME vs 14500.
+- Pinned step: `draft-epoch-2` (final checkpoint of the run) on `dflash-experimental`
+  (env `cust-instinct`, `outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-0` —
+  note trainer-0, the `draft-step-*` checkpoints live under trainer-1). Same
+  `target_config_sha256 == 2a5cb51c…` pin; `model.safetensors` 5,677,368,712 B, 96 BF16 tensors,
+  sha256 `34aec290324eeafdf49704be9d01de8abb3a407df6e1893315f2b8698280948d`. Copied to
+  `dflash_spec:k3-instinct-v5-dflash2/draft-epoch-2` 2026-09-16 19:47Z (size + sha256 of all three files
+  verified against the source). Validation (same-box p10,
+  engine at dev head e4aeedf60a, 7 deploy flags, epoch-2 vs 16000): 36-row greedy content/tool_calls
+  35/36 (row 743 only, a target near-tie row that also flips under target-only kernel changes);
+  15-min replay accept length 4.52 vs 4.60, paired TPOT/TTFT deltas not significant (bootstrap CIs
+  straddle 0, Wilcoxon p=0.71/0.055), 0 errors both arms; T=0.7 100-request replay 0 errors and 0
+  per-rank candidate/output mismatches across 8 TP ranks → SAME.
 - Evaluation (integration arm, no copy to `dflash_spec`): deploy with
   `K3_DFLASH2_VOLUME=dflash-experimental K3_DFLASH2_VOLUME_ENV=cust-instinct modal deploy serve.py`.
   The volume is mounted read-only at `/dflash2-eval` and the draft path defaults to
-  `/dflash2-eval/outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-1/draft-step-16000`
+  `/dflash2-eval/outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-0/draft-epoch-2`
   (override with `K3_DFLASH2_PATH=<dir>`). The boot check runs on the active path. Prod never sets
   these variables.
-- Ship procedure: (1) **required before deploying this pin:** copy `draft-step-16000` from the training volume into the immutable dir
-  `k3-instinct-v5-dflash2/draft-step-16000` on `dflash_spec` (steps rotate on the training volume;
+- Ship procedure: (1) **required before deploying this pin:** copy the chosen checkpoint from the training volume into the immutable dir
+  `k3-instinct-v5-dflash2/<step>` on `dflash_spec` (done for `draft-epoch-2`; steps rotate on the training volume;
   12000 disappeared once — until the copy exists the boot check fails fast); (2) bump
   `DFLASH2_PINNED_STEP` if a newer step is chosen; (3) integration lane advances `RELEASE_SHA` +
   `rel0914.bundle` to a dev head containing #27.
