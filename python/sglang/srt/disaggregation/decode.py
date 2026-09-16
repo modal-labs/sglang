@@ -77,6 +77,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
@@ -455,6 +456,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             # The draft shares logical slots, not the target's DCP physical rows.
             self.draft_token_to_kv_pool._pd_dflash_full_kv = True
+            # Retraction resumes directly into decode, so preserve draft KV
+            # together with target KV and Mamba state before releasing slots.
+            if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                self.token_to_kv_pool._pd_dflash_draft_kv_pool = self.draft_token_to_kv_pool
         if self.draft_token_to_kv_pool is not None and not draft_full:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.

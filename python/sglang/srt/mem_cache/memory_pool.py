@@ -3818,22 +3818,34 @@ class HybridLinearKVPool(KVCache):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
-        # mamba_pool stores PHYSICAL ids; translate the (unified-pool virtual) ids first.
+        from sglang.srt.layers.dcp.layout import filter_dcp_local_kv_indices
+
+        # Requests keep logical locations; the target stores one DCP shard.
+        target_indices = filter_dcp_local_kv_indices(indices)
+        kv_cpu = self.full_kv_pool.get_cpu_copy(target_indices)
         mamba_cpu = (
             self.mamba_pool.get_cpu_copy(self._mamba_translate(mamba_indices))
             if mamba_indices is not None
             else None
         )
-        return kv_cpu, mamba_cpu
+        draft_pool = getattr(self, "_pd_dflash_draft_kv_pool", None)
+        if draft_pool is None:
+            return kv_cpu, mamba_cpu
+        # The full draft shares logical locations, but is not token-sharded.
+        return kv_cpu, mamba_cpu, draft_pool.get_cpu_copy(indices)
 
     def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None):
-        kv_cpu, mamba_cpu = cache_cpu
-        self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
+        from sglang.srt.layers.dcp.layout import filter_dcp_local_kv_indices
+
+        kv_cpu, mamba_cpu = cache_cpu[:2]
+        target_indices = filter_dcp_local_kv_indices(indices)
+        self.full_kv_pool.load_cpu_copy(kv_cpu, target_indices)
         if mamba_cpu is not None and mamba_indices is not None:
             self.mamba_pool.load_cpu_copy(
                 mamba_cpu, self._mamba_translate(mamba_indices)
             )
+        if len(cache_cpu) == 3:
+            self._pd_dflash_draft_kv_pool.load_cpu_copy(cache_cpu[2], indices)
 
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
