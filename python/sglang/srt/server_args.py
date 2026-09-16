@@ -8252,6 +8252,13 @@ class ServerArgs:
                 )
 
     def _handle_debug_utils(self):
+        if envs.SGLANG_TEST_RETRACT_VERIFY.get() and (
+            not envs.SGLANG_TEST_RETRACT.get()
+            or self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                "SGLANG_TEST_RETRACT_VERIFY requires a forced-retraction decode worker"
+            )
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
             self.soft_watchdog_timeout = 300

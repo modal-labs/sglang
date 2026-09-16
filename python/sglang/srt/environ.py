@@ -358,6 +358,8 @@ class Envs:
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
+    # Isolated QA only: bounded byte checks add copies/synchronization on restore.
+    SGLANG_TEST_RETRACT_VERIFY = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
     # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries

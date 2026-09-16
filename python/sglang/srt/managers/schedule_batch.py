@@ -1588,6 +1588,16 @@ class Req(ReqDllmMixin):
         token_to_kv_pool_allocator.load_cpu_copy(
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
+        if envs.SGLANG_TEST_RETRACT_VERIFY.get():
+            from sglang.srt.mem_cache.retraction_debug import verify_retraction_restore
+
+            verify_retraction_restore(
+                token_to_kv_pool_allocator,
+                self.kv_cache_cpu,
+                token_indices,
+                self.mamba_pool_idx,
+                self.rid,
+            )
         del self.kv_cache_cpu
 
     def build_rebootstrap_payload(self) -> dict:
