@@ -70,6 +70,16 @@ def test_private_launcher_integrity_and_workspace_exports():
         assert export in text
 
 
+def test_rc5_launcher_integrity():
+    try:
+        from sglang.kernels.ops.moe import trtllm_gen_moe
+    except ImportError as exc:
+        pytest.skip(f"trtllm_gen_moe dependencies unavailable: {exc}")
+
+    source = trtllm_gen_moe._RC5_LAUNCHER.read_bytes()
+    assert hashlib.sha256(source).hexdigest() == trtllm_gen_moe._RC5_LAUNCHER_SHA256
+
+
 def test_private_launcher_staging_is_fail_closed(monkeypatch, tmp_path):
     base = b"reviewed private launcher base"
     pool_overlay = tmp_path / "pool" / "overlay"
