@@ -694,6 +694,9 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                from sglang.srt.managers import queue_diagnostics
+
+                queue_diagnostics.record_prefill_finished(self, req)
 
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):

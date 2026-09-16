@@ -116,3 +116,74 @@ def test_only_queue_head_controls_budget():
     add(a, object(), [head(10000), head(500)])
     assert a.remaining == 83616
     assert a.rem_chunk_tokens == 0
+
+
+def test_scan_promotes_short_waiters_beyond_ineligible_head():
+    a = Adder()
+    long, short, medium, short2 = head(10000), head(500), head(3000), head(1000)
+    queue = [long, short, medium, short2]
+    module.add_chunk_with_short_prefill_budget(
+        a,
+        object(),
+        queue,
+        threshold=SMALL,
+        chunk_size=CHUNK,
+        batch_size=TOTAL,
+        scan_waiting=True,
+    )
+    assert queue == [short, short2, long, medium]
+    assert a.remaining == 100000 - CHUNK
+    assert a.rem_chunk_tokens == SMALL
+
+
+def test_scan_keeps_long_request_progress_until_completion():
+    a = Adder(remaining=CHUNK * 3)
+    continuing = object()
+    for index in range(3):
+        continuing = module.add_chunk_with_short_prefill_budget(
+            a,
+            continuing,
+            [head(10000), head(500)],
+            threshold=SMALL,
+            chunk_size=CHUNK,
+            batch_size=TOTAL,
+            scan_waiting=True,
+        )
+        assert a.remaining == CHUNK * (2 - index)
+        a.rem_chunk_tokens = 16384
+    assert continuing is None
+
+
+def test_scan_does_not_mutate_queue_on_allocation_failure():
+    a = Adder(fail=True)
+    queue = [head(10000), head(500)]
+    original = list(queue)
+    with pytest.raises(RuntimeError):
+        module.add_chunk_with_short_prefill_budget(
+            a,
+            object(),
+            queue,
+            threshold=SMALL,
+            chunk_size=CHUNK,
+            batch_size=TOTAL,
+            scan_waiting=True,
+        )
+    assert queue == original
+    assert a.rem_chunk_tokens == 16384
+
+
+def test_scan_without_eligible_requests_preserves_queue_and_full_chunk():
+    a = Adder()
+    queue = [head(10000), head(3000)]
+    original = list(queue)
+    module.add_chunk_with_short_prefill_budget(
+        a,
+        object(),
+        queue,
+        threshold=SMALL,
+        chunk_size=CHUNK,
+        batch_size=TOTAL,
+        scan_waiting=True,
+    )
+    assert queue == original
+    assert a.remaining == 83616

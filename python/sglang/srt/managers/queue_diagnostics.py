@@ -61,6 +61,15 @@ def record_prefill(scheduler, selected, result):
     history = getattr(scheduler, "_queue_diagnostic_history", None)
     if history is None:
         history = scheduler._queue_diagnostic_history = deque(maxlen=64)
+    batch_tokens = sum(
+        getattr(getattr(req, "extend_range", None), "length", 0)
+        for req in selected
+    )
+    for req in selected:
+        if not hasattr(req, "_diagnostic_first_batch_tokens"):
+            req._diagnostic_first_batch_tokens = batch_tokens
+            req._diagnostic_first_batch_size = len(selected)
+        req._diagnostic_prefill_batches = getattr(req, "_diagnostic_prefill_batches", 0) + 1
     history.append(
         {
             "monotonic": time.perf_counter(),
@@ -77,9 +86,29 @@ def record_prefill(scheduler, selected, result):
     )
 
 
+def record_prefill_finished(scheduler, req):
+    if not enabled(scheduler):
+        return
+    history = getattr(scheduler, "_prefill_finished_diagnostics", None)
+    if history is None:
+        history = scheduler._prefill_finished_diagnostics = deque(maxlen=512)
+    item = request_metadata(req)
+    item.update(
+        completed_wall_time=time.time(),
+        first_batch_tokens=getattr(req, "_diagnostic_first_batch_tokens", None),
+        first_batch_size=getattr(req, "_diagnostic_first_batch_size", None),
+        prefill_batches=getattr(req, "_diagnostic_prefill_batches", None),
+    )
+    history.append(item)
+
+
 def snapshot(scheduler):
     now = time.perf_counter()
     result = {
+        "completed_prefills": {
+            "count": len(getattr(scheduler, "_prefill_finished_diagnostics", ())),
+            "requests": list(getattr(scheduler, "_prefill_finished_diagnostics", ())),
+        },
         "monotonic": now,
         "wall_time": time.time(),
         "waiting": request_list(scheduler.waiting_queue),
