@@ -35,7 +35,7 @@ def request_metadata(entry):
         "matched_tokens": matched,
         "host_hit_tokens": getattr(req, "host_hit_length", 0),
         "prefix_tokens": len(getattr(req, "prefix_indices", ())),
-        "extend_tokens": getattr(req, "extend_input_len", 0),
+        "extend_tokens": getattr(getattr(req, "extend_range", None), "length", 0),
         "min_uncached_seen": getattr(req, "min_uncached_seen", None),
         "arrival_stamp": getattr(req, "arrival_stamp", None),
         "waiting_for_input": getattr(entry, "waiting_for_input", None),

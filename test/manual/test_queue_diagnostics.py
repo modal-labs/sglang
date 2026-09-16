@@ -48,6 +48,9 @@ class TestQueueDiagnostics(unittest.TestCase):
     def test_metadata_does_not_read_contents(self):
         result = diag.request_metadata(NS(req=self.req(), waiting_for_input=True))
         self.assertEqual(result["input_tokens"], 17)
+        req = self.req()
+        req.extend_range = NS(length=4096)
+        self.assertEqual(diag.request_metadata(req)["extend_tokens"], 4096)
         self.assertTrue(result["waiting_for_input"])
         self.assertNotIn("origin_input_ids", json.dumps(result))
 
