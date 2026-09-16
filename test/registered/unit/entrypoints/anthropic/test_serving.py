@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 from fastapi.responses import JSONResponse  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicCountTokensRequest,
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
@@ -170,6 +172,80 @@ class TestAnthropicServing(unittest.TestCase):
         }
         data.update(overrides)
         return AnthropicMessagesRequest.model_validate(data)
+
+    def test_native_messages_uses_shared_conversion_executor(self):
+        class Executor:
+            def __init__(self):
+                self.calls = []
+                self.worker_threads = []
+
+            async def run(self, function, *args):
+                self.calls.append(function.__name__)
+
+                def invoke():
+                    self.worker_threads.append(threading.get_ident())
+                    return function(*args)
+
+                return await asyncio.to_thread(invoke)
+
+        for stream in (False, True):
+            chat = _FakeNonStreamingErrorOpenAI()
+            chat.tokenizer_manager = SimpleNamespace(create_abort_task=lambda request: None)
+            chat.request_conversion_executor = Executor()
+            serving = AnthropicServing(chat)
+            request = self._anthropic_request(stream=stream)
+            asyncio.run(serving.handle_messages(request, object()))
+            self.assertEqual(
+                chat.request_conversion_executor.calls,
+                [
+                    "_convert_to_chat_completion_request",
+                    "_convert_to_internal_request",
+                ],
+            )
+            self.assertTrue(
+                all(
+                    worker != threading.get_ident()
+                    for worker in chat.request_conversion_executor.worker_threads
+                )
+            )
+
+    def test_native_count_tokens_uses_shared_conversion_executor(self):
+        class Executor:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, function, *args):
+                self.calls.append(function.__name__)
+                return await asyncio.to_thread(function, *args)
+
+        serving = self._serving()
+        chat = serving.openai_serving_chat
+        chat.request_conversion_executor = Executor()
+        chat.tokenizer_manager.model_config = SimpleNamespace(is_multimodal=False)
+
+        def process_messages(request, is_multimodal):
+            return SimpleNamespace(prompt_ids=[1, 2, 3])
+
+        chat._process_messages = process_messages
+        request = AnthropicCountTokensRequest(
+            model="test-model", messages=[{"role": "user", "content": "hello"}]
+        )
+        response = asyncio.run(serving.handle_count_tokens(request, object()))
+        self.assertEqual(json.loads(response.body), {"input_tokens": 3})
+        self.assertEqual(
+            chat.request_conversion_executor.calls,
+            ["_convert_to_chat_completion_request", "process_messages"],
+        )
+
+    def test_native_conversion_cancellation_is_not_rewritten_as_api_error(self):
+        class CancelledExecutor:
+            async def run(self, function, *args):
+                raise asyncio.CancelledError()
+
+        serving = self._serving()
+        serving.openai_serving_chat.request_conversion_executor = CancelledExecutor()
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(serving.handle_messages(self._anthropic_request(), object()))
 
     def test_messages_preserves_pd_rendezvous_through_native_conversion(self):
         serving = self._serving()

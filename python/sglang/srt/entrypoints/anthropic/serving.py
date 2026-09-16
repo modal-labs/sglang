@@ -204,6 +204,16 @@ class AnthropicServing:
             return None
         return getattr(tokenizer, "chat_template", None)
 
+    async def _run_conversion(self, function, *args):
+        # Share the engine frontend's bounded pool with Chat and Responses.
+        # Disabled offload retains the existing synchronous behavior.
+        executor = getattr(
+            self.openai_serving_chat, "request_conversion_executor", None
+        )
+        if executor is None:
+            return function(*args)
+        return await executor.run(function, *args)
+
     async def handle_messages(
         self,
         request: AnthropicMessagesRequest,
@@ -211,7 +221,9 @@ class AnthropicServing:
     ) -> Union[JSONResponse, StreamingResponse]:
         """Main entry point for /v1/messages endpoint."""
         try:
-            chat_request = self._convert_to_chat_completion_request(request)
+            chat_request = await self._run_conversion(
+                self._convert_to_chat_completion_request, request
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -761,8 +773,10 @@ class AnthropicServing:
         try:
             # Convert to internal request
             adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
+                await self._run_conversion(
+                    self.openai_serving_chat._convert_to_internal_request,
+                    chat_request,
+                    raw_request,
                 )
             )
             adapted_request.received_time = received_time
@@ -811,8 +825,10 @@ class AnthropicServing:
 
         try:
             adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
+                await self._run_conversion(
+                    self.openai_serving_chat._convert_to_internal_request,
+                    chat_request,
+                    raw_request,
                 )
             )
             adapted_request.received_time = received_time
@@ -1440,7 +1456,9 @@ class AnthropicServing:
                 tools=request.tools,
                 tool_choice=request.tool_choice,
             )
-            chat_request = self._convert_to_chat_completion_request(messages_request)
+            chat_request = await self._run_conversion(
+                self._convert_to_chat_completion_request, messages_request
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1455,8 +1473,10 @@ class AnthropicServing:
             is_multimodal = (
                 self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
             )
-            processed = self.openai_serving_chat._process_messages(
-                chat_request, is_multimodal
+            processed = await self._run_conversion(
+                self.openai_serving_chat._process_messages,
+                chat_request,
+                is_multimodal,
             )
 
             if isinstance(processed.prompt_ids, list):
@@ -1464,7 +1484,9 @@ class AnthropicServing:
             else:
                 # prompt_ids is a string (multimodal case) — tokenize it
                 tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
-                input_tokens = len(tokenizer.encode(processed.prompt_ids))
+                input_tokens = len(
+                    await self._run_conversion(tokenizer.encode, processed.prompt_ids)
+                )
 
             return JSONResponse(
                 content=AnthropicCountTokensResponse(
