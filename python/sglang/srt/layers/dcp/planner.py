@@ -109,10 +109,11 @@ def prepare_decode_context_parallel_metadata(
         extend_prefix_lens_sum,
         parallel.dcp_size,
     )
+    # Prefix lengths are dcp_size-aligned (widened allocator page), so this
+    # rank's rows are every dcp_size-th one: a stride, not a boolean-mask
+    # nonzero() (device sync) — upstream sgl-project/sglang#35084.
     dcp_local_prefix_kv_indices = (
-        dcp_prefix_kv_indices[
-            dcp_prefix_kv_indices % parallel.dcp_size == parallel.dcp_rank
-        ]
+        dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
         // parallel.dcp_size
     )
     dcp_kv_buffer = torch.empty(

@@ -51,6 +51,34 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     return kv_indices
 
 
+def filter_dcp_local_chunk_kv_indices(
+    kv_indices: torch.Tensor,
+    chunk_starts_cpu: torch.Tensor,
+    chunk_seq_lens_cpu: torch.Tensor,
+) -> torch.Tensor:
+    """This rank's rows of a chunked-prefix kv-index run, taken by stride.
+
+    ``kv_indices`` concatenates per-request runs of ``chunk_seq_lens_cpu[i]``
+    virtual locs starting at absolute position ``chunk_starts_cpu[i]``; the
+    owner rule ``loc % dcp_size == dcp_rank`` holds every ``dcp_size``-th row,
+    phase-shifted by the run's start, so no boolean-mask ``nonzero`` (a device
+    sync per chunk per layer) is needed (upstream sgl-project/sglang#35084).
+    """
+    parallel = get_parallel()
+    if not parallel.dcp_enabled:
+        return kv_indices
+
+    dcp_size = parallel.dcp_size
+    parts = []
+    offset = 0
+    for start, length in zip(chunk_starts_cpu.tolist(), chunk_seq_lens_cpu.tolist()):
+        first = (parallel.dcp_rank - start) % dcp_size
+        parts.append(kv_indices[offset + first : offset + length : dcp_size])
+        offset += length
+    return torch.cat(parts) // dcp_size
+
+
+
 def update_local_kv_lens_for_dcp(kv_len_arr):
     """In-place per-rank KV length: the start=0 case of get_dcp_lens.
 
