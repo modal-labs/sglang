@@ -64,9 +64,10 @@ Image build check (in the build log): `rev-parse HEAD == 3ccb60f5b...`, `status 
 ## Rollback
 
 Check out the previous `serve.py` commit, regenerate its bundle with the same command, then deploy.
-Flags-only rollback (keep 3ccb60f5b, drop the 5 env lines) leaves the dev levers at their default-off
-values; at 462ade71f that configuration was == `release/2026-09-14` behavior, greedy-identical 36/36
-in every A/B arm.
+Flags-only rollback (keep 3ccb60f5b, drop all 7 env lines — the 5 prod flags and the 2 #26 lines) leaves
+the dev levers at their default-off values; at 462ade71f the 5-flags-off configuration was ==
+`release/2026-09-14` behavior, greedy-identical 36/36 in every A/B arm, and on 741f05e61 the flags-off
+parity leg was 36/36 identical to prod with Δp50 +0 ms.
 
 ## DFlash2 draft (kimi-k3-sglang #27 + #40 + #48 step-16000 pin, all in RELEASE_SHA 3ccb60f5b)
 
