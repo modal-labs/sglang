@@ -199,6 +199,7 @@ class TestAnthropicServing(unittest.TestCase):
                 chat.request_conversion_executor.calls,
                 [
                     "_convert_to_chat_completion_request",
+                    "_validate_request",
                     "_convert_to_internal_request",
                 ],
             )
