@@ -24,6 +24,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
+        runner.min_replay_bucket = 0
         return runner
 
     def _make_forward_batch(self, num_tokens):
@@ -48,6 +49,18 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
+
+    def test_min_replay_bucket_accepts_small_bucket(self):
+        runner = self._make_runner()
+        runner.min_replay_bucket = 16
+
+        self.assertTrue(runner.can_run_graph(self._make_forward_batch(5)))
+
+    def test_min_replay_bucket_still_rejects_large_bucket(self):
+        runner = self._make_runner()
+        runner.min_replay_bucket = 4
+
+        self.assertFalse(runner.can_run_graph(self._make_forward_batch(5)))
 
 
 if __name__ == "__main__":
