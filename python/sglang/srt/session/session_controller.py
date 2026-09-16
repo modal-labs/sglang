@@ -16,8 +16,10 @@ import logging
 import time
 import uuid
 from array import array
+from collections import Counter
 from typing import TYPE_CHECKING, Dict, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -95,6 +97,7 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        self._inflight_rid: Optional[str] = None
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
         # _share_token_arrays trims back first (heals aborted turns).
@@ -316,7 +319,16 @@ class Session:
             time_stats=req.time_stats,
         )
         if last_req is not None:
-            new_req.multimodal_inputs = last_req.multimodal_inputs
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                if abort or not last_req.finished():
+                    new_req.multimodal_inputs = None
+                else:
+                    new_req.multimodal_inputs = last_req.multimodal_inputs
+                    if new_req.multimodal_inputs is not None:
+                        new_req.session_mm_inherited = True
+                        new_req.session_mm_parent = last_req
+            else:
+                new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill
@@ -326,6 +338,7 @@ class Session:
         elif self.streaming:
             # req_nodes is NOT updated here — finish_req() handles it.
             self._inflight = True
+            self._inflight_rid = req.rid
         else:
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
@@ -335,6 +348,7 @@ class Session:
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
         self._inflight = False
+        self._inflight_rid = None
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
             prev_node.req.session = None
@@ -348,6 +362,91 @@ class Session:
     def abort_req(self):
         """Clear inflight flag on abort (req_nodes stays unchanged)."""
         self._inflight = False
+        self._inflight_rid = None
+
+    def release_dropped_turn_mm_inputs(self, req: Req) -> None:
+        """Release lease-pool proxies of a turn dropped before it was scheduled.
+
+        A session turn shares its predecessor's ``MultimodalInputs`` object and
+        ``merge``s its own items onto it. Identity-based removal preserves
+        inherited items and later siblings; in the sibling case, mrope tensors
+        remain untouched because they cannot be split.
+        """
+        if not envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            return
+        if self._inflight and self._inflight_rid == req.rid:
+            self.abort_req()
+        mm = req.multimodal_inputs
+        if mm is None:
+            return
+        if mm.session_live_refs > 0:
+            mm.session_live_refs -= 1
+            if mm.session_live_refs > 0:
+                req.multimodal_inputs = None
+                req.session_turn_mm_state = None
+                req.session_mm_parent = None
+                return
+            mm.release_features()
+            req.multimodal_inputs = None
+            req.session_turn_mm_state = None
+            req.session_mm_parent = None
+            return
+        if not req.session_mm_inherited:
+            mm.release_features()
+        else:
+            if (
+                req.session_mm_parent is not None
+                and not req.session_mm_parent.finished()
+            ):
+                logger.debug(
+                    "Skipping shared multimodal release for dropped turn %s; "
+                    "parent request %s is unfinished",
+                    req.rid,
+                    req.session_mm_parent.rid,
+                )
+                req.multimodal_inputs = None
+                req.session_turn_mm_state = None
+                req.session_mm_parent = None
+                return
+            st = req.session_turn_mm_state
+            if st is not None:
+                for item in st.items:
+                    try:
+                        item.release_transport_proxies()
+                    except Exception:
+                        logger.warning(
+                            "Failed to release an unused multimodal feature transport",
+                            exc_info=True,
+                        )
+                    item.feature = None
+                tail = mm.mm_items[st.n_items :]
+                if len(tail) == len(st.items) and all(
+                    a is b for a, b in zip(tail, st.items)
+                ):
+                    mm.mm_items = mm.mm_items[: st.n_items]
+                    if st.n_pad is not None and mm.image_pad_len is not None:
+                        mm.image_pad_len = mm.image_pad_len[: st.n_pad]
+                    if st.n_mrope_pos is not None and mm.mrope_positions is not None:
+                        mm.mrope_positions = mm.mrope_positions[:, : st.n_mrope_pos]
+                    if (
+                        st.n_mrope_delta is not None
+                        and mm.mrope_position_delta is not None
+                    ):
+                        mm.mrope_position_delta = mm.mrope_position_delta[
+                            : st.n_mrope_delta
+                        ]
+                    mm.mrope_position_delta_repeated_cache = None
+                else:
+                    own = {id(it) for it in st.items}
+                    keep = [i for i, it in enumerate(mm.mm_items) if id(it) not in own]
+                    if mm.image_pad_len is not None and len(mm.image_pad_len) == len(
+                        mm.mm_items
+                    ):
+                        mm.image_pad_len = [mm.image_pad_len[i] for i in keep]
+                    mm.mm_items = [mm.mm_items[i] for i in keep]
+        req.multimodal_inputs = None
+        req.session_turn_mm_state = None
+        req.session_mm_parent = None
 
 
 class SessionController:
@@ -424,8 +523,19 @@ class SessionController:
         # Session reqs skip the normal mm cleanup path (scheduler and
         # output_processor) so features stay alive until the session closes.
         seen_mm = set()
+        live = Counter()
+        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            live = Counter(
+                id(node.req.multimodal_inputs)
+                for node in session.req_nodes.values()
+                if not node.req.finished() and node.req.multimodal_inputs is not None
+            )
         for node in session.req_nodes.values():
             mm = node.req.multimodal_inputs
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get() and id(mm) in live:
+                if not node.req.finished():
+                    mm.session_live_refs = live[id(mm)]
+                continue
             if mm is not None and id(mm) not in seen_mm:
                 seen_mm.add(id(mm))
                 mm.release_features()

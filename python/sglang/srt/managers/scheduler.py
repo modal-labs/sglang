@@ -2215,13 +2215,41 @@ class Scheduler(
                 namespace,
             )
 
+    def _release_dropped_waiting_req_mm_inputs(self, req: Req) -> None:
+        """Release lease-pool proxies of a request that will never be scheduled.
+
+        Covers requests dropped from, or refused admission to, the waiting
+        queue: they never reach prefill, so no rank ever reconstructs or
+        acknowledges its CUDA-IPC leases; without this every rank's ack word
+        stays unwritten and the lease is never recycled.
+        Session turns delegate to Session so inherited items from the committed
+        prior turn are kept.
+        """
+        if not envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            return
+        if req.session is not None:
+            req.session.release_dropped_turn_mm_inputs(req)
+        elif req.multimodal_inputs is not None:
+            req.multimodal_inputs.release_features()
+            req.multimodal_inputs = None
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
-            # For session requests, keep mm_inputs for the next request
-            if req.session:
+            if req.session is not None and not (
+                envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get()
+                and mm_inputs.session_live_refs > 0
+            ):
                 continue
+            if (
+                envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get()
+                and mm_inputs.session_live_refs > 0
+            ):
+                mm_inputs.session_live_refs -= 1
+                if mm_inputs.session_live_refs > 0:
+                    req.multimodal_inputs = None
+                    continue
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()
             req.multimodal_inputs = None
@@ -2566,11 +2594,14 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
+            self._release_dropped_waiting_req_mm_inputs(req)
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
+                self._release_dropped_waiting_req_mm_inputs(req)
                 return
             if self._slo_admission_check(req):
+                self._release_dropped_waiting_req_mm_inputs(req)
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
@@ -2647,6 +2678,7 @@ class Scheduler(
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                self._release_dropped_waiting_req_mm_inputs(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -2775,6 +2807,7 @@ class Scheduler(
                     ),
                     req,
                 )
+                self._release_dropped_waiting_req_mm_inputs(req)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -4362,6 +4395,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._release_dropped_waiting_req_mm_inputs(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)

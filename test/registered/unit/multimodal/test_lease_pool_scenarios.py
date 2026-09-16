@@ -49,6 +49,37 @@ def _item(proxy):
     return MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
 
 
+def _session_recv(rid, parent_rid=None):
+    return SimpleNamespace(
+        rid=rid,
+        input_ids=array("q", [1]),
+        session_params=SimpleNamespace(
+            id="s",
+            rid=parent_rid,
+            offset=None,
+            replace=False,
+            drop_previous_output=False,
+        ),
+        sampling_params=SamplingParams(max_new_tokens=1),
+        lora_id=None,
+        custom_logit_processor=None,
+        stream=False,
+        return_logprob=False,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        return_sampling_mask=False,
+        require_reasoning=False,
+        return_hidden_states=False,
+        return_routed_experts=False,
+        routed_experts_start_len=0,
+        priority=None,
+        routing_key=None,
+        extra_key=None,
+        http_worker_ipc=None,
+        time_stats=None,
+    )
+
+
 def test_WQH0_waiting_timeout_abort_releases_once():
     proxy = _proxy()
     item = _item(proxy)
@@ -70,9 +101,10 @@ def test_WQH0_waiting_timeout_abort_releases_once():
 
 def test_WQHI_session_abort_close_releases_only_on_session_close():
     mm_inputs = Mock()
+    mm_inputs.session_live_refs = 0
     req = Req("rid", "", array("q", [1]), SamplingParams(max_new_tokens=1))
     req.multimodal_inputs = mm_inputs
-    req.session = object()
+    req.session = Session(32, "session")
 
     with (
         envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
@@ -81,10 +113,12 @@ def test_WQHI_session_abort_close_releases_only_on_session_close():
         ),
     ):
         req.set_finish_with_abort("session abort")
-    mm_inputs.release_features.assert_not_called()
+    mm_inputs.release_features.assert_called_once_with()
+    mm_inputs.release_features.reset_mock()
 
     close_req = Req("close-rid", "", array("q", [1]), SamplingParams(max_new_tokens=1))
     close_req.multimodal_inputs = mm_inputs
+    close_req.finished_reason = object()
     session = Session(32, "session")
     session.req_nodes["close-rid"] = SessionReqNode(close_req)
     controller = object.__new__(SessionController)
@@ -202,3 +236,597 @@ def test_XlIe_XnUU_inflight_generation_and_unpublished_reads():
     pool.publish(second)
     with pytest.raises(StaleLeaseError):
         pool.read(first)
+
+
+def _queued_abort_scheduler(waiting_queue):
+    from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.chunked_req = None
+    scheduler._pending_chunked_abort_req = None
+    scheduler.waiting_queue = waiting_queue
+    scheduler.enable_hicache_storage = False
+    scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
+    scheduler.disaggregation_mode = SimpleNamespace()
+    scheduler.dllm_config = None
+    scheduler.grammar_manager = Mock()
+    scheduler.ps = SimpleNamespace(pp_size=1)
+    scheduler.running_batch = None
+    scheduler.last_batch = None
+    return scheduler
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_P44_queued_client_abort_releases_unconsumed_leases(flag):
+    """A request aborted while still waiting never reaches prefill, so no rank
+    would otherwise ever acknowledge its leases (p44 stress leak)."""
+    from sglang.srt.managers.io_struct import AbortReq
+
+    item = _item(_proxy())
+    item.release_transport_proxies = Mock()
+    req = Req("rid", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+    other = Req("other", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    other.multimodal_inputs = MultimodalInputs(mm_items=[_item(_proxy())])
+    other.multimodal_inputs.mm_items[0].release_transport_proxies = Mock()
+    scheduler = _queued_abort_scheduler([other, req])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(flag):
+        scheduler.abort_request(AbortReq(rid="rid"))
+
+    assert scheduler.waiting_queue == [other]
+    other.multimodal_inputs.mm_items[0].release_transport_proxies.assert_not_called()
+    if flag:
+        item.release_transport_proxies.assert_called_once_with()
+        assert req.multimodal_inputs is None
+    else:
+        item.release_transport_proxies.assert_not_called()
+        assert req.multimodal_inputs is not None
+
+
+def test_P44_session_first_turn_queued_abort_releases_turn_leases():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session = Session(32, "s", streaming=True)
+    session._inflight = True
+    session._inflight_rid = "rid"
+    item = _item(_proxy())
+    item.release_transport_proxies = Mock()
+    req = Req("rid", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req.session = session
+    req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+    scheduler = _queued_abort_scheduler([req])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="rid"))
+
+    item.release_transport_proxies.assert_called_once_with()
+    assert req.multimodal_inputs is None
+    assert session._inflight is False
+    assert session._inflight_rid is None
+    assert session.req_nodes == {}
+
+
+def test_P44_session_later_turn_queued_abort_releases_only_new_turn_items():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session = Session(32, "s", streaming=True)
+    p = _item(_proxy())
+    p.release_transport_proxies = Mock()
+    a = _item(_proxy())
+    a.release_transport_proxies = Mock()
+    shared = MultimodalInputs(
+        mm_items=[p],
+        image_pad_len=[3],
+        mrope_positions=torch.zeros(3, 5),
+        mrope_position_delta=torch.zeros(1, 1),
+    )
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+    req = Req("rid", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req.session = session
+    req.multimodal_inputs = shared
+    req.session_mm_inherited = True
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        req.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[a],
+                image_pad_len=[5],
+                mrope_positions=torch.zeros(3, 2),
+                mrope_position_delta=torch.zeros(1, 1),
+            )
+        )
+    session._inflight = True
+    session._inflight_rid = "rid"
+    scheduler = _queued_abort_scheduler([req])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="rid"))
+
+    a.release_transport_proxies.assert_called_once_with()
+    p.release_transport_proxies.assert_not_called()
+    assert parent.multimodal_inputs is shared
+    assert shared.mm_items == [p]
+    assert shared.image_pad_len == [3]
+    assert shared.mrope_positions.shape == (3, 5)
+    assert shared.mrope_position_delta.shape == (1, 1)
+    assert shared.mrope_position_delta_repeated_cache is None
+    assert req.multimodal_inputs is None
+    assert req.session_turn_mm_state is None
+    assert session._inflight is False
+    assert "parent" in session.req_nodes
+
+
+def test_P44_session_sibling_turn_queued_abort_keeps_later_sibling_items():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session = Session(32, "s", streaming=False)
+    p = _item(_proxy())
+    p.release_transport_proxies = Mock()
+    a = _item(_proxy())
+    a.release_transport_proxies = Mock()
+    b = _item(_proxy())
+    b.release_transport_proxies = Mock()
+    shared = MultimodalInputs(mm_items=[p], image_pad_len=[3])
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+
+    req_a = Req("a", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_a.session = session
+    req_a.multimodal_inputs = shared
+    req_a.session_mm_inherited = True
+    req_b = Req("b", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_b.session = session
+    req_b.multimodal_inputs = shared
+    req_b.session_mm_inherited = True
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        req_a.extend_image_inputs(MultimodalInputs(mm_items=[a], image_pad_len=[5]))
+        req_b.extend_image_inputs(MultimodalInputs(mm_items=[b], image_pad_len=[7]))
+    scheduler = _queued_abort_scheduler([req_a])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="a"))
+
+    a.release_transport_proxies.assert_called_once_with()
+    p.release_transport_proxies.assert_not_called()
+    b.release_transport_proxies.assert_not_called()
+    assert shared.mm_items[0] is p
+    assert shared.mm_items[1] is b
+    assert req_b.multimodal_inputs is shared
+    assert req_a.multimodal_inputs is None
+    assert req_a.session_turn_mm_state is None
+
+
+def test_P44_session_inherited_only_turn_queued_abort_releases_nothing():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session = Session(32, "s", streaming=False)
+    p = _item(_proxy())
+    p.release_transport_proxies = Mock()
+    shared = MultimodalInputs(mm_items=[p], image_pad_len=[3])
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+    req = Req("child", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req.session = session
+    req.multimodal_inputs = shared
+    req.session_mm_inherited = True
+    scheduler = _queued_abort_scheduler([req])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="child"))
+
+    p.release_transport_proxies.assert_not_called()
+    assert shared.mm_items == [p]
+    assert req.multimodal_inputs is None
+    assert req.session_turn_mm_state is None
+
+
+def test_P44_session_queued_abort_flag_off_releases_nothing():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session = Session(32, "s", streaming=False)
+    p = _item(_proxy())
+    p.release_transport_proxies = Mock()
+    a = _item(_proxy())
+    a.release_transport_proxies = Mock()
+    shared = MultimodalInputs(mm_items=[p], image_pad_len=[3])
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+    req = Req("child", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req.session = session
+    req.multimodal_inputs = shared
+    req.session_mm_inherited = True
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False):
+        req.extend_image_inputs(MultimodalInputs(mm_items=[a], image_pad_len=[5]))
+    scheduler = _queued_abort_scheduler([req])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False):
+        scheduler.abort_request(AbortReq(rid="child"))
+
+    p.release_transport_proxies.assert_not_called()
+    a.release_transport_proxies.assert_not_called()
+    assert shared.mm_items == [p, a]
+    assert req.multimodal_inputs is shared
+    assert req.session_turn_mm_state is None
+
+
+def test_P44_session_abort_at_create_turn_gets_own_mm_object():
+    session = Session(32, "s", streaming=False)
+    parent_item = _item(_proxy())
+    parent_item.release_transport_proxies = Mock()
+    shared = MultimodalInputs(mm_items=[parent_item], image_pad_len=[3])
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(
+            schedule_batch, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+        ),
+    ):
+        new_req = session.create_req(
+            _session_recv("child", "parent"),
+            tokenizer=None,
+            vocab_size=32,
+        )
+        fresh_item = _item(_proxy())
+        fresh_item.release_transport_proxies = Mock()
+        new_req.extend_image_inputs(
+            MultimodalInputs(mm_items=[fresh_item], image_pad_len=[5])
+        )
+        session.release_dropped_turn_mm_inputs(new_req)
+
+    assert new_req.multimodal_inputs is None
+    assert not new_req.session_mm_inherited
+    fresh_item.release_transport_proxies.assert_called_once_with()
+    parent_item.release_transport_proxies.assert_not_called()
+    assert shared.mm_items == [parent_item]
+    assert shared.image_pad_len == [3]
+
+
+def test_P44_session_abort_at_create_turn_flag_off_shares_mm_object():
+    session = Session(32, "s", streaming=False)
+    shared = MultimodalInputs(mm_items=[_item(_proxy())], image_pad_len=[3])
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False),
+        patch.object(Req, "set_finish_with_abort") as set_finish_with_abort,
+    ):
+        new_req = session.create_req(
+            _session_recv("child", "parent"),
+            tokenizer=None,
+            vocab_size=32,
+        )
+
+    set_finish_with_abort.assert_called_once()
+    assert new_req.multimodal_inputs is shared
+    assert not new_req.session_mm_inherited
+
+
+def test_P44_session_close_skips_unfinished_tree_turns():
+    session = Session(32, "s", streaming=False)
+    shared = Mock()
+    finished = Req("finished", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    finished.multimodal_inputs = shared
+    finished.finished_reason = object()
+    unfinished = Req(
+        "unfinished", "", array("q", [1]), SamplingParams(max_new_tokens=1)
+    )
+    unfinished.session = session
+    unfinished.multimodal_inputs = shared
+    own = Mock()
+    own_req = Req("own", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    own_req.multimodal_inputs = own
+    own_req.finished_reason = object()
+    session.req_nodes = {
+        "finished": SessionReqNode(finished),
+        "unfinished": SessionReqNode(unfinished),
+        "own": SessionReqNode(own_req),
+    }
+    controller = object.__new__(SessionController)
+    controller.sessions = {"s": session}
+    controller.tree_cache = Mock()
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        controller._close("s")
+
+    shared.release_features.assert_not_called()
+    assert unfinished.multimodal_inputs is shared
+    assert unfinished.session is session
+    own.release_features.assert_called_once_with()
+    assert own_req.multimodal_inputs is None
+
+
+def test_P44_session_close_keeps_multiple_unfinished_shared_referents():
+    session = Session(32, "s", streaming=False)
+    shared = Mock()
+    req_a = Req("a", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_a.session = session
+    req_a.multimodal_inputs = shared
+    req_b = Req("b", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_b.session = session
+    req_b.multimodal_inputs = shared
+    session.req_nodes = {
+        "a": SessionReqNode(req_a),
+        "b": SessionReqNode(req_b),
+    }
+    controller = object.__new__(SessionController)
+    controller.sessions = {"s": session}
+    controller.tree_cache = Mock()
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        controller._close("s")
+
+    shared.release_features.assert_not_called()
+    assert shared.session_live_refs == 2
+    assert req_a.session is session
+    assert req_a.multimodal_inputs is shared
+    assert req_b.session is session
+    assert req_b.multimodal_inputs is shared
+
+    scheduler = _queued_abort_scheduler([])
+    req_a.finished_reason = object()
+    req_b.finished_reason = object()
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler._maybe_clear_mm_inputs(SimpleNamespace(reqs=[req_a]))
+    assert shared.session_live_refs == 1
+    assert req_a.multimodal_inputs is None
+    shared.release_features.assert_not_called()
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler._maybe_clear_mm_inputs(SimpleNamespace(reqs=[req_b]))
+    assert shared.session_live_refs == 0
+    assert req_b.multimodal_inputs is None
+    shared.release_features.assert_called_once_with()
+
+
+def test_P44_detached_abort_refcounts_shared_mm_inputs():
+    shared = Mock()
+    shared.session_live_refs = 2
+    req_a = Req("a", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_a.multimodal_inputs = shared
+    req_b = Req("b", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_b.multimodal_inputs = shared
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(
+            schedule_batch, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+        ),
+    ):
+        req_a.set_finish_with_abort("a")
+    assert shared.session_live_refs == 1
+    shared.release_features.assert_not_called()
+    assert req_a.multimodal_inputs is None
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(
+            schedule_batch, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+        ),
+    ):
+        req_b.set_finish_with_abort("b")
+    assert shared.session_live_refs == 0
+    shared.release_features.assert_called_once_with()
+    assert req_b.multimodal_inputs is None
+
+
+def test_P44_dropped_session_turn_refcounts_shared_mm_inputs():
+    session = Session(32, "s", streaming=False)
+    shared = Mock()
+    shared.session_live_refs = 2
+    req_a = Req("a", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_a.session = session
+    req_a.multimodal_inputs = shared
+    req_b = Req("b", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_b.session = session
+    req_b.multimodal_inputs = shared
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        session.release_dropped_turn_mm_inputs(req_a)
+    assert shared.session_live_refs == 1
+    shared.release_features.assert_not_called()
+    assert req_a.multimodal_inputs is None
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        session.release_dropped_turn_mm_inputs(req_b)
+    assert shared.session_live_refs == 0
+    shared.release_features.assert_called_once_with()
+    assert req_b.multimodal_inputs is None
+
+
+def test_P44_session_close_flag_off_releases_unfinished_tree_turns():
+    session = Session(32, "s", streaming=False)
+    shared = Mock()
+    finished = Req("finished", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    finished.multimodal_inputs = shared
+    finished.finished_reason = object()
+    unfinished = Req(
+        "unfinished", "", array("q", [1]), SamplingParams(max_new_tokens=1)
+    )
+    unfinished.multimodal_inputs = shared
+    session.req_nodes = {
+        "finished": SessionReqNode(finished),
+        "unfinished": SessionReqNode(unfinished),
+    }
+    controller = object.__new__(SessionController)
+    controller.sessions = {"s": session}
+    controller.tree_cache = Mock()
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False):
+        controller._close("s")
+
+    shared.release_features.assert_called_once_with()
+    assert finished.multimodal_inputs is None
+    assert unfinished.multimodal_inputs is None
+
+
+def test_P44_session_dropped_turn_with_live_parent_releases_nothing():
+    session = Session(32, "s", streaming=False)
+    parent_item = _item(_proxy())
+    parent_item.release_transport_proxies = Mock()
+    shared = MultimodalInputs(mm_items=[parent_item], image_pad_len=[3])
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    child = Req("child", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    child.session = session
+    child.multimodal_inputs = shared
+    child.session_mm_inherited = True
+    child.session_mm_parent = parent
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        session.release_dropped_turn_mm_inputs(child)
+
+    parent_item.release_transport_proxies.assert_not_called()
+    assert shared.mm_items == [parent_item]
+    assert child.multimodal_inputs is None
+    assert child.session_turn_mm_state is None
+    assert child.session_mm_parent is None
+
+
+def test_P44_session_preabort_releases_dropped_turn_leases():
+    session = Session(32, "s", streaming=False)
+    parent_item = _item(_proxy())
+    parent_item.release_transport_proxies = Mock()
+    new_item = _item(_proxy())
+    new_item.release_transport_proxies = Mock()
+    shared = MultimodalInputs(mm_items=[parent_item], image_pad_len=[3])
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    parent.finished_reason = object()
+    session.req_nodes["parent"] = SessionReqNode(parent)
+    req = Req("child", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req.session = session
+    req.multimodal_inputs = shared
+    req.session_mm_inherited = True
+    req.session_mm_parent = parent
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(
+            schedule_batch, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+        ),
+    ):
+        req.extend_image_inputs(
+            MultimodalInputs(mm_items=[new_item], image_pad_len=[5])
+        )
+        req.set_finish_with_abort("x")
+
+    new_item.release_transport_proxies.assert_called_once_with()
+    parent_item.release_transport_proxies.assert_not_called()
+    assert shared.mm_items == [parent_item]
+    assert shared.image_pad_len == [3]
+    assert req.multimodal_inputs is None
+
+
+def test_P44_session_preabort_flag_off_keeps_shared_mm_object_untouched():
+    session = Session(32, "s", streaming=False)
+    parent_item = _item(_proxy())
+    parent_item.release_transport_proxies = Mock()
+    new_item = _item(_proxy())
+    new_item.release_transport_proxies = Mock()
+    shared = MultimodalInputs(mm_items=[parent_item], image_pad_len=[3])
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    parent.finished_reason = object()
+    session.req_nodes["parent"] = SessionReqNode(parent)
+    req = Req("child", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req.session = session
+    req.multimodal_inputs = shared
+    req.session_mm_inherited = True
+    req.session_mm_parent = parent
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False),
+        patch.object(
+            schedule_batch, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+        ),
+    ):
+        req.extend_image_inputs(
+            MultimodalInputs(mm_items=[new_item], image_pad_len=[5])
+        )
+        req.set_finish_with_abort("x")
+
+    parent_item.release_transport_proxies.assert_not_called()
+    new_item.release_transport_proxies.assert_not_called()
+    assert shared.mm_items == [parent_item, new_item]
+    assert shared.image_pad_len == [3, 5]
+    assert req.multimodal_inputs is None
+
+
+def _mm_req(rid, priority=None):
+    item = _item(_proxy())
+    item.release_transport_proxies = Mock()
+    req = Req(
+        rid, "", array("q", [1]), SamplingParams(max_new_tokens=1), priority=priority
+    )
+    req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+    return req, item.release_transport_proxies
+
+
+def _admission_scheduler(waiting_queue, *, priority):
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+
+    scheduler = _queued_abort_scheduler(waiting_queue)
+    scheduler.disaggregation_mode = DisaggregationMode.NULL
+    scheduler.max_queued_requests = len(waiting_queue)
+    scheduler.enable_priority_scheduling = priority
+    scheduler.schedule_low_priority_values_first = True
+    scheduler.abort_on_priority_when_disabled = False
+    scheduler.enable_hierarchical_cache = False
+    scheduler.server_args = SimpleNamespace(schedule_policy="fcfs")
+    return scheduler
+
+
+def test_P44_queue_full_rejection_releases_incoming_leases():
+    queued, queued_release = _mm_req("queued")
+    incoming, incoming_release = _mm_req("incoming")
+    scheduler = _admission_scheduler([queued], priority=False)
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler._add_request_to_queue(incoming)
+
+    assert scheduler.waiting_queue == [queued]
+    incoming_release.assert_called_once_with()
+    queued_release.assert_not_called()
+
+
+def test_P44_priority_eviction_releases_only_evicted_leases():
+    queued, queued_release = _mm_req("queued", priority=10)
+    queued.time_stats.set_wait_queue_entry_time()
+    incoming, incoming_release = _mm_req("incoming", priority=1)
+    scheduler = _admission_scheduler([queued], priority=True)
+    scheduler._prefetch_kvcache = Mock()
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler._add_request_to_queue(incoming)
+
+    assert scheduler.waiting_queue == [incoming]
+    queued_release.assert_called_once_with()
+    incoming_release.assert_not_called()
+    assert incoming.multimodal_inputs is not None
+
+
+def test_P44_waiting_timeout_releases_timed_out_leases():
+    stale, stale_release = _mm_req("stale")
+    stale.time_stats.wait_queue_entry_time = 1.0
+    fresh, fresh_release = _mm_req("fresh")
+    fresh.time_stats.set_wait_queue_entry_time()
+    scheduler = _queued_abort_scheduler([stale, fresh])
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        envs.SGLANG_REQ_WAITING_TIMEOUT.override(1),
+    ):
+        scheduler._abort_on_waiting_timeout()
+
+    assert scheduler.waiting_queue == [fresh]
+    stale_release.assert_called_once_with()
+    fresh_release.assert_not_called()

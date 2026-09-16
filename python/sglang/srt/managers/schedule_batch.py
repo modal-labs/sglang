@@ -584,6 +584,7 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    session_live_refs = 0
 
     # Moss-VL related
     vision_position_ids: Optional[torch.Tensor] = None
@@ -777,6 +778,37 @@ class MultimodalInputs:
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
+
+
+@dataclasses.dataclass
+class SessionTurnMMState:
+    """What a session turn appended onto a shared MultimodalInputs."""
+
+    items: List[MultimodalDataItem]
+    n_items: int
+    n_pad: Optional[int]
+    n_mrope_pos: Optional[int]
+    n_mrope_delta: Optional[int]
+
+    @classmethod
+    def snapshot(
+        cls, shared: MultimodalInputs, appended: MultimodalInputs
+    ) -> SessionTurnMMState:
+        return cls(
+            items=list(appended.mm_items),
+            n_items=len(shared.mm_items),
+            n_pad=None if shared.image_pad_len is None else len(shared.image_pad_len),
+            n_mrope_pos=(
+                None
+                if shared.mrope_positions is None
+                else shared.mrope_positions.shape[1]
+            ),
+            n_mrope_delta=(
+                None
+                if shared.mrope_position_delta is None
+                else shared.mrope_position_delta.shape[0]
+            ),
+        )
 
 
 def _full_consumer_count(mm_items: List[MultimodalDataItem]) -> int:
@@ -1038,6 +1070,13 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Set by Session.create_req when this turn shares its predecessor's
+        # MultimodalInputs.
+        self.session_mm_inherited: bool = False
+        self.session_mm_parent: Optional[Req] = None
+        # Pre-merge snapshot of the shared object plus the items this turn
+        # appended.
+        self.session_turn_mm_state: Optional[SessionTurnMMState] = None
         self.mm_prefix_ack_done = False
         # Pre-computed multimodal prompt token counts; populated on the prefill
         # node and transferred to decode via the metadata buffer in disagg (PD) mode.
@@ -1310,6 +1349,10 @@ class Req(ReqDllmMixin):
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
         else:
+            if self.session is not None and envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                self.session_turn_mm_state = SessionTurnMMState.snapshot(
+                    self.multimodal_inputs, image_inputs
+                )
             self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
@@ -1801,12 +1844,17 @@ class Req(ReqDllmMixin):
     def set_finish_with_abort(self, error_msg: str):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
-        if (
-            envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get()
-            and self.multimodal_inputs is not None
-            and self.session is None
-        ):
-            self.multimodal_inputs.release_features()
+        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            if self.multimodal_inputs is not None:
+                mm_inputs = self.multimodal_inputs
+                if self.session is not None and mm_inputs.session_live_refs == 0:
+                    self.session.release_dropped_turn_mm_inputs(self)
+                elif mm_inputs.session_live_refs > 0:
+                    mm_inputs.session_live_refs -= 1
+                    if mm_inputs.session_live_refs == 0:
+                        mm_inputs.release_features()
+                else:
+                    mm_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = array(
