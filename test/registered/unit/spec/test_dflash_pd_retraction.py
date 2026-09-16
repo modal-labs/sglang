@@ -75,3 +75,36 @@ def test_offload_relocates_target_draft_and_mamba(
         torch.testing.assert_close(draft.v_buffer[0][dst], expected_v)
     if has_mamba:
         torch.testing.assert_close(mamba_data[7], expected_mamba)
+
+
+@pytest.mark.parametrize("world,rank", [(n, r) for n in [1, 2, 8] for r in range(n)])
+@pytest.mark.parametrize("length", [0, 1, 7, 8, 9, 23, 64, 71])
+@pytest.mark.parametrize("resolved", [False, True])
+def test_mla_backup_fragmented_pages_and_resolved_locations(
+    monkeypatch, world, rank, length, resolved
+):
+    from sglang.srt.mem_cache.unified_memory_pool import UnifiedMLATokenToKVPool
+
+    monkeypatch.setattr(memory_pool.current_platform, "synchronize", lambda: None)
+    pool_cls = UnifiedMLATokenToKVPool if resolved else MLATokenToKVPool
+    pool = pool_cls.__new__(pool_cls)
+    # Physical locations can start unaligned and need no owner filtering.
+    src = (
+        (torch.arange(8, 8 + length) * 3 + 1)
+        if resolved
+        else torch.cat([torch.arange(64, 128), torch.arange(192, 256)])[:length]
+    )
+    dst = src + 256
+    physical_src = src if resolved else src[src % world == rank] // world
+    physical_dst = dst if resolved else dst[dst % world == rank] // world
+    pool.kv_buffer = [torch.arange(1024 * 2).reshape(-1, 2)]
+    pool.layer_num = 1
+    pool.cpu_offloading_chunk_size = 3
+    expected = pool.kv_buffer[0][physical_src].clone()
+    with rc.get_parallel().override(
+        dcp_enabled=world > 1, dcp_size=world, dcp_rank=rank
+    ):
+        copied = pool.get_cpu_copy(src)
+        pool.kv_buffer[0].fill_(-1)
+        pool.load_cpu_copy(copied, dst)
+    torch.testing.assert_close(pool.kv_buffer[0][physical_dst], expected)

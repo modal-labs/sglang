@@ -605,6 +605,8 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     relocate whole page envelopes on the raw buffer.
     """
 
+    write_loc_is_dcp_resolved = True
+
     def __init__(
         self,
         *,
