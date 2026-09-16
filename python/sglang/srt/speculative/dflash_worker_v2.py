@@ -835,7 +835,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head, getattr(lm_head, "quant_method", None)
             ):
                 return _eager("unsupported quantized lm_head")
-            self.draft_model.lm_head = lm_head
+            self.draft_model.attach_lm_head(lm_head)
             if self.ps.tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode (greedy + sampling) folded into the "
@@ -1410,7 +1410,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """The eager fallback for batches the draft graph cannot take."""
         draft_model = self.draft_model
         if draft_model.lm_head is None:
-            draft_model.lm_head = lm_head
+            draft_model.attach_lm_head(lm_head)
 
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:

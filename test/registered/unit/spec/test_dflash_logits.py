@@ -115,6 +115,65 @@ def test_selector_rejects_a_quantized_target_lm_head():
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
 
 
+def test_selector_rejects_top_k_above_tp1_org_vocab(monkeypatch):
+    """Before attach-time validation, an oversized local top-k reaches torch.topk
+    during capture and raises its raw index error instead of a selector error."""
+    model = SimpleNamespace(candidate_selector=SimpleNamespace(top_k=16), lm_head=None)
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=1),
+    )
+    head = SimpleNamespace(
+        org_vocab_size=8,
+        weight=torch.randn(8, 4),
+    )
+    with pytest.raises(ValueError, match=r"selector_top_k=16.*org_vocab_size=8"):
+        DFlash2DraftModel.attach_lm_head(model, head)
+    assert model.lm_head is None
+
+    model.candidate_selector.top_k = 8
+    DFlash2DraftModel.attach_lm_head(model, head)
+    assert model.lm_head is head
+
+    model.candidate_selector.top_k = 16
+    model._transform_unary_logits = lambda logits: logits.float()
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash._flashinfer_top_k",
+        None,
+    )
+    with pytest.raises(RuntimeError, match="selected index k out of range"):
+        DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
+
+
+def test_selector_rejects_top_k_above_per_rank_shard(monkeypatch):
+    model = SimpleNamespace(candidate_selector=SimpleNamespace(top_k=16), lm_head=None)
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=8),
+    )
+    head = SimpleNamespace(
+        org_vocab_size=64,
+        shard_indices=SimpleNamespace(
+            num_org_elements=8,
+            org_vocab_start_index=0,
+        ),
+    )
+    with pytest.raises(ValueError, match=r"num_org_elements.*=8"):
+        DFlash2DraftModel.attach_lm_head(model, head)
+    assert model.lm_head is None
+
+    model.candidate_selector.top_k = 8
+    DFlash2DraftModel.attach_lm_head(model, head)
+    assert model.lm_head is head
+
+
+def test_candidate_selector_rejects_nonpositive_top_k():
+    with pytest.raises(
+        ValueError, match=r"dflash_config.selector_top_k must be positive"
+    ):
+        CandidateSelector(hidden_size=4, vocab_size=16, state_rank=2, top_k=0)
+
+
 def _flashinfer_contract_topk(scores, k, sorted=False, deterministic=False):
     """Stand-in for flashinfer.top_k pinning its call contract: contiguous
     input (its CHECK_INPUT) and the explicit sorted/deterministic flags
@@ -275,6 +334,9 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
         ),
+    )
+    worker.draft_model.attach_lm_head = lambda head: setattr(
+        worker.draft_model, "lm_head", head
     )
 
     sampler = worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker)

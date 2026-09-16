@@ -955,6 +955,10 @@ class CandidateSelector(nn.Module):
             )
         state_rank = int(state_rank)
         self.top_k = int(top_k)
+        if self.top_k <= 0:
+            raise ValueError(
+                f"dflash_config.selector_top_k must be positive, got {top_k}."
+            )
         self.predecessor_codebook = nn.Parameter(
             torch.zeros(int(vocab_size), state_rank), requires_grad=False
         )
@@ -1069,9 +1073,35 @@ class DFlash2DraftModel(DFlashDraftModel):
             state_rank=draft_config.selector_rank,
             top_k=draft_config.selector_top_k,
         )
+        if self.candidate_selector.top_k > int(config.vocab_size):
+            raise ValueError(
+                f"dflash_config.selector_top_k={self.candidate_selector.top_k} "
+                f"exceeds config.vocab_size={int(config.vocab_size)}."
+            )
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
+
+    def attach_lm_head(self, lm_head: nn.Module) -> None:
+        """Borrow the target head; each rank takes a local top-k over its own
+        original-vocabulary rows, so top_k must fit the smallest shard."""
+        k = self.candidate_selector.top_k
+        shard = getattr(lm_head, "shard_indices", None)
+        if get_parallel().tp_size == 1 or shard is None:
+            local_rows = int(lm_head.org_vocab_size)
+            source = "lm_head.org_vocab_size"
+        else:
+            local_rows = int(shard.num_org_elements)
+            source = "lm_head.shard_indices.num_org_elements (this TP rank)"
+        if k > local_rows:
+            raise ValueError(
+                f"dflash_config.selector_top_k={k} exceeds the target lm_head's "
+                f"original-vocabulary rows available to the DFlash2 selector "
+                f"({source}={local_rows}). The selector takes a local top-k on "
+                f"every TP rank before gathering, so selector_top_k must be "
+                f"<= {local_rows}."
+            )
+        self.lm_head = lm_head
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
