@@ -89,8 +89,8 @@ def metric_subset(text):
         "num_retracted_requests_total",
         "num_running_reqs",
         "num_queue_reqs",
-        "num_decode_prealloc_reqs",
-        "num_decode_transfer_reqs",
+        "num_decode_prealloc_queue_reqs",
+        "num_decode_transfer_queue_reqs",
         "full_token_usage",
         "mamba_usage",
         "spec_accept",
@@ -154,7 +154,7 @@ async def run(args):
         async def snapshot(tag):
             if not args.decode_url:
                 return
-            for path in ("/v1/loads?include=core", "/metrics"):
+            for path in ("/v1/loads?include=all", "/metrics"):
                 result = await fetch(session, args.decode_url + path, timeout=10)
                 if path == "/metrics":
                     result["body"] = metric_subset(result.get("body"))
