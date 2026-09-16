@@ -1,4 +1,4 @@
-# kimi-k3-fast -> dev/instinct/2026-09-15 @ c10d0d215, 4 PRs on
+# kimi-k3-fast -> dev/instinct/2026-09-15 @ 15fafd786, 4 PRs on
 
 Files in this directory:
 
@@ -28,8 +28,8 @@ git bundle list-heads deploy/instinct-2026-09-14/engine-<sha9>.bundle
 ```
 
 The pin ref is needed because bundles only advertise named refs; serve.py checks that the advertised
-head equals `RELEASE_SHA`. For the current pin, use `engine-c10d0d215.bundle` and
-`RELEASE_SHA=c10d0d21512d9df6a85c9968fa69080a9b16059e`.
+head equals `RELEASE_SHA`. For the current pin, use `engine-15fafd786.bundle` and
+`RELEASE_SHA=15fafd786dbf644224a4051a43ccfe5ba9491857`.
 
 Then run `modal deploy serve.py`. `serve.py` refuses to import if the bundle is missing, fails
 `git bundle verify`, or lacks `RELEASE_SHA`; the exception message carries the exact create
@@ -45,26 +45,26 @@ from any cwd.
 modal deploy serve.py          # in the directory that holds serve.py + generated bundle
 ```
 
-Image build check (in the build log): `rev-parse HEAD == c10d0d215...`, `status --porcelain` empty,
+Image build check (in the build log): `rev-parse HEAD == 15fafd786...`, `status --porcelain` empty,
 `sglang.__file__` printed. The A/B endpoint `kimi-k3-ab-instinct` was built with the identical steps.
 
 ## During cutover
 
 - Watch green containers schedule; if they don't, scale Instinct down a little to free GPUs.
 - Old (blue) containers are hard-terminated 4 h after deploy regardless of green progress.
-- Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release c10d0d215). ...` — the
+- Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release 15fafd786). ...` — the
   warmup number now includes the image turn (expect +25-80 s on containers with a cold mm JIT).
-- Env check on a running container: `SGLANG_RELEASE_SHA=c10d0d215...` and the 5 flags above;
+- Env check on a running container: `SGLANG_RELEASE_SHA=15fafd786...` and the 5 flags above;
   `SGLANG_ENABLE_MM_CUDA_IPC_PREFIX_ACK` must be absent.
 
 ## Rollback
 
 Check out the previous `serve.py` commit, regenerate its bundle with the same command, then deploy.
-Flags-only rollback (keep c10d0d215, drop the 5 env lines) leaves the dev levers at their default-off
+Flags-only rollback (keep 15fafd786, drop the 5 env lines) leaves the dev levers at their default-off
 values; at 462ade71f that configuration was == `release/2026-09-14` behavior, greedy-identical 36/36
 in every A/B arm.
 
-## DFlash2 draft (kimi-k3-sglang #40 — not deployable until RELEASE_SHA contains #27)
+## DFlash2 draft (kimi-k3-sglang #27 + #40, both in RELEASE_SHA 15fafd786)
 
 `serve.py` points the draft at `/dflash/k3-instinct-v5-dflash2/draft-step-14500` (`DFLASH2_PINNED_STEP`) on the
 existing `dflash_spec` mount (`DFlash2DraftModel`), `--speculative-draft-model-quantization unquant`
@@ -81,7 +81,7 @@ existing `dflash_spec` mount (`DFlash2DraftModel`), `--speculative-draft-model-q
   `/dflash2-eval/outputs/k3-instinct-v5-dflash2-hero-b8-30p2t-success-producer-v2/trainer-1/draft-step-14500`
   (override with `K3_DFLASH2_PATH=<dir>`). The boot check runs on the active path. Prod never sets
   these variables.
-- Ship procedure: (1) copy `draft-step-14500` from the training volume into the immutable dir
+- Ship procedure: (1) **required before deploying this pin:** copy `draft-step-14500` from the training volume into the immutable dir
   `k3-instinct-v5-dflash2/draft-step-14500` on `dflash_spec` (steps rotate on the training volume;
   12000 disappeared once — until the copy exists the boot check fails fast); (2) bump
   `DFLASH2_PINNED_STEP` if a newer step is chosen; (3) integration lane advances `RELEASE_SHA` +
