@@ -58,8 +58,8 @@ def make_case(case, model, rid):
         "rid": rid,
         "temperature": 0,
         "seed": case,
-        "thinking": {"type": "disabled"},
-        "max_tokens": 768,
+        "reasoning_effort": "low",
+        "max_tokens": 2048,
         "messages": [{"role": "user", "content": content}],
         "response_format": {
             "type": "json_schema",
@@ -123,13 +123,20 @@ async def run(args):
                     (body.get("choices") or [{}])[0] if isinstance(body, dict) else {}
                 )
                 text = (choice.get("message") or {}).get("content")
-                good, reason = check_answer(text, expected)
+                good, reason = (
+                    check_answer(text, expected)
+                    if result["status"] == 200
+                    else (False, "http_error")
+                )
+                if result["status"] != 200:
+                    result["error_body"] = body
                 result.update(
                     key=key,
                     rid=rid,
                     passed=good and result["status"] == 200,
                     reason=reason,
                     answer=text,
+                    reasoning=(choice.get("message") or {}).get("reasoning_content"),
                     finish_reason=choice.get("finish_reason"),
                     usage=body.get("usage") if isinstance(body, dict) else None,
                 )
