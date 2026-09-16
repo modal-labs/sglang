@@ -318,9 +318,16 @@ class OpenAIServingResponses(OpenAIServingChat):
             processed_messages: Optional[MessageProcessingResult] = None
 
             if self.use_harmony:
-                messages, request_prompts, engine_prompts = (
-                    self._make_request_with_harmony(request, prev_response)
-                )
+                if self.request_conversion_executor is None:
+                    messages, request_prompts, engine_prompts = (
+                        self._make_request_with_harmony(request, prev_response)
+                    )
+                else:
+                    messages, request_prompts, engine_prompts = (
+                        await self.request_conversion_executor.run(
+                            self._make_request_with_harmony, request, prev_response
+                        )
+                    )
             else:
                 (
                     messages,
@@ -2879,10 +2886,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                     adapted_request, raw_request
                 )
 
-            async for res in generator:
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
+            try:
+                async for res in generator:
+                    context.append_output(res)
+                    # NOTE(woosuk): The stop condition is handled by the engine.
+                    yield context
+            finally:
+                # Closing a Responses stream must close its active P/D turn
+                # immediately rather than waiting for async-generator GC.
+                await generator.aclose()
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
