@@ -1009,6 +1009,15 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     if batch.spec_algorithm.is_dflash_family():
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.cumulate_penalty_output_tokens_since_last()
+            from sglang.srt.speculative.dflash_utils import DFlashBlockPenaltyState
+
+            batch.sampling_info.dflash_block_penalty_state = (
+                DFlashBlockPenaltyState.from_orchestrator(
+                    batch.sampling_info.penalizer_orchestrator
+                )
+            )
+        else:
+            batch.sampling_info.dflash_block_penalty_state = None
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode

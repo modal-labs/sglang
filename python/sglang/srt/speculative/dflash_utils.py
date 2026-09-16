@@ -12,7 +12,15 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+from sglang.srt.sampling.penaltylib.frequency_penalty import BatchedFrequencyPenalizer
+from sglang.srt.sampling.penaltylib.min_new_tokens import (
+    BatchedMinNewTokensPenalizer,
+)
+from sglang.srt.sampling.penaltylib.presence_penalty import BatchedPresencePenalizer
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+    apply_scaling_penalties,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -114,11 +122,182 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 
+@dataclass
+class DFlashBlockPenaltyState:
+    """Committed penalty state, decomposed so a verify block can roll it
+    forward one draft candidate at a time."""
+
+    additive_base: torch.Tensor
+    frequency_penalties: Optional[torch.Tensor]
+    presence_penalties: Optional[torch.Tensor]
+    cumulated_presence: Optional[torch.Tensor]
+    repetition_penalties: Optional[torch.Tensor]
+    scaling_base: Optional[torch.Tensor]
+    min_new_tokens: Optional[torch.Tensor]
+    len_output_tokens: Optional[torch.Tensor]
+    stop_token_penalties: Optional[torch.Tensor]
+
+    @classmethod
+    def from_orchestrator(cls, orchestrator) -> Optional[DFlashBlockPenaltyState]:
+        """Return a snapshot of prepared penalties, or None if unused."""
+        orchestrator_penalizers = getattr(orchestrator, "penalizers", {})
+        penalizers = {
+            penalizer_type: orchestrator_penalizers.get(penalizer_type)
+            for penalizer_type in (
+                BatchedFrequencyPenalizer,
+                BatchedPresencePenalizer,
+                BatchedRepetitionPenalizer,
+                BatchedMinNewTokensPenalizer,
+            )
+        }
+        prepared = {
+            penalizer_type: penalizer
+            for penalizer_type, penalizer in penalizers.items()
+            if penalizer is not None and penalizer._is_prepared
+        }
+        if not prepared:
+            return None
+
+        row_tensor = next(
+            tensor
+            for penalizer in prepared.values()
+            for tensor in (
+                getattr(penalizer, "frequency_penalties", None),
+                getattr(penalizer, "presence_penalties", None),
+                getattr(penalizer, "repetition_penalties", None),
+                getattr(penalizer, "min_new_tokens", None),
+            )
+            if tensor is not None
+        )
+        bs = row_tensor.shape[0]
+        additive_base = torch.zeros(
+            (bs, orchestrator.vocab_size),
+            dtype=torch.float32,
+            device=orchestrator.device,
+        )
+
+        frequency = prepared.get(BatchedFrequencyPenalizer)
+        if frequency is not None:
+            frequency.apply(additive_base)
+        presence = prepared.get(BatchedPresencePenalizer)
+        if presence is not None:
+            presence.apply(additive_base)
+
+        repetition = prepared.get(BatchedRepetitionPenalizer)
+        min_new_tokens = prepared.get(BatchedMinNewTokensPenalizer)
+        return cls(
+            additive_base=additive_base,
+            frequency_penalties=(
+                getattr(frequency, "frequency_penalties", None)
+                if frequency is not None
+                else None
+            ),
+            presence_penalties=(
+                getattr(presence, "presence_penalties", None)
+                if presence is not None
+                else None
+            ),
+            cumulated_presence=(
+                presence.cumulated_presence_penalties.clone()
+                if presence is not None
+                else None
+            ),
+            repetition_penalties=(
+                getattr(repetition, "repetition_penalties", None)
+                if repetition is not None
+                else None
+            ),
+            scaling_base=(
+                repetition.cumulated_repetition_penalties.clone()
+                if repetition is not None
+                else None
+            ),
+            min_new_tokens=(
+                getattr(min_new_tokens, "min_new_tokens", None)
+                if min_new_tokens is not None
+                else None
+            ),
+            len_output_tokens=(
+                min_new_tokens.len_output_tokens.clone()
+                if min_new_tokens is not None
+                else None
+            ),
+            stop_token_penalties=(
+                getattr(min_new_tokens, "stop_token_penalties", None)
+                if min_new_tokens is not None
+                else None
+            ),
+        )
+
+
+def _apply_block_penalties(
+    logits2d: torch.Tensor,
+    state: DFlashBlockPenaltyState,
+    candidates: torch.Tensor,
+    bs: int,
+    k: int,
+) -> None:
+    vocab_size = logits2d.shape[1]
+    c = candidates[:, 1:]
+    logits3 = logits2d.view(bs, k, vocab_size)
+    add3 = state.additive_base[:, None, :].expand(bs, k, vocab_size).clone()
+
+    if state.frequency_penalties is not None:
+        planes = torch.zeros_like(add3)
+        frequency_delta = (-state.frequency_penalties).expand(bs, k - 1)
+        planes[:, 1:].scatter_add_(2, c[:, :, None], frequency_delta[:, :, None])
+        add3.add_(planes.cumsum(dim=1))
+
+    if state.presence_penalties is not None:
+        gathered = state.cumulated_presence.gather(1, c)
+        previous = c[:, :, None] == c[:, None, :]
+        seen_earlier = previous & torch.tril(
+            torch.ones((k - 1, k - 1), dtype=torch.bool, device=c.device),
+            diagonal=-1,
+        )
+        new = ~seen_earlier.any(dim=-1) & gathered.eq(0)
+        planes = torch.zeros_like(add3)
+        presence_delta = -state.presence_penalties.expand(bs, k - 1) * new
+        planes[:, 1:].scatter_add_(2, c[:, :, None], presence_delta[:, :, None])
+        add3.add_(planes.cumsum(dim=1))
+
+    if state.min_new_tokens is not None:
+        positions = torch.arange(k, device=logits2d.device)[None, :]
+        mask = (state.len_output_tokens + positions) < state.min_new_tokens
+        add3.add_(
+            torch.where(
+                mask[:, :, None],
+                state.stop_token_penalties[:, None, :],
+                0.0,
+            )
+        )
+
+    logits3.add_(add3.to(dtype=logits2d.dtype))
+
+    if state.scaling_base is not None:
+        scale3 = state.scaling_base[:, None, :].expand(bs, k, vocab_size).clone()
+        idx = c[:, None, :].expand(bs, k, k - 1)
+        i_le_j = (
+            torch.arange(k - 1, device=logits2d.device)[None, :]
+            < torch.arange(k, device=logits2d.device)[:, None]
+        )
+        same_token = c[:, None, :, None] == c[:, None, None, :]
+        visible_token = (i_le_j[None, :, None, :] & same_token).any(dim=-1)
+        src = torch.where(
+            visible_token,
+            state.repetition_penalties[:, :, None].expand(bs, k, k - 1),
+            scale3.gather(2, idx),
+        )
+        scale3.scatter_(2, idx, src)
+        apply_scaling_penalties(logits2d, scale3.view(bs * k, vocab_size))
+
+
 def apply_dflash_verify_logits_adjustments(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    candidates: Optional[torch.Tensor] = None,
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
@@ -155,25 +334,49 @@ def apply_dflash_verify_logits_adjustments(
     vocab_mask = getattr(sampling_info, "vocab_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
-    if penalizer is not None and penalizer.is_required:
-        additive = torch.zeros(
-            (bs, next_token_logits.shape[1]),
-            dtype=torch.float32,
-            device=next_token_logits.device,
-        )
-        penalizer.accumulate_additive_penalties(additive)
-        scaling = penalizer.accumulate_scaling_penalties()
+    state = getattr(sampling_info, "dflash_block_penalty_state", None)
+    if state is None and penalizer is not None and penalizer.is_required:
+        state = DFlashBlockPenaltyState.from_orchestrator(penalizer)
+    if candidates is not None:
+        if tuple(candidates.shape) != (bs, draft_token_num):
+            raise ValueError(
+                "candidates shape mismatch for DFlash verify adjustments. "
+                f"Expected {(bs, draft_token_num)}, got {tuple(candidates.shape)}."
+            )
 
     logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
 
-    if additive is not None:
-        logits_3d.add_(additive[:, None, :].to(dtype=next_token_logits.dtype))
-
-    if scaling is not None:
-        apply_scaling_penalties(
+    if candidates is not None and state is not None and draft_token_num > 1:
+        if state.additive_base.shape[0] != bs:
+            raise ValueError(
+                "penalty state rows mismatch: "
+                f"Expected {bs}, got {state.additive_base.shape[0]}."
+            )
+        _apply_block_penalties(
             next_token_logits,
-            torch.repeat_interleave(scaling, draft_token_num, dim=0),
+            state,
+            candidates,
+            bs,
+            draft_token_num,
         )
+    else:
+        if penalizer is not None and penalizer.is_required:
+            additive = torch.zeros(
+                (bs, next_token_logits.shape[1]),
+                dtype=torch.float32,
+                device=next_token_logits.device,
+            )
+            penalizer.accumulate_additive_penalties(additive)
+            scaling = penalizer.accumulate_scaling_penalties()
+
+        if additive is not None:
+            logits_3d.add_(additive[:, None, :].to(dtype=next_token_logits.dtype))
+
+        if scaling is not None:
+            apply_scaling_penalties(
+                next_token_logits,
+                torch.repeat_interleave(scaling, draft_token_num, dim=0),
+            )
 
     if vocab_mask is not None:
         masked = torch.zeros(
