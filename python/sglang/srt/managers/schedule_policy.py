@@ -1131,6 +1131,9 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            # This fast path can truncate and create a continuing request.
+            if has_chunked_req:
+                return AddReqResult.OTHER
             return self.add_one_req_ignore_eos(req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
@@ -1304,6 +1307,9 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
+                # The scheduler owns only one continuing prefill request.
+                if has_chunked_req:
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
