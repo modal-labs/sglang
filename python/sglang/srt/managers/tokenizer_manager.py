@@ -1303,6 +1303,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
+        from sglang.srt.managers.queue_diagnostics import record_request_identity
+
+        record_request_identity(obj, tokenized_obj)
+
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 

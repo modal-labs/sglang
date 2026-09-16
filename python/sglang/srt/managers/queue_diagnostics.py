@@ -142,3 +142,39 @@ def snapshot(scheduler):
             "total_tokens": backfill.total_tokens,
         }
     return result
+
+
+def record_request_identity(obj, tokenized):
+    """Canary-only bridge to existing colo prompt fingerprints; no body logging."""
+    if not ENABLED:
+        return
+    import hashlib
+    import json
+    import logging
+
+    started = time.perf_counter()
+    raw = getattr(obj, "text", None)
+    kind = "text"
+    if raw is None:
+        raw = getattr(obj, "input_ids", None)
+        kind = "input_ids"
+    if raw is None:
+        return
+    fingerprint = hashlib.sha256(
+        json.dumps(raw, sort_keys=True).encode()
+    ).hexdigest()[:24]
+    rid = str(getattr(obj, "rid", ""))
+    ids = getattr(tokenized, "input_ids", None)
+    logging.getLogger(__name__).info(
+        "K3_REQUEST_IDENTITY %s",
+        json.dumps({
+            "fingerprint": fingerprint,
+            "fingerprint_kind": kind,
+            "request_id": hashlib.sha256(rid.encode()).hexdigest()[:24],
+            "room": str(getattr(tokenized, "bootstrap_room", None)),
+            "prompt_tokens": len(ids) if ids is not None else None,
+            "multimodal": bool(getattr(tokenized, "mm_inputs", None)),
+            "wall_time": time.time(),
+            "fingerprint_elapsed_s": time.perf_counter() - started,
+        }),
+    )
