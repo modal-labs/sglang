@@ -130,6 +130,18 @@ async def run(args):
                 )
                 if result["status"] != 200:
                     result["error_body"] = body
+                try:
+                    answer_object = json.loads(text)
+                except (TypeError, ValueError):
+                    answer_object = None
+                answer_valid = isinstance(answer_object, dict)
+                result["json_valid"] = answer_valid
+                result["answer_correct"] = answer_valid and all(
+                    answer_object.get(key) == value for key, value in expected.items()
+                )
+                result["sequence_correct"] = (
+                    answer_valid and answer_object.get("sequence") == _SEQUENCE
+                )
                 result.update(
                     key=key,
                     rid=rid,
