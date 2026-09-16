@@ -7177,7 +7177,11 @@ class ServerArgs:
                 "backup and the storage keys must become dcp_rank-aware "
                 "first. Run HiCache+DCP with L1/L2 only."
             )
-        if self.speculative_algorithm is not None:
+        full_dflash_kv = (
+            self.speculative_algorithm == "DFLASH"
+            and not self.speculative_dflash_draft_ring
+        )
+        if self.speculative_algorithm is not None and not full_dflash_kv:
             raise NotImplementedError(
                 "HiCache with --dcp-size > 1 does not support speculative "
                 "decoding yet (the draft-model host pool has no DCP index "

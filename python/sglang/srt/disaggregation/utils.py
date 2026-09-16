@@ -981,6 +981,10 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
+    if getattr(draft_token_to_kv_pool, "_pd_dflash_full_kv", False):
+        dp, dl, il = draft_token_to_kv_pool.get_contiguous_buf_infos()
+        append_state_component(kv_args, StateType.DFLASH_KV, dp, dl, il)
+
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(

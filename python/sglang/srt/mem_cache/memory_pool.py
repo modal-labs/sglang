@@ -1727,7 +1727,14 @@ class MHATokenToKVPool(KVCache):
         kv_cache_layout: Optional[str] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        padding_size: Optional[int] = None,
     ):
+        self.padding_size = page_size if padding_size is None else padding_size
+        assert self.padding_size >= page_size and self.padding_size % page_size == 0
+        if post_capture_active and self.padding_size != page_size:
+            raise ValueError(
+                "Extended draft padding does not yet support post-capture KV backing"
+            )
         if post_capture_active:
             # Reserved upper bound only (unbacked VA): page-align UP so
             # (size + page_size) % page_size == 0 holds for paged layouts.
@@ -1749,7 +1756,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -1768,7 +1777,7 @@ class MHATokenToKVPool(KVCache):
             self.use_hnd = False
             self.kv_cache_layout = kv_cache_layout
         elif self.use_hnd:
-            total_slots = self.size + self.page_size
+            total_slots = self.size + self.padding_size
             assert total_slots % self.page_size == 0, (
                 f"HND KV cache needs (size+page_size) divisible by page_size, got "
                 f"size={self.size}, page_size={self.page_size}"
@@ -1789,7 +1798,7 @@ class MHATokenToKVPool(KVCache):
                     # X = 16 / storage itemsize: sized by the STORAGE dtype (not compute
                     # dtype) since it tiles the 16-byte on-pool vector.
                     self._kv_vector_x = 16 // self.store_dtype.itemsize
-                    assert (self.size + self.page_size) % self.page_size == 0
+                    assert (self.size + self.padding_size) % self.page_size == 0
                     assert self.page_size % self._kv_vector_x == 0, (
                         f"page_size={self.page_size} must be divisible by "
                         f"X={self._kv_vector_x} for vectorized_5d layout"
@@ -1905,7 +1914,7 @@ class MHATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 buf = self.quant_method.create_buffers(
-                    self.size + self.page_size,
+                    self.size + self.padding_size,
                     self.head_num,
                     self.head_dim,
                     self.layer_num,
@@ -1998,7 +2007,7 @@ class MHATokenToKVPool(KVCache):
                 (self.num_pages, self.head_num, self.page_size, self.head_dim),
                 (self.num_pages, self.head_num, self.page_size, self.v_head_dim),
             )
-        rows = self.size + self.page_size
+        rows = self.size + self.padding_size
         return (
             (rows, self.head_num, self.head_dim),
             (rows, self.head_num, self.v_head_dim),
@@ -2013,7 +2022,7 @@ class MHATokenToKVPool(KVCache):
             ):
                 # The padded page (slot 0's page) absorbs dummy padded-token writes.
                 if self.kv_cache_layout == "vectorized_5d":
-                    total_slots = self.size + self.page_size
+                    total_slots = self.size + self.padding_size
                     num_blocks = total_slots // self.page_size
                     x = self._kv_vector_x
                     # K: (num_blocks, H, D_k // X, page, X)
@@ -2074,7 +2083,7 @@ class MHATokenToKVPool(KVCache):
             k_shape, v_shape = self._kv_buffer_shapes()
         # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
         # a single token slot for the plain NHD [slots, ...] layout.
-        num_slots = self.size + self.page_size
+        num_slots = self.size + self.padding_size
         tokens_per_row = (
             self.page_size if k_shape[0] * self.page_size == num_slots else 1
         )
@@ -2170,7 +2179,10 @@ class MHATokenToKVPool(KVCache):
         tensors = self._pd_registerable_tensors()
         ptrs = [t.data_ptr() for t in tensors]
         lens = [
-            d.final_span_bytes(self.size, self.page_size) for d in self._kv_buffer_descs
+            d.final_span_bytes(
+                self.size + self.padding_size - self.page_size, self.page_size
+            )
+            for d in self._kv_buffer_descs
         ]
         item_lens = [d.item_len_bytes(self.page_size) for d in self._kv_buffer_descs]
         return ptrs, lens, item_lens
@@ -2280,7 +2292,7 @@ class MHATokenToKVPool(KVCache):
         loc, _, _ = unwrap_write_loc(loc_info)
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
+        maybe_detect_oob(loc, 0, self.size + self.padding_size, "set_kv_buffer (MHA)")
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -2388,7 +2400,7 @@ class MHATokenToKVPool(KVCache):
             device_module=self.device_module,
             # size + page_size = real slots + the reserved padding slot (padded /
             # dummy tokens write there); valid index range is [0, size + page_size).
-            size_limit=self.size + self.page_size,
+            size_limit=self.size + self.padding_size,
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
         )
@@ -2733,7 +2745,7 @@ class MHATokenToKVPool(KVCache):
             return
 
         # Catch stale indices here instead of as illegal-addr or silent KV corruption.
-        size_limit = self.size + self.page_size
+        size_limit = self.size + self.padding_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 

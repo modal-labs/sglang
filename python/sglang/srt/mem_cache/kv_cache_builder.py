@@ -204,8 +204,12 @@ def maybe_register_hicache_draft(
         )
     else:
         draft_pool_start = None
+    anchor = getattr(primary, "anchor_entry", None)
+    target_host = primary if anchor is None else anchor.host_pool
+    # Target host rows are DCP-local; the draft retains the logical slot domain.
+    host_tokens = getattr(target_host, "logical_size", target_host.size)
     kw = dict(
-        host_to_device_ratio=primary.size / pool.size,
+        host_to_device_ratio=host_tokens / pool.size,
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,

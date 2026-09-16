@@ -443,7 +443,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
-        if self.draft_token_to_kv_pool is not None:
+        draft_full = (
+            self.draft_token_to_kv_pool is not None
+            and self.scheduler.spec_algorithm.is_dflash()
+            and not getattr(self.scheduler.draft_worker, "use_draft_ring", False)
+        )
+        if draft_full:
+            if self.transfer_backend != TransferBackend.NIXL:
+                raise NotImplementedError(
+                    "Full DFlash PD KV transfer currently requires NIXL"
+                )
+            # The draft shares logical slots, not the target's DCP physical rows.
+            self.draft_token_to_kv_pool._pd_dflash_full_kv = True
+        if self.draft_token_to_kv_pool is not None and not draft_full:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -459,7 +471,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_item_lens = kv_item_lens
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
+            if (self.draft_token_to_kv_pool is None or draft_full)
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
@@ -1159,7 +1171,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if clear_c128_state is not None:
                     clear_c128_state(int(decode_req.req.req_pool_idx))
             for st in state_types:
-                if st == StateType.MAMBA:
+                if st == StateType.DFLASH_KV:
+                    from sglang.srt.speculative.dflash_kv_layout import (
+                        draft_kv_transfer_start,
+                    )
+
+                    draft_page = int(self.draft_token_to_kv_pool.page_size)
+                    tail_start = draft_kv_transfer_start(
+                        seq_len,
+                        self.scheduler.server_args.speculative_draft_window_size,
+                        draft_page,
+                    )
+                    locs = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, tail_start:seq_len
+                    ]
+                    state_indices.append(kv_to_page_indices(locs, draft_page))
+                elif st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())
                 elif st == StateType.SWA:
                     state_indices.append(_swa_payload())

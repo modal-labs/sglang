@@ -2237,6 +2237,13 @@ class NixlKVManager(CommonKVManager):
             dst_lids = dst_state_layer_ids[i] if i < len(dst_state_layer_ids) else []
             comp_notif = f"{notif}_{i}"
 
+            if (
+                st == StateType.DFLASH_KV
+                and self.pp_size is not None
+                and self.pp_size > 1
+            ):
+                raise RuntimeError("Full DFlash KV transfer currently requires PP=1")
+
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
                     h = self._send_mamba_state_slice(
@@ -2272,12 +2279,15 @@ class NixlKVManager(CommonKVManager):
                         dst_layer_ids=dst_lids,
                     )
             elif st in (
+                StateType.DFLASH_KV,
                 StateType.SWA,
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
             ):
-                if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
+                if (
+                    not self.is_mla_backend or st == StateType.DFLASH_KV
+                ) and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )

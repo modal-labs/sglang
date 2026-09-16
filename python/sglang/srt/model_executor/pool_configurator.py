@@ -173,10 +173,29 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_cell_size = None
+                if (
+                    kvc.spec_algorithm.is_dflash()
+                    and not kvc.server_args.speculative_dflash_draft_ring
+                ):
+                    from sglang.srt.speculative.dflash_kv_layout import (
+                        draft_kv_bytes_per_target_token,
+                    )
+
+                    aux = kvc.spec_aux_config
+                    draft_cell_size = draft_kv_bytes_per_target_token(
+                        num_layers=int(draft_num_layers),
+                        total_kv_heads=aux.dflash_draft_total_num_kv_heads,
+                        head_dim=aux.dflash_draft_head_dim,
+                        tp_size=get_parallel().attn_tp_size,
+                        dcp_size=kvc.server_args.dcp_size,
+                        dtype=aux.dflash_draft_kv_dtype,
+                    )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
+                    draft_cell_size_per_token=draft_cell_size,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:

@@ -1419,6 +1419,22 @@ class KVCacheConfigurator:
             pool_kwargs["quant_method"] = quant_method
         else:
             pool_kwargs["post_capture_active"] = self.post_capture_kv_active
+        if (
+            self.is_draft_worker
+            and self.server_args.speculative_algorithm == "DFLASH"
+            and not self.server_args.speculative_dflash_draft_ring
+            and self.server_args.dcp_size > 1
+            and pool_cls is MHATokenToKVPool
+        ):
+            pool_kwargs["padding_size"] = (
+                self.server_args.page_size * self.server_args.dcp_size
+            )
+            logger.info(
+                "DFlash KV padding: usable=%s physical_page=%s padding=%s",
+                max_total_num_tokens,
+                self.server_args.page_size,
+                pool_kwargs["padding_size"],
+            )
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,
