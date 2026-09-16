@@ -1259,6 +1259,14 @@ class ServerArgs:
         "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
         NS("device"),
     ] = None
+    freeze_gc_after_warmup: A[
+        bool,
+        "Call /freeze_gc after server warmup so the tokenizer, scheduler, and "
+        "detokenizer processes freeze their startup object graphs (gc.freeze), "
+        "removing them from later gen2 collections. Skipped with a warning when "
+        "tokenizer_worker_num > 1 (/freeze_gc reaches only one tokenizer worker).",
+        NS("device"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # HTTP server

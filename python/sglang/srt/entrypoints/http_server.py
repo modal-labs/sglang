@@ -2302,6 +2302,44 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _freeze_gc_after_server_warmup(server_args: ServerArgs):
+    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
+    # Use /freeze_gc to freeze scheduler and detokenizer as well.
+    if server_args.tokenizer_worker_num > 1:
+        # /freeze_gc only freezes the tokenizer worker that serves the request.
+        logger.warning(
+            "--freeze-gc-after-warmup is skipped because tokenizer_worker_num=%d > 1",
+            server_args.tokenizer_worker_num,
+        )
+        return
+    freeze_key = server_args.admin_api_key or server_args.api_key
+    freeze_headers = {}
+    if freeze_key:
+        freeze_headers["Authorization"] = f"Bearer {freeze_key}"
+    # --skip-server-warmup bypasses the wait-for-server loop, so this request
+    # can race uvicorn binding its socket. The connect timeout and retry delay
+    # bound repeated connection failures to about 30 seconds.
+    max_attempts = 15
+    for attempt in range(max_attempts):
+        try:
+            res = requests.post(
+                server_args.url() + "/freeze_gc",
+                headers=freeze_headers,
+                timeout=(1, 10),
+                verify=server_args.ssl_verify(),
+            )
+            res.raise_for_status()
+            return
+        except requests.exceptions.ConnectionError:
+            if attempt == max_attempts - 1:
+                logger.warning("post-warmup freeze_gc failed", exc_info=True)
+                return
+            time.sleep(1)
+        except requests.exceptions.RequestException:
+            logger.warning("post-warmup freeze_gc failed", exc_info=True)
+            return
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2324,6 +2362,9 @@ def _wait_and_warmup(
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
+    if server_args.freeze_gc_after_warmup:
+        _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
