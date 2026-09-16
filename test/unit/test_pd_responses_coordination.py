@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import unittest
 from dataclasses import dataclass, field
+from aiohttp import web
 from pathlib import Path
 
 _path = (
@@ -199,6 +200,56 @@ class LifecycleTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(outputs, [output])
                 self.assertTrue(prefill.cancelled())
                 self.assertEqual(aborted, ["resp_test"])
+
+    async def test_prefill_http_failure_retains_status_without_waiting_for_body(self):
+        # A rejecting P may leave its response body open; headers suffice to
+        # release the paired D reservation promptly.
+        closed = asyncio.Event()
+
+        async def reject(request):
+            response = web.StreamResponse(status=503)
+            await response.prepare(request)
+            await closed.wait()
+            return response
+
+        app = web.Application()
+        app.router.add_post("/generate", reject)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            with self.assertRaises(module.PDResponsesError) as error:
+                await asyncio.wait_for(
+                    module.run_prefill(f"http://127.0.0.1:{port}", {"rid": "p"}, 10),
+                    1,
+                )
+            self.assertEqual(error.exception.status_code, 503)
+        finally:
+            closed.set()
+            await runner.cleanup()
+
+    async def test_committed_decode_does_not_fail_on_prefill_http_drain(self):
+        aborted = []
+        allow_second = asyncio.Event()
+
+        async def decode():
+            yield {"text": "first"}
+            await allow_second.wait()
+            yield {"text": "last"}
+
+        async def prefill():
+            await allow_second.wait()
+            raise module.PDResponsesError("drain failed", 502)
+
+        p = asyncio.create_task(prefill())
+        gen = module.coordinated_turn(Request(), decode(), p, aborted.append)
+        self.assertEqual(await anext(gen), {"text": "first"})
+        allow_second.set()
+        self.assertEqual(await self.collect(gen), [{"text": "last"}])
+        await asyncio.sleep(0)
+        self.assertEqual(aborted, [])
 
     async def collect(self, gen):
         return [item async for item in gen]

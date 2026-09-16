@@ -665,7 +665,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
-            return self.create_error_response(str(e))
+            status_code = getattr(e, "status_code", 400)
+            return self.create_error_response(
+                str(e),
+                status_code=status_code,
+                err_type="server_error" if status_code >= 500 else "invalid_request_error",
+            )
 
         status = "completed"
         if self.use_harmony:
@@ -2950,6 +2955,22 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             try:
                 async for res in generator:
+                    if prefill_url and isinstance(res, dict):
+                        finish_reason = (res.get("meta_info") or {}).get(
+                            "finish_reason"
+                        )
+                        if (
+                            isinstance(finish_reason, dict)
+                            and finish_reason.get("type") == "abort"
+                        ):
+                            from sglang.srt.entrypoints.openai.pd_responses import (
+                                PDResponsesError,
+                            )
+
+                            raise PDResponsesError(
+                                finish_reason.get("message") or "PD decode aborted",
+                                finish_reason.get("status_code", 500),
+                            )
                     context.append_output(res)
                     # NOTE(woosuk): The stop condition is handled by the engine.
                     yield context

@@ -15,6 +15,14 @@ from urllib.parse import urlsplit
 import aiohttp
 
 
+class PDResponsesError(ValueError):
+    """Keep a worker failure distinct from invalid client input."""
+
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def prepare_prefill_turn(request, prefill_url, bootstrap_port):
     parsed = urlsplit(prefill_url)
     if (
@@ -42,8 +50,9 @@ def prepare_prefill_turn(request, prefill_url, bootstrap_port):
     payload["rid"] = f"{request.rid or 'responses'}-prefill-{uuid.uuid4().hex}"
     payload["stream"] = False
     payload["background"] = False
-    # Validate serialization before either engine admits the turn. In particular,
-    # process-local CUDA IPC handles must never be used as a cross-node transport.
+    # These are API media references before TokenizerManager preprocessing.
+    # Validate serialization before either engine admits the turn; process-local
+    # tensors are not a supported cross-node media transport.
     json.dumps(payload)
     return payload
 
@@ -58,7 +67,10 @@ async def run_prefill(prefill_url, payload, timeout):
             ) as response:
                 if response.status >= 400:
                     # Do not log raw request bodies or model output.
-                    raise ValueError(f"PD prefill failed with HTTP {response.status}")
+                    raise PDResponsesError(
+                        f"PD prefill failed with HTTP {response.status}",
+                        response.status,
+                    )
                 async for _ in response.content.iter_chunked(65536):
                     pass
         except asyncio.CancelledError:
@@ -73,8 +85,10 @@ async def run_prefill(prefill_url, payload, timeout):
                 # Cleanup must not mask the consumer cancellation.
                 pass
             raise
-        except (aiohttp.ClientError, TimeoutError) as exc:
-            raise ValueError("PD prefill worker transport failed") from exc
+        except TimeoutError as exc:
+            raise PDResponsesError("PD prefill worker timed out", 504) from exc
+        except aiohttp.ClientError as exc:
+            raise PDResponsesError("PD prefill worker transport failed", 502) from exc
 
 
 async def coordinated_turn(request, decode_generator, prefill_task, abort_decode):
@@ -83,21 +97,28 @@ async def coordinated_turn(request, decode_generator, prefill_task, abort_decode
     next_output = None
     completed = False
     decode_aborted = False
+    decode_started = False
     try:
         while True:
             next_output = asyncio.create_task(anext(iterator))
             pending = {next_output}
-            if not prefill_task.done():
-                pending.add(prefill_task)
-            else:
-                prefill_task.result()
+            if not decode_started:
+                if prefill_task.done():
+                    prefill_task.result()
+                else:
+                    pending.add(prefill_task)
             await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            if prefill_task.done():
+            # A real D output proves transfer success. Prefer it over a
+            # simultaneous P HTTP drain failure; after commit, only D owns
+            # the client result. Before commit, P failure must release D.
+            if not decode_started and prefill_task.done() and not next_output.done():
                 prefill_task.result()
             try:
                 output = await next_output
             except StopAsyncIteration:
-                completed = not decode_aborted
+                if not decode_started and prefill_task.done():
+                    prefill_task.result()
+                completed = decode_started and not decode_aborted
                 break
             next_output = None
             # Streaming scheduler errors are yielded as terminal abort outputs,
@@ -108,7 +129,11 @@ async def coordinated_turn(request, decode_generator, prefill_task, abort_decode
                 if isinstance(output, dict)
                 else {}
             )
-            decode_aborted |= finish_reason.get("type") == "abort"
+            decode_aborted |= (
+                isinstance(finish_reason, dict) and finish_reason.get("type") == "abort"
+            )
+            if not decode_aborted:
+                decode_started = True
             yield output
     finally:
         if next_output is not None and not next_output.done():

@@ -1001,3 +1001,67 @@ class MultiToolCallStreamingOrderTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PDWorkerFailureTestCase(unittest.TestCase):
+    def test_worker_error_is_not_reclassified_as_client_validation(self):
+        from sglang.srt.entrypoints.openai.pd_responses import PDResponsesError
+
+        async def run(status):
+            serving = make_serving()
+            request = ResponsesRequest(model="x", input="hi", store=False)
+            async def failed():
+                raise PDResponsesError("worker rejected", status)
+                yield None
+            return await serving.responses_full_generator(
+                request, {}, failed(), SimpleContext(), "x", Mock(),
+                RequestResponseMetadata(request_id=request.request_id),
+            )
+
+        for status in (400, 502, 503, 504):
+            with self.subTest(status=status):
+                response = asyncio.run(run(status))
+                self.assertEqual(response.status_code, status)
+
+    def test_pd_decode_abort_closes_prefill_and_raises_terminal_failure(self):
+        from types import SimpleNamespace
+        from sglang.srt.entrypoints.openai.pd_responses import PDResponsesError
+
+        async def run():
+            serving = make_serving()
+            cleaned = asyncio.Event()
+            aborted = []
+            async def prefill(*args, **kwargs):
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleaned.set()
+            async def decode(*args):
+                yield {
+                    "text": "",
+                    "meta_info": {
+                        "finish_reason": {
+                            "type": "abort", "status_code": 503,
+                            "message": "decode unavailable",
+                        }
+                    },
+                }
+            serving.tokenizer_manager = SimpleNamespace(
+                server_args=SimpleNamespace(
+                    responses_prefill_url="http://prefill:8000",
+                    disaggregation_bootstrap_port=8998,
+                ),
+                generate_request=decode,
+                abort_request=aborted.append,
+            )
+            request = GenerateReqInput(input_ids=[1, 2], rid="resp_abort")
+            with patch("sglang.srt.entrypoints.openai.pd_responses.run_prefill", prefill):
+                generator = serving._generate_with_builtin_tools(
+                    "resp_abort", [1, 2], request, {}, SimpleContext()
+                )
+                with self.assertRaises(PDResponsesError) as error:
+                    await anext(generator)
+                self.assertEqual(error.exception.status_code, 503)
+            self.assertTrue(cleaned.is_set())
+            self.assertEqual(aborted, ["resp_abort"])
+        asyncio.run(run())
