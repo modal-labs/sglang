@@ -1199,12 +1199,25 @@ class ModelRunner:
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
     @property
+    def logical_max_total_num_tokens(self):
+        """Capacity in the allocator's request-token domain, not per-rank rows.
+
+        Keep max_total_num_tokens physical: it sizes target buffers and is shared
+        with the draft pool's memory configuration. DCP's paged allocator already
+        widens its capacity, so use that value rather than multiplying again.
+        Hybrid SWA allocators have separate full/SWA capacity semantics.
+        """
+        if self.server_args.dcp_size > 1 and not self.is_hybrid_swa:
+            return self.token_to_kv_pool_allocator.size
+        return self.max_total_num_tokens
+
+    @property
     def effective_max_total_num_tokens(self):
-        """Return the max token pool size considering hybrid swa settings."""
+        """Return the logical request capacity considering hybrid SWA settings."""
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
-            return self.max_total_num_tokens
+            return self.logical_max_total_num_tokens
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
         # the weight-resolved kv-cache dtype is written to the config
