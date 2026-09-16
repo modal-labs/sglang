@@ -1,11 +1,19 @@
 """CPU lifecycle tests for native Responses PD turns."""
 
 import asyncio
+import base64
 import importlib.util
+import io
+import json
 import unittest
 from dataclasses import dataclass, field
 from aiohttp import web
 from pathlib import Path
+
+from PIL import Image
+from pydantic import TypeAdapter
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.utils import ImageData, VideoData, load_image
 
 _path = (
     Path(__file__).resolve().parents[2]
@@ -51,6 +59,72 @@ class PrepareTest(unittest.TestCase):
         self.assertFalse(payload["background"])
         payload["input_ids"].append(4)
         self.assertEqual(request.input_ids, [1, 2, 3])
+
+    def test_image_reference_survives_native_http_roundtrip(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                image = ImageData(
+                    url="data:image/png;base64,abc",
+                    detail="original",
+                    max_dynamic_patch=3,
+                    preprocess_kwargs={"min_pixels": 256, "max_pixels": 1024},
+                )
+                images = [[image]] if nested else [image]
+                request = GenerateReqInput(input_ids=[1, 2], image_data=images)
+                payload = module.prepare_prefill_turn(request, "http://worker", 8998)
+                encoded = json.dumps(payload)
+                received = TypeAdapter(GenerateReqInput).validate_json(encoded)
+                received.normalize_batch_and_arguments()
+                result = received.image_data[0][0] if nested else received.image_data[0]
+                self.assertIsInstance(result, ImageData)
+                self.assertEqual(result, image)
+                self.assertIsNot(result, image)
+                self.assertEqual(request.image_data, images)
+                result.preprocess_kwargs["min_pixels"] = 512
+                self.assertEqual(image.preprocess_kwargs["min_pixels"], 256)
+
+    def test_http_roundtrip_image_is_accepted_by_native_loader(self):
+        content = io.BytesIO()
+        Image.new("RGB", (16, 16), "red").save(content, format="PNG")
+        image = ImageData(
+            url="data:image/png;base64," + base64.b64encode(content.getvalue()).decode(),
+            detail="original",
+        )
+        request = GenerateReqInput(input_ids=[[1], [2]], image_data=[[image], [image]])
+        payload = module.prepare_prefill_turn(request, "http://worker", 8998)
+        received = TypeAdapter(GenerateReqInput).validate_json(json.dumps(payload))
+        received.normalize_batch_and_arguments()
+        for images in received.image_data:
+            self.assertEqual(images[0], image)
+            loaded, _ = load_image(images[0], gpu_image_decode=False)
+            self.assertEqual(loaded.size, (16, 16))
+            self.assertEqual(loaded.getpixel((0, 0)), (255, 0, 0))
+
+    def test_video_reference_survives_native_http_roundtrip(self):
+        video = VideoData(url="data:video/mp4;base64,abc", preprocess_kwargs={"fps": 1})
+        request = GenerateReqInput(input_ids=[1], video_data=[video])
+        payload = module.prepare_prefill_turn(request, "http://worker", 8998)
+        received = TypeAdapter(GenerateReqInput).validate_json(json.dumps(payload))
+        received.normalize_batch_and_arguments()
+        self.assertIsInstance(received.video_data[0], VideoData)
+        self.assertEqual(received.video_data[0], video)
+        self.assertEqual(request.video_data, [video])
+
+    def test_precomputed_media_dictionary_is_not_a_url_reference(self):
+        media = {"format": "processor_output", "url": "opaque", "features": [1, 2]}
+        request = GenerateReqInput(input_ids=[1], image_data=[media])
+        payload = module.prepare_prefill_turn(request, "http://worker", 8998)
+        received = TypeAdapter(GenerateReqInput).validate_json(json.dumps(payload))
+        received.normalize_batch_and_arguments()
+        self.assertEqual(received.image_data, [media])
+
+    def test_process_local_image_options_fail_before_admission(self):
+        request = GenerateReqInput(
+            input_ids=[1],
+            image_data=[ImageData(url="image.png", preprocess_kwargs={"tensor": object()})],
+        )
+        with self.assertRaises(TypeError):
+            module.prepare_prefill_turn(request, "http://worker", 8998)
 
     def test_tool_turns_get_distinct_prefill_identity_and_room(self):
         request = Request()

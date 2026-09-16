@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from sglang.srt.utils import ImageData, VideoData
+
 
 class PDResponsesError(ValueError):
     """Keep a worker failure distinct from invalid client input."""
@@ -21,6 +23,15 @@ class PDResponsesError(ValueError):
     def __init__(self, message, status_code):
         super().__init__(message)
         self.status_code = status_code
+
+
+def _media_reference_json(value):
+    """Encode API media references, preserving their preprocessing options."""
+    if isinstance(value, (ImageData, VideoData)):
+        return dataclasses.asdict(value)
+    if isinstance(value, list):
+        return [_media_reference_json(item) for item in value]
+    return value
 
 
 def prepare_prefill_turn(request, prefill_url, bootstrap_port):
@@ -53,6 +64,9 @@ def prepare_prefill_turn(request, prefill_url, bootstrap_port):
     # These are API media references before TokenizerManager preprocessing.
     # Validate serialization before either engine admits the turn; process-local
     # tensors are not a supported cross-node media transport.
+    for field in ("image_data", "video_data"):
+        if field in payload:
+            payload[field] = _media_reference_json(payload[field])
     json.dumps(payload)
     return payload
 

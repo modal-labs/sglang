@@ -55,7 +55,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils import ImageData, VideoData, normalize_media_references
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
@@ -347,6 +347,8 @@ class GenerateReqInput:
                        text, input_ids, input_embeds are provided)
         """
         self._validate_inputs()
+        self.image_data = normalize_media_references(self.image_data, ImageData)
+        self.video_data = normalize_media_references(self.video_data, VideoData)
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")

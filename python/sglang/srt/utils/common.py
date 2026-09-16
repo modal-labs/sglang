@@ -1633,6 +1633,23 @@ class VideoData:
     preprocess_kwargs: Optional[Dict] = None
 
 
+def normalize_media_references(value, media_type):
+    """Restore URL dataclasses after native HTTP JSON parsing.
+
+    The native media union also accepts dictionaries of precomputed processor
+    output. Pydantic keeps URL references as dictionaries too, so restore only
+    URL references and leave explicitly formatted processor inputs unchanged.
+    """
+    if isinstance(value, list):
+        return [normalize_media_references(item, media_type) for item in value]
+    if isinstance(value, dict) and "url" in value and "format" not in value:
+        try:
+            return media_type(**value)
+        except TypeError as exc:
+            raise ValueError(f"Invalid {media_type.__name__} reference: {exc}") from exc
+    return value
+
+
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 
