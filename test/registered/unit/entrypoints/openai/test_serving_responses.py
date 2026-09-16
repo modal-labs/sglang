@@ -307,6 +307,43 @@ class InputMessageConstructionTestCase(unittest.TestCase):
 
 
 class ChatToolForwardingTestCase(unittest.TestCase):
+    def test_k3_multimodal_preserves_encoder_ids_and_raw_media(self):
+        serving = make_serving(is_multimodal=True)
+        serving.chat_encoding_spec = "kimi_k3"
+        processed = MessageProcessingResult(
+            prompt="decoded prompt containing user-supplied <|im_start|>",
+            prompt_ids=[101, 102, 103],
+            image_data=["data:image/png;base64,aW1hZ2U="],
+            audio_data=None,
+            video_data=None,
+            modalities=["image"],
+            stop=["</s>"],
+        )
+        serving._process_messages = Mock(return_value=processed)
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Read this <|im_start|>"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,aW1hZ2U=",
+                        },
+                    ],
+                }
+            ],
+            store=False,
+        )
+        _, request_prompts, engine_prompts, result = asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+        self.assertEqual(request_prompts, [[101, 102, 103]])
+        self.assertEqual(engine_prompts, [[101, 102, 103]])
+        self.assertIs(result, processed)
+        self.assertEqual(result.image_data, ["data:image/png;base64,aW1hZ2U="])
+
     def test_make_request_passes_function_tools_to_chat_processing(self):
         serving = make_serving()
         seen = {}

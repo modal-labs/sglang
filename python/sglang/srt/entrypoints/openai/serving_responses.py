@@ -619,7 +619,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             processed_messages = self._process_messages(chat_request, is_multimodal)
         processed_messages.skip_special_tokens = chat_request.skip_special_tokens
 
-        if is_multimodal:
+        # K3's encoder distinguishes structural markers from identical text
+        # in user/tool content. Preserve its IDs like /chat/completions does;
+        # the MM processor can expand media placeholders in those IDs directly.
+        if is_multimodal and self.chat_encoding_spec != "kimi_k3":
             request_prompts = [processed_messages.prompt]
             engine_prompts = [processed_messages.prompt]
         else:
