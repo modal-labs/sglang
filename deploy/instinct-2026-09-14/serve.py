@@ -35,7 +35,7 @@ DFLASH_MOUNT_PATH = "/dflash"
 # DFlash2 path from the checkpoint config. The chosen step is copied into an
 # immutable versioned dir on dflash_spec at ship time and pinned here.
 # v1 rollback: f"{DFLASH_MOUNT_PATH}/k3-instinct-v5-epoch1", fp8 + static scheme.
-DFLASH2_PINNED_STEP = "draft-step-14500"  # newest complete on the training volume at 2026-09-16 03:35Z
+DFLASH2_PINNED_STEP = "draft-step-16000"  # previous pin: draft-step-14500 (kept on dflash_spec as fallback)
 DFLASH2_TARGET_CONFIG_SHA256 = (
     "2a5cb51c92f3b64e68f7670042e4d8cfff0acd4bcf1e3c5f7190d69609381de6"
 )
