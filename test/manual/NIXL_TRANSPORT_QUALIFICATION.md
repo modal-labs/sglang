@@ -78,11 +78,14 @@ strides. The equal DCP8-to-DCP8 topology has one destination per rank, so its
 replication factor is one.
 
 `setup_state_kv_args` registers full draft KV separately as `DFLASH_KV`.
-The final prefill chunk supplies draft page indices covering the full logical
-prefix when no draft window is configured. The draft is therefore not divided by
-the target's DCP factor. Mamba contributes its per-request state-slot bytes.
-Transferred padding is counted; small auxiliary metadata and protocol overhead
-are not.
+The final prefill chunk supplies draft page indices in the logical token domain.
+A resolved-runtime check found `speculative_draft_window_size=4096` and
+`speculative_dflash_draft_ring=false`: this candidate allocates a full logical
+draft pool but transfers only the page-aligned 4096-token draft tail. It does not
+transfer the entire draft prefix. With window=None, the same code would transfer
+the full prefix. Draft indices/bytes are not divided by the target DCP factor.
+Mamba contributes its per-request state-slot bytes. Transferred padding is counted;
+small auxiliary metadata and protocol overhead are not.
 
 A read-only CPU check executed the actual generic NIXL descriptor-construction
 and metric methods over 20 K3-shaped cases: lengths 1–100000, partial pages,
@@ -118,3 +121,30 @@ Historical rank-7 `NIXL_ERR_NOT_FOUND` evidence does not yet have a minimized ca
 Current full-draft state geometry differs from the old combined target/draft
 region layout, so an isolated prepared-versus-descriptor A/B can test present need
 for the workaround without retroactively claiming the historical cause.
+
+## Cold/warm and allocation-order baseline
+
+The descriptor fallback completed a frozen 23-request synthetic trace:
+cold/repeated 8K, cold/two repeated 128K, 16 mixed 4K/8K/16K/32K requests at
+concurrency eight with staggered 16/64/128-token outputs, and two fresh 8K requests.
+All returned HTTP 200, zero retractions; both roles ended with zero running,
+waiting and stage queues, and decode used tokens returned to zero.
+
+| Case | Request wall time | Actual cached tokens | Transfer metric, rank 0 |
+| --- | --- | --- | --- |
+| Cold 8K | 0.463 s | 0 | 4.059 ms, 53.194 MiB |
+| Repeated 8K | 0.455 s | 0 | 2.238 ms, 53.194 MiB |
+| Cold 128K | 6.168 s | 0 | 5283.819 ms, 255.694 MiB |
+| Repeated 128K, first | 1.084 s | 114688 | 846.756 ms, 255.694 MiB |
+| Repeated 128K, second | 0.333 s | 130560 | 172.290 ms, 255.694 MiB |
+
+The repeated 8K case had no measured cache hit and is not evidence of a warm-prefix
+benefit. The cold 128K transfer metric reports only 0.047 GiB/s, even on the same
+proven GPU RDMA path. Its timer spans later prefill chunks; this directly
+demonstrates why low request-level transfer speed is not pure network bandwidth.
+The exact split among compute gaps, descriptor work, transfer queueing and
+scheduler observation still requires finer timing.
+
+Trace SHA256: `2fefa66392fbe2f19ef2d2270a341e0a564a7349a4fc874c75ffff1202db70b3`.
+The prepared-path comparison must use this same trace and inspect actual cache
+hits, not assume equal warmth. No prepared-path result has been claimed yet.
