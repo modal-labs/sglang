@@ -4,6 +4,8 @@ on:
   push:
     branches: [ main ]
   pull_request:
+    # Fork: no self-hosted GPU runners, so PRs only run this on main.
+    branches: [main]
   workflow_dispatch:
   workflow_call:
     inputs:

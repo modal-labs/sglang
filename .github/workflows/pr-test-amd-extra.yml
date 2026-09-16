@@ -26,6 +26,8 @@ on:
     # is added after the latest push. See call-gate.if for the matching guard
     # that prevents unrelated label additions from dispatching a full run.
     types: [opened, synchronize, reopened, labeled]
+    # Fork: no self-hosted GPU runners, so PRs only run this on main.
+    branches: [main]
   workflow_dispatch:
     inputs:
       runner_arch:

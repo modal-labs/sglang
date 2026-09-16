@@ -20,6 +20,8 @@ on:
     # skipped run in place and there's no way to enable extra without
     # another push. See check-changes.if below for the matching guard.
     types: [opened, synchronize, reopened, labeled]
+    # Fork: no self-hosted GPU runners, so PRs only run this on main.
+    branches: [main]
   workflow_dispatch:
     inputs:
       force_continue_on_error:

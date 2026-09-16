@@ -201,7 +201,11 @@ jobs:
             // \n* absorbs preceding blank lines so repeated PATCHes don't accumulate them.
             const blockRe = new RegExp(`\\n*(?:---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
             let newBody;
-            if (blockRe.test(body)) {
+            // Fork: pr-test* only trigger for PRs against main; elsewhere the
+            // block can only advertise checks that never run, so strip it.
+            if (pr.base.ref !== 'main') {
+              newBody = body.replace(blockRe, '');
+            } else if (blockRe.test(body)) {
               newBody = body.replace(blockRe, `\n\n${newBlock}`);
             } else {
               const sep = body.length === 0
