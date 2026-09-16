@@ -1,4 +1,4 @@
-# Instinct `kimi-k3-fast` deploy files for dev/instinct/2026-09-15 @ 15fafd786
+# Instinct `kimi-k3-fast` deploy files for dev/instinct/2026-09-15 @ 741f05e61
 
 The deploy recipe and procedure for the 2026-09-15 Instinct cutover are version-controlled next to the
 code they deploy. See `DEPLOY.md` for the procedure, checks and rollback.

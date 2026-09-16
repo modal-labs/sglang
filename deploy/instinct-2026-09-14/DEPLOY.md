@@ -1,4 +1,4 @@
-# kimi-k3-fast -> dev/instinct/2026-09-15 @ 15fafd786, 4 PRs on
+# kimi-k3-fast -> dev/instinct/2026-09-15 @ 741f05e61, 4 PRs on
 
 Files in this directory:
 
@@ -11,6 +11,9 @@ Files in this directory:
      `SGLANG_TRTLLM_MLA_VERIFY_FUSED_KV_WRITE=1` (#18), `SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK=1` (#17),
      `SGLANG_KIMI_ENCODE_FAST_PATH=1` + `SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS=32000000` (#20),
      `SGLANG_K3_MM_USE_RENDERED_INPUT_IDS=1` (#19). No prefix-ack (#15 dropped).
+     Also in this pin but NOT set (default off, flip in prod after their gates): `SGLANG_MM_CUDA_IPC_LEASE_POOL=1`
+     (#33, after the IPC stress soak), `SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET=128` (#29) and the other
+     default-off dev levers (#26/#37/#38/#43) as their same-box rows land. Rollback of any flip = unset the var.
   3. warmup: one 1280x800 synthetic-PNG image turn after the text greeting (autoinference #516).
   Unchanged: app name, model/draft, server args, volumes, B300:8, min_containers=63,
   routing/kv-aware routing, auth, heartbeat/terminate, JIT-cache salt (`SGLANG_EFFECTIVE_COMMIT`).
@@ -28,8 +31,8 @@ git bundle list-heads deploy/instinct-2026-09-14/engine-<sha9>.bundle
 ```
 
 The pin ref is needed because bundles only advertise named refs; serve.py checks that the advertised
-head equals `RELEASE_SHA`. For the current pin, use `engine-15fafd786.bundle` and
-`RELEASE_SHA=15fafd786dbf644224a4051a43ccfe5ba9491857`.
+head equals `RELEASE_SHA`. For the current pin, use `engine-741f05e61.bundle` and
+`RELEASE_SHA=741f05e61c1c8c3efc3bc0d067f2cf788a63b8d3`.
 
 Then run `modal deploy serve.py`. `serve.py` refuses to import if the bundle is missing, fails
 `git bundle verify`, or lacks `RELEASE_SHA`; the exception message carries the exact create
@@ -45,26 +48,26 @@ from any cwd.
 modal deploy serve.py          # in the directory that holds serve.py + generated bundle
 ```
 
-Image build check (in the build log): `rev-parse HEAD == 15fafd786...`, `status --porcelain` empty,
+Image build check (in the build log): `rev-parse HEAD == 741f05e61...`, `status --porcelain` empty,
 `sglang.__file__` printed. The A/B endpoint `kimi-k3-ab-instinct` was built with the identical steps.
 
 ## During cutover
 
 - Watch green containers schedule; if they don't, scale Instinct down a little to free GPUs.
 - Old (blue) containers are hard-terminated 4 h after deploy regardless of green progress.
-- Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release 15fafd786). ...` — the
+- Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release 741f05e61). ...` — the
   warmup number now includes the image turn (expect +25-80 s on containers with a cold mm JIT).
-- Env check on a running container: `SGLANG_RELEASE_SHA=15fafd786...` and the 5 flags above;
+- Env check on a running container: `SGLANG_RELEASE_SHA=741f05e61...` and the 5 flags above;
   `SGLANG_ENABLE_MM_CUDA_IPC_PREFIX_ACK` must be absent.
 
 ## Rollback
 
 Check out the previous `serve.py` commit, regenerate its bundle with the same command, then deploy.
-Flags-only rollback (keep 15fafd786, drop the 5 env lines) leaves the dev levers at their default-off
+Flags-only rollback (keep 741f05e61, drop the 5 env lines) leaves the dev levers at their default-off
 values; at 462ade71f that configuration was == `release/2026-09-14` behavior, greedy-identical 36/36
 in every A/B arm.
 
-## DFlash2 draft (kimi-k3-sglang #27 + #40, both in RELEASE_SHA 15fafd786)
+## DFlash2 draft (kimi-k3-sglang #27 + #40, both in RELEASE_SHA 741f05e61)
 
 `serve.py` points the draft at `/dflash/k3-instinct-v5-dflash2/draft-step-14500` (`DFLASH2_PINNED_STEP`) on the
 existing `dflash_spec` mount (`DFlash2DraftModel`), `--speculative-draft-model-quantization unquant`
