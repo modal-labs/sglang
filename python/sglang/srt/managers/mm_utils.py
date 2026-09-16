@@ -8,6 +8,7 @@ import os
 import pickle
 import sys
 from abc import abstractmethod
+from array import array
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -358,6 +359,31 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
+
+
+def pad_input_ids_array(input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    """array('q') equivalent of
+    MultiModalityDataPaddingPatternMultimodalTokens.pad_input_tokens.
+
+    Same semantics (per-item pad_value written over each inclusive
+    [start, end] offset, items whose modality has no token id skipped),
+    always returns a new array.
+    """
+    if not input_ids or not mm_inputs.mm_items:
+        return array("q", input_ids)
+
+    buf = np.frombuffer(input_ids, dtype=np.int64).copy()
+    token_id_map = {
+        Modality.IMAGE: mm_inputs.im_token_id,
+        Modality.AUDIO: mm_inputs.audio_token_id,
+        Modality.VIDEO: mm_inputs.video_token_id,
+    }
+    for item in mm_inputs.mm_items:
+        if token_id_map.get(item.modality) is None:
+            continue
+        for start, end in item.offsets:
+            buf[start : end + 1] = item.pad_value
+    return array("q", buf.tobytes())
 
 
 embedding_cache: Optional[MultiModalStaticCache] = None

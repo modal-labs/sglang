@@ -975,6 +975,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
+                if envs.SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS.get():
+                    mm_inputs.input_ids = None
             if mm_inputs and mm_inputs.token_type_ids is not None:
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):

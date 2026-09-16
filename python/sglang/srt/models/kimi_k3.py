@@ -8,6 +8,7 @@
 
 import logging
 import time
+from array import array
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -90,6 +91,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_input_ids_array,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -3771,6 +3773,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return self.mm_projector(image_embeds)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        if (
+            envs.SGLANG_K3_SCHED_MM_FASTPATH.get()
+            and isinstance(input_ids, array)
+            and input_ids.typecode == "q"
+        ):
+            return pad_input_ids_array(input_ids, mm_inputs)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

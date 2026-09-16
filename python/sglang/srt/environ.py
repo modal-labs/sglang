@@ -959,6 +959,14 @@ class Envs:
     # the per-token expansion loop, under which user text spelling a control
     # token (e.g. "<|sep|>") collapses into that control token.
     SGLANG_K3_MM_USE_RENDERED_INPUT_IDS = EnvBool(False)
+    # Kimi-K3 scheduler-side image padding: when Req.origin_input_ids is an
+    # array('q'), pad it via a numpy view instead of the
+    # torch.as_tensor(list) -> tolist() -> array round trip.
+    SGLANG_K3_SCHED_MM_FASTPATH = EnvBool(False)
+    # Drop MultimodalProcessorOutput.input_ids in the tokenizer once it has been
+    # consumed, so the scheduler request broadcast does not carry a second copy
+    # of the prompt token ids.
+    SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS = EnvBool(False)
 
     # Upper bound on the fp32 pixel bytes a single GPU image-preprocessing
     # sub-batch may hold. Groups larger than this are processed in chunks so a
