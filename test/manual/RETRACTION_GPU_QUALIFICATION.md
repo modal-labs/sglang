@@ -75,3 +75,24 @@ provenance, CPU regressions, earlier allocator-failure artifacts, and
 The generic pending-result ordering fix is being prepared separately for
 upstream. The allocator-page fix already exists upstream. The verifier and
 synthetic harness are qualification tooling.
+
+## Isolated decode-role failure and recovery
+
+On the same qualified pin, the idle forced-QA decode engine received one
+SIGKILL after assertions verified its app, role, process, pin, and QA flags.
+The process-aware heartbeat detected exit code -9 about 3.5 seconds later.
+Modal automatically replaced both gang tasks without a manual redeploy.
+
+- Injected failure: 2026-09-16 07:15:16.490 UTC.
+- Replacement router, prefill, and decode healthy: 07:20:21.610 UTC.
+- Exact text and image smoke checks both HTTP200/pass: 07:20:23.080 UTC.
+- Total recovery plus smoke: **306.6 seconds**, within the ten-minute bound.
+- Subsequent idle probe: zero decode used tokens, running requests, and queues.
+
+Router `/health` briefly remained200 after decode was unavailable. It proves
+router process health, not full PD serving readiness; qualification therefore
+checked both engines and real text/image generation. This test does not claim
+uninterrupted availability for a single-pair endpoint.
+
+Recovery evidence and checksums:
+`/home/ec2-user/k3-productionization-evidence/20260916T071426Z-5c937-role-recovery/`
