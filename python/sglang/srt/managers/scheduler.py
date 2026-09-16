@@ -168,6 +168,8 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    _full_consumer_count,
+    release_raw_mm_inputs,
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -2109,7 +2111,13 @@ class Scheduler(
         # increase the CUDA kernel launch time.
         if self.dp_tp_group.rank_in_group == 0:
             # Only the entry rank materializes once from dict.
-            image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get() and group_world_size > 1:
+                image_inputs = MultimodalInputs.from_processor_output(
+                    raw_mm_inputs,
+                    ipc_consumer_count=_full_consumer_count(raw_mm_inputs.mm_items),
+                )
+            else:
+                image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
             # Broadcast to other TP ranks (use src=0 within the group).
             if group_world_size > 1:
                 obj_list = [image_inputs]
@@ -2222,6 +2230,13 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        def release_unattached_mm_inputs():
+            if (
+                envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get()
+                and recv_req.mm_inputs is not None
+            ):
+                release_raw_mm_inputs(recv_req.mm_inputs)
+
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2307,6 +2322,7 @@ class Scheduler(
                     )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
+                    release_unattached_mm_inputs()
                     return
 
         elif (
@@ -2327,6 +2343,7 @@ class Scheduler(
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
+                release_unattached_mm_inputs()
                 return
 
         else:
@@ -2349,6 +2366,7 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            release_unattached_mm_inputs()
             return
 
         self._maybe_namespace_elastic_radix_cache(req)
@@ -2359,6 +2377,7 @@ class Scheduler(
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
+                release_unattached_mm_inputs()
                 return
 
         if (
@@ -2373,6 +2392,7 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            release_unattached_mm_inputs()
             return
 
         if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
@@ -2384,6 +2404,7 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            release_unattached_mm_inputs()
             return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
@@ -2396,6 +2417,7 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            release_unattached_mm_inputs()
             return
 
         if req.return_sampling_mask and self.server_args.sampling_backend == "ascend":
@@ -2408,6 +2430,7 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            release_unattached_mm_inputs()
             return
 
         # Handle multimodal inputs

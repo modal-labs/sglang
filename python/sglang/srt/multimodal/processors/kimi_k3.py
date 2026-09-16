@@ -432,23 +432,46 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # produced, so a request's full patch set never resides on the GPU at
         # once. The tokenizer process's GPU footprint stays bounded regardless
         # of the request's image count or resolution.
-        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
-            base_output,
-            self.mm_tokens,
-            sglang_original_input_ids=base_output.input_ids,
-            sglang_feature_sink=MMFeatureStreamSink(self),
-        )
-
-        # K3's tower is unconditionally image-wise data-parallel (each image
-        # is consumed by exactly one TP rank), so keep IPC proxies lazy until
-        # that assignment is known: one tokenizer/scheduler crossing per
-        # image instead of one per rank. K2.5 gates this on
-        # --mm-enable-dp-encoder; K3 needs no flag.
-        if getattr(self, "use_cuda_ipc", False):
-            for item in mm_items:
-                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
-                    True
+        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get() and getattr(
+            self, "use_cuda_ipc", False
+        ):
+            sink = MMFeatureStreamSink(self)
+            try:
+                mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
+                    base_output,
+                    self.mm_tokens,
+                    sglang_original_input_ids=base_output.input_ids,
+                    sglang_feature_sink=sink,
                 )
+                # K3's tower is unconditionally image-wise data-parallel (each
+                # image is consumed by exactly one TP rank), so keep IPC
+                # proxies lazy until that assignment is known.
+                if getattr(self, "use_cuda_ipc", False):
+                    for item in mm_items:
+                        item.model_specific_data[
+                            DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY
+                        ] = True
+            except BaseException:
+                sink.cancel_all(f"Kimi K3 request={request_obj.rid}")
+                raise
+        else:
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
+                base_output,
+                self.mm_tokens,
+                sglang_original_input_ids=base_output.input_ids,
+                sglang_feature_sink=MMFeatureStreamSink(self),
+            )
+
+            # K3's tower is unconditionally image-wise data-parallel (each image
+            # is consumed by exactly one TP rank), so keep IPC proxies lazy until
+            # that assignment is known: one tokenizer/scheduler crossing per
+            # image instead of one per rank. K2.5 gates this on
+            # --mm-enable-dp-encoder; K3 needs no flag.
+            if getattr(self, "use_cuda_ipc", False):
+                for item in mm_items:
+                    item.model_specific_data[
+                        DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY
+                    ] = True
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),

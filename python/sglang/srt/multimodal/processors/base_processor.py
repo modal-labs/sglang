@@ -361,11 +361,19 @@ class BaseMultimodalProcessor(ABC):
                 worker_num,
                 MM_FEATURE_CACHE_SIZE / (1024 * 1024),
             )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                per_worker_pool_size,
-                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-                self.server_args.base_gpu_id,
-            )
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+                    per_worker_pool_size,
+                    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                    self.server_args.base_gpu_id,
+                    self.server_args.tp_size,
+                )
+            else:
+                self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+                    per_worker_pool_size,
+                    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                    self.server_args.base_gpu_id,
+                )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -1350,6 +1358,13 @@ class BaseMultimodalProcessor(ABC):
         if not tensor.is_cuda:
             return tensor
 
+        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
+                tensor,
+                use_pool_handle_cache=self.use_ipc_pool_handle_cache,
+            )
+            return proxy if proxy is not None else tensor.cpu()
+
         sync_flag, available_slice, byte_offset = (
             self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
         )
@@ -1368,6 +1383,54 @@ class BaseMultimodalProcessor(ABC):
                 pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
             )
         return tensor.cpu()
+
+    def _prepare_mm_items_for_transport(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> List[MultimodalDataItem]:
+        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            if not self.use_cuda_ipc:
+                return mm_items
+
+            updates = []
+            try:
+                for item in mm_items:
+                    fields = (
+                        ("feature", item.feature),
+                        ("precomputed_embeddings", item.precomputed_embeddings),
+                    )
+                    for field, tensor in fields:
+                        if not isinstance(tensor, torch.Tensor):
+                            continue
+                        wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
+                        setattr(item, field, wrapped)
+                        updates.append((item, field, tensor, wrapped))
+            except BaseException as error:
+                rollback_errors = []
+                for item, field, tensor, wrapped in reversed(updates):
+                    try:
+                        if isinstance(wrapped, CudaIpcTensorTransportProxy):
+                            self.cudaipc_mmfeature_pool.cancel_proxy(wrapped)
+                    except BaseException as rollback_error:
+                        rollback_errors.append(rollback_error)
+                    finally:
+                        setattr(item, field, tensor)
+                if rollback_errors:
+                    error.add_note(
+                        f"{len(rollback_errors)} CUDA IPC rollback operation(s) also failed"
+                    )
+                    raise error from rollback_errors[0]
+                raise
+            return mm_items
+
+        if self.use_cuda_ipc:
+            for item in mm_items:
+                if isinstance(item.feature, torch.Tensor):
+                    item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+                if isinstance(item.precomputed_embeddings, torch.Tensor):
+                    item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
+                        item.precomputed_embeddings
+                    )
+        return mm_items
 
     @staticmethod
     def _move_feature_to_cpu(value):
@@ -1614,16 +1677,7 @@ class BaseMultimodalProcessor(ABC):
 
         self._precompute_hashes_before_cpu_transfer(all_collected_items)
 
-        # Wrap GPU features in the bounded IPC pool; pool misses fall back to CPU.
-        if self.use_cuda_ipc:
-            # post-process, prepare for cuda-ipc transfer
-            for item in all_collected_items:
-                if isinstance(item.feature, torch.Tensor):
-                    item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
-                if isinstance(item.precomputed_embeddings, torch.Tensor):
-                    item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
-                        item.precomputed_embeddings
-                    )
+        all_collected_items = self._prepare_mm_items_for_transport(all_collected_items)
 
         return all_collected_items, input_ids, ret
 

@@ -571,15 +571,19 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
     the equivalent single acknowledgement.  This preserves the fixed-pool
     lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
     """
-    parallel = get_parallel()
-    if parallel.attn_tp_rank != 0:
-        return
-    server_args = get_server_args()
-    # The pool's recycler uses ServerArgs.tp_size, so its acknowledgement must
-    # match that count even when an attention subgroup is smaller.
-    consumer_count = max(getattr(server_args, "tp_size", parallel.attn_tp_size), 1)
-    for item in items:
-        item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
+    if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+        for item in items:
+            item.acknowledge_deferred_cuda_ipc_feature(1)
+    else:
+        parallel = get_parallel()
+        if parallel.attn_tp_rank != 0:
+            return
+        server_args = get_server_args()
+        # The pool's recycler uses ServerArgs.tp_size, so its acknowledgement must
+        # match that count even when an attention subgroup is smaller.
+        consumer_count = max(getattr(server_args, "tp_size", parallel.attn_tp_size), 1)
+        for item in items:
+            item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
 
 def _get_chunked_embedding_full(
@@ -688,6 +692,23 @@ def _batch_encode_per_image_misses(
             elif item.hash not in unique_misses:
                 token_count = end - start + 1
                 unique_misses[item.hash] = (item, token_count)
+
+    if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+        miss_item_ids = {id(item) for item, _ in unique_misses.values()}
+        cache_hit_items = []
+        seen_item_ids = set()
+        for req_info in per_image_requests:
+            for _, item, _, _ in req_info.overlapping:
+                item_id = id(item)
+                if (
+                    item_id not in miss_item_ids
+                    and item_id not in seen_item_ids
+                    and isinstance(item.feature, CudaIpcTensorTransportProxy)
+                ):
+                    seen_item_ids.add(item_id)
+                    cache_hit_items.append(item)
+        if cache_hit_items:
+            _acknowledge_deferred_cuda_ipc_cache_hits(cache_hit_items)
 
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:

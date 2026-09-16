@@ -150,6 +150,32 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _detach_parallel_clone_inputs(pool, tokenized_objs):
+    from sglang.srt.multimodal.transport.lease_lifecycle import (
+        cancel_undispatched_proxies,
+        detach_proxies_for_clones,
+    )
+
+    try:
+        return [
+            (
+                detach_proxies_for_clones(pool, tokenized_obj.mm_inputs)
+                if tokenized_obj.mm_inputs and tokenized_obj.mm_inputs.mm_items
+                else None
+            )
+            for tokenized_obj in tokenized_objs
+        ]
+    except BaseException:
+        for tokenized_obj in tokenized_objs:
+            if tokenized_obj.mm_inputs and tokenized_obj.mm_inputs.mm_items:
+                cancel_undispatched_proxies(
+                    pool,
+                    tokenized_obj.mm_inputs.mm_items,
+                    context="parallel sampling clone",
+                )
+        raise
+
+
 def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
     """Do not silently turn a failed EPD request into local vision work."""
     if (
@@ -1023,6 +1049,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
+        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            from sglang.srt.multimodal.transport.lease_lifecycle import (
+                cancel_undispatched_proxies,
+            )
+
+            try:
+                self._validate_one_request(obj, input_ids)
+                return self._create_tokenized_object(
+                    obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+                )
+            except BaseException:
+                if (
+                    getattr(self.mm_processor, "use_cuda_ipc", False)
+                    and mm_inputs
+                    and mm_inputs.mm_items
+                ):
+                    cancel_undispatched_proxies(
+                        self.mm_processor.cudaipc_mmfeature_pool,
+                        mm_inputs.mm_items,
+                        context=f"tokenize rid={obj.rid}",
+                    )
+                raise
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
@@ -1705,9 +1753,42 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
+            use_lease_pool = envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get() and getattr(
+                self.mm_processor, "use_cuda_ipc", False
             )
+            if use_lease_pool:
+                from sglang.srt.multimodal.transport.lease_lifecycle import (
+                    cancel_undispatched_proxies,
+                )
+
+                gathered = await asyncio.gather(
+                    *(self._tokenize_one_request(obj) for obj in objs),
+                    return_exceptions=True,
+                )
+                errors = [
+                    result for result in gathered if isinstance(result, BaseException)
+                ]
+                if errors:
+                    for result in gathered:
+                        if isinstance(result, BaseException):
+                            continue
+                        if result.mm_inputs and result.mm_inputs.mm_items:
+                            cancel_undispatched_proxies(
+                                self.mm_processor.cudaipc_mmfeature_pool,
+                                result.mm_inputs.mm_items,
+                                context="parallel sampling gather",
+                            )
+                    raise errors[0]
+                tokenized_objs = gathered
+            else:
+                tokenized_objs = await asyncio.gather(
+                    *(self._tokenize_one_request(obj) for obj in objs)
+                )
+
+            clone_mm_inputs = None
+            if use_lease_pool:
+                pool = self.mm_processor.cudaipc_mmfeature_pool
+                clone_mm_inputs = _detach_parallel_clone_inputs(pool, tokenized_objs)
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
@@ -1733,11 +1814,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
-                    if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
-                        tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
+                    if use_lease_pool and clone_mm_inputs[i] is not None:
+                        tokenized_obj.mm_inputs = copy.copy(clone_mm_inputs[i])
                         tokenized_obj.mm_inputs.mm_items = [
-                            copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
+                            copy.copy(item) for item in clone_mm_inputs[i].mm_items
                         ]
+                    else:
+                        if (
+                            hasattr(tokenized_obj, "mm_inputs")
+                            and tokenized_obj.mm_inputs
+                        ):
+                            tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
+                            tokenized_obj.mm_inputs.mm_items = [
+                                copy.copy(item)
+                                for item in tokenized_obj.mm_inputs.mm_items
+                            ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]

@@ -386,16 +386,32 @@ class MultimodalDataItem:
                     target_device, consumer_count=ipc_consumer_count
                 )
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
-            self.precomputed_embeddings = (
-                self.precomputed_embeddings.reconstruct_on_target_device(target_device)
-            )
+            if ipc_consumer_count == 1:
+                self.precomputed_embeddings = (
+                    self.precomputed_embeddings.reconstruct_on_target_device(
+                        target_device
+                    )
+                )
+            else:
+                self.precomputed_embeddings = (
+                    self.precomputed_embeddings.reconstruct_on_target_device(
+                        target_device, consumer_count=ipc_consumer_count
+                    )
+                )
         for extra_key in self.model_specific_data:
             if isinstance(
                 self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
             ):
-                extra_data = self.model_specific_data[
-                    extra_key
-                ].reconstruct_on_target_device(target_device)
+                if ipc_consumer_count == 1:
+                    extra_data = self.model_specific_data[
+                        extra_key
+                    ].reconstruct_on_target_device(target_device)
+                else:
+                    extra_data = self.model_specific_data[
+                        extra_key
+                    ].reconstruct_on_target_device(
+                        target_device, consumer_count=ipc_consumer_count
+                    )
                 self.model_specific_data[extra_key] = extra_data
 
     def can_defer_cuda_ipc_feature_reconstruction(self) -> bool:
@@ -422,7 +438,37 @@ class MultimodalDataItem:
     def acknowledge_deferred_cuda_ipc_feature(self, consumer_count: int = 1):
         """Release a lazy IPC feature when an embedding-cache hit skips ViT."""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                consumer_count = self._resolve_transport_consumer_count(
+                    self.feature, consumer_count
+                )
             self.feature.acknowledge_consumption(consumer_count)
+
+    def release_transport_proxies(self, consumer_count: int = 1) -> None:
+        """Best-effort release of proxies left by an abandoned request."""
+        values = [self.feature, self.precomputed_embeddings]
+        values.extend(self.model_specific_data.values())
+        for value in values:
+            if not isinstance(value, CudaIpcTensorTransportProxy):
+                continue
+            count = self._resolve_transport_consumer_count(value, consumer_count)
+            try:
+                value.release_without_reconstruction(count)
+            except Exception:
+                logger.warning(
+                    "Failed to release an abandoned multimodal transport proxy",
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _resolve_transport_consumer_count(proxy, requested_count: int) -> int:
+        """Clamp a group acknowledgement to the proxy's actual consumer set."""
+        proxy_count = getattr(
+            proxy,
+            "total_consumer_count",
+            getattr(proxy, "consumer_count", requested_count),
+        )
+        return min(requested_count, proxy_count)
 
 
 @dataclasses.dataclass
@@ -544,27 +590,67 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
+    def acknowledge_prefix_resident_items(self, prefix_len: int) -> int:
+        """Acknowledge deferred proxies fully covered by the cached prefix."""
+        acknowledged = 0
+        for item in self.mm_items:
+            if (
+                item.has_cuda_ipc_proxy()
+                and item.offsets is not None
+                and all(end < prefix_len for start, end in item.offsets)
+            ):
+                item.acknowledge_deferred_cuda_ipc_feature(1)
+                acknowledged += 1
+        return acknowledged
+
     def release_features(self):
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                try:
+                    item.release_transport_proxies()
+                except Exception:
+                    logger.warning(
+                        "Failed to release an unused multimodal feature transport",
+                        exc_info=True,
+                    )
             item.feature = None
 
     @staticmethod
-    def from_processor_output(obj: MultimodalProcessorOutput):
+    def from_processor_output(
+        obj: MultimodalProcessorOutput, ipc_consumer_count: int = 1
+    ):
         mm_items = obj.mm_items
         assert isinstance(mm_items, list)
         mm_items = [item for item in mm_items if item.is_valid()]
 
         # try reconstructing from cuda-ipc
         reconstruct_device = None
-        for mm_item in mm_items:
-            if (
-                mm_item.has_cuda_ipc_proxy()
-                and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
-            ):
-                if reconstruct_device is None:
-                    reconstruct_device = torch.cuda.current_device()
-                mm_item.reconstruct(reconstruct_device)
+        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            try:
+                for mm_item in mm_items:
+                    if (
+                        mm_item.has_cuda_ipc_proxy()
+                        and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
+                    ):
+                        if reconstruct_device is None:
+                            reconstruct_device = torch.cuda.current_device()
+                        mm_item.reconstruct(
+                            reconstruct_device, ipc_consumer_count=ipc_consumer_count
+                        )
+            except BaseException:
+                for mm_item in mm_items:
+                    mm_item.release_transport_proxies(ipc_consumer_count)
+                raise
+        else:
+            for mm_item in mm_items:
+                if (
+                    mm_item.has_cuda_ipc_proxy()
+                    and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
+                ):
+                    if reconstruct_device is None:
+                        reconstruct_device = torch.cuda.current_device()
+                    mm_item.reconstruct(reconstruct_device)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             # Multi-modal feature hashing optimization:
@@ -691,6 +777,55 @@ class MultimodalInputs:
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
+
+
+def _full_consumer_count(mm_items: List[MultimodalDataItem]) -> int:
+    """Return the largest consumer group declared by any transport proxy."""
+    consumer_count = 1
+    for item in mm_items:
+        values = [item.feature, item.precomputed_embeddings]
+        values.extend(item.model_specific_data.values())
+        for value in values:
+            if isinstance(value, CudaIpcTensorTransportProxy):
+                consumer_count = max(
+                    consumer_count, getattr(value, "total_consumer_count", 1)
+                )
+    return consumer_count
+
+
+def _acknowledge_prefix_resident_requests(reqs) -> None:
+    if not envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+        return
+    for req in reqs:
+        if req.multimodal_inputs is not None and not req.mm_prefix_ack_done:
+            req.multimodal_inputs.acknowledge_prefix_resident_items(
+                len(req.prefix_indices)
+            )
+            req.mm_prefix_ack_done = True
+
+
+def release_raw_mm_inputs(raw_mm_inputs) -> int:
+    """Release producer-owned proxies before raw multimodal inputs are attached."""
+    released = 0
+    seen = set()
+    for item in getattr(raw_mm_inputs, "mm_items", raw_mm_inputs):
+        values = [item.feature, item.precomputed_embeddings]
+        values.extend(item.model_specific_data.values())
+        for value in values:
+            if not isinstance(value, CudaIpcTensorTransportProxy):
+                continue
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            try:
+                value.release_without_reconstruction(1)
+                released += 1
+            except Exception:
+                logger.warning(
+                    "Failed to release a raw multimodal transport proxy",
+                    exc_info=True,
+                )
+    return released
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -902,6 +1037,7 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        self.mm_prefix_ack_done = False
         # Pre-computed multimodal prompt token counts; populated on the prefill
         # node and transferred to decode via the metadata buffer in disagg (PD) mode.
         self.mm_image_tokens: int = 0
@@ -1663,6 +1799,12 @@ class Req(ReqDllmMixin):
     def set_finish_with_abort(self, error_msg: str):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
+        if (
+            envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get()
+            and self.multimodal_inputs is not None
+            and self.session is None
+        ):
+            self.multimodal_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = array(
@@ -2216,6 +2358,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_range.length for r in reqs]
+        _acknowledge_prefix_resident_requests(reqs)
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
                 logprob_start_len=r.logprob_start_len,

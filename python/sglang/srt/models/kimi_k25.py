@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.vision_rope import (
     prepare_fused_qk_complex_rope_inplace,
 )
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -31,6 +32,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
+    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
@@ -720,6 +722,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 grid_thw = item.model_specific_data["grid_thws"]
             image_grid_thws.append(grid_thw)
         grid_thws = torch.concat(image_grid_thws, dim=0)
+        encoded_image_indices = []
 
         def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
             """Move only this encoder-DP rank's images to its local GPU.
@@ -730,13 +733,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
             acknowledges the entire TP group so the bounded IPC pool remains
             recyclable.
             """
-            parallel = get_parallel()
-            server_args = get_server_args()
-            # Match MmItemMemoryPool.try_to_recycle(), which waits for the
-            # server TP size rather than the attention subgroup size.
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                encoded_image_indices.extend(image_indices)
+                ipc_consumer_count = 1
+            else:
+                parallel = get_parallel()
+                server_args = get_server_args()
+                # Match MmItemMemoryPool.try_to_recycle(), which waits for the
+                # server TP size rather than the attention subgroup size.
+                ipc_consumer_count = max(
+                    getattr(server_args, "tp_size", parallel.attn_tp_size), 1
+                )
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
@@ -771,6 +778,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 pixel_values_device=device,
                 pixel_values_dtype=target_dtype,
             )
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                # Image-wise DP: non-owner ranks release their ack word here.
+                for image_index, item in enumerate(items):
+                    if image_index not in encoded_image_indices and isinstance(
+                        item.feature, CudaIpcTensorTransportProxy
+                    ):
+                        item.acknowledge_deferred_cuda_ipc_feature(1)
             image_features = self.mm_projector(image_embeds)
             return image_features
 

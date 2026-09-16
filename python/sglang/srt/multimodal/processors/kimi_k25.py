@@ -379,6 +379,7 @@ class MMFeatureStreamSink:
     def __init__(self, sglang_processor):
         self._sglang_processor = sglang_processor
         self._hashes: dict[int, int] = {}
+        self._proxies: list = []
 
     def __call__(self, index: int, patches: torch.Tensor):
         from sglang.srt.managers.mm_utils import hash_feature
@@ -387,12 +388,31 @@ class MMFeatureStreamSink:
             self._hashes[index] = hash_feature(patches)
         processor = self._sglang_processor
         if getattr(processor, "use_cuda_ipc", False):
-            return processor._wrap_tensor_for_cuda_ipc(patches)
+            proxy = processor._wrap_tensor_for_cuda_ipc(patches)
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                from sglang.srt.multimodal.transport.cuda_ipc import (
+                    CudaIpcTensorTransportProxy,
+                )
+
+                if isinstance(proxy, CudaIpcTensorTransportProxy):
+                    self._proxies.append(proxy)
+            return proxy
         return patches.cpu()
 
     def hash_list(self, count: int) -> list:
         # Entries are None when hashing is skipped; consumers must handle it.
         return [self._hashes.get(index) for index in range(count)]
+
+    def cancel_all(self, context: str) -> int:
+        processor = self._sglang_processor
+        pool = getattr(processor, "cudaipc_mmfeature_pool", None)
+        if pool is None:
+            return 0
+        from sglang.srt.multimodal.transport.lease_lifecycle import cancel_proxies
+
+        proxies = list(self._proxies)
+        self._proxies.clear()
+        return cancel_proxies(pool, proxies, context=context)
 
 
 # ---------------------------------------------------------------------------
@@ -636,22 +656,45 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # Stream each image's feature (hash -> transport wrap -> free) as it is
         # produced, bounding the tokenizer process's GPU footprint regardless
         # of the request's image count or resolution.
-        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
-            base_output,
-            self.mm_tokens,
-            sglang_original_input_ids=base_output.input_ids,
-            sglang_feature_sink=MMFeatureStreamSink(self),
-        )
-
-        # K2.5/K2.7 encoder-DP assigns an image to exactly one TP rank. Keep
-        # its IPC proxy lazy until that assignment is known, avoiding a full
-        # image copy to every rank. The scheduler only honors this marker once
-        # the processor has already set the item's hash and pad value.
-        if self.use_cuda_ipc and self.server_args.mm_enable_dp_encoder:
-            for item in mm_items:
-                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
-                    True
+        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get() and getattr(
+            self, "use_cuda_ipc", False
+        ):
+            sink = MMFeatureStreamSink(self)
+            try:
+                mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
+                    base_output,
+                    self.mm_tokens,
+                    sglang_original_input_ids=base_output.input_ids,
+                    sglang_feature_sink=sink,
                 )
+                # K2.5/K2.7 encoder-DP assigns an image to exactly one TP rank.
+                # Keep its IPC proxy lazy until that assignment is known,
+                # avoiding a full image copy to every rank.
+                if self.use_cuda_ipc and self.server_args.mm_enable_dp_encoder:
+                    for item in mm_items:
+                        item.model_specific_data[
+                            DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY
+                        ] = True
+            except BaseException:
+                sink.cancel_all(f"Kimi K2.5 request={request_obj.rid}")
+                raise
+        else:
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
+                base_output,
+                self.mm_tokens,
+                sglang_original_input_ids=base_output.input_ids,
+                sglang_feature_sink=MMFeatureStreamSink(self),
+            )
+
+            # K2.5/K2.7 encoder-DP assigns an image to exactly one TP rank. Keep
+            # its IPC proxy lazy until that assignment is known, avoiding a full
+            # image copy to every rank. The scheduler only honors this marker once
+            # the processor has already set the item's hash and pad value.
+            if self.use_cuda_ipc and self.server_args.mm_enable_dp_encoder:
+                for item in mm_items:
+                    item.model_specific_data[
+                        DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY
+                    ] = True
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),

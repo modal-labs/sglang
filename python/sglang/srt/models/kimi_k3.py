@@ -94,6 +94,7 @@ from sglang.srt.managers.mm_utils import (
     pad_input_ids_array,
 )
 from sglang.srt.managers.schedule_batch import (
+    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
@@ -3709,6 +3710,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             image_grid_thws.append(grid_thw)
         grid_thws_host = torch.concat(image_grid_thws, dim=0).cpu()
         grid_thw_list = grid_thws_host.tolist()
+        encoded_image_indices = []
 
         def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
             """Materialize features for the images assigned to this rank.
@@ -3722,11 +3724,15 @@ class KimiK3ForConditionalGeneration(nn.Module):
             MmItemMemoryPool.try_to_recycle(), which waits for the server TP
             size rather than the attention subgroup size.
             """
-            parallel = get_parallel()
-            server_args = get_server_args()
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                encoded_image_indices.extend(image_indices)
+                ipc_consumer_count = 1
+            else:
+                parallel = get_parallel()
+                server_args = get_server_args()
+                ipc_consumer_count = max(
+                    getattr(server_args, "tp_size", parallel.attn_tp_size), 1
+                )
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
@@ -3766,6 +3772,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pixel_values_device=device,
                 pixel_values_dtype=target_dtype,
             )
+            if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                # Image-wise DP: non-owner ranks release their ack word here.
+                for image_index, item in enumerate(items):
+                    if image_index not in encoded_image_indices and isinstance(
+                        item.feature, CudaIpcTensorTransportProxy
+                    ):
+                        item.acknowledge_deferred_cuda_ipc_feature(1)
             return self.mm_projector(image_embeds)
 
         pixel_values = materialize_item_features(list(range(len(items))))
