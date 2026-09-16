@@ -1470,6 +1470,21 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
         self.labels = labels or {}
 
+        self.finished_prompt_tokens_by_outcome = Counter(
+            name="sglang:finished_prompt_tokens_by_outcome_total",
+            documentation="Reported prompt tokens at completion, separated by outcome; not executed prefill work.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.finished_cached_tokens_by_outcome = Counter(
+            name="sglang:finished_cached_tokens_by_outcome_total",
+            documentation="Reported cached prompt tokens at completion, separated by outcome.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.finished_requests_by_outcome = Counter(
+            name="sglang:finished_requests_by_outcome_total",
+            documentation="Terminal request outcomes, including aborts with no output.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
@@ -1670,12 +1685,30 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_inter_token_latency,
         )
 
+        self.histogram_request_tpot = Histogram(
+            name="sglang:request_time_per_output_token_seconds",
+            documentation="Per-request mean decode latency as the reciprocal of response decode_throughput; excludes aborts and N<=1.",
+            labelnames=[*labels.keys(), "stream"],
+            buckets=bucket_inter_token_latency,
+        )
+
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
             labelnames=labels.keys(),
             buckets=bucket_e2e_request_latency,
         )
+
+    def observe_request_tpot(self, labels, value, *, stream):
+        self.histogram_request_tpot.labels(
+            **labels, stream=str(stream).lower()
+        ).observe(value)
+
+    def observe_finished_outcome(self, labels, outcome, prompt_tokens, cached_tokens):
+        outcome_labels = {**labels, "outcome": outcome}
+        self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(prompt_tokens)
+        self.finished_cached_tokens_by_outcome.labels(**outcome_labels).inc(cached_tokens)
+        self.finished_requests_by_outcome.labels(**outcome_labels).inc()
 
     def observe_one_finished_request(
         self,
@@ -1753,6 +1786,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def observe_inter_token_latency(
         self, labels: Dict[str, str], internval: float, num_new_tokens: int
     ):
+        if num_new_tokens <= 0:
+            return
         adjusted_interval = internval / num_new_tokens
 
         # A faster version of the Histogram::observe which observes multiple values at the same time.
