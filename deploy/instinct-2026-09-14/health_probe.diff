@@ -1,0 +1,93 @@
+--- serve.py	2026-09-15 07:33:36.736830186 +0000
++++ serve_probe.py	2026-09-15 17:44:47.327868698 +0000
+@@ -9,11 +9,14 @@
+ from __future__ import annotations
+ 
+ import base64
++import json
+ import os
+ import shutil
+ import struct
+ import subprocess
+ import time
++import urllib.error
++import urllib.request
+ import zlib
+ from pathlib import Path
+ 
+@@ -270,6 +273,50 @@
+ WARMUP_IMAGE_WIDTH = 1280
+ WARMUP_IMAGE_HEIGHT = 800
+ 
++# Heartbeat probe on the real request path (chat template -> tokenizer ->
++# scheduler -> 1 token). SGLang /health only runs a bare 1-token generate and
++# stays green when requests stall before the scheduler.
++PROBE_PAYLOAD = {
++    "model": MODEL_NAME,
++    "messages": [{"role": "user", "content": "ping"}],
++    "max_tokens": 1,
++    "temperature": 0,
++    "stream": False,
++}
++PROBE_REQUEST_TIMEOUT_SECONDS = 30.0
++PROBE_URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
++
++
++def probe_chat_completions() -> str | None:
++    """One real-path probe. None = healthy, str = failure reason.
++
++    Any prompt HTTP answer counts as healthy: 503 is the bounded queue
++    (--max-queued-requests) rejecting a busy-but-serving container, and a 4xx
++    means the API layer is responsive. Only no-answer-in-time and 5xx count.
++    """
++    body = json.dumps(PROBE_PAYLOAD).encode("utf-8")
++    req = urllib.request.Request(
++        PROBE_URL,
++        data=body,
++        headers={"Content-Type": "application/json"},
++        method="POST",
++    )
++    started = time.monotonic()
++    try:
++        with urllib.request.urlopen(
++            req, timeout=PROBE_REQUEST_TIMEOUT_SECONDS
++        ) as resp:
++            resp.read()
++    except urllib.error.HTTPError as exc:
++        if exc.code == 503 or 400 <= exc.code < 500:
++            print(f"[probe] chat/completions answered {exc.code} (busy or 4xx)")
++            return None
++        return f"chat/completions returned status {exc.code}"
++    except (urllib.error.URLError, TimeoutError, OSError) as exc:
++        elapsed = time.monotonic() - started
++        return f"chat/completions probe failed after {elapsed:.1f}s: {type(exc).__name__}: {exc}"
++    return None
++
+ 
+ def warmup_image_data_url(width: int, height: int) -> str:
+     """Encode a synthetic RGB gradient PNG as an OpenAI image_url data URL."""
+@@ -340,7 +387,8 @@
+     """Collect bounded forensics and stop an unhealthy production container."""
+     try:
+         subprocess.run(
+-            "for p in $(pgrep 'sglang::schedul'); do "
++            "for p in $(pgrep -f '[s]glang.launch_server') "
++            "$(pgrep 'sglang::schedul'); do "
+             "py-spy dump --pid $p --nonblocking; done; "
+             "nvidia-smi --query-gpu=index,utilization.gpu,power.draw --format=csv",
+             shell=True,
+@@ -438,8 +486,13 @@
+         )
+         warmup_elapsed = time.monotonic() - started
+ 
++        def heartbeat() -> str | None:
++            # /health first: raises if the server process exited, and still
++            # catches the all-rank engine freeze; then the real request path.
++            return self.endpoint.health_check() or probe_chat_completions()
++
+         start_heartbeat_thread(
+-            self.endpoint.health_check,
++            heartbeat,
+             on_failure=terminate_unhealthy_container,
+             poll_interval=10.0,
+             max_consecutive_failures=6,

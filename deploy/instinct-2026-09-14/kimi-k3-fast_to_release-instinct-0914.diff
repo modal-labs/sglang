@@ -1,0 +1,199 @@
+--- prod_serve.py	2026-09-15 06:35:22.760284633 +0000
++++ prod-instinct/serve.py	2026-09-15 07:33:36.736830186 +0000
+@@ -8,11 +8,14 @@
+ 
+ from __future__ import annotations
+ 
++import base64
+ import os
+ import shutil
++import struct
++import subprocess
+ import time
++import zlib
+ from pathlib import Path
+-import subprocess
+ 
+ import modal
+ from modal._utils.async_utils import synchronize_api
+@@ -46,19 +49,11 @@
+ 
+ SGLANG_BASE_IMAGE = "modalresearch/sglang:kimi-k3-cu13-20260806-b9e90a6d6"
+ SGLANG_COMMIT = "b9e90a6d6ef1859830c3b879cef999092975a41a"   # HEAD stays here
+-SGLANG_EFFECTIVE_COMMIT = "2c881e2ed528746312ec326fa89ee6e5e2169adf"  # code actually running
+-SGLANG_BUMP_PATCH = Path(__file__).parent / "vendor" / "sglang_b9e90a6d_to_2c881e2e.patch"
+-SGLANG_BUMP_PATCH_IMAGE_PATH = "/tmp/sglang_bump.patch"
+-NEW_FILES = [
+-    "test/registered/core/test_responses_codex_compat.py",
+-    "test/registered/core/test_responses_custom_tools.py",
+-    "test/registered/unit/mem_cache/test_hicache_v3_reservation_precheck.py",
+-    "test/registered/unit/mem_cache/test_mamba_repoint_match.py",
+-    "test/registered/unit/multimodal/test_kimi_mm_preprocess_bounded.py",
+-    "test/srt/test_graceful_drain_signals.py",
+-]
+-SGLANG_BUMP_TRACKED_MODIFIED = 24
+-SGLANG_BUMP_NEW_FILES = 6
++SGLANG_EFFECTIVE_COMMIT = "2c881e2ed528746312ec326fa89ee6e5e2169adf"  # JIT-cache salt (unchanged: same kernels/ABI)
++RELEASE_REF = "release/instinct/2026-09-14"
++RELEASE_SHA = "462ade71f00ee31c60a149bb6b29e77889dcbc91"  # code actually running (PR #22 head)
++RELEASE_BUNDLE = Path(__file__).parent / "rel0914.bundle"
++RELEASE_BUNDLE_IMAGE_PATH = "/tmp/rel0914.bundle"
+ SGLANG_SOURCE_PATH = "/sgl-workspace/sglang"
+ FLASHINFER_TARGET_VERSION = "0.6.16rc5"
+ FLASHINFER_EXTRA_INDEX = "https://flashinfer.ai/whl"
+@@ -144,6 +139,13 @@
+     "SGLANG_K3_ATTN_RES_FP8_FUSION": "1",
+     "SGLANG_VLM_MEDIA_URL_FETCH_ENABLED": "false",
+     "SGLANG_OPENAI_MEDIA_URL_FETCH_ENABLED": "false",
++    "SGLANG_RELEASE_SHA": RELEASE_SHA,
++    # release/instinct/2026-09-14 (PR #22): all default-off, opted in here
++    "SGLANG_TRTLLM_MLA_VERIFY_FUSED_KV_WRITE": "1",
++    "SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK": "1",
++    "SGLANG_KIMI_ENCODE_FAST_PATH": "1",
++    "SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS": "32000000",
++    "SGLANG_K3_MM_USE_RENDERED_INPUT_IDS": "1",
+ }
+ 
+ PREBUILT_JIT_MODULE = "sgl_trtllm_gen_moe_fi_651799c8f7fd_4153db87ecc2"
+@@ -156,10 +158,6 @@
+ )
+ PREBUILT_JIT_IMAGE_DIR = "/opt/prebuilt-jit"
+ 
+-# sgl-project/sglang#31633 ("[feature] sglext output ids field", head afd75cb5)
+-SGLANG_PR31633_PATCH = Path(__file__).parent / "sglang_pr31633_output_ids.patch"
+-SGLANG_PR31633_PATCH_IMAGE_PATH = "/tmp/sglang_pr31633_output_ids.patch"
+-
+ serving_image = (
+     modal.Image.from_registry(SGLANG_BASE_IMAGE)
+     .entrypoint([])
+@@ -180,35 +178,17 @@
+     .run_commands(
+         f'test "$(git -C {SGLANG_SOURCE_PATH} rev-parse HEAD)" = "{SGLANG_COMMIT}"'
+     )
+-    # --- bump the fork by patch, before PR31633 so the ordering matches the
+-    #     vendored-tree build (where PR31633 applied cleanly onto this content)
+-    .add_local_file(SGLANG_BUMP_PATCH, SGLANG_BUMP_PATCH_IMAGE_PATH, copy=True)
++    # --- release source: fork commits since the image's HEAD as a git bundle;
++    #     checkout the release sha (it contains the old bump + PR31633)
++    .add_local_file(RELEASE_BUNDLE, RELEASE_BUNDLE_IMAGE_PATH, copy=True)
+     .run_commands(
+         f'set -eu; '
+-        f'git -C {SGLANG_SOURCE_PATH} apply --check -v {SGLANG_BUMP_PATCH_IMAGE_PATH}; '
+-        f'git -C {SGLANG_SOURCE_PATH} apply {SGLANG_BUMP_PATCH_IMAGE_PATH}; '
+-        # the patch is the only thing that may have touched the tree
+-        f'n=$(git -C {SGLANG_SOURCE_PATH} diff --name-only | wc -l); '
+-        f'echo "tracked files modified: $n (expected {SGLANG_BUMP_TRACKED_MODIFIED})"; '
+-        f'test "$n" = "{SGLANG_BUMP_TRACKED_MODIFIED}"; '
+-        f'for f in {" ".join(NEW_FILES)}; do '
+-        f'test -f "{SGLANG_SOURCE_PATH}/$f" || (echo "missing new file $f" && exit 1); '
+-        f'done; '
+-        f'echo "new files present: {SGLANG_BUMP_NEW_FILES}"; '
+-        f'python -c "'
+-        f'import ast;'
+-        f'fs=[\'srt/managers/scheduler.py\',\'srt/managers/tokenizer_manager.py\','
+-        f'\'srt/mem_cache/unified_radix_cache.py\',\'kernels/ops/moe/trtllm_gen_moe.py\'];'
+-        f'[ast.parse(open(\'{SGLANG_SOURCE_PATH}/python/sglang/\'+f).read()) for f in fs];'
+-        f'print(\'syntax ok\')"'
+-    )
+-    .add_local_file(
+-        SGLANG_PR31633_PATCH,
+-        SGLANG_PR31633_PATCH_IMAGE_PATH,
+-        copy=True,
+-    )
+-    .run_commands(
+-        f"git -C {SGLANG_SOURCE_PATH} apply -v {SGLANG_PR31633_PATCH_IMAGE_PATH}"
++        f'git -C {SGLANG_SOURCE_PATH} fetch -q {RELEASE_BUNDLE_IMAGE_PATH} {RELEASE_SHA}; '
++        f'git -C {SGLANG_SOURCE_PATH} checkout -q {RELEASE_SHA}; '
++        f'test "$(git -C {SGLANG_SOURCE_PATH} rev-parse HEAD)" = "{RELEASE_SHA}"; '
++        f'test -z "$(git -C {SGLANG_SOURCE_PATH} status --porcelain --untracked-files=no)"; '
++        f'rm -f {RELEASE_BUNDLE_IMAGE_PATH}; '
++        f'python -c "import sglang; print(sglang.__file__)"'
+     )
+     .run_commands(
+         "mkdir -p /opt/prebuilt-jit && cd /opt/prebuilt-jit && "
+@@ -287,6 +267,63 @@
+     "temperature": 0.7,
+ }
+ 
++WARMUP_IMAGE_WIDTH = 1280
++WARMUP_IMAGE_HEIGHT = 800
++
++
++def warmup_image_data_url(width: int, height: int) -> str:
++    """Encode a synthetic RGB gradient PNG as an OpenAI image_url data URL."""
++
++    def chunk(tag: bytes, payload: bytes) -> bytes:
++        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
++        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
++
++    row = bytes(
++        channel
++        for x in range(width)
++        for channel in (
++            x * 255 // max(width - 1, 1),
++            128,
++            255 - x * 255 // max(width - 1, 1),
++        )
++    )
++    scanlines = b"".join(b"\x00" + row for _ in range(height))
++    png = b"".join(
++        (
++            b"\x89PNG\r\n\x1a\n",
++            chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),
++            chunk(b"IDAT", zlib.compress(scanlines, 9)),
++            chunk(b"IEND", b""),
++        )
++    )
++    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
++
++
++# First image request on a fresh container pays the mm-path JIT/autotune
++# (25-80 s observed); take it in warmup instead of on a user request.
++WARMUP_IMAGE_PAYLOAD = {
++    "model": MODEL_NAME,
++    "messages": [
++        {
++            "role": "user",
++            "content": [
++                {"type": "text", "text": "Describe this screenshot in one sentence."},
++                {
++                    "type": "image_url",
++                    "image_url": {
++                        "url": warmup_image_data_url(
++                            WARMUP_IMAGE_WIDTH, WARMUP_IMAGE_HEIGHT
++                        )
++                    },
++                },
++            ],
++        }
++    ],
++    "max_tokens": 64,
++    "temperature": 0.7,
++}
++
++
+ async def _stop_current_container() -> None:
+     from modal.client import _Client
+ 
+@@ -393,6 +430,12 @@
+             successful_requests=1,
+             request_timeout=30 * MINUTES,
+         )
++        warmup_chat_completions(
++            port=PORT,
++            payload=WARMUP_IMAGE_PAYLOAD,
++            successful_requests=1,
++            request_timeout=30 * MINUTES,
++        )
+         warmup_elapsed = time.monotonic() - started
+ 
+         start_heartbeat_thread(
+@@ -403,7 +446,7 @@
+         )
+ 
+         print(
+-            "Kimi K3 TP8 DFlash is ready. "
++            f"Kimi K3 TP8 DFlash is ready (release {RELEASE_SHA[:9]}). "
+             f"endpoint={endpoint_elapsed:.2f}s cumulative, "
+             f"warmup={warmup_elapsed:.2f}s cumulative."
+         )
