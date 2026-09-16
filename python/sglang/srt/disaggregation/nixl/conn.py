@@ -1026,6 +1026,8 @@ class NixlKVManager(CommonKVManager):
                 )
 
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
+            if envs.SGLANG_NIXL_DISABLE_PREPPED.get():
+                return
             # Build the shared src dlist on the first equal-TP/MLA peer; later
             # peers reuse it. Skipped entirely on heterogeneous-TP-only setups.
             if "" not in self.prep_handles:
@@ -1430,6 +1432,7 @@ class NixlKVManager(CommonKVManager):
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
             not bypass_prepped
+            and not envs.SGLANG_NIXL_DISABLE_PREPPED.get()
             and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
@@ -1463,6 +1466,15 @@ class NixlKVManager(CommonKVManager):
             if state == "ERR":
                 raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
+
+        # A hybrid MLA payload is a flat region list, not equal MHA K/V halves.
+        # Keep this override limited to the explicitly opted-in payload path.
+        if (
+            envs.SGLANG_NIXL_DISABLE_PREPPED.get()
+            and self.is_hybrid_mla_backend
+            and src_data_ptrs is self.kv_args.kv_data_ptrs
+        ):
+            force_flat = True
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
         # Convert pointer lists to np.uint64 arrays up front.
