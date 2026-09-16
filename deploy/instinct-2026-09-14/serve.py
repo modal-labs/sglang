@@ -205,6 +205,9 @@ BASE_RUNTIME_ENV = {
     "SGLANG_KIMI_ENCODE_FAST_PATH": "1",
     "SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS": "32000000",
     "SGLANG_K3_MM_USE_RENDERED_INPUT_IDS": "1",
+    # dev/instinct/2026-09-15 #26: scheduler-side mm padding fast path (CONFIRMED same-box, image p50 -25..-33 ms)
+    "SGLANG_K3_SCHED_MM_FASTPATH": "1",
+    "SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS": "1",
 }
 
 PREBUILT_JIT_MODULE = "sgl_trtllm_gen_moe_fi_651799c8f7fd_4153db87ecc2"

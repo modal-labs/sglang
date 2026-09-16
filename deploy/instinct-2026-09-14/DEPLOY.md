@@ -1,4 +1,4 @@
-# kimi-k3-fast -> dev/instinct/2026-09-15 @ 3ccb60f5b, 4 PRs on
+# kimi-k3-fast -> dev/instinct/2026-09-15 @ 3ccb60f5b, 4 PRs of #22 + #26 on
 
 Files in this directory:
 
@@ -11,9 +11,10 @@ Files in this directory:
      `SGLANG_TRTLLM_MLA_VERIFY_FUSED_KV_WRITE=1` (#18), `SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK=1` (#17),
      `SGLANG_KIMI_ENCODE_FAST_PATH=1` + `SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS=32000000` (#20),
      `SGLANG_K3_MM_USE_RENDERED_INPUT_IDS=1` (#19). No prefix-ack (#15 dropped).
+     Plus #26 (dev, CONFIRMED same-box): `SGLANG_K3_SCHED_MM_FASTPATH=1` + `SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS=1`.
      Also in this pin but NOT set (default off, flip in prod after their gates): `SGLANG_MM_CUDA_IPC_LEASE_POOL=1`
      (#33, after the IPC stress soak), `SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET=128` (#29) and the other
-     default-off dev levers (#26/#37/#38/#43) as their same-box rows land. Rollback of any flip = unset the var.
+     default-off dev levers (#37/#38/#43) as their same-box rows land. Rollback of any flip = unset the var.
   3. warmup: one 1280x800 synthetic-PNG image turn after the text greeting (autoinference #516).
   Unchanged: app name, model/draft, server args, volumes, B300:8, min_containers=63,
   routing/kv-aware routing, auth, heartbeat/terminate, JIT-cache salt (`SGLANG_EFFECTIVE_COMMIT`).
@@ -57,7 +58,7 @@ Image build check (in the build log): `rev-parse HEAD == 3ccb60f5b...`, `status 
 - Old (blue) containers are hard-terminated 4 h after deploy regardless of green progress.
 - Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release 3ccb60f5b). ...` — the
   warmup number now includes the image turn (expect +25-80 s on containers with a cold mm JIT).
-- Env check on a running container: `SGLANG_RELEASE_SHA=3ccb60f5b...` and the 5 flags above;
+- Env check on a running container: `SGLANG_RELEASE_SHA=3ccb60f5b...` and the 7 flag lines above;
   `SGLANG_ENABLE_MM_CUDA_IPC_PREFIX_ACK` must be absent.
 
 ## Rollback
