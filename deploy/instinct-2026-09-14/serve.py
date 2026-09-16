@@ -50,10 +50,34 @@ HICACHE_WRITE_POLICY = "write_through_selective"
 SGLANG_BASE_IMAGE = "modalresearch/sglang:kimi-k3-cu13-20260806-b9e90a6d6"
 SGLANG_COMMIT = "b9e90a6d6ef1859830c3b879cef999092975a41a"   # HEAD stays here
 SGLANG_EFFECTIVE_COMMIT = "2c881e2ed528746312ec326fa89ee6e5e2169adf"  # JIT-cache salt (unchanged: same kernels/ABI)
-RELEASE_REF = "release/instinct/2026-09-14"
-RELEASE_SHA = "462ade71f00ee31c60a149bb6b29e77889dcbc91"  # code actually running (PR #22 head)
-RELEASE_BUNDLE = Path(__file__).parent / "rel0914.bundle"
-RELEASE_BUNDLE_IMAGE_PATH = "/tmp/rel0914.bundle"
+RELEASE_REF = "dev/instinct/2026-09-15"
+RELEASE_SHA = "c10d0d21512d9df6a85c9968fa69080a9b16059e"  # dev head validated by Lane 14 (boot + probe36 + paired replay)
+RELEASE_BUNDLE = Path(__file__).parent / f"engine-{RELEASE_SHA[:9]}.bundle"  # untracked; regenerate per RELEASE_SHA (see DEPLOY.md)
+RELEASE_BUNDLE_IMAGE_PATH = f"/tmp/{RELEASE_BUNDLE.name}"
+RELEASE_PIN_REF = f"refs/deploy/{RELEASE_BUNDLE.stem}"  # a bundle only advertises named refs, so pin the SHA under one
+RELEASE_BUNDLE_CMD = (
+    f"git update-ref {RELEASE_PIN_REF} {RELEASE_SHA} && "
+    f"git bundle create {RELEASE_BUNDLE} "
+    f"{SGLANG_COMMIT}..{RELEASE_PIN_REF} {SGLANG_COMMIT}..origin/release/2026-09-14"
+)
+
+
+def verify_release_bundle(bundle: Path = RELEASE_BUNDLE, sha: str = RELEASE_SHA) -> None:
+    """Deploy-time check (operator machine): the untracked bundle exists, is a valid git bundle
+    and carries RELEASE_SHA. Raises with the exact regeneration command otherwise."""
+    hint = f"regenerate it with:\n  {RELEASE_BUNDLE_CMD}"
+    if not bundle.is_file():
+        raise FileNotFoundError(f"{bundle} missing (bundles are not tracked in git); {hint}")
+    v = subprocess.run(["git", "bundle", "verify", str(bundle)], cwd=bundle.parent, capture_output=True, text=True)
+    if v.returncode != 0:
+        raise RuntimeError(f"`git bundle verify {bundle}` failed:\n{v.stderr.strip()}\n{hint}")
+    heads = subprocess.run(["git", "bundle", "list-heads", str(bundle)], cwd=bundle.parent, capture_output=True, text=True, check=True).stdout
+    if sha not in heads.split():
+        raise RuntimeError(f"{bundle} does not contain RELEASE_SHA {sha}; heads:\n{heads.strip()}\n{hint}")
+
+
+if modal.is_local():  # the bundle only exists on the operator machine, not inside the container
+    verify_release_bundle()
 SGLANG_SOURCE_PATH = "/sgl-workspace/sglang"
 FLASHINFER_TARGET_VERSION = "0.6.16rc5"
 FLASHINFER_EXTRA_INDEX = "https://flashinfer.ai/whl"

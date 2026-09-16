@@ -286,3 +286,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# deploy bundles are generated per RELEASE_SHA, never committed (a bundle would embed the previous one)
+deploy/instinct-2026-09-14/*.bundle
