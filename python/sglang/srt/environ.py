@@ -25,6 +25,11 @@ def _default_hip() -> bool:
         return False
 
 
+def _default_tree_cache_sanity_check() -> bool:
+    """Enable the expensive tree-cache sanity check by default in CI."""
+    return envs.SGLANG_IS_IN_CI.get()
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -366,6 +371,9 @@ class Envs:
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    # The explicit environment variable still takes precedence over this CI
+    # default, so production remains opt-in and CI remains opt-out if needed.
+    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
 
