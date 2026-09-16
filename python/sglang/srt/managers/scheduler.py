@@ -27,6 +27,8 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.managers import queue_diagnostics
+
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
@@ -3213,6 +3215,7 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        res = "not_attempted"
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3284,6 +3287,9 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        if queue_diagnostics.enabled(self):
+            queue_diagnostics.record_prefill(self, adder.can_run_list, res if self.waiting_queue else "no_waiting")
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4212,6 +4218,8 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if queue_diagnostics.enabled(self):
+            ret["queue_diagnostics"] = queue_diagnostics.snapshot(self)
 
         if self.server_args.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
