@@ -715,6 +715,91 @@ def test_P44_session_sibling_turn_queued_abort_removes_own_mrope_slice():
     assert req_b.multimodal_inputs is shared
 
 
+def _absent_parent_mrope_delta_session():
+    session = Session(32, "s", streaming=False)
+    p = _item(_proxy())
+    p.release_transport_proxies = Mock()
+    a = _item(_proxy())
+    a.release_transport_proxies = Mock()
+    b = _item(_proxy())
+    b.release_transport_proxies = Mock()
+    shared = MultimodalInputs(
+        mm_items=[p],
+        image_pad_len=[3],
+        mrope_positions=torch.full((3, 5), 0.0),
+        mrope_position_delta=None,
+    )
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+
+    req_a = Req("a", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_a.session = session
+    req_a.multimodal_inputs = shared
+    req_a.session_mm_inherited = True
+    req_b = Req("b", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_b.session = session
+    req_b.multimodal_inputs = shared
+    req_b.session_mm_inherited = True
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        req_a.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[a],
+                image_pad_len=[5],
+                mrope_positions=torch.full((3, 2), 1.0),
+                mrope_position_delta=torch.full((1, 1), 1.0),
+            )
+        )
+        req_b.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[b],
+                image_pad_len=[7],
+                mrope_positions=torch.full((3, 4), 2.0),
+                mrope_position_delta=torch.full((1, 1), 2.0),
+            )
+        )
+    return session, shared, req_a, req_b, p, a, b
+
+
+def test_P44_session_sibling_abort_restores_absent_parent_mrope_delta():
+    """Parent had no mrope_position_delta; aborting turn a must strip only
+    a's adopted delta, leaving exactly b's — not leave a's value behind."""
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session, shared, req_a, req_b, _p, a, _b = _absent_parent_mrope_delta_session()
+    scheduler = _queued_abort_scheduler([req_a])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="a"))
+
+    a.release_transport_proxies.assert_called_once_with()
+    assert shared.mrope_position_delta is not None
+    assert shared.mrope_position_delta.shape == (1, 1)
+    assert torch.equal(shared.mrope_position_delta, torch.full((1, 1), 2.0))
+    assert shared.mrope_positions.shape == (3, 9)
+    assert req_b.multimodal_inputs is shared
+
+
+def test_P44_session_all_siblings_abort_restores_none_parent_mrope_delta():
+    """Parent had no mrope_position_delta; once every contributing turn is
+    aborted the shared container must return to None, not a 0-row tensor."""
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session, shared, req_a, req_b, p, a, b = _absent_parent_mrope_delta_session()
+    scheduler = _queued_abort_scheduler([req_a, req_b])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="a"))
+        scheduler.abort_request(AbortReq(rid="b"))
+
+    a.release_transport_proxies.assert_called_once_with()
+    b.release_transport_proxies.assert_called_once_with()
+    assert shared.mrope_position_delta is None
+    assert torch.equal(shared.mrope_positions, torch.zeros(3, 5))
+    assert shared.mm_items == [p]
+    assert shared.session_turn_states == []
+
+
 def _repeated_sibling_mm_session():
     session = Session(32, "s", streaming=False)
     p = _item(_proxy())

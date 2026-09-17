@@ -504,6 +504,8 @@ class Session:
                         >= delta_off + st.own_mrope_delta
                     ):
                         mm.mrope_position_delta = mm.mrope_position_delta[:delta_off]
+                        if mm.mrope_position_delta.shape[0] == 0:
+                            mm.mrope_position_delta = None
                         mrope_changed = True
                     if mrope_changed:
                         mm.mrope_position_delta_repeated_cache = None
@@ -551,6 +553,8 @@ class Session:
                             ],
                             dim=0,
                         )
+                        if mm.mrope_position_delta.shape[0] == 0:
+                            mm.mrope_position_delta = None
                         mrope_changed = True
                     if items_removed:
                         remove_state()

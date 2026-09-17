@@ -816,7 +816,7 @@ class SessionTurnMMState:
                 else shared.mrope_positions.shape[1]
             ),
             n_mrope_delta=(
-                None
+                0
                 if shared.mrope_position_delta is None
                 else shared.mrope_position_delta.shape[0]
             ),
