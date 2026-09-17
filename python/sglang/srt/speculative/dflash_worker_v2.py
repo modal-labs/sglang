@@ -2101,6 +2101,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._warned_sampling_fallback = True
 
+    def _sync_greedy_draft(
+        self, draft_next: torch.Tensor, sampling_info
+    ) -> torch.Tensor:
+        # The selector T>0 block is already synced at DFLASH_DRAFT_SAMPLE;
+        # every other proposal is a rank-local argmax.
+        if self._is_domino or self.selector is None or _is_all_greedy(sampling_info):
+            draft_next = self._tp_sync.sync(
+                SpecTpSyncSite.DFLASH_DRAFT_GREEDY, draft_next
+            )
+        return draft_next
+
     def _make_next_draft_input_prefill(
         self,
         *,
@@ -2593,6 +2604,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 lm_head=lm_head,
             ).view(bs, int(self.block_size) - 1)
+
+        draft_next = self._sync_greedy_draft(draft_next, batch.sampling_info)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])

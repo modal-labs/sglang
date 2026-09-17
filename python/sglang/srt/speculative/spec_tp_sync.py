@@ -37,6 +37,7 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_ACCEPT_GREEDY = 15
     DFLASH_TARGET = 16
     DFLASH_DRAFT_SAMPLE = 17  # selector T>0 block: tokens, candidate_ids, q_rows
+    DFLASH_DRAFT_GREEDY = 18  # greedy draft proposal (block minus anchor) from the selector / vocab-parallel head
 
     @property
     def slug(self) -> str:

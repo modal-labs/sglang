@@ -339,11 +339,9 @@ class Envs:
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-6".
-    # The DFLASH greedy accept site is off by default: greedy verify is
-    # TP-symmetric by construction (see the dflash_worker_v2 batch-identity
-    # probe), so its broadcast is a value no-op that would commit rank-0 rows
-    # into peers' rows if batch composition ever diverged.
-    SGLANG_SPEC_TP_SYNC = EnvStr("all,-dflash-accept-greedy")
+    # Every site is on: the greedy DFLASH proposal and target argmax come from
+    # rank-local numerics, so peers take rank 0's decision.
+    SGLANG_SPEC_TP_SYNC = EnvStr("all")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
