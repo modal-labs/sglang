@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    take_kv_age_hit_observation,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
@@ -96,6 +97,11 @@ class UnifiedTreeNode:
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
+        # Wall-clock twins of the logical timestamps above. Only the KV age
+        # metrics read them; eviction order keeps using the logical counter.
+        now = time.monotonic()
+        self.last_access_wall = now
+        self.creation_wall = now
         self.hash_value = None
         self.hit_count = 0
         self.priority = priority
@@ -1083,10 +1089,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
+        now_wall = time.monotonic()
+        kv_age = self.kv_age_metrics_collector()
+        observe_kv_age = kv_age is not None and take_kv_age_hit_observation(params)
         while node_update:
+            if observe_kv_age:
+                self._emit_kv_age(
+                    node_update,
+                    "hit",
+                    "host" if node_update.evicted else "device",
+                    "hit",
+                    now_wall,
+                )
             node_update.last_access_time = cur_time
+            node_update.last_access_wall = now_wall
             cur_time -= 0.00001
             node_update = node_update.parent
+
+        if observe_kv_age and best_match_node is self.root_node:
+            params.req.kv_age_hit_observed = False
 
         # last_host_node will be used as the starting node for the subsequent
         # `prefetch_from_storage` flow. We directly use best_match_node here,
@@ -1120,6 +1141,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return result
 
+    def _emit_kv_age(
+        self,
+        node: UnifiedTreeNode,
+        event: str,
+        tier: str,
+        outcome: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record one node's age when it is matched again or leaves a tier."""
+        mc = self.kv_age_metrics_collector()
+        if mc is None or node.parent is None or node.key is None:
+            return
+        if now is None:
+            now = time.monotonic()
+        age = now - node.last_access_wall
+        num_tokens = len(node.key)
+        if event == "hit":
+            mc.observe_kv_age(age, num_tokens, event="hit", tier=tier, outcome=outcome)
+        else:
+            mc.observe_kv_eviction(
+                age,
+                now - node.creation_wall,
+                node.hit_count,
+                num_tokens,
+                tier,
+                outcome,
+            )
+
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> UnifiedTreeNode:
@@ -1129,6 +1178,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        new_node.creation_wall = child.creation_wall
+        new_node.last_access_wall = child.last_access_wall
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -1155,6 +1206,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             child, UnifiedLRUList.insert_mru, skip_existing=True
         )
         child.last_access_time = get_and_increase_time_counter()
+        child.last_access_wall = time.monotonic()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
@@ -1162,6 +1214,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
+        node.last_access_wall = time.monotonic()
         if node != self.root_node:
             for comp in self._components_tuple:
                 if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1576,6 +1629,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         """GPU→CPU demotion: release all device resources, node stays in tree."""
         assert not node.evicted and node.backuped
+        self._emit_kv_age(node, "evict", "device", "demoted")
         trigger = self.components[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
@@ -1670,6 +1724,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # this node being a D-leaf, and D-leaves evict before ancestors.
             assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
             assert desc.write_through_pending_id is None
+            self._emit_kv_age(desc, "evict", "host", "dropped")
             self._release_all_component_layers(desc, StorageMedium.CPU, tracker)
             self._remove_leaf_from_parent(desc)
         self._delete_unbacked_device_leaf(node, tracker)
@@ -1695,6 +1750,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
     ) -> None:
         """Delete a device leaf that has no host backup, freeing all layers."""
+        self._emit_kv_age(node, "evict", "device", "dropped")
         self._release_all_component_layers(node, StorageMedium.GPU, tracker)
         parent = node.parent
         self._remove_leaf_from_parent(node)
@@ -1709,6 +1765,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
+        self._emit_kv_age(node, "evict", "host", "dropped")
         self._record_remove_event(node, medium=StorageMedium.CPU)
         for comp in self._components_tuple:
             _, hf = self._evict_component_and_detach_lru(

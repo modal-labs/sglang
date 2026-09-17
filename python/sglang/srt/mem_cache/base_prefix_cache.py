@@ -57,6 +57,21 @@ class MatchPrefixParams:
     repoint_only: bool = False
 
 
+def take_kv_age_hit_observation(params: MatchPrefixParams) -> bool:
+    """Return True for the first match_prefix a request performs, False after.
+
+    Only that first match measures real reuse: the scheduler re-matches waiting
+    requests every round and the cache re-matches after each insert, and those
+    would all land in the sub-second age bucket. Matches without a request
+    (tests, probes) never observe.
+    """
+    req = params.req
+    if req is None or getattr(req, "kv_age_hit_observed", False):
+        return False
+    req.kv_age_hit_observed = True
+    return True
+
+
 @dataclasses.dataclass
 class InsertParams:
     """Unified parameters for insert across different cache types"""
@@ -239,6 +254,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             RadixCacheMetricsCollector,
         )
         self.metrics_collector = radix_cache_cls(labels=labels)
+
+    def kv_age_metrics_collector(self) -> Optional[RadixCacheMetricsCollector]:
+        """The metrics collector iff the per-node KV age hooks are enabled."""
+        mc = self.metrics_collector
+        if mc is not None and mc.kv_age_enabled:
+            return mc
+        return None
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:

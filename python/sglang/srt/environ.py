@@ -259,6 +259,8 @@ class Envs:
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
 
     # Logging Options
+    # Per-node KV age/lifetime/reuse histograms (sglang:kv_age_seconds etc.); needs --enable-metrics.
+    SGLANG_ENABLE_KV_AGE_METRICS = EnvBool(False)
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
