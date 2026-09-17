@@ -50,6 +50,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_utils import to_fp8_satfinite
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -3987,7 +3988,10 @@ class MLATokenToKVPool(KVCache):
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
         if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
+            if self.dtype.is_floating_point and torch.finfo(self.dtype).bits == 8:
+                cache_k = to_fp8_satfinite(cache_k, self.dtype)
+            else:
+                cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
@@ -4032,8 +4036,12 @@ class MLATokenToKVPool(KVCache):
             )
         else:
             if cache_k_nope.dtype != self.dtype:
-                cache_k_nope = cache_k_nope.to(self.dtype)
-                cache_k_rope = cache_k_rope.to(self.dtype)
+                if self.dtype.is_floating_point and torch.finfo(self.dtype).bits == 8:
+                    cache_k_nope = to_fp8_satfinite(cache_k_nope, self.dtype)
+                    cache_k_rope = to_fp8_satfinite(cache_k_rope, self.dtype)
+                else:
+                    cache_k_nope = cache_k_nope.to(self.dtype)
+                    cache_k_rope = cache_k_rope.to(self.dtype)
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)

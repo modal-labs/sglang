@@ -14,9 +14,10 @@
 //   - warps [batch, batch + batch*H) convert one (token, head) query row
 //     and store it to the fp8 query output.
 //
-// Conversion is float-mediated cvt.rn.satfinite (__NV_NOSAT / E4M3),
-// matching torch's Tensor.to(float8_e4m3fn); the unit test asserts
-// bit-equality against the aten cast chain.
+// Conversion is float-mediated cvt.rn.satfinite (E4M3): round-to-nearest-even,
+// finite values beyond +-448 saturate to +-448 (0x7E/0xFE), only NaN inputs
+// produce the NaN encoding. The unit test asserts bit-equality against
+// clamp(+-448) -> Tensor.to(float8_e4m3fn).
 //
 // PDL: wait-primary before any load; trigger-secondary only after the
 // concat stores have issued and the TMA stores committed.
@@ -70,10 +71,10 @@ struct SetMlaKVConcatQFp8Params {
   int32_t qo_stride_1;
 };
 
-// 2x bf16 -> 2x fp8 e4m3, float-mediated cvt.rn NOSAT (matches aten: overflow -> NaN).
+// 2x bf16 -> 2x fp8 e4m3, float-mediated cvt.rn.satfinite.
 SGL_DEVICE uint16_t bf16x2_to_fp8x2(const bf16x2_t v) {
   const float2 f = __bfloat1622float2(v);
-  return __nv_cvt_float2_to_fp8x2(f, __NV_NOSAT, __NV_E4M3);
+  return __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
 }
 
 // Convert 8 bf16 (one int4 load) to 8 fp8 packed in a uint2.
