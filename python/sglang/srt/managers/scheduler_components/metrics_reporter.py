@@ -658,6 +658,13 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def record_admission_block(self, cause: str, num_blocked_reqs: int) -> None:
+        """A prefill admission pass ended with `num_blocked_reqs` waiting
+        requests it could not admit; `cause` is the gate that stopped it."""
+        if not self.current_scheduler_metrics_enabled:
+            return
+        self.metrics_collector.increment_admission_blocked(cause, num_blocked_reqs)
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
