@@ -999,81 +999,90 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     max_req_input_len=self.max_req_input_len,
                 )
 
-            if mm_inputs and mm_inputs.input_ids is not None:
-                input_ids = mm_inputs.input_ids
-                if envs.SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS.get():
-                    mm_inputs.input_ids = None
-            if mm_inputs and mm_inputs.token_type_ids is not None:
-                token_type_ids = mm_inputs.token_type_ids
-                if not isinstance(token_type_ids, list):
-                    token_type_ids = token_type_ids.flatten().tolist()
-            # Caller-supplied per-image hashes (external KV routers, e.g.
-            # routing-aware orchestrators that compute a content-addressed
-            # hash before dispatch). Setting MultimodalDataItem.hash here
-            # short-circuits the internal hash_feature() recompute inside
-            # set_pad_value(), making the derived pad_value deterministic
-            # from the caller's hash. That alignment lets the router's
-            # routing decision agree with sglang's prefix-cache key for
-            # the same image. On any per-item parse error or list-length
-            # mismatch we fall back to the internal recompute so a
-            # malformed mm_hashes never blocks a request.
-            caller_mm_hashes = getattr(obj, "mm_hashes", None)
-            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
-                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
-                    logger.warning(
-                        "mm_hashes length (%d) != mm_items length (%d); "
-                        "ignoring caller hashes for this request.",
-                        len(caller_mm_hashes),
-                        len(mm_inputs.mm_items),
-                    )
-                else:
-                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
-                        if not isinstance(item, MultimodalDataItem):
-                            continue
-                        try:
-                            item.set_hash(int(hex_hash, 16))
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Ignoring malformed mm_hashes entry %r; "
-                                "this item will fall back to hash_feature().",
-                                hex_hash,
-                            )
-            if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
-                and mm_inputs
-                and mm_inputs.mm_items
-            ):
-                for item in mm_inputs.mm_items:
-                    if isinstance(item, MultimodalDataItem):
-                        item.set_pad_value()
-        else:
-            mm_inputs = None
-
-        if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
-            from sglang.srt.multimodal.transport.lease_lifecycle import (
-                cancel_undispatched_proxies,
-            )
-
             try:
-                self._validate_one_request(obj, input_ids)
-                return self._create_tokenized_object(
-                    obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
-                )
-            except BaseException:
+                if mm_inputs and mm_inputs.input_ids is not None:
+                    input_ids = mm_inputs.input_ids
+                    if envs.SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS.get():
+                        mm_inputs.input_ids = None
+                if mm_inputs and mm_inputs.token_type_ids is not None:
+                    token_type_ids = mm_inputs.token_type_ids
+                    if not isinstance(token_type_ids, list):
+                        token_type_ids = token_type_ids.flatten().tolist()
+                # Caller-supplied per-image hashes (external KV routers, e.g.
+                # routing-aware orchestrators that compute a content-addressed
+                # hash before dispatch). Setting MultimodalDataItem.hash here
+                # short-circuits the internal hash_feature() recompute inside
+                # set_pad_value(), making the derived pad_value deterministic
+                # from the caller's hash. That alignment lets the router's
+                # routing decision agree with sglang's prefix-cache key for
+                # the same image. On any per-item parse error or list-length
+                # mismatch we fall back to the internal recompute so a
+                # malformed mm_hashes never blocks a request.
+                caller_mm_hashes = getattr(obj, "mm_hashes", None)
+                if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
+                    if len(caller_mm_hashes) != len(mm_inputs.mm_items):
+                        logger.warning(
+                            "mm_hashes length (%d) != mm_items length (%d); "
+                            "ignoring caller hashes for this request.",
+                            len(caller_mm_hashes),
+                            len(mm_inputs.mm_items),
+                        )
+                    else:
+                        for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
+                            if not isinstance(item, MultimodalDataItem):
+                                continue
+                            try:
+                                item.set_hash(int(hex_hash, 16))
+                            except (TypeError, ValueError):
+                                logger.warning(
+                                    "Ignoring malformed mm_hashes entry %r; "
+                                    "this item will fall back to hash_feature().",
+                                    hex_hash,
+                                )
                 if (
-                    getattr(self.mm_processor, "use_cuda_ipc", False)
+                    envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                     and mm_inputs
                     and mm_inputs.mm_items
                 ):
-                    cancel_undispatched_proxies(
-                        self.mm_processor.cudaipc_mmfeature_pool,
-                        mm_inputs.mm_items,
-                        context=f"tokenize rid={obj.rid}",
-                    )
+                    for item in mm_inputs.mm_items:
+                        if isinstance(item, MultimodalDataItem):
+                            item.set_pad_value()
+            except BaseException:
+                self._cancel_undispatched_mm_proxies(
+                    mm_inputs, context=f"tokenize rid={obj.rid}"
+                )
                 raise
-        self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+        else:
+            mm_inputs = None
+
+        try:
+            self._validate_one_request(obj, input_ids)
+            return self._create_tokenized_object(
+                obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+            )
+        except BaseException:
+            self._cancel_undispatched_mm_proxies(
+                mm_inputs, context=f"tokenize rid={obj.rid}"
+            )
+            raise
+
+    def _cancel_undispatched_mm_proxies(self, mm_inputs, *, context: str) -> None:
+        if not envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+            return
+        if not (
+            getattr(self.mm_processor, "use_cuda_ipc", False)
+            and mm_inputs
+            and mm_inputs.mm_items
+        ):
+            return
+        from sglang.srt.multimodal.transport.lease_lifecycle import (
+            cancel_undispatched_proxies,
+        )
+
+        cancel_undispatched_proxies(
+            self.mm_processor.cudaipc_mmfeature_pool,
+            mm_inputs.mm_items,
+            context=context,
         )
 
     def _validate_one_request(
@@ -1484,11 +1493,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
-        tokenized_obj.time_stats.set_api_server_dispatch_time()
-        tokenized_obj = wrap_shm_features(tokenized_obj)
-        time_stats = tokenized_obj.time_stats
-        tokenized_obj.wrap_pickle_fields()
-        self._dispatch_to_scheduler(tokenized_obj)
+        mm_inputs = getattr(tokenized_obj, "mm_inputs", None)
+        try:
+            tokenized_obj.time_stats.set_api_server_dispatch_time()
+            tokenized_obj = wrap_shm_features(tokenized_obj)
+            time_stats = tokenized_obj.time_stats
+            tokenized_obj.wrap_pickle_fields()
+            self._dispatch_to_scheduler(tokenized_obj)
+        except BaseException:
+            self._cancel_undispatched_mm_proxies(
+                mm_inputs, context=f"send rid={tokenized_obj.rid}"
+            )
+            raise
         tokenized_obj.time_stats = time_stats
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
@@ -1499,17 +1515,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
-        set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
-        time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
-        for tokenized_obj in tokenized_objs:
-            tokenized_obj.wrap_pickle_fields()
+        raw_mm_inputs = [
+            getattr(tokenized_obj, "mm_inputs", None)
+            for tokenized_obj in tokenized_objs
+        ]
+        try:
+            set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+            time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
+            for tokenized_obj in tokenized_objs:
+                tokenized_obj.wrap_pickle_fields()
 
-        if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-            batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
-        else:
-            batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+            if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
+                batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+            else:
+                batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
-        self._dispatch_to_scheduler(batch_req)
+            self._dispatch_to_scheduler(batch_req)
+        except BaseException:
+            for tokenized_obj, mm_inputs in zip(tokenized_objs, raw_mm_inputs):
+                self._cancel_undispatched_mm_proxies(
+                    mm_inputs,
+                    context=f"send-batch rid={tokenized_obj.rid}",
+                )
+            raise
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")

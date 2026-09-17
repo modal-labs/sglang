@@ -2481,20 +2481,26 @@ class Scheduler(
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
-            SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
+            try:
+                SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
-            # The following steps are already fast, execute locally on each rank.
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings.
-            # The pad function is model-specific and can be None for some backends.
-            if (
-                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
-                and self.pad_input_ids_func
-            ):
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
-                )
-            req.extend_image_inputs(image_inputs)
-            self._maybe_compute_mrope_positions(req)
+                # The following steps are already fast, execute locally on each rank.
+                # Expand a single image token into multiple dummy tokens for receiving image embeddings.
+                # The pad function is model-specific and can be None for some backends.
+                if (
+                    not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                    and self.pad_input_ids_func
+                ):
+                    req.origin_input_ids = array(
+                        "q",
+                        self.pad_input_ids_func(req.origin_input_ids, image_inputs),
+                    )
+                req.extend_image_inputs(image_inputs)
+                self._maybe_compute_mrope_positions(req)
+            except BaseException:
+                if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                    image_inputs.release_features()
+                raise
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -2857,21 +2863,26 @@ class Scheduler(
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            # The `pad_input_ids_func` is model-specific and may be None for
-            # embedding models or models not requiring special padding.
-            # If None, `req.origin_input_ids` is expected to be correctly populated already.
-            if (
-                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
-                and self.pad_input_ids_func
-            ):
-                # See companion call site above for the array.array wrap rationale.
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
-                )
+            try:
+                # Expand a single image token into multiple dummy tokens for receiving image embeddings
+                # The `pad_input_ids_func` is model-specific and may be None for
+                # embedding models or models not requiring special padding.
+                # If None, `req.origin_input_ids` is expected to be correctly populated already.
+                if (
+                    not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                    and self.pad_input_ids_func
+                ):
+                    # See companion call site above for the array.array wrap rationale.
+                    req.origin_input_ids = array(
+                        "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                    )
 
-            req.extend_image_inputs(image_inputs)
-            self._maybe_compute_mrope_positions(req)
+                req.extend_image_inputs(image_inputs)
+                self._maybe_compute_mrope_positions(req)
+            except BaseException:
+                if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
+                    image_inputs.release_features()
+                raise
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(

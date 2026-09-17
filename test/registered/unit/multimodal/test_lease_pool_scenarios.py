@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers import schedule_batch
+from sglang.srt.managers import mm_utils, schedule_batch
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Modality,
@@ -17,7 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import MMFeatureStreamSink
-from sglang.srt.multimodal.transport import lease_lifecycle
+from sglang.srt.multimodal.transport import lease_guard, lease_lifecycle
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.multimodal.transport.lease_guard import StaleLeaseError
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -44,6 +44,17 @@ class FakePool:
 def _proxy():
     proxy = object.__new__(CudaIpcTensorTransportProxy)
     proxy.proxy_state = {"ipc_extra": {"pool_handle": ("scenario",)}}
+    return proxy
+
+
+def _lease_proxy(generation=1, ready_byte_offset=0):
+    proxy = _proxy()
+    proxy.generation = generation
+    proxy.ready_byte_offset = ready_byte_offset
+    proxy.ack_byte_offset = 4
+    proxy.total_consumer_count = 1
+    proxy.transport_name = "CUDA IPC"
+    proxy._consumer_acknowledged = False
     return proxy
 
 
@@ -80,6 +91,154 @@ def _session_recv(rid, parent_rid=None):
         http_worker_ipc=None,
         time_stats=None,
     )
+
+
+def test_P44_nonowner_materialize_keeps_item_encodable():
+    lease_guard.reset()
+    proxy = _lease_proxy()
+    ack_count = 0
+    wait_count = 0
+
+    def reconstruct(_device_index):
+        nonlocal ack_count, wait_count
+        ack_count += 1
+        wait_count += 1
+        return torch.ones(1)
+
+    proxy.reconstruct_on_target_device = Mock(side_effect=reconstruct)
+    item = _item(proxy)
+
+    with patch.object(
+        schedule_batch, "CudaIpcTensorTransportProxy", CudaIpcTensorTransportProxy
+    ):
+        item.materialize_deferred_cuda_ipc_feature(0)
+
+    assert isinstance(item.feature, torch.Tensor)
+    assert ack_count == 1
+    assert wait_count == 1
+    item.reconstruct(0)
+    assert ack_count == 1
+    assert wait_count == 1
+
+    legacy_proxy = _lease_proxy()
+    legacy_item = _item(legacy_proxy)
+    legacy_proxy.acknowledge_consumption = Mock(
+        side_effect=lambda _count: lease_guard.record_write(legacy_proxy, rank=0)
+    )
+    legacy_proxy.reconstruct_on_target_device = (
+        lambda _device_index: lease_guard.check_read(legacy_proxy, rank=0)
+    )
+
+    with patch.object(
+        schedule_batch, "CudaIpcTensorTransportProxy", CudaIpcTensorTransportProxy
+    ):
+        legacy_item.acknowledge_deferred_cuda_ipc_feature(1)
+        with pytest.raises(StaleLeaseError):
+            legacy_item.reconstruct(0)
+    legacy_proxy.acknowledge_consumption.assert_called_once_with(1)
+    lease_guard.reset()
+
+
+def test_P44_cache_hit_materializes_under_lease_flag():
+    proxy = _lease_proxy()
+    proxy.reconstruct_on_target_device = Mock(return_value=torch.ones(1))
+    item = _item(proxy)
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(
+            schedule_batch, "CudaIpcTensorTransportProxy", CudaIpcTensorTransportProxy
+        ),
+        patch(
+            "sglang.srt.managers.mm_utils.torch.cuda.current_device",
+            return_value=0,
+        ),
+    ):
+        mm_utils._acknowledge_deferred_cuda_ipc_cache_hits([item])
+
+    assert isinstance(item.feature, torch.Tensor)
+    proxy = _lease_proxy()
+    item = _item(proxy)
+    item.acknowledge_deferred_cuda_ipc_feature = Mock()
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False),
+        patch.object(
+            mm_utils,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_tp_rank=0, attn_tp_size=2),
+        ),
+        patch.object(
+            mm_utils, "get_server_args", return_value=SimpleNamespace(tp_size=8)
+        ),
+    ):
+        mm_utils._acknowledge_deferred_cuda_ipc_cache_hits([item])
+
+    item.acknowledge_deferred_cuda_ipc_feature.assert_called_once_with(8)
+    assert item.feature is proxy
+
+
+def test_P44_stale_acknowledge_enqueues_no_wait():
+    lease_guard.reset()
+    recorded = _lease_proxy(generation=7)
+    lease_guard.record_write(recorded, rank=0)
+    fresh = _lease_proxy(generation=7)
+
+    with (
+        patch(
+            "sglang.srt.multimodal.transport.memory_pool.stream_wait_value32"
+        ) as wait_ready,
+        patch(
+            "sglang.srt.multimodal.transport.memory_pool.stream_write_value32"
+        ) as write_ack_memory_pool,
+        patch(
+            "sglang.srt.multimodal.transport.cuda_ipc.stream_write_value32"
+        ) as write_ack,
+    ):
+        fresh.acknowledge_consumption(1)
+
+    assert fresh._consumer_acknowledged is True
+    wait_ready.assert_not_called()
+    write_ack_memory_pool.assert_not_called()
+    write_ack.assert_not_called()
+    lease_guard.reset()
+
+
+def test_P44_prefix_resident_materializes_then_reencodes():
+    lease_guard.reset()
+    proxy = _lease_proxy()
+    proxy.reconstruct_on_target_device = Mock(return_value=torch.ones(1))
+    item = _item(proxy)
+    item.offsets = [(0, 3)]
+    mm_inputs = MultimodalInputs(mm_items=[item])
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(
+            schedule_batch, "CudaIpcTensorTransportProxy", CudaIpcTensorTransportProxy
+        ),
+        patch.object(schedule_batch.torch.cuda, "current_device", return_value=0),
+    ):
+        assert mm_inputs.acknowledge_prefix_resident_items(4) == 1
+
+    assert isinstance(item.feature, torch.Tensor)
+    item.reconstruct(0)
+    proxy = _lease_proxy()
+    legacy_item = _item(proxy)
+    legacy_item.offsets = [(0, 3)]
+    proxy.acknowledge_consumption = Mock(
+        side_effect=lambda _count: lease_guard.record_write(proxy, rank=0)
+    )
+    proxy.reconstruct_on_target_device = lambda _device_index: lease_guard.check_read(
+        proxy, rank=0
+    )
+    with patch.object(
+        schedule_batch, "CudaIpcTensorTransportProxy", CudaIpcTensorTransportProxy
+    ):
+        legacy_item.acknowledge_deferred_cuda_ipc_feature(1)
+        with pytest.raises(StaleLeaseError):
+            legacy_item.reconstruct(0)
+    lease_guard.reset()
 
 
 def test_WQH0_waiting_timeout_abort_releases_once():
@@ -1074,3 +1233,38 @@ def test_P44_waiting_timeout_releases_timed_out_leases():
     assert scheduler.waiting_queue == [fresh]
     stale_release.assert_called_once_with()
     fresh_release.assert_not_called()
+
+
+def test_P44_retract_resets_prefix_ack_state():
+    """A retracted request re-prefills and must re-ack prefix-resident leases."""
+    proxy_a = _lease_proxy()
+    proxy_a.reconstruct_on_target_device = Mock(return_value=torch.ones(1))
+    item_a = _item(proxy_a)
+    item_a.offsets = [(0, 3)]
+    proxy_b = _lease_proxy(generation=2, ready_byte_offset=8)
+    proxy_b.reconstruct_on_target_device = Mock(return_value=torch.ones(1))
+    item_b = _item(proxy_b)
+    item_b.offsets = [(4, 7)]
+    req = Req("rid", "", array("q", [1] * 8), SamplingParams(max_new_tokens=1))
+    req.multimodal_inputs = MultimodalInputs(mm_items=[item_a, item_b])
+    req.prefix_indices = torch.arange(4)
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(
+            schedule_batch, "CudaIpcTensorTransportProxy", CudaIpcTensorTransportProxy
+        ),
+        patch.object(schedule_batch.torch.cuda, "current_device", return_value=0),
+    ):
+        schedule_batch._acknowledge_prefix_resident_requests([req])
+        assert isinstance(item_a.feature, torch.Tensor)
+        assert item_b.feature is proxy_b
+        assert req.mm_prefix_ack_done is True
+
+        req.reset_for_retract()
+        assert req.mm_prefix_ack_done is False
+
+        req.prefix_indices = torch.arange(8)
+        schedule_batch._acknowledge_prefix_resident_requests([req])
+        assert isinstance(item_b.feature, torch.Tensor)
+        proxy_a.reconstruct_on_target_device.assert_called_once()

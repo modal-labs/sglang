@@ -779,12 +779,15 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 pixel_values_dtype=target_dtype,
             )
             if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
-                # Image-wise DP: non-owner ranks release their ack word here.
+                lease_device_index = device.index
+                if device.type == "cuda" and lease_device_index is None:
+                    lease_device_index = torch.cuda.current_device()
+                # Image-wise DP: non-owner ranks copy the slice out and ack here.
                 for image_index, item in enumerate(items):
                     if image_index not in encoded_image_indices and isinstance(
                         item.feature, CudaIpcTensorTransportProxy
                     ):
-                        item.acknowledge_deferred_cuda_ipc_feature(1)
+                        item.materialize_deferred_cuda_ipc_feature(lease_device_index)
             image_features = self.mm_projector(image_embeds)
             return image_features
 

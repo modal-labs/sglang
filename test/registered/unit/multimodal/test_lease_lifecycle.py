@@ -5,6 +5,7 @@ import hashlib
 import os
 import subprocess
 import sys
+from array import array
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -14,6 +15,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers import tokenizer_manager
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -24,6 +26,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.multimodal.processors.kimi_k25 import MMFeatureStreamSink
 from sglang.srt.multimodal.transport import lease_lifecycle
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -302,6 +305,159 @@ def test_feature_sink_cancels_proxies_but_not_cpu_fallback():
 
     assert isinstance(fallback, torch.Tensor)
     assert pool.cancelled == [proxy]
+
+
+def test_pad_value_failure_cancels_undispatched_proxies():
+    pool = FakePool()
+    proxy = _proxy()
+    mm_output = MultimodalProcessorOutput(
+        input_ids=[1],
+        mm_items=[MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)],
+    )
+    mm_output.mm_items[0].set_pad_value = Mock(side_effect=RuntimeError("pad failed"))
+    processor = SimpleNamespace(
+        use_cuda_ipc=True,
+        prefer_tokenized_input=False,
+        cudaipc_mmfeature_pool=pool,
+    )
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.mm_processor = processor
+    manager.server_args = SimpleNamespace(
+        language_only=False,
+        encoder_transfer_backend=None,
+        disable_radix_cache=True,
+    )
+    manager.model_config = SimpleNamespace(hf_config=SimpleNamespace(architectures=[]))
+    manager.max_req_input_len = 16
+    manager.tokenizer = None
+    manager._validate_mm_limits = lambda obj: None
+    manager._validate_one_request = Mock()
+    obj = SimpleNamespace(
+        rid="pad-value-failure",
+        text="",
+        input_ids=[1],
+        input_embeds=None,
+        image_data=["image"],
+        audio_data=None,
+        video_data=None,
+        need_wait_for_mm_inputs=False,
+        mm_hashes=None,
+        contains_mm_input=lambda: True,
+    )
+
+    async def process_mm_data_async(**kwargs):
+        return mm_output
+
+    processor.process_mm_data_async = process_mm_data_async
+
+    async def run():
+        with (
+            envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+            envs.SGLANG_MM_PRECOMPUTE_HASH.override(True),
+            pytest.raises(RuntimeError, match="pad failed"),
+        ):
+            await manager._tokenize_one_request(obj)
+
+    asyncio.run(run())
+
+    assert pool.cancelled == [proxy]
+
+
+def test_send_failure_before_dispatch_cancels_undispatched_proxies():
+    def _manager_and_obj():
+        pool = FakePool()
+        proxy = _proxy()
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.mm_processor = SimpleNamespace(
+            use_cuda_ipc=True,
+            cudaipc_mmfeature_pool=pool,
+        )
+        manager._dispatch_to_scheduler = Mock(side_effect=RuntimeError("zmq down"))
+        tokenized_obj = SimpleNamespace(
+            rid="send-failure",
+            mm_inputs=MultimodalInputs(
+                mm_items=[MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)]
+            ),
+            time_stats=Mock(),
+            wrap_pickle_fields=Mock(),
+        )
+        return pool, proxy, manager, tokenized_obj
+
+    pool, proxy, manager, tokenized_obj = _manager_and_obj()
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(tokenizer_manager, "wrap_shm_features", side_effect=lambda o: o),
+        pytest.raises(RuntimeError, match="zmq down"),
+    ):
+        manager._send_one_request(tokenized_obj)
+
+    assert pool.cancelled == [proxy]
+
+    pool, proxy, manager, tokenized_obj = _manager_and_obj()
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False),
+        patch.object(tokenizer_manager, "wrap_shm_features", side_effect=lambda o: o),
+        pytest.raises(RuntimeError, match="zmq down"),
+    ):
+        manager._send_one_request(tokenized_obj)
+
+    assert pool.cancelled == []
+
+
+def test_send_batch_failure_cancels_each_request_mm_inputs():
+    pool = FakePool()
+    proxies = [_proxy(), _proxy()]
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.mm_processor = SimpleNamespace(
+        use_cuda_ipc=True,
+        cudaipc_mmfeature_pool=pool,
+    )
+    manager._dispatch_to_scheduler = Mock(side_effect=RuntimeError("zmq down"))
+    tokenized_objs = []
+    for index, proxy in enumerate(proxies):
+        tokenized_obj = TokenizedGenerateReqInput(
+            rid=f"send-batch-{index}",
+            input_text="",
+            input_ids=array("q", [1]),
+            input_embeds=None,
+            mm_inputs=MultimodalInputs(
+                mm_items=[MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)]
+            ),
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=1),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+        )
+        tokenized_obj.time_stats = Mock()
+        tokenized_objs.append(tokenized_obj)
+
+    original_mm_inputs = [tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs]
+
+    wrap_index = 0
+
+    def replace_mm_inputs():
+        nonlocal wrap_index
+        tokenized_objs[wrap_index].mm_inputs = object()
+        wrap_index += 1
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(
+            TokenizedGenerateReqInput,
+            "wrap_pickle_fields",
+            side_effect=replace_mm_inputs,
+        ),
+        pytest.raises(RuntimeError, match="zmq down"),
+    ):
+        manager._send_batch_request(tokenized_objs)
+
+    assert pool.cancelled == proxies
+    assert [
+        tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
+    ] != original_mm_inputs
 
 
 if __name__ == "__main__":

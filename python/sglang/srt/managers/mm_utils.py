@@ -564,16 +564,16 @@ def _move_items_to_device(
 def _acknowledge_deferred_cuda_ipc_cache_hits(
     items: List[MultimodalDataItem],
 ) -> None:
-    """Release lazy Kimi IPC slices when a cached embedding skips ViT.
+    """Handle lazy Kimi IPC slices when a cached embedding skips ViT.
 
     On an encoder-DP miss, exactly one rank copies an image and acknowledges
     the full TP group.  On a cache hit no rank copies it, so rank zero performs
-    the equivalent single acknowledgement.  This preserves the fixed-pool
-    lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
+    the equivalent single acknowledgement.  Under the lease pool, the slice
+    is copied out so the item stays encodable on a later pass.
     """
     if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
         for item in items:
-            item.acknowledge_deferred_cuda_ipc_feature(1)
+            item.materialize_deferred_cuda_ipc_feature(torch.cuda.current_device())
     else:
         parallel = get_parallel()
         if parallel.attn_tp_rank != 0:

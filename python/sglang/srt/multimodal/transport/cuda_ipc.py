@@ -321,6 +321,13 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         """Stream-order pool release when a cache hit needs no tensor copy."""
         if self._consumer_acknowledged:
             return
+        if consumer_count == 1 or consumer_count == self.total_consumer_count:
+            own_rank = resolve_consumer_rank(
+                self.total_consumer_count, consumer_rank, self.transport_name
+            )
+            if not lease_guard.check_write(self, rank=own_rank):
+                self._consumer_acknowledged = True
+                return
         device_id = torch.cuda.current_device()
         with torch.cuda.device(device_id):
             _, storage = self._open_pool_slice(device_id)

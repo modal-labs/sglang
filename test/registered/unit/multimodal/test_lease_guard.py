@@ -12,6 +12,7 @@ from sglang.srt.managers.mm_utils import PerImageRequestInfo
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalInputs,
     MultimodalProcessorOutput,
 )
 from sglang.srt.models import kimi_k3, kimi_k25
@@ -141,12 +142,13 @@ def test_deferred_cache_hits_ack_each_rank_only_with_flag():
 
     with (
         patch.object(mm_utils, "get_parallel", return_value=parallel),
+        patch.object(mm_utils.torch.cuda, "current_device", return_value=0),
         envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
     ):
         mm_utils._acknowledge_deferred_cuda_ipc_cache_hits(items)
 
     for item in items:
-        item.acknowledge_deferred_cuda_ipc_feature.assert_called_once_with(1)
+        item.materialize_deferred_cuda_ipc_feature.assert_called_once_with(0)
 
     for item in items:
         item.reset_mock()
@@ -172,7 +174,7 @@ def test_k3_dp_non_owner_acknowledges_deferred_proxy():
         model_specific_data={"image_grid_thw": torch.tensor([[1, 1, 1]])},
     )
     item_owner.reconstruct = Mock()
-    item_non_owner.acknowledge_deferred_cuda_ipc_feature = Mock()
+    item_non_owner.materialize_deferred_cuda_ipc_feature = Mock()
 
     model = object.__new__(kimi_k3.KimiK3ForConditionalGeneration)
     model.use_data_parallel = True
@@ -209,7 +211,7 @@ def test_k3_dp_non_owner_acknowledges_deferred_proxy():
         model.get_image_feature([item_owner, item_non_owner])
 
     item_owner.reconstruct.assert_called_once_with(0, ipc_consumer_count=1)
-    item_non_owner.acknowledge_deferred_cuda_ipc_feature.assert_called_once_with(1)
+    item_non_owner.materialize_deferred_cuda_ipc_feature.assert_called_once_with(0)
 
 
 def test_k25_dp_non_owner_acknowledges_deferred_proxy():
@@ -224,7 +226,7 @@ def test_k25_dp_non_owner_acknowledges_deferred_proxy():
         model_specific_data={"image_grid_thw": torch.tensor([[1, 1, 1]])},
     )
     item_owner.reconstruct = Mock()
-    item_non_owner.acknowledge_deferred_cuda_ipc_feature = Mock()
+    item_non_owner.materialize_deferred_cuda_ipc_feature = Mock()
 
     model = object.__new__(kimi_k25.KimiK25ForConditionalGeneration)
     model.use_data_parallel = True
@@ -261,7 +263,7 @@ def test_k25_dp_non_owner_acknowledges_deferred_proxy():
         model.get_image_feature([item_owner, item_non_owner])
 
     item_owner.reconstruct.assert_called_once_with(0, ipc_consumer_count=1)
-    item_non_owner.acknowledge_deferred_cuda_ipc_feature.assert_called_once_with(1)
+    item_non_owner.materialize_deferred_cuda_ipc_feature.assert_called_once_with(0)
 
 
 def test_broadcast_materialization_passes_group_consumer_count():
@@ -294,7 +296,7 @@ def _prefix_item(offsets):
         offsets=offsets,
         feature=_proxy(),
     )
-    item.acknowledge_deferred_cuda_ipc_feature = Mock()
+    item.materialize_deferred_cuda_ipc_feature = Mock()
     return item
 
 
@@ -313,12 +315,13 @@ def test_prefix_resident_ack_only_covers_wholly_cached_items():
             "CudaIpcTensorTransportProxy",
             CudaIpcTensorTransportProxy,
         ),
+        patch.object(schedule_batch.torch.cuda, "current_device", return_value=0),
     ):
         assert mm_inputs.acknowledge_prefix_resident_items(15) == 1
 
-    items[0].acknowledge_deferred_cuda_ipc_feature.assert_called_once_with(1)
-    items[1].acknowledge_deferred_cuda_ipc_feature.assert_not_called()
-    items[2].acknowledge_deferred_cuda_ipc_feature.assert_not_called()
+    items[0].materialize_deferred_cuda_ipc_feature.assert_called_once_with(0)
+    items[1].materialize_deferred_cuda_ipc_feature.assert_not_called()
+    items[2].materialize_deferred_cuda_ipc_feature.assert_not_called()
 
 
 def test_prefix_resident_ack_requires_all_offsets_inside_prefix():
@@ -333,11 +336,12 @@ def test_prefix_resident_ack_requires_all_offsets_inside_prefix():
             "CudaIpcTensorTransportProxy",
             CudaIpcTensorTransportProxy,
         ),
+        patch.object(schedule_batch.torch.cuda, "current_device", return_value=0),
     ):
         assert mm_inputs.acknowledge_prefix_resident_items(15) == 1
 
-    inside.acknowledge_deferred_cuda_ipc_feature.assert_called_once_with(1)
-    crossing.acknowledge_deferred_cuda_ipc_feature.assert_not_called()
+    inside.materialize_deferred_cuda_ipc_feature.assert_called_once_with(0)
+    crossing.materialize_deferred_cuda_ipc_feature.assert_not_called()
 
 
 def test_prefix_resident_ack_request_guard_is_idempotent():
@@ -377,7 +381,7 @@ def test_per_image_cache_hits_and_duplicate_hashes_ack_before_encoding():
         feature=_proxy(),
     )
     for item in (item_a, item_b, item_c):
-        item.acknowledge_deferred_cuda_ipc_feature = Mock()
+        item.materialize_deferred_cuda_ipc_feature = Mock()
     mm_utils.embedding_cache.set(
         1, mm_utils.EmbeddingResult(embedding=torch.ones(10, 2))
     )
@@ -405,23 +409,24 @@ def test_per_image_cache_hits_and_duplicate_hashes_ack_before_encoding():
             "CudaIpcTensorTransportProxy",
             CudaIpcTensorTransportProxy,
         ),
+        patch.object(mm_utils.torch.cuda, "current_device", return_value=0),
     ):
         mm_utils._batch_encode_per_image_misses(
             lambda items: torch.ones(10, 2), requests, torch.device("cpu")
         )
 
-    item_a.acknowledge_deferred_cuda_ipc_feature.assert_called_once_with(1)
-    item_b.acknowledge_deferred_cuda_ipc_feature.assert_not_called()
-    item_c.acknowledge_deferred_cuda_ipc_feature.assert_called_once_with(1)
+    item_a.materialize_deferred_cuda_ipc_feature.assert_called_once_with(0)
+    item_b.materialize_deferred_cuda_ipc_feature.assert_not_called()
+    item_c.materialize_deferred_cuda_ipc_feature.assert_called_once_with(0)
 
     for item in (item_a, item_b, item_c):
-        item.acknowledge_deferred_cuda_ipc_feature.reset_mock()
+        item.materialize_deferred_cuda_ipc_feature.reset_mock()
     with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False):
         mm_utils._batch_encode_per_image_misses(
             lambda items: torch.ones(10, 2), requests, torch.device("cpu")
         )
     for item in (item_a, item_b, item_c):
-        item.acknowledge_deferred_cuda_ipc_feature.assert_not_called()
+        item.materialize_deferred_cuda_ipc_feature.assert_not_called()
 
 
 def test_scheduler_rejection_releases_raw_mm_proxy():
@@ -463,6 +468,109 @@ def test_scheduler_rejection_releases_raw_mm_proxy():
         instance.handle_generate_request(recv_req)
 
     proxy.release_without_reconstruction.assert_called_once_with(1)
+
+
+def test_mm_attach_failure_releases_features():
+    """An exception while attaching mm inputs (pad/mrope path) must release the
+    image_inputs fetched by _get_multimodal_inputs instead of orphaning them."""
+    image_inputs = MultimodalInputs(mm_items=[])
+    image_inputs.release_features = Mock()
+    recv_req = Mock()
+    recv_req.session_params = None
+    recv_req.session_id = None
+    recv_req.input_embeds = None
+    recv_req.bootstrap_port = 8998
+    recv_req.input_ids = [1]
+    recv_req.mm_inputs = SimpleNamespace(mm_items=[])
+    req = SimpleNamespace(
+        return_sampling_mask=False,
+        tokenizer=None,
+    )
+    instance = object.__new__(scheduler.Scheduler)
+    instance.server_args = SimpleNamespace(
+        enable_session_radix_cache=False,
+        disaggregation_bootstrap_port=8998,
+    )
+    instance.session_controller = {}
+    instance.model_config = SimpleNamespace(vocab_size=8, hf_eos_token_id=None)
+    instance.tokenizer = None
+    instance.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    instance.dllm_config = None
+    instance.disaggregation_mode = scheduler.DisaggregationMode.NULL
+    instance.spec_algorithm = SimpleNamespace(
+        is_dflash_family=lambda: False,
+        is_none=lambda: True,
+    )
+    instance._maybe_namespace_elastic_radix_cache = Mock()
+    instance._get_multimodal_inputs = Mock(return_value=image_inputs)
+    instance._try_apply_padded_mm_input_ids = Mock(
+        side_effect=RuntimeError("pad failed")
+    )
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True),
+        patch.object(scheduler, "Req", return_value=req),
+        patch.object(scheduler.SessionController, "adjust_mm_offsets"),
+        pytest.raises(RuntimeError, match="pad failed"),
+    ):
+        instance.handle_generate_request(recv_req)
+
+    image_inputs.release_features.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("lease_enabled", "release_count"),
+    [(True, 1), (False, 0)],
+)
+def test_mm_mrope_failure_releases_features_only_with_flag(
+    lease_enabled, release_count
+):
+    image_inputs = MultimodalInputs(mm_items=[])
+    image_inputs.release_features = Mock()
+    recv_req = Mock()
+    recv_req.session_params = None
+    recv_req.session_id = None
+    recv_req.input_embeds = None
+    recv_req.bootstrap_port = 8998
+    recv_req.input_ids = [1]
+    recv_req.mm_inputs = SimpleNamespace(mm_items=[])
+    req = SimpleNamespace(
+        return_sampling_mask=False,
+        tokenizer=None,
+        origin_input_ids=[1],
+        extend_image_inputs=Mock(),
+    )
+    instance = object.__new__(scheduler.Scheduler)
+    instance.server_args = SimpleNamespace(
+        enable_session_radix_cache=False,
+        disaggregation_bootstrap_port=8998,
+    )
+    instance.session_controller = {}
+    instance.model_config = SimpleNamespace(vocab_size=8, hf_eos_token_id=None)
+    instance.tokenizer = None
+    instance.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    instance.dllm_config = None
+    instance.disaggregation_mode = scheduler.DisaggregationMode.NULL
+    instance.spec_algorithm = SimpleNamespace(
+        is_dflash_family=lambda: False,
+        is_none=lambda: True,
+    )
+    instance.pad_input_ids_func = None
+    instance._maybe_namespace_elastic_radix_cache = Mock()
+    instance._get_multimodal_inputs = Mock(return_value=image_inputs)
+    instance._try_apply_padded_mm_input_ids = Mock(return_value=True)
+    instance._maybe_compute_mrope_positions = Mock(
+        side_effect=RuntimeError("mrope failed")
+    )
+
+    with (
+        envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(lease_enabled),
+        patch.object(scheduler, "Req", return_value=req),
+        pytest.raises(RuntimeError, match="mrope failed"),
+    ):
+        instance.handle_generate_request(recv_req)
+
+    assert image_inputs.release_features.call_count == release_count
 
 
 if __name__ == "__main__":

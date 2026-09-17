@@ -444,6 +444,10 @@ class MultimodalDataItem:
                 )
             self.feature.acknowledge_consumption(consumer_count)
 
+    def materialize_deferred_cuda_ipc_feature(self, device_index: int) -> None:
+        if isinstance(self.feature, CudaIpcTensorTransportProxy):
+            self.reconstruct(device_index, ipc_consumer_count=1)
+
     def release_transport_proxies(self, consumer_count: int = 1) -> None:
         """Best-effort release of proxies left by an abandoned request."""
         values = [self.feature, self.precomputed_embeddings]
@@ -595,7 +599,7 @@ class MultimodalInputs:
     visible_frame_counts: Optional[torch.Tensor] = None
 
     def acknowledge_prefix_resident_items(self, prefix_len: int) -> int:
-        """Acknowledge deferred proxies fully covered by the cached prefix."""
+        """Materialize deferred proxies fully covered by the cached prefix."""
         acknowledged = 0
         for item in self.mm_items:
             if (
@@ -603,7 +607,7 @@ class MultimodalInputs:
                 and item.offsets is not None
                 and all(end < prefix_len for start, end in item.offsets)
             ):
-                item.acknowledge_deferred_cuda_ipc_feature(1)
+                item.materialize_deferred_cuda_ipc_feature(torch.cuda.current_device())
                 acknowledged += 1
         return acknowledged
 
@@ -1743,6 +1747,7 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        self.mm_prefix_ack_done = False
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.skip_lock_node_ids = {}
