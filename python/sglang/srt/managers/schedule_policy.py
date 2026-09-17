@@ -59,12 +59,14 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: F401  re-exported; tests import it here
+    get_mamba_cache_miss_tokens,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
-    MatchResult,
     zero_match_result,
 )
 from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
@@ -153,22 +155,6 @@ def estimate_prefill_extend_tile_metrics(
         "saved_q_tiles_per_head": saved_tiles,
         "saved_q_tile_ratio": saved_ratio,
     }
-
-
-def get_mamba_cache_miss_tokens(match_result: MatchResult) -> int:
-    """Return Full-KV tokens blocked by a missing reusable Mamba checkpoint."""
-    if match_result.mamba_branching_seqlen is None:
-        return 0
-
-    mamba_boundary_len = len(match_result.device_indices) + match_result.host_hit_length
-    if match_result.full_kv_hit_length <= mamba_boundary_len:
-        return 0
-
-    return max(
-        min(match_result.mamba_branching_seqlen, match_result.full_kv_hit_length)
-        - mamba_boundary_len,
-        0,
-    )
 
 
 def match_prefix_for_req(

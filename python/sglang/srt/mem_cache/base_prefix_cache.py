@@ -72,6 +72,22 @@ class MatchPrefixParams:
     req: Optional[Req] = None
 
 
+def get_mamba_cache_miss_tokens(match_result: MatchResult) -> int:
+    """Return Full-KV tokens blocked by a missing reusable Mamba checkpoint."""
+    if match_result.mamba_branching_seqlen is None:
+        return 0
+
+    mamba_boundary_len = len(match_result.device_indices) + match_result.host_hit_length
+    if match_result.full_kv_hit_length <= mamba_boundary_len:
+        return 0
+
+    return max(
+        min(match_result.mamba_branching_seqlen, match_result.full_kv_hit_length)
+        - mamba_boundary_len,
+        0,
+    )
+
+
 def kv_age_hit_pending(params: MatchPrefixParams) -> bool:
     """True until the request's first *non-empty* match has been observed.
 
