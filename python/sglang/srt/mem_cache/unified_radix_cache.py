@@ -866,7 +866,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
         if getattr(req, "evict_on_finish", False):
-            self._evict_finished_req_prefix(req)
+            self.evict_finished_req_prefix(
+                req.last_node,
+                matched_len=req.cache_protected_len,
+                kv_len=self.finished_key_len(kv_len_to_handle),
+                rid=req.rid,
+            )
 
         # cleanup
         for comp in self._components_tuple:
@@ -1662,13 +1667,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.eviction_strategy.get_priority(node),
         )
 
-    def _evict_finished_req_prefix(self, req: Req) -> dict[ComponentType, int]:
+    def finished_key_len(self, kv_len: int) -> int:
+        # EAGLE keys are bigrams: N raw tokens produce N-1 key entries.
+        n = kv_len - 1 if self.is_eagle and kv_len > 0 else kv_len
+        return n // self.page_size * self.page_size
+
+    def evict_finished_req_prefix(
+        self, last_node, *, matched_len: int, kv_len: int, rid=None
+    ) -> dict[ComponentType, int]:
         """Explicit eviction signal (``Req.evict_on_finish``): the client says
         this request is the last turn of its trajectory and the prefix will not
         be reused. A finished request is otherwise the most recently used entry
-        in the tree and outlives idle-but-live sessions under LRU.
+        in the tree and outlives idle-but-live sessions under LRU. The request
+        owns a node only if it extended strictly past it (``kv_len >
+        matched_len``); a request whose tokens end exactly at an existing node
+        has no claim on it.
 
-        Walk up from ``req.last_node`` while the node is private to this
+        Walk up from ``last_node`` while the node is private to this
         trajectory: every child (if any) is itself a marked chain member. Stop
         at the first node shared with another chain or pinned by a lock
         (another request, an in-flight backup or load-back).
@@ -1683,7 +1698,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         them before any live entry.
         """
         tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
-        node = req.last_node
+        if kv_len <= matched_len:
+            return tracker
+        node = last_node
         marked = 0
         while node is not None and node is not self.root_node:
             if any(not child.evict_first for child in node.children.values()):
@@ -1704,7 +1721,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if marked:
             logger.debug(
                 "evict_on_finish rid=%s: marked %d nodes, freed device tokens %s",
-                getattr(req, "rid", None),
+                rid,
                 marked,
                 {ct.name: n for ct, n in tracker.items() if n},
             )

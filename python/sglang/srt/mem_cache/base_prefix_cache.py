@@ -299,6 +299,23 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
+    def finished_key_len(self, kv_len: int) -> int:
+        """Logical (page-aligned) radix-key length a finished request of ``kv_len``
+        tokens inserts; the unit ``evict_finished_req_prefix`` compares against
+        ``matched_len``."""
+        return kv_len // self.page_size * self.page_size
+
+    def evict_finished_req_prefix(
+        self, last_node, *, matched_len: int, kv_len: int, rid=None
+    ) -> None:
+        """Explicit eviction signal (``Req.evict_on_finish``): free the prefix chain
+        ending at ``last_node`` that is private to the finishing request. The request
+        owns a node only if it extended strictly past it (``kv_len > matched_len``,
+        where ``kv_len`` is the logical key length ``finished_key_len``); a request
+        whose tokens end exactly at an existing node has no claim on it.
+        Backends without an implementation keep the tree untouched."""
+        return None
+
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass

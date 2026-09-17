@@ -494,6 +494,14 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+        if getattr(req, "evict_on_finish", False):
+            self.evict_finished_req_prefix(
+                req.last_node,
+                matched_len=req.cache_protected_len,
+                kv_len=self.finished_key_len(kv_len_to_handle),
+                rid=req.rid,
+            )
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
@@ -561,6 +569,40 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         req.last_node = new_last_node
 
         self._tag_session_leaf(req, radix_key, node=new_last_node)
+
+    def finished_key_len(self, kv_len: int) -> int:
+        # EAGLE keys are bigrams: N raw tokens produce N-1 key entries.
+        n = kv_len - 1 if self.is_eagle and kv_len > 0 else kv_len
+        return n // self.page_size * self.page_size
+
+    def evict_finished_req_prefix(self, last_node, *, matched_len, kv_len, rid=None):
+        """Explicit eviction signal (``Req.evict_on_finish``): free the prefix
+        chain ending at ``last_node`` that is private to the finishing request.
+        The request owns a node only if it extended strictly past it
+        (``kv_len > matched_len``); a request whose tokens end exactly at an
+        existing node has no claim on it.
+
+        Chunked prefill keeps inserting chunks via ``cache_unfinished_req`` so
+        concurrent requests can still share them during chunking; the private
+        ones are removed at finish by this walk.
+        """
+        if self.disable or kv_len <= matched_len:
+            return
+        node = last_node
+        while node is not None and node is not self.root_node:
+            if (
+                node.lock_ref > 0
+                or len(node.children) > 0
+                or node.evicted
+                or node.backuped
+            ):
+                break  # shared, pinned, or host-backed (HiRadixCache) — not ours to drop
+            parent = node.parent
+            self._observe_kv_eviction(node, len(node.value), "device", "dropped")
+            self.token_to_kv_pool_allocator.free(node.value)
+            self._delete_leaf(node)
+            self._record_remove_event(node)
+            node = parent
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)

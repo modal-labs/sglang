@@ -350,6 +350,17 @@ class StreamingSession(BasePrefixCache):
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
 
+        if getattr(req, "evict_on_finish", False):
+            lock_node, matched_len = slot.last_node, slot.cache_protected_len
+            self.release_session(session_id)
+            if lock_node is not None and not isinstance(lock_node, _VirtualNode):
+                self.inner.evict_finished_req_prefix(
+                    lock_node,
+                    matched_len=matched_len,
+                    kv_len=self.inner.finished_key_len(target),
+                    rid=req.rid,
+                )
+
         return True
 
     def try_cache_unfinished_req(

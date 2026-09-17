@@ -661,6 +661,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
 
+        if getattr(req, "evict_on_finish", False):
+            self.evict_finished_req_prefix(
+                req.last_node,
+                matched_len=req.cache_protected_len,
+                kv_len=self.finished_key_len(kv_len_to_handle),
+                rid=req.rid,
+            )
+
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
 
@@ -789,6 +797,29 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
+
+    def evict_finished_req_prefix(self, last_node, *, matched_len, kv_len, rid=None):
+        """Explicit eviction signal (``Req.evict_on_finish``): free the prefix
+        chain ending at ``last_node`` that is private to the finishing request.
+        The request owns a node only if it extended strictly past it
+        (``kv_len > matched_len``); a request whose tokens end exactly at an
+        existing node has no claim on it.
+        """
+        if self.disable or kv_len <= matched_len:
+            return
+        node = last_node
+        while node is not None and node is not self.root_node:
+            if (
+                len(node.children) > 0
+                or node.full_lock_ref > 0
+                or node.mamba_lock_ref > 0
+                or node.mamba_value is None
+            ):
+                break  # shared, pinned, or tombstone — not ours to drop
+            if node.host_value is not None or node.mamba_host_value is not None:
+                break  # host-backed (HiMambaRadixCache) — not ours to drop
+            _, _, node, _ = self._evict_leaf_node(node, False)
+            node = node.parent
 
     def _evict_leaf_node(
         self, x: TreeNode, is_evict_mamba: bool

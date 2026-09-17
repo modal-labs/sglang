@@ -1252,6 +1252,9 @@ class PrefillAdder:
                     req.mamba_host_hit_length = 0
                     req.mamba_cow_src_index = None
                     req.mamba_needs_clear = True
+                    # The request now matches nothing; its lock/finish
+                    # bookkeeping must not reference the abandoned device node.
+                    req.last_node = self.tree_cache.root_node
                 else:
                     req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)

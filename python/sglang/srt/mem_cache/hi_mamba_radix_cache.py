@@ -919,6 +919,40 @@ class HiMambaRadixCache(MambaRadixCache):
                 return self._evict_regular(x)
         return self._evict_to_host(x)
 
+    def evict_finished_req_prefix(self, last_node, *, matched_len, kv_len, rid=None):
+        """``evict_finished_req_prefix`` on the hierarchical helpers: the base
+        implementation drives ``_evict_leaf_node``, which cannot run here
+        (allocator shape, host copies, 3-tuple tombstone cascade)."""
+        if self.disable or kv_len <= matched_len:
+            return
+        node = last_node
+        while node is not None and node is not self.root_node:
+            if (
+                len(node.children) > 0
+                or node.full_lock_ref > 0
+                or node.mamba_lock_ref > 0
+                or node.evicted
+                or node.backuped
+                or node.mamba_backuped
+                or node.host_ref_counter > 0
+                or node.host_mamba_ref_counter > 0
+                or node.id in self.ongoing_write_through
+                or node.id in self.ongoing_load_back
+                or node.mamba_value is None
+            ):
+                break  # shared, pinned, host-backed / backup in flight, or tombstone
+            parent = node.parent
+            self._evict_regular(node)
+            # _evict_regular may have cascaded tombstone ancestors out of the
+            # tree; resume at the deepest one still attached.
+            while (
+                parent is not self.root_node
+                and parent.parent.children.get(parent.key.child_key(self.page_size))
+                is not parent
+            ):
+                parent = parent.parent
+            node = parent
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
