@@ -100,6 +100,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     MatchPrefixParams,
+    get_mamba_cache_miss_tokens,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -1415,6 +1416,10 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+            # This is the match that decides the prefill shape: record the Full-KV
+            # prefix it could not reuse for want of a Mamba checkpoint here, not
+            # only in the policy-time match (which FCFS skips on the unified cache).
+            self.mamba_cache_miss_tokens = get_mamba_cache_miss_tokens(match_result)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()

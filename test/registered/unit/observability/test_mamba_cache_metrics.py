@@ -1,3 +1,4 @@
+from array import array
 from types import SimpleNamespace
 
 import torch
@@ -122,3 +123,35 @@ def test_scheduler_metrics_collector_increments_mamba_cache_miss_counters():
 
     assert collector.mamba_cache_miss_requests_total.values == [2]
     assert collector.mamba_cache_miss_tokens_total.values == [12288]
+
+
+def test_init_next_round_input_records_mamba_cache_miss():
+    """Admission matches through Req.init_next_round_input (FCFS on the unified
+    cache never runs the policy-time match), so the miss must be recorded there."""
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    result = _match_result(
+        branching_seqlen=8192, full_kv_hit_length=10000, device_len=2048
+    )
+
+    class _TreeCache:
+        def swa_reprefill_tail_tokens(self):
+            return 0
+
+        def supports_mamba(self):
+            return True
+
+        def match_prefix(self, _params):
+            return result
+
+    req = Req(
+        rid="r",
+        origin_input_text="",
+        origin_input_ids=array("q", range(16)),
+        sampling_params=SamplingParams(),
+    )
+    req.init_next_round_input(_TreeCache())
+
+    assert req.mamba_cache_miss_tokens == 6144
+    assert req.mamba_branching_seqlen == 8192
