@@ -391,6 +391,64 @@ class TestSessionQueueAbort(CustomTestCase):
         )
         self.assertIsNone(follow_up.finished_reason)
 
+    def test_retracted_queue_abort_in_decode_mode_finishes(self):
+        """PD decode: a retracted req (KV already nuked by release_req) sits in
+        disagg_decode_prealloc_queue.retracted_queue with kv_cache_cpu. Aborting
+        it must stamp FINISH_ABORT and clear the session's inflight turn."""
+        (
+            server_args,
+            cache,
+            allocator,
+            req_to_token_pool,
+            observer,
+            checker,
+            session,
+        ) = self._setup_first_turn()
+        req = session.create_req(
+            _recv("turn-2", list(range(32, 48))),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        req.init_next_round_input(cache)
+        release_req(
+            req=req,
+            remaing_req_count=1,
+            server_args=server_args,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=cache,
+            hisparse_coordinator=None,
+            offload_kv=False,
+        )
+        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.kv)
+
+        req.kv_cache_cpu = torch.empty(0)
+        scheduler = _scheduler_stub(cache)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[req]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertFalse(session.has_unfinished_request())
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.retracted_queue, [])
+        self.assertFalse(hasattr(req, "kv_cache_cpu"))
+        send_output.assert_called_once()
+        self.assertIsInstance(send_output.call_args[0][0], AbortReq)
+        self.assertEqual(send_output.call_args[0][0].rid, req.rid)
+        self._assert_idle(observer, checker)
+        follow_up = session.create_req(
+            _recv("turn-3", [99]),
+            tokenizer=None,
+            vocab_size=VOCAB_SIZE,
+        )
+        self.assertIsNone(follow_up.finished_reason)
+
     def test_oom_retract_of_last_streaming_turn_aborts_session_turn(self):
         (
             server_args,
