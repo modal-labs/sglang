@@ -909,25 +909,30 @@ class SchedulerDisaggregationPrefillMixin:
             f"{req.rid=} {req.bootstrap_room=}"
         )
         exc: Optional[Exception] = None
+        user_aborted = isinstance(req.finished_reason, FINISH_ABORT)
+        # failure_exception() also clears the sender's transfer records; always
+        # run it, and only report the exception for non-user failures.
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
-            exc = e
-            error_message += f" with exception {e}"
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if getattr(exc, "is_from_another_rank", False):
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
+            if not user_aborted:
+                exc = e
+                error_message += f" with exception {e}"
+        if not user_aborted:
+            # Mute error message for propagated exceptions to avoid duplicate logging
+            if getattr(exc, "is_from_another_rank", False):
+                logger.debug(error_message)
+            else:
+                logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         # Stamp the abort before releasing so the streaming-session hook sees a
         # terminal state instead of committing the failed turn as a finish.
-        if not isinstance(req.finished_reason, FINISH_ABORT):
+        if not user_aborted:
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
         release_kv_cache(req, self.tree_cache)  # unlock the tree
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not user_aborted:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
@@ -954,19 +959,24 @@ class SchedulerDisaggregationPrefillMixin:
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
+        user_aborted = isinstance(req.finished_reason, FINISH_ABORT)
         is_propagated = False
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
-            error_message += f" with exception {e}"
-            is_propagated = getattr(e, "is_from_another_rank", False)
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if is_propagated:
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
+            if not user_aborted:
+                error_message += f" with exception {e}"
+                is_propagated = getattr(e, "is_from_another_rank", False)
+        if not user_aborted:
+            # Mute error message for propagated exceptions to avoid duplicate logging
+            if is_propagated:
+                logger.debug(error_message)
+            else:
+                logger.warning(error_message)
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         if (
             req.req_pool_idx is not None
             or req.kv is not None
@@ -979,7 +989,7 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not user_aborted:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)

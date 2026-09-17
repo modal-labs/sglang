@@ -4495,6 +4495,8 @@ class Scheduler(
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if self.enable_hicache_storage:
                         self.tree_cache.release_aborted_request(req.rid)
+                    prepare_abort(req, "Aborted")
+                    self._release_dropped_waiting_req_mm_inputs(req)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
@@ -4503,6 +4505,7 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    prepare_abort(req, "Aborted")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -4524,6 +4527,23 @@ class Scheduler(
                     prepare_abort(decode_req.req, "Aborted")
                     if self.enable_hicache_storage:
                         self.tree_cache.release_aborted_request(decode_req.req.rid)
+
+            # Abort requests held for rebootstrap (KV already freed by retract)
+            held_rebootstrap = self.disagg_decode_prealloc_queue.held_rebootstrap_reqs
+            idx = 0
+            while idx < len(held_rebootstrap):
+                req = held_rebootstrap[idx]
+                if not (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                    idx += 1
+                    continue
+                prepare_abort(req, "Aborted")
+                self._release_dropped_waiting_req_mm_inputs(req)
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+                held_rebootstrap.pop(idx)
 
             # Abort requests already retracted to CPU cache
             retracted_queue = self.disagg_decode_prealloc_queue.retracted_queue
