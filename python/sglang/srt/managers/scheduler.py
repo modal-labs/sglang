@@ -3271,6 +3271,7 @@ class Scheduler(
         return res
 
     def _req_slot_block_cause(self, running_bs: int) -> str:
+        # Same operands as this tree's get_num_allocatable_reqs (no beam rows here).
         return req_slot_block_cause(
             pp_budget=get_parallel().config.pp_max_micro_batch_size - running_bs,
             available_req_slots=self.req_to_token_pool.available_size(),
@@ -3282,14 +3283,17 @@ class Scheduler(
         self.metrics_reporter.record_admission_block(cause, num_blocked_reqs)
 
     def _account_admission_block(
-        self, cause: Optional[str], admitted: set[Req]
+        self, cause: Optional[str], not_blocked: set[Req]
     ) -> None:
         """Close out an admission pass: count it as blocked when a gate stopped
-        it while waiting requests remained, otherwise forget the last cause."""
+        it while waiting requests remained, otherwise forget the last cause.
+        `not_blocked` holds the requests admitted this pass and those the loop
+        skipped for its own reasons (LoRA slots, prefetch in flight), which the
+        stopping gate did not hold back."""
         num_blocked = (
             0
             if cause is None
-            else sum(1 for r in self.waiting_queue if r not in admitted)
+            else sum(1 for r in self.waiting_queue if r not in not_blocked)
         )
         if num_blocked == 0:
             self._last_admission_block_cause = None
@@ -3378,7 +3382,8 @@ class Scheduler(
         ):
             running_batch.batch_is_full = True
             self._record_admission_block(
-                self._req_slot_block_cause(running_bs), len(self.waiting_queue)
+                self._req_slot_block_cause(running_bs),
+                len(self.waiting_queue),
             )
             return None, running_batch
 
@@ -3448,6 +3453,8 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # First gate that stops this pass, for the admission-block metrics.
         block_cause: Optional[str] = None
+        # Requests the loop skipped for its own reasons; not blocked by the gate.
+        skipped: set[Req] = set()
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if adder.chunk_budget_exhausted():
@@ -3455,6 +3462,7 @@ class Scheduler(
                 break
 
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                skipped.add(req)
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3481,6 +3489,7 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    skipped.add(req)
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
@@ -3552,7 +3561,7 @@ class Scheduler(
 
         can_run_list: List[Req] = adder.can_run_list
         can_run_set = set(can_run_list)
-        self._account_admission_block(block_cause, can_run_set)
+        self._account_admission_block(block_cause, can_run_set | skipped)
 
         # Update waiting queue
         if len(can_run_list) == 0:

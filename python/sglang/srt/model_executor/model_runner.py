@@ -927,6 +927,10 @@ class ModelRunner:
                 self.memory_pool_config.max_running_requests = (
                     resize.capped_max_running_requests
                 )
+                if resize.max_running_requests_cap_source is not None:
+                    self.memory_pool_config.max_running_requests_cap_source = (
+                        resize.max_running_requests_cap_source
+                    )
 
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
