@@ -10,6 +10,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers import schedule_batch
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
@@ -25,6 +26,7 @@ from sglang.srt.session.session_controller import (
     SessionController,
     SessionReqNode,
 )
+from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -307,6 +309,56 @@ def test_P44_session_first_turn_queued_abort_releases_turn_leases():
     assert session.req_nodes == {}
 
 
+def test_P44_session_first_turn_queued_abort_flag_off_clears_inflight():
+    session = Session(32, "s", streaming=True)
+    req = session.create_req(
+        _session_recv("rid"),
+        tokenizer=None,
+        vocab_size=32,
+    )
+    assert session._inflight is True
+    assert session._inflight_rid == "rid"
+    scheduler = _queued_abort_scheduler([req])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(False):
+        scheduler._release_dropped_waiting_req_mm_inputs(req)
+
+    assert session._inflight is False
+    assert session._inflight_rid is None
+    next_req = session.create_req(
+        _session_recv("next"),
+        tokenizer=None,
+        vocab_size=32,
+    )
+    assert next_req.finished_reason is None
+
+
+def test_P44_streaming_session_reap_waits_for_inflight_request(caplog):
+    session = Session(32, "s", streaming=True)
+    session._inflight = True
+    session._inflight_rid = "rid"
+    controller = object.__new__(SessionController)
+    controller.sessions = {"s": session}
+    controller.tree_cache = Mock()
+    controller._last_reap_time = 0
+
+    with caplog.at_level("INFO", logger="sglang.srt.session.session_controller"):
+        controller._close("s")
+        assert session.close_on_finish is True
+        assert controller.plan_reap(2) is None
+
+        session.abort_req("rid")
+        plan = controller.plan_reap(4)
+        assert plan is not None
+        assert plan.deferred == ["s"]
+        controller.apply_reap(plan)
+
+    assert "s" not in controller.sessions
+    assert (
+        caplog.messages.count("Deferring session close for s (unfinished request)") == 1
+    )
+
+
 def test_P44_session_later_turn_queued_abort_releases_only_new_turn_items():
     from sglang.srt.managers.io_struct import AbortReq
 
@@ -358,6 +410,31 @@ def test_P44_session_later_turn_queued_abort_releases_only_new_turn_items():
     assert "parent" in session.req_nodes
 
 
+def test_P44_preaborted_streaming_req_does_not_clear_other_inflight_turn():
+    session = Session(32, "s", streaming=True)
+    session._inflight = True
+    session._inflight_rid = "A"
+
+    req = Req("B", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req.session = session
+    req.to_finish = FINISH_ABORT()
+
+    inner = Mock()
+    cache = StreamingSession(inner)
+    cache.slots["s"] = SessionSlot(kv=SimpleNamespace())
+    assert cache.find_active_slot(req) is None
+    assert req.session is None
+    assert session._inflight is True
+    assert session._inflight_rid == "A"
+
+    controller = object.__new__(SessionController)
+    controller.sessions = {"s": session}
+    controller.tree_cache = Mock()
+    controller._close("s")
+    assert session.close_on_finish is True
+    controller.tree_cache.release_session.assert_not_called()
+
+
 def test_P44_session_sibling_turn_queued_abort_keeps_later_sibling_items():
     from sglang.srt.managers.io_struct import AbortReq
 
@@ -397,6 +474,173 @@ def test_P44_session_sibling_turn_queued_abort_keeps_later_sibling_items():
     assert req_b.multimodal_inputs is shared
     assert req_a.multimodal_inputs is None
     assert req_a.session_turn_mm_state is None
+
+
+def test_P44_session_sibling_turn_queued_abort_removes_own_mrope_slice():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session = Session(32, "s", streaming=False)
+    p = _item(_proxy())
+    p.release_transport_proxies = Mock()
+    a = _item(_proxy())
+    a.release_transport_proxies = Mock()
+    b = _item(_proxy())
+    b.release_transport_proxies = Mock()
+    shared = MultimodalInputs(
+        mm_items=[p],
+        image_pad_len=[3],
+        mrope_positions=torch.full((3, 5), 0.0),
+        mrope_position_delta=torch.full((1, 1), 0.0),
+    )
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+
+    req_a = Req("a", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_a.session = session
+    req_a.multimodal_inputs = shared
+    req_a.session_mm_inherited = True
+    req_b = Req("b", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_b.session = session
+    req_b.multimodal_inputs = shared
+    req_b.session_mm_inherited = True
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        req_a.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[a],
+                image_pad_len=[5],
+                mrope_positions=torch.full((3, 2), 1.0),
+                mrope_position_delta=torch.full((1, 1), 1.0),
+            )
+        )
+        req_b.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[b],
+                image_pad_len=[7],
+                mrope_positions=torch.full((3, 4), 2.0),
+                mrope_position_delta=torch.full((1, 1), 2.0),
+            )
+        )
+    scheduler = _queued_abort_scheduler([req_a])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="a"))
+
+    a.release_transport_proxies.assert_called_once_with()
+    assert shared.mm_items == [p, b]
+    assert shared.image_pad_len == [3, 7]
+    assert shared.mrope_positions.shape == (3, 9)
+    assert torch.equal(
+        shared.mrope_positions,
+        torch.cat(
+            [
+                torch.full((3, 5), 0.0),
+                torch.full((3, 4), 2.0),
+            ],
+            dim=1,
+        ),
+    )
+    assert shared.mrope_position_delta.shape == (2, 1)
+    assert torch.equal(
+        shared.mrope_position_delta,
+        torch.cat(
+            [
+                torch.full((1, 1), 0.0),
+                torch.full((1, 1), 2.0),
+            ],
+            dim=0,
+        ),
+    )
+    assert shared.mrope_position_delta_repeated_cache is None
+    assert req_b.multimodal_inputs is shared
+
+
+def _repeated_sibling_mm_session():
+    session = Session(32, "s", streaming=False)
+    p = _item(_proxy())
+    p.release_transport_proxies = Mock()
+    a = _item(_proxy())
+    a.release_transport_proxies = Mock()
+    b = _item(_proxy())
+    b.release_transport_proxies = Mock()
+    shared = MultimodalInputs(
+        mm_items=[p],
+        image_pad_len=[3],
+        mrope_positions=torch.full((3, 5), 0.0),
+        mrope_position_delta=torch.full((1, 1), 0.0),
+    )
+    parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    parent.multimodal_inputs = shared
+    session.req_nodes["parent"] = SessionReqNode(parent)
+
+    req_a = Req("a", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_a.session = session
+    req_a.multimodal_inputs = shared
+    req_a.session_mm_inherited = True
+    req_b = Req("b", "", array("q", [1]), SamplingParams(max_new_tokens=1))
+    req_b.session = session
+    req_b.multimodal_inputs = shared
+    req_b.session_mm_inherited = True
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        req_a.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[a],
+                image_pad_len=[5],
+                mrope_positions=torch.full((3, 2), 1.0),
+                mrope_position_delta=torch.full((1, 1), 1.0),
+            )
+        )
+        req_b.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[b],
+                image_pad_len=[7],
+                mrope_positions=torch.full((3, 4), 2.0),
+                mrope_position_delta=torch.full((1, 1), 2.0),
+            )
+        )
+    return session, shared, req_a, req_b, p, a, b
+
+
+def test_P44_session_repeated_sibling_aborts_restore_parent_mrope():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session, shared, req_a, req_b, p, a, b = _repeated_sibling_mm_session()
+    scheduler = _queued_abort_scheduler([req_a, req_b])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="a"))
+        scheduler.abort_request(AbortReq(rid="b"))
+
+    assert p.release_transport_proxies.call_count == 0
+    a.release_transport_proxies.assert_called_once_with()
+    b.release_transport_proxies.assert_called_once_with()
+    assert shared.mm_items == [p]
+    assert shared.image_pad_len == [3]
+    assert torch.equal(shared.mrope_positions, torch.zeros(3, 5))
+    assert shared.mrope_position_delta.shape == (1, 1)
+    assert torch.equal(shared.mrope_position_delta, torch.zeros(1, 1))
+    assert shared.session_turn_states == []
+
+
+def test_P44_session_repeated_sibling_aborts_restore_parent_mrope_reverse_order():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    session, shared, req_a, req_b, p, a, b = _repeated_sibling_mm_session()
+    scheduler = _queued_abort_scheduler([req_a, req_b])
+
+    with envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.override(True):
+        scheduler.abort_request(AbortReq(rid="b"))
+        scheduler.abort_request(AbortReq(rid="a"))
+
+    assert p.release_transport_proxies.call_count == 0
+    a.release_transport_proxies.assert_called_once_with()
+    b.release_transport_proxies.assert_called_once_with()
+    assert shared.mm_items == [p]
+    assert shared.image_pad_len == [3]
+    assert torch.equal(shared.mrope_positions, torch.zeros(3, 5))
+    assert shared.mrope_position_delta.shape == (1, 1)
+    assert torch.equal(shared.mrope_position_delta, torch.zeros(1, 1))
+    assert shared.session_turn_states == []
 
 
 def test_P44_session_inherited_only_turn_queued_abort_releases_nothing():

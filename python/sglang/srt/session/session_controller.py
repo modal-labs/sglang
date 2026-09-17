@@ -19,11 +19,14 @@ from array import array
 from collections import Counter
 from typing import TYPE_CHECKING, Dict, Optional
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    SessionReapPlan,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
@@ -109,6 +112,11 @@ class Session:
         if self.timeout is None:
             return False
         return time.monotonic() - self.last_active_time > self.timeout
+
+    def has_unfinished_request(self) -> bool:
+        if self.streaming and self._inflight:
+            return True
+        return any(not node.req.finished() for node in self.req_nodes.values())
 
     @staticmethod
     def _strip_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
@@ -360,8 +368,10 @@ class Session:
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
 
-    def abort_req(self):
+    def abort_req(self, rid: Optional[str] = None):
         """Clear inflight flag on abort (req_nodes stays unchanged)."""
+        if rid is not None and self._inflight_rid != rid:
+            return
         self._inflight = False
         self._inflight_rid = None
 
@@ -371,7 +381,7 @@ class Session:
         A session turn shares its predecessor's ``MultimodalInputs`` object and
         ``merge``s its own items onto it. Identity-based removal preserves
         inherited items and later siblings; in the sibling case, mrope tensors
-        remain untouched because they cannot be split.
+        have the turn's own appended slice removed.
         """
         if not envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
             return
@@ -420,6 +430,36 @@ class Session:
                             exc_info=True,
                         )
                     item.feature = None
+                state_index = next(
+                    (
+                        i
+                        for i, state in enumerate(mm.session_turn_states)
+                        if state is st
+                    ),
+                    None,
+                )
+                pos_off = delta_off = None
+                if state_index is not None and mm.session_turn_states:
+                    first = mm.session_turn_states[0]
+                    if first.n_mrope_pos is not None:
+                        pos_off = first.n_mrope_pos + sum(
+                            state.own_mrope_pos or 0
+                            for state in mm.session_turn_states[:state_index]
+                        )
+                    if first.n_mrope_delta is not None:
+                        delta_off = first.n_mrope_delta + sum(
+                            state.own_mrope_delta or 0
+                            for state in mm.session_turn_states[:state_index]
+                        )
+
+                def remove_state() -> None:
+                    if state_index is None:
+                        return
+                    removed = mm.session_turn_states.pop(state_index)
+                    if state_index == 0 and mm.session_turn_states:
+                        mm.session_turn_states[0].n_mrope_pos = removed.n_mrope_pos
+                        mm.session_turn_states[0].n_mrope_delta = removed.n_mrope_delta
+
                 tail = mm.mm_items[st.n_items :]
                 if len(tail) == len(st.items) and all(
                     a is b for a, b in zip(tail, st.items)
@@ -427,24 +467,75 @@ class Session:
                     mm.mm_items = mm.mm_items[: st.n_items]
                     if st.n_pad is not None and mm.image_pad_len is not None:
                         mm.image_pad_len = mm.image_pad_len[: st.n_pad]
-                    if st.n_mrope_pos is not None and mm.mrope_positions is not None:
-                        mm.mrope_positions = mm.mrope_positions[:, : st.n_mrope_pos]
+                    mrope_changed = False
                     if (
-                        st.n_mrope_delta is not None
-                        and mm.mrope_position_delta is not None
+                        pos_off is not None
+                        and st.own_mrope_pos
+                        and mm.mrope_positions is not None
+                        and mm.mrope_positions.shape[1] >= pos_off + st.own_mrope_pos
                     ):
-                        mm.mrope_position_delta = mm.mrope_position_delta[
-                            : st.n_mrope_delta
-                        ]
-                    mm.mrope_position_delta_repeated_cache = None
+                        mm.mrope_positions = mm.mrope_positions[:, :pos_off]
+                        mrope_changed = True
+                    if (
+                        delta_off is not None
+                        and st.own_mrope_delta
+                        and mm.mrope_position_delta is not None
+                        and mm.mrope_position_delta.shape[0]
+                        >= delta_off + st.own_mrope_delta
+                    ):
+                        mm.mrope_position_delta = mm.mrope_position_delta[:delta_off]
+                        mrope_changed = True
+                    if mrope_changed:
+                        mm.mrope_position_delta_repeated_cache = None
+                    remove_state()
                 else:
                     own = {id(it) for it in st.items}
+                    old_item_count = len(mm.mm_items)
                     keep = [i for i, it in enumerate(mm.mm_items) if id(it) not in own]
+                    items_removed = len(keep) < old_item_count
                     if mm.image_pad_len is not None and len(mm.image_pad_len) == len(
                         mm.mm_items
                     ):
                         mm.image_pad_len = [mm.image_pad_len[i] for i in keep]
                     mm.mm_items = [mm.mm_items[i] for i in keep]
+                    mrope_changed = False
+                    if (
+                        items_removed
+                        and pos_off is not None
+                        and st.own_mrope_pos
+                        and mm.mrope_positions is not None
+                        and mm.mrope_positions.shape[1] >= pos_off + st.own_mrope_pos
+                    ):
+                        mm.mrope_positions = torch.cat(
+                            [
+                                mm.mrope_positions[:, :pos_off],
+                                mm.mrope_positions[:, pos_off + st.own_mrope_pos :],
+                            ],
+                            dim=1,
+                        )
+                        mrope_changed = True
+                    if (
+                        items_removed
+                        and delta_off is not None
+                        and st.own_mrope_delta
+                        and mm.mrope_position_delta is not None
+                        and mm.mrope_position_delta.shape[0]
+                        >= delta_off + st.own_mrope_delta
+                    ):
+                        mm.mrope_position_delta = torch.cat(
+                            [
+                                mm.mrope_position_delta[:delta_off],
+                                mm.mrope_position_delta[
+                                    delta_off + st.own_mrope_delta :
+                                ],
+                            ],
+                            dim=0,
+                        )
+                        mrope_changed = True
+                    if items_removed:
+                        remove_state()
+                    if mrope_changed:
+                        mm.mrope_position_delta_repeated_cache = None
         req.multimodal_inputs = None
         req.session_turn_mm_state = None
         req.session_mm_parent = None
@@ -492,17 +583,12 @@ class SessionController:
     def _close(self, session_id: str):
         session = self.sessions[session_id]
         req = None
-        has_unfinished_request = False
-        if session.streaming and session._inflight:
-            has_unfinished_request = True
-        elif session.streaming and session.req_nodes:
+        if session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
             [last_node] = session.req_nodes.values()
             req = last_node.req
-            if not req.finished():
-                has_unfinished_request = True
 
-        if has_unfinished_request:
+        if session.streaming and session.has_unfinished_request():
             # An in-flight request is still decoding on this session's KV
             # memory. Freeing now would corrupt the scheduler. Mark the
             # session for deferred cleanup: the request keeps its session
@@ -548,31 +634,42 @@ class SessionController:
             logger, f"Session closed: {session_id} (active={len(self.sessions)})"
         )
 
+    def plan_reap(self, now: float, interval: float = 1.0) -> Optional[SessionReapPlan]:
+        if now - self._last_reap_time <= interval:
+            return None
+        self._last_reap_time = now
+        deferred = [
+            sid
+            for sid, session in self.sessions.items()
+            if session.close_on_finish and not session.has_unfinished_request()
+        ]
+        timed_out = [
+            sid for sid, session in self.sessions.items() if session.is_timed_out()
+        ]
+        if not deferred and not timed_out:
+            return None
+        return SessionReapPlan(deferred=deferred, timed_out=timed_out)
+
+    def apply_reap(self, plan: SessionReapPlan) -> None:
+        for sid in plan.deferred:
+            session = self.sessions.get(sid)
+            if session is None or not session.close_on_finish:
+                continue
+            log_info_on_rank0(
+                logger, f"Deferred close ready for session {sid}, releasing."
+            )
+            session.close_on_finish = False
+            self._close(sid)
+        for sid in plan.timed_out:
+            if sid not in self.sessions:
+                continue
+            log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
+            self._close(sid)
+
     def maybe_reap(self, now: float, interval: float = 1.0):
-        # reap sessions every second
-        if now - self._last_reap_time > interval:
-            self._last_reap_time = now
-
-            # Finish deferred closes for sessions whose requests completed.
-            pending = [
-                sid
-                for sid, session in self.sessions.items()
-                if session.close_on_finish and self._all_requests_finished(session)
-            ]
-            for sid in pending:
-                log_info_on_rank0(
-                    logger, f"Deferred close ready for session {sid}, releasing."
-                )
-                # Reset close_on_finish so _close proceeds with the release.
-                self.sessions[sid].close_on_finish = False
-                self._close(sid)
-
-            timed_out = [
-                sid for sid, session in self.sessions.items() if session.is_timed_out()
-            ]
-            for sid in timed_out:
-                log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
-                self._close(sid)
+        plan = self.plan_reap(now, interval)
+        if plan is not None:
+            self.apply_reap(plan)
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:

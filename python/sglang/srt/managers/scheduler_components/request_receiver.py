@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -18,6 +19,7 @@ from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    SessionReapPlan,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -63,6 +65,7 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
+    plan_session_reap: Optional[Callable[[float], Any]] = None
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     # HiCache V3 authority: the per-step rank0->peers request broadcast below
     # is the publication carrier for cache control-plane records (bytes on an
@@ -131,6 +134,10 @@ class SchedulerRequestReceiver:
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+                if self.plan_session_reap is not None:
+                    plan = self.plan_session_reap(time.monotonic())
+                    if plan is not None:
+                        recv_reqs.append(plan)
             else:
                 recv_reqs = None
         else:
@@ -299,6 +306,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    SessionReapPlan,
                 ),
             )
         ]
@@ -312,6 +320,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    SessionReapPlan,
                 ),
             )
         ]

@@ -131,6 +131,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionReapPlan,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     ShutdownReq,
@@ -1801,8 +1802,11 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
-        now = time.monotonic()
-        self.session_controller.maybe_reap(now)
+        reap_plans = [r for r in recv_reqs if isinstance(r, SessionReapPlan)]
+        if reap_plans:
+            recv_reqs = [r for r in recv_reqs if not isinstance(r, SessionReapPlan)]
+            for plan in reap_plans:
+                self.session_controller.apply_reap(plan)
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -1895,6 +1899,7 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
+            plan_session_reap=self.session_controller.plan_reap,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             # HiCache V3: the request broadcast doubles as the cache
             # control-plane publication carrier (None unless hierarchical
@@ -2225,6 +2230,8 @@ class Scheduler(
         Session turns delegate to Session so inherited items from the committed
         prior turn are kept.
         """
+        if req.session is not None:
+            req.session.abort_req(req.rid)
         if not envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
             return
         if req.session is not None:

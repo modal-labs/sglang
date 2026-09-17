@@ -220,7 +220,7 @@ class StreamingSession(BasePrefixCache):
         if slot is None or slot.kv is None:
             return None
         if req.to_finish is not None:
-            req.session.abort_req()
+            req.session.abort_req(req.rid)
             req.session = None
             return None
         return slot
@@ -326,7 +326,7 @@ class StreamingSession(BasePrefixCache):
             self.release_session(session_id)
             req.req_pool_idx = None
             req.kv = None
-            req.session.abort_req()
+            req.session.abort_req(req.rid)
             return True
 
         if is_first:
@@ -510,7 +510,7 @@ class StreamingSession(BasePrefixCache):
             if slot.mamba_pool_idx is not None:
                 total += slot.mamba_pool_idx.numel()
             if slot.mamba_ping_pong_track_buffer is not None:
-                total += slot.mamba_ping_pong_track_buffer.numel()
+                total += int((slot.mamba_ping_pong_track_buffer != -1).sum().item())
         return total
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
@@ -522,7 +522,8 @@ class StreamingSession(BasePrefixCache):
             mamba_allocator.free(slot.mamba_pool_idx.unsqueeze(0))
             slot.mamba_pool_idx = None
         if slot.mamba_ping_pong_track_buffer is not None:
-            mamba_allocator.free(slot.mamba_ping_pong_track_buffer)
+            buf = slot.mamba_ping_pong_track_buffer
+            mamba_allocator.free(buf[buf != -1])
             slot.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --

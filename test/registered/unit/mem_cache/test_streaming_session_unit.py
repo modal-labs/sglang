@@ -1,9 +1,16 @@
+import time
 from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.io_struct import SessionReapPlan
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.session.session_controller import Session, SessionController
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -46,15 +53,29 @@ class _FakeInnerCache:
         return None
 
 
+class _FakeSessionTreeCache:
+    def __init__(self):
+        self.released = []
+
+    def release_session(self, session_id):
+        self.released.append(session_id)
+
+
+class _FinishedReq:
+    def finished(self):
+        return True
+
+
 class _FakeReq:
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
+        self.rid = session_id
         self.session = SimpleNamespace(
             session_id=session_id,
             streaming=True,
             finish_req=lambda req: None,
-            abort_req=lambda: None,
+            abort_req=lambda rid=None: None,
             _inflight=False,
         )
         self.req_pool_idx = req_pool_idx
@@ -217,6 +238,127 @@ def test_release_session_threads_mamba_skip_ids():
     params = inner.dec_lock_ref_params[0]
     assert params is not None
     assert params.skip_lock_node_ids.get(ComponentType.MAMBA) == {42}
+
+
+def test_release_session_skips_lazy_ping_pong_sentinels():
+    allocator = MambaSlotAllocator(size=8, device="cpu")
+    allocator.alloc(8)
+    req_to_token_pool = SimpleNamespace(mamba_allocator=allocator)
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        _FakeAllocator(),
+        page_size=1,
+    )
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-a"] = SessionSlot(
+        mamba_pool_idx=torch.tensor(3),
+        mamba_ping_pong_track_buffer=torch.tensor([5, -1]),
+    )
+
+    tree_cache.release_session("session-a")
+
+    assert set(allocator.free_slots.tolist()) == {3, 5}
+    assert -1 not in allocator.free_slots.tolist()
+    assert allocator.available_size() == 2
+
+
+def test_session_held_mamba_slots_ignores_sentinels():
+    req_to_token_pool = SimpleNamespace(mamba_allocator=_FakeAllocator())
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        _FakeAllocator(),
+        page_size=1,
+    )
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-a"] = SessionSlot(
+        mamba_pool_idx=torch.tensor(3),
+        mamba_ping_pong_track_buffer=torch.tensor([5, -1]),
+    )
+    assert tree_cache.session_held_mamba_slots() == 2
+
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-b"] = SessionSlot(
+        mamba_pool_idx=torch.tensor(4),
+        mamba_ping_pong_track_buffer=torch.tensor([-1, -1]),
+    )
+    assert tree_cache.session_held_mamba_slots() == 1
+
+
+def test_session_controller_plan_reap_defers_application():
+    tree_cache = _FakeSessionTreeCache()
+    controller = SessionController(tree_cache)
+    ready = Session(16, "ready")
+    ready.close_on_finish = True
+    ready.req_nodes["req"] = SimpleNamespace(req=_FinishedReq())
+    timed_out = Session(16, "timed-out", timeout=1)
+    timed_out.last_active_time = time.monotonic() - 2
+    controller.sessions.update({"ready": ready, "timed-out": timed_out})
+
+    controller._last_reap_time = 10
+    assert controller.plan_reap(10.5) is None
+    plan = controller.plan_reap(12)
+
+    assert plan == SessionReapPlan(
+        deferred=["ready"],
+        timed_out=["timed-out"],
+    )
+    assert set(controller.sessions) == {"ready", "timed-out"}
+    assert tree_cache.released == []
+
+
+def test_session_controller_apply_reap_filters_stale_sessions():
+    tree_cache = _FakeSessionTreeCache()
+    controller = SessionController(tree_cache)
+    deferred = Session(16, "deferred")
+    deferred.close_on_finish = True
+    not_deferred = Session(16, "not-deferred")
+    timed_out = Session(16, "timed-out")
+    controller.sessions.update(
+        {
+            "deferred": deferred,
+            "not-deferred": not_deferred,
+            "timed-out": timed_out,
+        }
+    )
+
+    controller.apply_reap(
+        SessionReapPlan(
+            deferred=["deferred", "missing", "not-deferred"],
+            timed_out=["timed-out", "missing"],
+        )
+    )
+
+    assert tree_cache.released == ["deferred", "timed-out"]
+    assert set(controller.sessions) == {"not-deferred"}
+
+
+def test_session_controller_apply_reap_is_rank_symmetric():
+    controllers = []
+    for _ in range(2):
+        tree_cache = _FakeSessionTreeCache()
+        controller = SessionController(tree_cache)
+        deferred = Session(16, "deferred")
+        deferred.close_on_finish = True
+        controller.sessions.update(
+            {"deferred": deferred, "untouched": Session(16, "untouched")}
+        )
+        controllers.append(controller)
+
+    plan = SessionReapPlan(deferred=["deferred"], timed_out=[])
+    for controller in controllers:
+        controller.apply_reap(plan)
+
+    assert set(controllers[0].sessions) == set(controllers[1].sessions) == {"untouched"}
+
+
+def test_request_receiver_classifies_session_reap_plan_as_work():
+    receiver = object.__new__(SchedulerRequestReceiver)
+    plan = SessionReapPlan(deferred=[], timed_out=[])
+
+    work, control = receiver._split_work_and_control_reqs([plan])
+
+    assert work == [plan]
+    assert control == []
 
 
 # Shrink tests removed: streaming sessions are append-only after the

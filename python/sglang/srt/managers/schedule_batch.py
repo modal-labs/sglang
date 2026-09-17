@@ -584,6 +584,9 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    session_turn_states: List[SessionTurnMMState] = dataclasses.field(
+        default_factory=list
+    )
     session_live_refs = 0
 
     # Moss-VL related
@@ -789,6 +792,8 @@ class SessionTurnMMState:
     n_pad: Optional[int]
     n_mrope_pos: Optional[int]
     n_mrope_delta: Optional[int]
+    own_mrope_pos: Optional[int]
+    own_mrope_delta: Optional[int]
 
     @classmethod
     def snapshot(
@@ -807,6 +812,16 @@ class SessionTurnMMState:
                 None
                 if shared.mrope_position_delta is None
                 else shared.mrope_position_delta.shape[0]
+            ),
+            own_mrope_pos=(
+                None
+                if appended.mrope_positions is None
+                else appended.mrope_positions.shape[1]
+            ),
+            own_mrope_delta=(
+                None
+                if appended.mrope_position_delta is None
+                else appended.mrope_position_delta.shape[0]
             ),
         )
 
@@ -1359,9 +1374,11 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs = image_inputs
         else:
             if self.session is not None and envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
-                self.session_turn_mm_state = SessionTurnMMState.snapshot(
+                state = SessionTurnMMState.snapshot(
                     self.multimodal_inputs, image_inputs
                 )
+                self.session_turn_mm_state = state
+                self.multimodal_inputs.session_turn_states.append(state)
             self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
