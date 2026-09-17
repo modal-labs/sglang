@@ -4429,6 +4429,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            prepare_abort(req, "Aborted")
             self._release_dropped_waiting_req_mm_inputs(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
