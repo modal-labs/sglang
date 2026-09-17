@@ -3811,16 +3811,22 @@ class Scheduler(
         return res
 
     def _req_slot_block_cause(
-        self, running_bs: int, running_batch: Optional[ScheduleBatch] = None
+        self,
+        running_bs: int,
+        running_batch: Optional[ScheduleBatch] = None,
+        beam_width: Optional[int] = None,
     ) -> str:
         # Same operands as get_num_allocatable_reqs: rows reserved for pending
-        # beam members are not available, or the wrong limit gets blamed.
+        # beam members are not available, and a beam candidate needs beam_width
+        # rows at once, or the wrong limit gets blamed.
         active_batch = running_batch or self.running_batch
         available = max(
             self.req_to_token_pool.available_size()
             - self.beam_coordinator.pending_member_rows(active_batch),
             0,
         )
+        if beam_width is not None and available // beam_width <= 0:
+            return AdmissionBlockCause.MAX_RUNNING_REQUESTS
         return req_slot_block_cause(
             pp_budget=get_parallel().pp_max_micro_batch_size - running_bs,
             available_req_slots=available,
@@ -4024,7 +4030,9 @@ class Scheduler(
                 running_batch=running_batch,
             ):
                 running_batch.batch_is_full = True
-                block_cause = self._req_slot_block_cause(running_bs, running_batch)
+                block_cause = self._req_slot_block_cause(
+                    running_bs, running_batch, candidate_beam_width
+                )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
