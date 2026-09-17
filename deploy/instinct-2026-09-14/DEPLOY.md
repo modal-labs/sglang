@@ -145,6 +145,8 @@ pools ~797 GiB (modelled from the pool sizes), under the fork's 800 GiB host-poo
 cycled), so the TTL and the pool horizon are matched. Caveat: at full prod inflow every arm's retention
 horizon is shorter than measured; the ranking is unaffected (the gap is ~50x the cross-box band).
 
+Note on `evict_on_finish` under `write_through`: release is best-effort-immediate, not guaranteed — the finished turn's private device KV is freed inline, its host copies are only marked `evict_first` (taken at the next host watermark round), and any prefix another chain already hit stays under normal LRU; the 13.5x Mamba host tier is the shock absorber for that deferred part.
+
 Check on a running container: `--enable-mla-hicache-host-dedup` in the server command line and the
 HiCache init log reporting the host KV pool at 140 GB with the Mamba host pool sized 13.5x device.
 
