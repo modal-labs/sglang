@@ -1015,6 +1015,10 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        # Full-KV tokens that could not be reused because the matching Mamba
+        # checkpoint was unavailable. Reported once on the first prefill pass.
+        self.mamba_cache_miss_tokens = 0
+        self._mamba_cache_miss_reported = False
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1707,6 +1711,8 @@ class Req(ReqDllmMixin):
         self.mamba_last_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.mamba_cache_miss_tokens = 0
+        self._mamba_cache_miss_reported = False
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
