@@ -42,13 +42,16 @@ logger = logging.getLogger(__name__)
 def _inherit_mm_inputs(mm: Optional[MultimodalInputs]) -> Optional[MultimodalInputs]:
     """Per-turn MultimodalInputs container sharing the predecessor's items
     (features included) but not its list objects, so a turn's merge never
-    reaches the committed turn or a sibling."""
+    reaches the committed turn or a sibling. The decode-side M-RoPE delta cache
+    is per-turn (it memoizes the turn's own merged delta), so it is not
+    inherited."""
     if mm is None:
         return None
     inherited = copy.copy(mm)
     inherited.mm_items = list(mm.mm_items)
     if mm.image_pad_len is not None:
         inherited.image_pad_len = list(mm.image_pad_len)
+    inherited.mrope_position_delta_repeated_cache = None
     inherited.session_turn_states = []
     return inherited
 

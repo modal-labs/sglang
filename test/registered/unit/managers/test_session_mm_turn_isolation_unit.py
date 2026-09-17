@@ -128,6 +128,10 @@ class TestSessionMultimodalTurnIsolation(CustomTestCase):
         recv1, image1 = _image_turn("turn-1", prefix_len=5, pad_value=1_000_001)
         req1 = _admit_image_turn(session, recv1, image1)
         req1.finished_reason = FINISH_LENGTH(1)
+        req1.multimodal_inputs.mrope_position_delta = torch.zeros(1, dtype=torch.long)
+        req1.multimodal_inputs.mrope_position_delta_repeated_cache = torch.zeros(
+            3, 1, dtype=torch.long
+        )
 
         recv2a, image2a = _image_turn(
             "turn-2a",
@@ -146,6 +150,9 @@ class TestSessionMultimodalTurnIsolation(CustomTestCase):
 
         self.assertEqual(len(req1.multimodal_inputs.mm_items), 1)
         self.assertEqual(len(req2b.multimodal_inputs.mm_items), 1)
+        self.assertIsNone(req2a.multimodal_inputs.mrope_position_delta_repeated_cache)
+        self.assertIsNone(req2b.multimodal_inputs.mrope_position_delta_repeated_cache)
+        self.assertIsNotNone(req1.multimodal_inputs.mrope_position_delta_repeated_cache)
         self.assertEqual(_placeholder_counts(req2b), [IMG_TOKENS])
 
 
