@@ -66,12 +66,15 @@ PREFILL_CUDA_GRAPH_MAX_BS = "4096"
 PREFILL_CUDA_GRAPH_BS = "128 256 512 768 1024 1536 2048 3072 4096"
 DECODE_CUDA_GRAPH_MAX_BS = "48"
 
-# HiCache: host-memory (L2) KV cache tier.
-# Host pool size ~= HICACHE_RATIO x GPU KV pool (30.67 GB) x 8 TP ranks.
-# Ratio 3 => ~735 GB of host memory, within the 1 TiB container request
-# (Modal's maximum memory request is 1048576 MiB = 1 TiB).
-HICACHE_RATIO = "3"
-HICACHE_WRITE_POLICY = "write_through_selective"
+# HiCache: host-memory (L2) KV cache tier, sized for a 60-minute session TTL.
+# MLA host dedup keeps one copy of the (TP-replicated) target KV across the 8
+# ranks instead of 8, so the host KV pool is an absolute size (GB, all ranks)
+# and the rank-local Mamba/KDA state is sized separately as a ratio of the
+# device Mamba pool. 140 GB KV + 13.5x Mamba => ~800 GB pinned host memory,
+# within the 1 TiB container request (Modal's maximum is 1048576 MiB = 1 TiB).
+HICACHE_KV_SIZE_GB = "140"
+HICACHE_MAMBA_RATIO = "13.5"
+HICACHE_WRITE_POLICY = "write_through"
 
 SGLANG_BASE_IMAGE = "modalresearch/sglang:kimi-k3-cu13-20260806-b9e90a6d6"
 SGLANG_COMMIT = "b9e90a6d6ef1859830c3b879cef999092975a41a"   # HEAD stays here
@@ -292,7 +295,9 @@ EXTRA_SERVER_ARGS = {
     "--cuda-graph-bs-decode": "1 2 4 8 12 16 24 32 48",
     "--enable-cache-report": "",
     "--enable-hierarchical-cache": "",
-    "--hicache-ratio": HICACHE_RATIO,
+    "--enable-mla-hicache-host-dedup": "",
+    "--hicache-size": HICACHE_KV_SIZE_GB,
+    "--hicache-mamba-ratio": HICACHE_MAMBA_RATIO,
     "--hicache-write-policy": HICACHE_WRITE_POLICY,
     "--speculative-algorithm": "DFLASH",
     "--speculative-attention-mode": "decode",

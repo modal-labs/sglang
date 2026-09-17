@@ -16,7 +16,10 @@ Files in this directory:
      (#33, after the IPC stress soak), `SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET=128` (#29) and the other
      default-off dev levers (#37/#38/#43) as their same-box rows land. Rollback of any flip = unset the var.
   3. warmup: one 1280x800 synthetic-PNG image turn after the text greeting (autoinference #516).
-  Unchanged: app name, model/draft, server args, volumes, B300:8, min_containers=63,
+  4. HiCache host tier re-sized for the 60-minute session TTL (see "HiCache sizing" below):
+     `--enable-mla-hicache-host-dedup --hicache-size 140 --hicache-mamba-ratio 13.5 --hicache-write-policy write_through`
+     replaces `--hicache-ratio 3 --hicache-write-policy write_through_selective`.
+  Unchanged: app name, model/draft, other server args, volumes, B300:8, min_containers=63,
   routing/kv-aware routing, auth, heartbeat/terminate, JIT-cache salt (`SGLANG_EFFECTIVE_COMMIT`).
 
 ## Bundle generation (per validated dev merge)
@@ -106,6 +109,51 @@ existing `dflash_spec` mount (`DFlash2DraftModel`), `--speculative-draft-model-q
 - Rollback to v1 (engine may stay): `SPECULATIVE_DRAFT_MODEL_PATH = f"{DFLASH_MOUNT_PATH}/k3-instinct-v5-epoch1"`,
   `DRAFT_QUANTIZATION = "fp8"` + restore `"--speculative-draft-fp8-activation-scheme": "static"`,
   drop the `check_dflash2_checkpoint` call; redeploy.
+
+## HiCache sizing (dedup 140 GB KV / 13.5x Mamba, write_through)
+
+With the router's session affinity TTL at 60 min, the host tier must hold a session's prefix for up to an
+hour. At `--hicache-ratio 3` (735 GB host, 8 replicated KV copies) the pool cycles in ~20-30 min. MLA host
+dedup keeps one KV copy across the 8 TP ranks, so the same memory holds ~7x more distinct prefix tokens.
+
+Measured (5% prod mirror replay, 1/3 of per-replica session pressure, 60-min sticky affinity, three
+simultaneous fresh 8xB300 boxes, 45-min scored window, tree 24423fcdd3; HiCache code is byte-identical to
+3ccb60f5b):
+
+| arm | token hit | 30-45 min wake | 45-60 min wake | TTFT p50 | queue-full errors |
+|---|---|---|---|---|---|
+| ratio 3 selective (previous prod) | 88.0% | 44% | 28% | 4.6 s | 66 |
+| dedup 130 GB / mamba 16 / selective | 94.9% | 95% | 79% | 0.4 s | 0 |
+| **dedup 140 GB / mamba 13.5 / write_through** | **95.0%** | **97%** | **82%** | **0.4 s** | **0** |
+
+Host memory at steady state: RSS sum ~815 GiB, max rank ~216 GiB (rank 0 owns the dedup pool); pinned
+pools ~797 GiB (modelled from the pool sizes), under the fork's 800 GiB host-pool budget. Wakes >= 60 min miss on every arm (the pool has
+cycled), so the TTL and the pool horizon are matched. Caveat: at full prod inflow every arm's retention
+horizon is shorter than measured; the ranking is unaffected (the gap is ~50x the cross-box band).
+
+Check on a running container: `--enable-mla-hicache-host-dedup` in the server command line and the
+HiCache init log reporting the host KV pool at 140 GB with the Mamba host pool sized 13.5x device.
+
+Fallback if rank-0 RSS is a problem: `--hicache-size 130 --hicache-mamba-ratio 16 --hicache-write-policy
+write_through_selective` (within 0.05 pt overall, -2 to -3 pt on 20-60 min wakes, ~45 GiB less pinned).
+
+Rollback to the previous tier: drop `--enable-mla-hicache-host-dedup --hicache-size --hicache-mamba-ratio`,
+restore `--hicache-ratio 3 --hicache-write-policy write_through_selective`. Cache contents are per-container
+and rebuilt from traffic either way; no engine code change is involved (RELEASE_SHA unchanged).
+
+Validation (2026-09-17, L27 gate runs on fresh boxes, same tree as the measured arms):
+
+- Output parity: greedy 36-row probe (29 reasoning, 1 content, 6 tool-call; 8 image rows
+  containing literal `<|sep|>`), idle engines, dedup 140/13.5 write_through vs current
+  ratio-3 selective: 36/36 byte-identical.
+- Full-inflow stability: 15 min at 1x per-replica session inflow (all sessions, 6x pace, no
+  flush) on the 140/13.5 arm: health 200 throughout, 0 tracebacks, 0 OOM, rank-0 RSS flat
+  at 217 GiB (sum 818 GiB) under both queue saturation and idle, host KV pool 97% full.
+  Retention at full inflow could not be scored: 2/3 of sessions arrived cold (~130k uncached
+  tokens each) and a single replica ingests ~19k uncached tok/s, so the box stayed
+  queue-saturated (running 10-11 / queued 16, TTFT dominated by queue wait). Warm-path
+  buckets that did complete stayed at 99%+. The 1/3-slice 45-min comparison above
+  therefore remains the retention estimate; horizons shorten at full inflow for every arm.
 
 ## Not verified
 
