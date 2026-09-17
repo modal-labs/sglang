@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -79,6 +79,55 @@ class TestSessionArrivalStamp(CustomTestCase):
 
         self.assertEqual(req.arrival_stamp, 123.456)
         self_obj._add_request_to_queue.assert_called_once_with(req)
+
+    def test_slo_admission_uses_arrival_stamp_not_rank_local_clock(self):
+        """_slo_admission_check must base virtual_arrival on the tokenizer's
+        broadcast arrival_stamp (same clock domain as r_vtime), not a
+        rank-local perf_counter — otherwise every queued req looks like
+        work-ahead and fresh admissions get spuriously 429'd."""
+        send_output = Mock()
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = SimpleNamespace(
+            schedule_policy="openrouter_slo",
+            slo_prefill_tokens_per_s=1000.0,
+            slo_ttft_slope_ms_per_uncached_token=1.0,
+            slo_ttft_base_s=0.0,
+            slo_429_margin_s=0.0,
+            openrouter_slo_429=True,
+        )
+        scheduler.chunked_req = None
+        scheduler.tree_cache = Mock()
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=send_output)
+        )
+
+        req = SimpleNamespace(
+            rid="incoming",
+            origin_input_ids=[0] * 100,
+            output_ids=[],
+            finished_reason=None,
+            arrival_stamp=1000.0,
+            num_matched_prefix_tokens=0,
+            min_uncached_seen=None,
+            time_stats=SimpleNamespace(trace_ctx=SimpleNamespace(abort=Mock())),
+        )
+        # Queued req whose virtual arrival lands just AFTER the incoming
+        # req's (1000.0 + 0.001*100 = 1000.1) -> not work ahead.
+        queued = SimpleNamespace(
+            rid="queued",
+            origin_input_ids=[0] * 100,
+            num_matched_prefix_tokens=0,
+            min_uncached_seen=100,
+            arrival_stamp=1000.0 + 0.001 * 100 + 1e-6,
+        )
+        scheduler.waiting_queue = [queued]
+
+        # uncached=100 -> virtual_arrival=1000.1; only own work counted ->
+        # predicted 0.1s <= limit 0.1s -> admitted. With a rank-local
+        # perf_counter base (>> 1000.0) queued counts too -> 0.2s -> 429.
+        with patch("sglang.srt.managers.scheduler.match_prefix_for_req", Mock()):
+            self.assertFalse(scheduler._slo_admission_check(req))
+        send_output.assert_not_called()
 
 
 if __name__ == "__main__":

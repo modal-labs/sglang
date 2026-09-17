@@ -2750,8 +2750,13 @@ class Scheduler(
         match_prefix_for_req(self.tree_cache, req, include_req=True)
         uncached = SchedulePolicy.update_min_uncached_seen(req)
 
-        now = time.perf_counter()
-        virtual_arrival = now + slope_s * uncached
+        # Rank-identical vtime base (tokenizer arrival_stamp), matching the
+        # queue sort key and r_vtime below; rank-local perf_counter only for
+        # legacy requests without a stamp.
+        base = (
+            req.arrival_stamp if req.arrival_stamp is not None else time.perf_counter()
+        )
+        virtual_arrival = base + slope_s * uncached
         work_ahead = uncached
         if self.chunked_req is not None:
             cr = self.chunked_req
