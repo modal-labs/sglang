@@ -614,7 +614,8 @@ class HybridCacheController(BaseHiCacheController):
                     pool_transfers=resolved_pool_transfers,
                     pool_names=rank_local_pool_names,
                 )
-            if self.has_draft and host_indices.numel() > 0:
+            draft_write = self.has_draft and host_indices.numel() > 0
+            if draft_write:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     draft_host_indices,
@@ -628,6 +629,12 @@ class HybridCacheController(BaseHiCacheController):
                 device_indices,
                 resolved_pool_transfers,
             )
+            if draft_write:
+                # Keep the draft indices alive for the async staged D2H kernel
+                # even when they are not the tensors recorded above.
+                self._record_transfer_indices_on_stream(
+                    self.write_stream, draft_host_indices, draft_device_indices
+                )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def reserve_load(
