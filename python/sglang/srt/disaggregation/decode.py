@@ -757,25 +757,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
-                error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-                is_propagated = False
-                try:
-                    decode_req.kv_receiver.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                    is_propagated = getattr(e, "is_from_another_rank", False)
-                # Mute error message for propagated exceptions to avoid duplicate logging
-                if is_propagated:
-                    logger.debug(error_message)
-                else:
-                    logger.error(error_message)
-                prepare_abort(
-                    decode_req.req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                if self.scheduler.metrics_reporter.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                    error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                    is_propagated = False
+                    try:
+                        decode_req.kv_receiver.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                        is_propagated = getattr(e, "is_from_another_rank", False)
+                    # Mute error message for propagated exceptions to avoid duplicate logging
+                    if is_propagated:
+                        logger.debug(error_message)
+                    else:
+                        logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -923,6 +924,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
+                self.scheduler._release_dropped_waiting_req_mm_inputs(decode_req.req)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
@@ -1891,28 +1893,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
             ):
-                error_message = (
-                    f"Decode transfer failed for request rank={self.tp_rank} "
-                    f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-                )
-                is_propagated = False
-                if poll == KVPoll.Failed:
-                    try:
-                        decode_req.kv_receiver.failure_exception()
-                    except Exception as e:
-                        error_message += f" with exception {e}"
-                        is_propagated = getattr(e, "is_from_another_rank", False)
                 self._clean_hicache_prefetch_resources(decode_req)
-                # Mute error message for propagated exceptions to avoid duplicate logging
-                if is_propagated:
-                    logger.debug(error_message)
-                else:
-                    logger.error(error_message)
-                prepare_abort(
-                    decode_req.req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                user_aborted = isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+                if not user_aborted:
+                    error_message = (
+                        f"Decode transfer failed for request rank={self.tp_rank} "
+                        f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                    )
+                    is_propagated = False
+                    if poll == KVPoll.Failed:
+                        try:
+                            decode_req.kv_receiver.failure_exception()
+                        except Exception as e:
+                            error_message += f" with exception {e}"
+                            is_propagated = getattr(e, "is_from_another_rank", False)
+                    # Mute error message for propagated exceptions to avoid duplicate logging
+                    if is_propagated:
+                        logger.debug(error_message)
+                    else:
+                        logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],
                     decode_req.req.return_logprob,
@@ -1921,10 +1925,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                self.scheduler._release_dropped_waiting_req_mm_inputs(decode_req.req)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 indices_to_remove.add(i)
-                if self.scheduler.metrics_reporter.enable_metrics:
+                if not user_aborted and self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
@@ -1947,7 +1952,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         )
                     self._clean_hicache_prefetch_resources(decode_req)
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                    if self.scheduler.metrics_reporter.enable_metrics:
+                    self.scheduler._release_dropped_waiting_req_mm_inputs(
+                        decode_req.req
+                    )
+                    if (
+                        decode_req.req.finished_reason.status_code is not None
+                        and self.scheduler.metrics_reporter.enable_metrics
+                    ):
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
                     transferred_reqs.append(decode_req.req)

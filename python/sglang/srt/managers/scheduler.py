@@ -4512,30 +4512,37 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    prepare_abort(decode_req.req, "Aborted")
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(decode_req.req.rid)
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    prepare_abort(decode_req.req, "Aborted")
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(decode_req.req.rid)
 
             # Abort requests already retracted to CPU cache
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        assert hasattr(decode_req, "kv_cache_cpu")
-                        del decode_req.kv_cache_cpu
-                        prepare_abort(decode_req, "Aborted")
-                        self._release_dropped_waiting_req_mm_inputs(decode_req)
-                        if self.enable_hicache_storage:
-                            self.tree_cache.release_aborted_request(decode_req.rid)
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=decode_req.rid), decode_req
-                        )
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+            retracted_queue = self.disagg_decode_prealloc_queue.retracted_queue
+            idx = 0
+            while idx < len(retracted_queue):
+                decode_req = retracted_queue[idx]
+                if not (recv_req.abort_all or decode_req.rid.startswith(recv_req.rid)):
+                    idx += 1
+                    continue
+                assert hasattr(decode_req, "kv_cache_cpu")
+                prepare_abort(decode_req, "Aborted")
+                self._release_dropped_waiting_req_mm_inputs(decode_req)
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(decode_req.rid)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=decode_req.rid), decode_req
+                )
+                del decode_req.kv_cache_cpu
+                retracted_queue.pop(idx)
 
         # Delete requests in the running batch
         if self.ps.pp_size == 1:
