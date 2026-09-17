@@ -188,6 +188,20 @@ def test_account_admission_block_excludes_admitted_and_skipped_requests():
     sched.metrics_reporter.record_admission_block.assert_not_called()
 
 
+def test_configurator_declares_the_cap_source_slot():
+    """KVCacheConfigurator is a slots dataclass: resolve_max_num_reqs must write
+    a declared field, or every server start raises AttributeError."""
+    import dataclasses
+
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+    names = {f.name for f in dataclasses.fields(KVCacheConfigurator)}
+    assert "max_running_requests_cap_source" in names
+    cfg = object.__new__(KVCacheConfigurator)
+    cfg.max_running_requests_cap_source = "mamba_pool"
+    assert cfg.max_running_requests_cap_source == "mamba_pool"
+
+
 def test_collector_increments_both_counters_with_cause_label():
     collector = object.__new__(SchedulerMetricsCollector)
     collector.labels = {"model_name": "test"}
