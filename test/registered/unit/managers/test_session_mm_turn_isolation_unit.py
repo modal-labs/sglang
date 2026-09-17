@@ -84,7 +84,7 @@ def _image_turn(rid, *, prefix_len, pad_value, parent_rid=None):
 def _admit_image_turn(session, recv, image_inputs, *, vocab_size=VOCAB):
     req = session.create_req(recv, tokenizer=None, vocab_size=vocab_size)
     SessionController.adjust_mm_offsets(recv, req, image_inputs)
-    req.origin_input_ids = pad_input_ids_array(req.origin_input_ids, image_inputs)
+    req.set_origin_input_ids(pad_input_ids_array(req.origin_input_ids, image_inputs))
     req.extend_image_inputs(image_inputs)
     return req
 
@@ -154,6 +154,35 @@ class TestSessionMultimodalTurnIsolation(CustomTestCase):
         self.assertIsNone(req2b.multimodal_inputs.mrope_position_delta_repeated_cache)
         self.assertIsNotNone(req1.multimodal_inputs.mrope_position_delta_repeated_cache)
         self.assertEqual(_placeholder_counts(req2b), [IMG_TOKENS])
+
+    def test_streaming_turn_pads_carried_fill_ids(self):
+        session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
+        req1 = session.create_req(
+            _recv("turn-1", [1] * 5, max_new_tokens=20),
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+        req1.output_ids.extend(range(20))
+        req1._refresh_fill_ids()
+        self.assertEqual(len(req1.full_untruncated_fill_ids), 25)
+        session.finish_req(req1)
+
+        recv2, image2 = _image_turn("turn-2", prefix_len=3, pad_value=1_000_002)
+        req2 = _admit_image_turn(session, recv2, image2)
+        req2._refresh_fill_ids()
+
+        self.assertEqual(
+            list(req2.full_untruncated_fill_ids), list(req2.origin_input_ids)
+        )
+        self.assertEqual(
+            int(
+                torch.isin(
+                    torch.tensor(list(req2.full_untruncated_fill_ids)),
+                    torch.tensor([1_000_002]),
+                ).sum()
+            ),
+            IMG_TOKENS,
+        )
 
 
 if __name__ == "__main__":

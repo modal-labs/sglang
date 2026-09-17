@@ -1395,6 +1395,12 @@ class Req(ReqDllmMixin):
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.extend_range.end]
 
+    def set_origin_input_ids(self, input_ids: array) -> None:
+        """Replace origin_input_ids (e.g. multimodal padding); the fill array
+        is rebuilt from the new origin by _refresh_fill_ids."""
+        self.origin_input_ids = input_ids
+        self.full_untruncated_fill_ids = array("q")
+
     def _refresh_fill_ids(self) -> None:
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
         appending only the new output tokens.

@@ -2171,9 +2171,11 @@ class Scheduler(
 
         padded_input_ids = array("q", padded_input_ids)
         if prefix_len == 0:
-            req.origin_input_ids = padded_input_ids
+            req.set_origin_input_ids(padded_input_ids)
         else:
-            req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
+            req.set_origin_input_ids(
+                req.origin_input_ids[:prefix_len] + padded_input_ids
+            )
         return True
 
     def _maybe_compute_mrope_positions(self, req) -> None:
@@ -2491,9 +2493,11 @@ class Scheduler(
                     not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
                     and self.pad_input_ids_func
                 ):
-                    req.origin_input_ids = array(
-                        "q",
-                        self.pad_input_ids_func(req.origin_input_ids, image_inputs),
+                    req.set_origin_input_ids(
+                        array(
+                            "q",
+                            self.pad_input_ids_func(req.origin_input_ids, image_inputs),
+                        )
                     )
                 req.extend_image_inputs(image_inputs)
                 self._maybe_compute_mrope_positions(req)
@@ -2873,8 +2877,11 @@ class Scheduler(
                     and self.pad_input_ids_func
                 ):
                     # See companion call site above for the array.array wrap rationale.
-                    req.origin_input_ids = array(
-                        "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                    req.set_origin_input_ids(
+                        array(
+                            "q",
+                            self.pad_input_ids_func(req.origin_input_ids, image_inputs),
+                        )
                     )
 
                 req.extend_image_inputs(image_inputs)
