@@ -558,6 +558,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
+        req.pin_first_matched_len()
         req.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(

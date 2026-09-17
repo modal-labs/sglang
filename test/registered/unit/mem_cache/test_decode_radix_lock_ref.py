@@ -77,6 +77,7 @@ class MockReq:
         self.output_ids = array("q", [fill_ids[-1]] if len(fill_ids) > 1 else [])
         self.req_pool_idx = req_pool_idx
         self.cache_protected_len = cache_protected_len
+        self.first_matched_len = None
         self.last_node = last_node
         self.extra_key = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
@@ -86,6 +87,10 @@ class MockReq:
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
+
+    def pin_first_matched_len(self):
+        if self.first_matched_len is None:
+            self.first_matched_len = self.cache_protected_len
 
 
 def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):

@@ -876,7 +876,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if getattr(req, "evict_on_finish", False):
             self.evict_finished_req_prefix(
                 req.last_node,
-                matched_len=req.cache_protected_len,
+                matched_len=req.evict_matched_len(),
                 kv_len=self.finished_key_len(kv_len_to_handle),
                 rid=req.rid,
             )
@@ -994,6 +994,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             req.prefix_indices = new_indices
+        req.pin_first_matched_len()
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock

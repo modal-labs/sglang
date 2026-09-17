@@ -51,6 +51,9 @@ class SessionSlot:
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
     cache_protected_len: int = 0
+    # First turn's first-admission match; unlike cache_protected_len it is
+    # not re-anchored by cache_unfinished_req. Bound for evict_on_finish.
+    first_matched_len: Optional[int] = None
     swa_uuid_for_lock: Optional[str] = None
     # components the first req skipped locking on last_node, so release dec
     # releases only what it took (may share the node with another req).
@@ -77,6 +80,7 @@ class SessionSlot:
         if is_first:
             self.last_node = req.last_node
             self.cache_protected_len = req.cache_protected_len
+            self.first_matched_len = req.evict_matched_len()
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
             self.skip_lock_node_ids = req.skip_lock_node_ids
 
@@ -330,7 +334,11 @@ class StreamingSession(BasePrefixCache):
         req.session.finish_req(req)
 
         if getattr(req, "evict_on_finish", False):
-            lock_node, matched_len = slot.last_node, slot.cache_protected_len
+            lock_node, matched_len = slot.last_node, (
+                slot.first_matched_len
+                if slot.first_matched_len is not None
+                else slot.cache_protected_len
+            )
             self.release_session(session_id)
             if lock_node is not None and not isinstance(lock_node, _VirtualNode):
                 self.inner.evict_finished_req_prefix(

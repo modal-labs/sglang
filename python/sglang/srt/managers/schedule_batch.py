@@ -1146,6 +1146,10 @@ class Req(ReqDllmMixin):
         self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Prefix length matched from the tree at first admission; unlike
+        # cache_protected_len it is not re-anchored by cache_unfinished_req
+        # (which instead pins it, see pin_first_matched_len).
+        self.first_matched_len: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1744,6 +1748,20 @@ class Req(ReqDllmMixin):
         if self.grammar is not None and self.grammar.is_terminated():
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
+
+    def pin_first_matched_len(self) -> None:
+        """Called by cache_unfinished_req right before it re-anchors
+        cache_protected_len to the request's own insert; the value it captures
+        is the match of the admission that actually ran the prefill."""
+        if self.first_matched_len is None:
+            self.first_matched_len = self.cache_protected_len
+
+    def evict_matched_len(self) -> int:
+        """Ownership bound for evict_on_finish: tokens up to this length were
+        matched from the tree at first admission and are not this req's to free."""
+        if self.first_matched_len is None:
+            return self.cache_protected_len
+        return self.first_matched_len
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this

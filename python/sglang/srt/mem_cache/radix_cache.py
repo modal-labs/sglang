@@ -502,7 +502,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if getattr(req, "evict_on_finish", False):
             self.evict_finished_req_prefix(
                 req.last_node,
-                matched_len=req.cache_protected_len,
+                matched_len=req.evict_matched_len(),
                 kv_len=self.finished_key_len(kv_len_to_handle),
                 rid=req.rid,
             )
@@ -556,6 +556,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
         # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
+        req.pin_first_matched_len()
         req.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node)

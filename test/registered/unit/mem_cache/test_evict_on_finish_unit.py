@@ -69,14 +69,16 @@ FULL = ComponentType.FULL
 KV_SIZE = 256
 
 
-def _build_cache():
-    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
+def _build_cache(page_size=1):
+    set_global_server_args_for_scheduler(
+        ServerArgs(model_path="dummy", page_size=page_size)
+    )
     req_to_token_pool = ReqToTokenPool(
         size=8, max_context_len=64, device="cpu", enable_memory_saver=False
     )
     kv_pool = MHATokenToKVPool(
         size=KV_SIZE,
-        page_size=1,
+        page_size=page_size,
         dtype=torch.bfloat16,
         head_num=2,
         head_dim=16,
@@ -94,7 +96,7 @@ def _build_cache():
     params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
-        page_size=1,
+        page_size=page_size,
         disable=False,
         tree_components=(FULL,),
         eviction_policy="lru",
@@ -104,6 +106,53 @@ def _build_cache():
 
 def _key(tokens):
     return RadixKey(array("q", tokens))
+
+
+def _hit_on(cache, tokens):
+    return len(cache.match_prefix(MatchPrefixParams(key=_key(tokens))).device_indices)
+
+
+def _scheduler_run(cache, allocator, pool, rid, tokens, *, evict_on_finish, n_out):
+    """The real scheduler flow: admission match -> prefill ->
+    ``cache_unfinished_req`` (which re-anchors ``cache_protected_len`` and
+    ``last_node`` to the request's own insert) -> decode ``n_out`` tokens ->
+    finish. Mirrors ``maybe_cache_unfinished_req`` in
+    batch_result_processor.py."""
+    match = cache.match_prefix(MatchPrefixParams(key=_key(tokens)))
+    prefix_len = len(match.device_indices)
+    cache.inc_lock_ref(match.last_device_node)
+    req = Req(
+        rid=str(rid),
+        origin_input_text="",
+        origin_input_ids=array("q", tokens),
+        sampling_params=SamplingParams(temperature=0, max_new_tokens=n_out),
+        evict_on_finish=evict_on_finish,
+    )
+    pool.alloc([req])
+    req.output_ids = array("q")
+    req.prefix_indices = match.device_indices
+    req.last_node = match.last_device_node
+    req.cache_protected_len = prefix_len
+    req.extra_key = None
+    total = len(tokens) + n_out
+    if prefix_len:
+        pool.write((req.req_pool_idx, slice(0, prefix_len)), match.device_indices)
+    new_indices = allocator.alloc(total - prefix_len)
+    assert new_indices is not None
+    pool.write((req.req_pool_idx, slice(prefix_len, total)), new_indices)
+    req.kv_committed_len = len(tokens)
+    req.kv = ReqKvInfo(kv_allocated_len=total, swa_evicted_seqlen=0)
+    req.full_untruncated_fill_ids = array("q", tokens)
+    req.set_extend_range(prefix_len, len(tokens))
+    # First output token: prefill done but the request is not finished, so
+    # the scheduler runs cache_unfinished_req on it.
+    req.output_ids.append(9000 + 10 * rid)
+    cache.cache_unfinished_req(req)
+    for i in range(1, n_out):
+        req.output_ids.append(9000 + 10 * rid + i)
+    req.kv_committed_len = total
+    release_kv_cache(req, cache)
+    return req
 
 
 class EvictOnFinishTest(unittest.TestCase):
@@ -288,6 +337,54 @@ class EvictOnFinishTest(unittest.TestCase):
         self.assertEqual(KV_SIZE - self.allocator.available_size(), 16)
         self.cache.sanity_check()
 
+    # -- page_size > 1: the eviction bound is the first-admission match -------
+    # In the real flow cache_unfinished_req re-anchors cache_protected_len to
+    # the request's own page-aligned insert, so a short output that does not
+    # cross the next page boundary must still free the private prompt chain.
+
+    def test_flagged_finish_frees_private_prompt_without_page_crossing(self):
+        cache, allocator, pool = _build_cache(page_size=4)
+        P = list(range(1, 9))
+        _scheduler_run(cache, allocator, pool, 0, P, evict_on_finish=True, n_out=1)
+        self.assertEqual(_hit_on(cache, P), 0)
+        self.assertEqual(KV_SIZE - allocator.available_size(), 0)
+
+    def test_flagged_finish_keeps_shared_prefix_without_page_crossing(self):
+        cache, allocator, pool = _build_cache(page_size=4)
+        S = list(range(1, 9))
+        a1, b1 = list(range(101, 105)), list(range(201, 205))
+        _scheduler_run(
+            cache, allocator, pool, 0, S + b1, evict_on_finish=False, n_out=1
+        )
+        _scheduler_run(cache, allocator, pool, 1, S + a1, evict_on_finish=True, n_out=1)
+        self.assertEqual(_hit_on(cache, S + a1), len(S))
+        self.assertEqual(_hit_on(cache, S + b1), len(S + b1))
+        self.assertEqual(KV_SIZE - allocator.available_size(), len(S + b1))
+
+    def test_unflagged_finish_keeps_private_prompt_without_page_crossing(self):
+        cache, allocator, pool = _build_cache(page_size=4)
+        P = list(range(1, 9))
+        _scheduler_run(cache, allocator, pool, 0, P, evict_on_finish=False, n_out=1)
+        self.assertEqual(_hit_on(cache, P), len(P))
+
+    def test_rejected_admission_does_not_stale_ownership(self):
+        """A rejected first scheduling attempt must not freeze the eviction
+        bound: the bound is the match of the admission that actually ran the
+        prefill."""
+        cache, allocator, pool = _build_cache(page_size=4)
+        P = list(range(1, 9))
+        # Rejected attempt: matched nothing, lock taken and dropped, no insert.
+        match = cache.match_prefix(MatchPrefixParams(key=_key(P)))
+        self.assertEqual(len(match.device_indices), 0)
+        cache.inc_lock_ref(match.last_device_node)
+        cache.dec_lock_ref(match.last_device_node)
+        # Another trajectory caches P exactly while this req waits.
+        _scheduler_run(cache, allocator, pool, 0, P, evict_on_finish=False, n_out=1)
+        # Real admission matches all of P; 1 output token, no page crossing.
+        _scheduler_run(cache, allocator, pool, 1, P, evict_on_finish=True, n_out=1)
+        self.assertEqual(_hit_on(cache, P), len(P))
+        self.assertEqual(KV_SIZE - allocator.available_size(), len(P))
+
 
 class EvictOnFinishPlumbingTest(unittest.TestCase):
     def test_generate_req_input_carries_flag_per_item(self):
@@ -364,15 +461,17 @@ class EvictOnFinishSessionTest(unittest.TestCase):
         self.assertFalse(self._create_req(False).evict_on_finish)
 
 
-def _build_radix_cache():
+def _build_radix_cache(page_size=1):
     """Plain ``RadixCache`` (no tree components) over small CPU pools."""
-    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
+    set_global_server_args_for_scheduler(
+        ServerArgs(model_path="dummy", page_size=page_size)
+    )
     req_to_token_pool = ReqToTokenPool(
         size=8, max_context_len=64, device="cpu", enable_memory_saver=False
     )
     kv_pool = MHATokenToKVPool(
         size=KV_SIZE,
-        page_size=1,
+        page_size=page_size,
         dtype=torch.bfloat16,
         head_num=2,
         head_dim=16,
@@ -390,7 +489,7 @@ def _build_radix_cache():
     params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
-        page_size=1,
+        page_size=page_size,
         disable=False,
         eviction_policy="lru",
     )
@@ -529,6 +628,55 @@ class EvictOnFinishRadixCacheTest(CustomTestCase):
         self._finish(S, evict_on_finish=True)
         self.assertEqual(self._hit(S), len(S))
         self.assertEqual(KV_SIZE - self.allocator.available_size(), len(S))
+
+    # -- page_size > 1: the eviction bound is the first-admission match -------
+    # In the real flow cache_unfinished_req re-anchors cache_protected_len to
+    # the request's own page-aligned insert, so a short output that does not
+    # cross the next page boundary must still free the private prompt chain.
+
+    def test_flagged_finish_frees_private_prompt_without_page_crossing(self):
+        cache, allocator, pool = _build_radix_cache(page_size=4)
+        P = list(range(1, 9))
+        _scheduler_run(cache, allocator, pool, 0, P, evict_on_finish=True, n_out=1)
+        self.assertEqual(_hit_on(cache, P), 0)
+        self.assertEqual(KV_SIZE - allocator.available_size(), 0)
+        self.assertEqual(cache.total_size(), 0)
+
+    def test_flagged_finish_keeps_shared_prefix_without_page_crossing(self):
+        cache, allocator, pool = _build_radix_cache(page_size=4)
+        S = list(range(1, 9))
+        a1, b1 = list(range(101, 105)), list(range(201, 205))
+        _scheduler_run(
+            cache, allocator, pool, 0, S + b1, evict_on_finish=False, n_out=1
+        )
+        _scheduler_run(cache, allocator, pool, 1, S + a1, evict_on_finish=True, n_out=1)
+        self.assertEqual(_hit_on(cache, S + a1), len(S))
+        self.assertEqual(_hit_on(cache, S + b1), len(S + b1))
+        self.assertEqual(KV_SIZE - allocator.available_size(), len(S + b1))
+
+    def test_unflagged_finish_keeps_private_prompt_without_page_crossing(self):
+        cache, allocator, pool = _build_radix_cache(page_size=4)
+        P = list(range(1, 9))
+        _scheduler_run(cache, allocator, pool, 0, P, evict_on_finish=False, n_out=1)
+        self.assertEqual(_hit_on(cache, P), len(P))
+
+    def test_rejected_admission_does_not_stale_ownership(self):
+        """A rejected first scheduling attempt must not freeze the eviction
+        bound: the bound is the match of the admission that actually ran the
+        prefill."""
+        cache, allocator, pool = _build_radix_cache(page_size=4)
+        P = list(range(1, 9))
+        # Rejected attempt: matched nothing, lock taken and dropped, no insert.
+        match = cache.match_prefix(MatchPrefixParams(key=_key(P)))
+        self.assertEqual(len(match.device_indices), 0)
+        cache.inc_lock_ref(match.last_device_node)
+        cache.dec_lock_ref(match.last_device_node)
+        # Another trajectory caches P exactly while this req waits.
+        _scheduler_run(cache, allocator, pool, 0, P, evict_on_finish=False, n_out=1)
+        # Real admission matches all of P; 1 output token, no page crossing.
+        _scheduler_run(cache, allocator, pool, 1, P, evict_on_finish=True, n_out=1)
+        self.assertEqual(_hit_on(cache, P), len(P))
+        self.assertEqual(KV_SIZE - allocator.available_size(), len(P))
 
 
 class EvictOnFinishStreamingSessionTest(CustomTestCase):

@@ -669,7 +669,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if getattr(req, "evict_on_finish", False):
             self.evict_finished_req_prefix(
                 req.last_node,
-                matched_len=req.cache_protected_len,
+                matched_len=req.evict_matched_len(),
                 kv_len=self.finished_key_len(kv_len_to_handle),
                 rid=req.rid,
             )
@@ -791,6 +791,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
+        req.pin_first_matched_len()
         req.cache_protected_len = len(new_indices)
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node

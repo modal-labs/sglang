@@ -311,7 +311,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Explicit eviction signal (``Req.evict_on_finish``): free the prefix chain
         ending at ``last_node`` that is private to the finishing request. The request
         owns a node only if it extended strictly past it (``kv_len > matched_len``,
-        where ``kv_len`` is the logical key length ``finished_key_len``); a request
+        where ``kv_len`` is the logical key length ``finished_key_len`` and
+        ``matched_len`` is the first-admission match ``Req.evict_matched_len``,
+        not the ``cache_unfinished_req``-re-anchored ``cache_protected_len``); a request
         whose tokens end exactly at an existing node has no claim on it.
         Backends without an implementation keep the tree untouched."""
         return None
