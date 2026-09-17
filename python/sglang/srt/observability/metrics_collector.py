@@ -2079,6 +2079,26 @@ class ExpertDispatchCollector(_StatLoggerDIMixin):
         )
 
 
+def radix_cache_metric_labels(
+    cache_type: str, parallel: Any, dp_attention_enabled: bool
+) -> Dict[str, Any]:
+    # Every scheduler rank runs its own cache over its own KV shard; without
+    # rank labels the multiprocess registry sums ranks into TP x the count.
+    # Same rank keys as the storage collector (cache_controller's storage
+    # config), so one rank's L2 and L3 series line up. (Backport of the label
+    # part of sgl-project/sglang#39280.)
+    if dp_attention_enabled:
+        tp_rank, dp_rank = parallel.attn_tp_rank, parallel.attn_dp_rank
+    else:
+        tp_rank, dp_rank = parallel.tp_rank, 0
+    return {
+        "cache_type": cache_type,
+        "tp_rank": tp_rank,
+        "pp_rank": parallel.pp_rank,
+        "dp_rank": dp_rank,
+    }
+
+
 KV_AGE_BUCKETS = (
     1.0,
     5.0,

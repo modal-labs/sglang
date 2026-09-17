@@ -477,3 +477,30 @@ class TestUnifiedRadixCacheEmitsKvAge(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRadixCacheMetricLabels(unittest.TestCase):
+    def test_labels_carry_the_rank_so_tp_ranks_are_not_summed(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.observability.metrics_collector import radix_cache_metric_labels
+
+        ps = SimpleNamespace(tp_rank=2, pp_rank=0, attn_tp_rank=1, attn_dp_rank=3)
+        self.assertEqual(
+            radix_cache_metric_labels("UnifiedRadixCache", ps, False),
+            {
+                "cache_type": "UnifiedRadixCache",
+                "tp_rank": 2,
+                "pp_rank": 0,
+                "dp_rank": 0,
+            },
+        )
+        self.assertEqual(
+            radix_cache_metric_labels("UnifiedRadixCache", ps, True),
+            {
+                "cache_type": "UnifiedRadixCache",
+                "tp_rank": 1,
+                "pp_rank": 0,
+                "dp_rank": 3,
+            },
+        )
