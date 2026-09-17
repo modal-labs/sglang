@@ -733,14 +733,14 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        from sgl_kernel import tree_speculative_sampling_target_only
 
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
+        )
+        from sglang.srt.layers.sampling_renorm import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
         )
 
         use_rejection_sampling = get_server_args().speculative_use_rejection_sampling
