@@ -152,29 +152,69 @@ def test_account_admission_block_excludes_admitted_and_skipped_requests():
             self.rid = rid
 
     a, b, c, d = (_Req(r) for r in "abcd")
+    chunked = _Req("chunked")
     sched = object.__new__(Scheduler)
     sched.waiting_queue = [a, b, c, d]
+    sched.chunked_req = chunked
     sched._last_admission_block_cause = None
-    sched.metrics_reporter = MagicMock()
+    sched.metrics_reporter = MagicMock(current_scheduler_metrics_enabled=True)
 
-    # a admitted, b skipped by the loop (LoRA / prefetch): only c and d were
-    # held back by the gate that stopped the pass.
-    sched._account_admission_block(AdmissionBlockCause.MAMBA_SLOTS, {a, b})
+    # a admitted (plus the chunked continuation, which is not in the queue),
+    # b skipped by the loop: only c and d were held back by the gate.
+    sched._account_admission_block(AdmissionBlockCause.MAMBA_SLOTS, [chunked, a], 1)
     sched.metrics_reporter.record_admission_block.assert_called_once_with(
         AdmissionBlockCause.MAMBA_SLOTS, 2
     )
     assert sched._last_admission_block_cause == AdmissionBlockCause.MAMBA_SLOTS
 
-    # Everything admitted or skipped: not a blocked pass, and the carried-over
+    # Everything admitted or skipped: not a blocked pass; the carried-over
     # cause is forgotten.
     sched.metrics_reporter.reset_mock()
-    sched._account_admission_block(AdmissionBlockCause.KV_TOKENS, {a, b, c, d})
+    sched._account_admission_block(AdmissionBlockCause.KV_TOKENS, [a, b], 2)
     sched.metrics_reporter.record_admission_block.assert_not_called()
     assert sched._last_admission_block_cause is None
 
     # No gate fired: nothing recorded.
-    sched._account_admission_block(None, set())
+    sched._account_admission_block(None, [], 0)
     sched.metrics_reporter.record_admission_block.assert_not_called()
+
+    # Scheduler metrics off: no queue accounting at all.
+    sched.metrics_reporter = MagicMock(current_scheduler_metrics_enabled=False)
+    sched._account_admission_block(AdmissionBlockCause.KV_TOKENS, [], 0)
+    sched.metrics_reporter.record_admission_block.assert_not_called()
+
+
+def test_req_slot_cause_with_a_binding_beam_cap():
+    """A beam candidate needs beam_width rows: when available // beam_width is
+    the smaller operand (zero or not) the row pool is binding, not PP."""
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers import scheduler as scheduler_module
+
+    sched = object.__new__(Scheduler)
+    sched.running_batch = object()
+    sched.req_to_token_pool = SimpleNamespace(available_size=lambda: 10)
+    sched.beam_coordinator = SimpleNamespace(pending_member_rows=lambda _b: 0)
+    parallel = SimpleNamespace(pp_max_micro_batch_size=5)
+    original = scheduler_module.get_parallel
+    scheduler_module.get_parallel = lambda: parallel
+    try:
+        # 10 rows, beam 3 -> 3 rows' worth of candidates < pp budget 5
+        assert (
+            sched._req_slot_block_cause(0, None, 3)
+            == AdmissionBlockCause.MAX_RUNNING_REQUESTS
+        )
+        # 10 rows, no beam -> pp budget 5 is the smaller operand
+        assert (
+            sched._req_slot_block_cause(0, None, None)
+            == AdmissionBlockCause.PP_MICRO_BATCH
+        )
+        # beam wider than the pool -> zero rows -> pool
+        assert (
+            sched._req_slot_block_cause(0, None, 40)
+            == AdmissionBlockCause.MAX_RUNNING_REQUESTS
+        )
+    finally:
+        scheduler_module.get_parallel = original
 
 
 def test_configurator_declares_the_cap_source_slot():
