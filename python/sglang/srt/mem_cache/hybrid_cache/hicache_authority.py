@@ -30,10 +30,13 @@ import threading
 import weakref
 import zlib
 from collections import deque
+from contextlib import contextmanager, nullcontext
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -195,6 +198,17 @@ class HiCacheAuthority:
         self._crc = 0  # running bookkeeping CRC (every rank)
         self._outbox: deque = deque()  # worker/scheduler emitted records
         self._stash: dict = {}  # rank 0: seq -> HybridWriteReservation
+        # rank 0: D2H finish events launched on the worker's stream, awaiting
+        # a wait on the scheduler stream (streams are thread-local).
+        self._forward_fences: deque = deque()
+        # rank 0, SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF: held by the worker across
+        # fence-on-latest-forward -> commit_write and by the scheduler across
+        # fence drain -> wait_stream -> forward launch -> forward_done.record,
+        # so a D2H is ordered either before or after every forward.
+        self.atomic_write_handoff = (
+            envs.SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF.get()
+        )
+        self._launch_lock = threading.Lock()
         self._stalled: deque = deque()  # intents awaiting an eviction round
         # Node ids whose intents are parked: children of a STALLED parent
         # must stall behind it, or a child PLACE publishes before its
@@ -388,7 +402,45 @@ class HiCacheAuthority:
         # broadcast) for multi-ms per intent during write bursts.
         if intent.fence_event is not None:
             torch.get_device_module().current_stream().wait_event(intent.fence_event)
-        self.controller.commit_write(reservation)
+        with self._launch_lock if self.atomic_write_handoff else nullcontext():
+            if self.atomic_write_handoff and self.cache is not None:
+                # Under the lock the latest forward_done is exactly the last
+                # forward the scheduler launched; order this D2H behind it.
+                self.cache.fence_state_read()
+            _, finish_event = self.controller.commit_write_with_event(reservation)
+            if finish_event is not None:
+                with self._lock:
+                    self._forward_fences.append(finish_event)
+
+    @contextmanager
+    def forward_launch_section(self):
+        """Scheduler thread, rank 0: wrap wait_stream -> forward launch ->
+        forward_done.record. With SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF the
+        worker's commit is excluded from this section and the fence drain
+        happens inside it, so no D2H can slip between drain and launch.
+        Otherwise a no-op (the plain per-launch drain applies)."""
+        if not self.atomic_write_handoff:
+            yield
+            return
+        with self._launch_lock:
+            self.fence_forward_stream()
+            yield
+
+    def fence_forward_stream(self) -> None:
+        """Scheduler thread, rank 0, right before each forward launch: make the
+        scheduler stream wait on every D2H the worker launched since the last
+        call, so the forward (which waits on the scheduler stream) is ordered
+        after it. A commit landing between this drain and the forward's
+        wait_stream is only fenced at the next launch (enqueue-vs-launch
+        race)."""
+        with self._lock:
+            if not self._forward_fences:
+                return
+            fences = list(self._forward_fences)
+            self._forward_fences.clear()
+        stream = torch.get_device_module().current_stream()
+        for finish_event in fences:
+            stream.wait_event(finish_event)
 
     def _poll_write_acks(self) -> None:
         with self._lock:

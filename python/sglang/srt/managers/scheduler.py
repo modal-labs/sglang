@@ -3673,6 +3673,16 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 
+        # HiCache V3 rank 0: order this forward behind the D2H writes the
+        # authority worker launched on its own stream (delegated fence).
+        hicache_authority = getattr(self.tree_cache, "hicache_authority", None)
+        forward_launch_section = nullcontext()
+        if hicache_authority is not None and hicache_authority.is_rank0:
+            hicache_authority.fence_forward_stream()
+            # SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF: exclude worker D2H commits
+            # across wait_stream -> launch -> forward_done.record (no-op when off).
+            forward_launch_section = hicache_authority.forward_launch_section()
+
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -3682,7 +3692,7 @@ class Scheduler(
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
-                with self.forward_stream_ctx:
+                with self.forward_stream_ctx, forward_launch_section:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the

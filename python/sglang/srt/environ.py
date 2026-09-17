@@ -526,6 +526,13 @@ class Envs:
     # fractions of the pool size; 0 evicts only when the write cannot fit.
     SGLANG_HICACHE_HOST_EVICT_TRIGGER_RATIO = EnvFloat(0.02)
     SGLANG_HICACHE_HOST_EVICT_BATCH_RATIO = EnvFloat(0.01)
+    # HiCache V3 rank 0: serialize the authority worker's D2H
+    # launch (fence on latest forward -> commit_write) against the
+    # scheduler's forward launch (fence drain -> wait_stream -> launch ->
+    # forward_done.record) with one lock, closing the enqueue-vs-launch race
+    # left open by the per-launch fence drain. Costs rank-0 forward-launch
+    # latency behind DMA-launch bursts; set to 0 to A/B without the lock.
+    SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF = EnvBool(True)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)

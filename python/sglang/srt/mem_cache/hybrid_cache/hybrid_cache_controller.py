@@ -512,6 +512,13 @@ class HybridCacheController(BaseHiCacheController):
         return True
 
     def commit_write(self, reservation: HybridWriteReservation) -> torch.Tensor:
+        return self.commit_write_with_event(reservation)[0]
+
+    def commit_write_with_event(
+        self, reservation: HybridWriteReservation
+    ) -> tuple[torch.Tensor, Any]:
+        """Like commit_write, also returning the D2H finish event so callers off
+        the scheduler thread can fence on it without touching ack_write_queue."""
         self.write_queue.append(
             CacheOperation(
                 reservation.host_indices,
@@ -521,8 +528,8 @@ class HybridCacheController(BaseHiCacheController):
                 pool_transfers=reservation.pool_reservation.transfers,
             )
         )
-        self.start_writing()
-        return reservation.host_indices
+        finish_event = self.start_writing()
+        return reservation.host_indices, finish_event
 
     def abort_write(self, reservation: HybridWriteReservation) -> None:
         try:
@@ -548,9 +555,9 @@ class HybridCacheController(BaseHiCacheController):
             return None
         return self.commit_write(reservation)
 
-    def start_writing(self) -> None:
+    def start_writing(self) -> Any:
         if not self.write_queue:
-            return
+            return None
         op = CacheOperation.merge_ops(self.write_queue)
         self.write_queue.clear()
         start_event = device_module.Event()
@@ -571,7 +578,7 @@ class HybridCacheController(BaseHiCacheController):
             self.ack_write_queue.append(
                 HiCacheAck(start_event, finish_event, op.node_ids)
             )
-            return
+            return finish_event
 
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
         if (
@@ -635,7 +642,13 @@ class HybridCacheController(BaseHiCacheController):
                 self._record_transfer_indices_on_stream(
                     self.write_stream, draft_host_indices, draft_device_indices
                 )
+        # Rejoin the D2H stream onto the caller's stream so subsequent forward
+        # work starts only after this transfer completes. Off the scheduler
+        # thread (HiCache V3 rank-0 worker) the authority re-fences the
+        # scheduler stream on this event each step.
+        finish_event.wait()
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        return finish_event
 
     def reserve_load(
         self,

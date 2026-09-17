@@ -834,6 +834,11 @@ class HiCacheController:
                     draft_host_indices, draft_device_indices
                 )
 
+        # Rejoin the D2H stream onto the caller's stream so subsequent forward
+        # work starts only after this transfer completes. Off the scheduler
+        # thread (HiCache V3 rank-0 worker) the authority re-fences the
+        # scheduler stream on this event each step.
+        finish_event.wait()
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def _resolve_write_indices(

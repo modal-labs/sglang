@@ -1,5 +1,6 @@
 """Unit tests for HiCache staged write-back host-pool dispatch."""
 
+import threading
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers import cache_controller as manager_cache_controller
 from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheOperation
 from sglang.srt.managers.cache_controller import (
@@ -18,8 +20,13 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import (
+    hicache_authority,
     hybrid_cache_controller,
     hybrid_pool_assembler,
+)
+from sglang.srt.mem_cache.hybrid_cache.hicache_authority import (
+    HiCacheAuthority,
+    WriteIntent,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
@@ -151,11 +158,17 @@ def _cpu_per_layer_pf_lf_copy(
 
 
 class _FakeEvent:
+    def __init__(self):
+        self.waited_streams = []
+
     def record(self):
         pass
 
-    def wait(self, stream):
-        pass
+    def wait(self, stream=None):
+        self.waited_streams.append(stream)
+
+    def query(self):
+        return False
 
 
 class _FakeDeviceModule:
@@ -800,6 +813,9 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.move_hybrid_indices.assert_not_called()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
         self.assertEqual(captured["pool_transfers"][0].host_indices.device.type, "cpu")
+        self.assertEqual(
+            controller.ack_write_queue[0].finish_event.waited_streams, [None]
+        )
 
     def test_hybrid_write_moves_indices_without_write_back_jit(self):
         captured = {}
@@ -892,6 +908,9 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
         controller.move_indices.assert_not_called()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+        self.assertEqual(
+            controller.ack_write_queue[0].finish_event.waited_streams, [None]
+        )
 
     def test_cache_controller_moves_indices_without_write_back_jit(self):
         captured = {}
@@ -1633,6 +1652,160 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             reporter.stats.hicache_host_pool_used_slots,
             {"kv": 40, "mamba": 5, "draft": 25},
         )
+
+    def _run_authority_worker_write(self, finish_event, ack_write_queue, pop_ack):
+        """Drive one authority-worker write on a fake worker stream, then drain
+        the fence on a fake scheduler stream. pop_ack simulates the scheduler's
+        _poll_write_acks consuming the ack right after the commit (trivially
+        short D2H) — the fence must come from commit_write_with_event, not from
+        ack_write_queue[-1]."""
+
+        def commit_write_with_event(reservation):
+            ack_write_queue.append(
+                SimpleNamespace(finish_event=finish_event, node_ids=(1,))
+            )
+            if pop_ack:
+                ack_write_queue.pop()
+            return reservation.host_indices, finish_event
+
+        controller = SimpleNamespace(
+            ack_write_queue=ack_write_queue,
+            reserve_write=lambda *args, **kwargs: SimpleNamespace(
+                host_indices=_indices(0, 4), node_id=1
+            ),
+            commit_write_with_event=commit_write_with_event,
+        )
+        authority = HiCacheAuthority(cache=None, controller=controller, is_rank0=True)
+        authority.shutdown()
+        scheduler_stream = mock.Mock()
+        worker_stream = mock.Mock()
+        fake_module = SimpleNamespace(current_stream=lambda: worker_stream)
+        with mock.patch.object(
+            hicache_authority.torch, "get_device_module", return_value=fake_module
+        ):
+            authority._process_intent(
+                WriteIntent(
+                    node_id=1,
+                    op=hicache_authority.OP_WRITE,
+                    kv_device=_indices(0, 4),
+                    extra_pools=None,
+                    kv_len=4,
+                )
+            )
+            worker_stream.wait_event.assert_not_called()
+            fake_module.current_stream = lambda: scheduler_stream
+            authority.fence_forward_stream()
+            authority.fence_forward_stream()
+        scheduler_stream.wait_event.assert_called_once_with(finish_event)
+        worker_stream.wait_event.assert_not_called()
+
+    def test_authority_worker_write_is_fenced_on_scheduler_stream(self):
+        ack_write_queue = []
+        self._run_authority_worker_write(_FakeEvent(), ack_write_queue, pop_ack=False)
+        self.assertEqual(len(ack_write_queue), 1)
+
+    def test_authority_worker_fence_survives_immediate_ack_pop(self):
+        ack_write_queue = [
+            SimpleNamespace(finish_event=_FakeEvent(), node_ids=(7,)),
+        ]
+        finish_event = _FakeEvent()
+        self._run_authority_worker_write(finish_event, ack_write_queue, pop_ack=True)
+        # Only the older ack remains (ack_write_queue[-1] would be the wrong
+        # event); the fence still targeted the new write's event.
+        self.assertEqual(len(ack_write_queue), 1)
+        self.assertIsNot(ack_write_queue[-1].finish_event, finish_event)
+
+    def _atomic_handoff_authority(self, finish_event, cache):
+        controller = SimpleNamespace(
+            ack_write_queue=[],
+            reserve_write=lambda *args, **kwargs: SimpleNamespace(
+                host_indices=_indices(0, 4), node_id=1
+            ),
+            commit_write_with_event=lambda reservation: (
+                reservation.host_indices,
+                finish_event,
+            ),
+        )
+        authority = HiCacheAuthority(cache=cache, controller=controller, is_rank0=True)
+        authority.shutdown()
+        return authority
+
+    def _atomic_handoff_intent(self):
+        return WriteIntent(
+            node_id=1,
+            op=hicache_authority.OP_WRITE,
+            kv_device=_indices(0, 4),
+            extra_pools=None,
+            kv_len=4,
+        )
+
+    def test_atomic_write_handoff_off_is_noop(self):
+        with envs.SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF.override(False):
+            authority = self._atomic_handoff_authority(_FakeEvent(), cache=mock.Mock())
+        self.assertFalse(authority.atomic_write_handoff)
+        stream = mock.Mock()
+        fake_module = SimpleNamespace(current_stream=lambda: stream)
+        with mock.patch.object(
+            hicache_authority.torch, "get_device_module", return_value=fake_module
+        ):
+            authority._process_intent(self._atomic_handoff_intent())
+            with authority.forward_launch_section():
+                self.assertFalse(authority._launch_lock.locked())
+                # Drain still happens per launch (outside the section) when off.
+                self.assertEqual(len(authority._forward_fences), 1)
+        authority.cache.fence_state_read.assert_not_called()
+
+    def test_atomic_write_handoff_serializes_commit_against_launch(self):
+        finish_event = _FakeEvent()
+        cache = mock.Mock()
+        with envs.SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF.override(True):
+            authority = self._atomic_handoff_authority(finish_event, cache=cache)
+        self.assertTrue(authority.atomic_write_handoff)
+        scheduler_stream = mock.Mock()
+        fake_module = SimpleNamespace(current_stream=lambda: scheduler_stream)
+        committed = threading.Event()
+
+        def worker():
+            authority._process_intent(self._atomic_handoff_intent())
+            committed.set()
+
+        with mock.patch.object(
+            hicache_authority.torch, "get_device_module", return_value=fake_module
+        ):
+            with authority.forward_launch_section():
+                # Scheduler holds the launch lock: the worker's commit must wait.
+                thread = threading.Thread(target=worker)
+                thread.start()
+                self.assertFalse(committed.wait(0.2))
+                self.assertEqual(len(authority._forward_fences), 0)
+                cache.fence_state_read.assert_not_called()
+            thread.join(timeout=5)
+            self.assertTrue(committed.is_set())
+            # Worker fenced on the latest forward before committing, and its
+            # event is drained at the next launch inside the section.
+            cache.fence_state_read.assert_called_once_with()
+            self.assertEqual(list(authority._forward_fences), [finish_event])
+            with authority.forward_launch_section():
+                scheduler_stream.wait_event.assert_called_once_with(finish_event)
+                self.assertEqual(len(authority._forward_fences), 0)
+
+    def test_hybrid_controller_commit_write_with_event_returns_finish_event(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = []
+        sentinel = object()
+        controller.start_writing = lambda: sentinel
+        reservation = SimpleNamespace(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+            priority=None,
+            pool_reservation=SimpleNamespace(transfers=None),
+        )
+        host_indices, finish_event = controller.commit_write_with_event(reservation)
+        self.assertIs(host_indices, reservation.host_indices)
+        self.assertIs(finish_event, sentinel)
+        self.assertEqual(len(controller.write_queue), 1)
+        self.assertIs(controller.commit_write(reservation), reservation.host_indices)
 
 
 if __name__ == "__main__":
