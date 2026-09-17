@@ -14,6 +14,7 @@ import os
 import shutil
 import struct
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -152,6 +153,7 @@ BASE_RUNTIME_ENV = {
 }
 
 PREBUILT_JIT_MODULE = "sgl_trtllm_gen_moe_fi_651799c8f7fd_4153db87ecc2"
+PREBUILT_JIT_STALE_SECONDS = 3600
 PREBUILT_JIT_URL = (
     "https://github.com/modal-projects/flashinfer/releases/download/"
     f"jit-prebuilt-4153db87/{PREBUILT_JIT_MODULE}.tar.gz"
@@ -407,13 +409,52 @@ app = modal.App(name="kimi-k3-fast")
 
 
 def seed_prebuilt_jit(jit_cache_path: str) -> None:
-    """Copy the image-baked module into the volume cache if absent."""
+    """Copy the image-baked module into the volume cache if absent.
+
+    Staged into a sibling temp dir and published with one rename so a
+    concurrent cold boot never sees a partially copied module. Leftover
+    ``.<module>.*`` dirs (a seeder killed mid-copy) are reclaimed once
+    their inode change time is older than any plausible copy."""
     src = Path(PREBUILT_JIT_IMAGE_DIR) / PREBUILT_JIT_MODULE
     dst = Path(jit_cache_path) / "tvm-ffi" / PREBUILT_JIT_MODULE
+    stale_before = time.time() - PREBUILT_JIT_STALE_SECONDS
+    for leftover in dst.parent.glob(f".{PREBUILT_JIT_MODULE}.*"):
+        try:
+            st = leftover.stat()
+            if max(st.st_mtime, st.st_ctime) < stale_before:
+                shutil.rmtree(leftover, ignore_errors=True)
+        except OSError:
+            pass
     if any(dst.glob("*.so")):
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{PREBUILT_JIT_MODULE}.", dir=dst.parent)
+    )
+    quarantine = None
+    try:
+        shutil.copytree(src, staging, dirs_exist_ok=True)
+        try:
+            os.rename(staging, dst)
+        except OSError:
+            if any(dst.glob("*.so")):
+                raise
+            # An interrupted seed left a partial module (no .so): move it
+            # aside and publish over it.
+            quarantine = Path(
+                tempfile.mkdtemp(prefix=f".{PREBUILT_JIT_MODULE}.stale.", dir=dst.parent)
+            )
+            os.rename(dst, quarantine / "partial")
+            os.rename(staging, dst)
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)
+        if any(dst.glob("*.so")):
+            print(f"Prebuilt JIT module {PREBUILT_JIT_MODULE} already seeded at {dst}")
+            return
+        raise
+    finally:
+        if quarantine is not None:
+            shutil.rmtree(quarantine, ignore_errors=True)
     print(f"Seeded prebuilt JIT module {PREBUILT_JIT_MODULE} into {dst}")
 
 
