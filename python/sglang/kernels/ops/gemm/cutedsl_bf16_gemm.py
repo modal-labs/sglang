@@ -20,7 +20,8 @@ Toggled by ``use_2cta`` in the constructor:
 Warp specialization (8 warps, 256 threads/CTA; warp 3 idle):
   Warp 0    DMA_A   TMA-loads A tiles
   Warp 1    DMA_B   TMA-loads B tiles; PDL griddepcontrol.wait
-  Warp 2    MMA     tcgen05.mma into TMEM; owns alloc/dealloc
+  Warp 2    MMA     tcgen05.mma into TMEM; owns alloc; dealloc after the
+                    end-of-kernel cluster barrier (2-CTA)
   Warps 4-7 EPILOG  TMEM -> RMEM -> bf16 cast -> st.global
 """
 
@@ -134,6 +135,9 @@ class TgvGemmCuteExtKernel:
         # adds it to the accumulator before the bf16 cast. When False, all
         # bias-related code is elided via cutlass.const_expr.
         self.has_bias = has_bias
+        # Half of TMEM (256 of 512 cols) so the next CTA can prefetch its
+        # alloc on the other half.
+        self.num_tmem_cols = 256
 
         # 1-CTA: cta_n ∈ [8, 256] step 8 (bf16 tcgen05.mma atom limit).
         # 2-CTA: cta_n ∈ [16, 256] step 16 (bf16 K-major cluster mma).
@@ -490,6 +494,20 @@ class TgvGemmCuteExtKernel:
                 d_layout,
             )
 
+        # ---- TMEM dealloc. PTX: tcgen05.dealloc.cta_group::2 is collective
+        # (one warp from EACH peer CTA) and requires the peer CTA to still be
+        # resident and its alloc complete. All 8 warps of both CTAs meet at
+        # a cluster barrier first so neither CTA can exit (or still be
+        # allocating) while its peer deallocates.
+        if cutlass.const_expr(self.use_2cta):
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        if warp_idx == 2:
+            tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr)
+            cute.arch.dealloc_tmem(
+                tmem_ptr, self.num_tmem_cols, is_two_cta=self.use_2cta
+            )
+
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
     # 1-CTA: SM90_TMA_LOAD into local sA, arrives on local bar_full.
@@ -646,7 +664,7 @@ class TgvGemmCuteExtKernel:
     # ====================================================================
     # MMA WARP — owns the TMEM accumulator and issues every tcgen05.mma.
     # 1-CTA: every CTA's MMA warp runs the K-loop on its own TMEM.
-    # 2-CTA: BOTH CTAs alloc/dealloc TMEM (cluster-coherent via
+    # 2-CTA: BOTH CTAs alloc TMEM (cluster-coherent via
     #        is_two_cta=True); only the leader runs the K-loop; commits
     #        multicast to both CTAs (mask=0b11) so each one's bar_empty /
     #        bar_mma_epilog still gets signaled.
@@ -687,8 +705,9 @@ class TgvGemmCuteExtKernel:
         # alloc on the other half. For CTA_M=64 the accumulator only uses
         # 64 lanes (16 lanes × 4 subpartitions), well within half-of-TMEM.
         # 2-CTA: alloc/relinquish/dealloc are cluster-coherent (is_two_cta=True).
-        num_tmem_cols = 256
-        cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta)
+        cute.arch.alloc_tmem(
+            self.num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta
+        )
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 0: 32 of 160
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
 
@@ -753,14 +772,11 @@ class TgvGemmCuteExtKernel:
             with cute.arch.elect_one():
                 tcgen05.commit(bar_mma_epilog, commit_mask, self.cta_group)
 
-        # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
-        # bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld is observable
-        # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
-        # cross-CTA handshake) because each CTA owns its own physical TMEM
-        # half; the cluster-shared accumulator is just a logical view.
+        # ---- Wait for own EPILOG's tcgen05.ld to retire before the dealloc
+        # in kernel(). bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld
+        # is observable (post fence_view_async_tmem_load).
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
-        cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
     # EPILOG WARPS — TMEM → RMEM → bf16 cast → direct st.global to GMEM.
