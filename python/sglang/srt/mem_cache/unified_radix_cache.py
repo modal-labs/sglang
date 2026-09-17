@@ -198,6 +198,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+        # KV age metrics: the tree core reports per-node hit / eviction ages.
+        if self.metrics_collector is not None:
+            self.tree_core.kv_age_observer = self._observe_kv_age_event
 
         # Session ref tracking (--enable-session-radix-cache).
         self.session_refs = UnifiedSessionRefTracker(
@@ -728,6 +731,26 @@ class UnifiedRadixCache(BasePrefixCache):
                             )
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _observe_kv_age_event(
+        self,
+        event: str,
+        tier: str,
+        outcome: str,
+        age_seconds: float,
+        lifetime_seconds: float,
+        reuses: int,
+        num_tokens: int,
+    ) -> None:
+        """Tree-core callback: forward one node's age to the metrics collector."""
+        if event == "hit":
+            self.metrics_collector.observe_kv_age(
+                age_seconds, num_tokens, event="hit", tier=tier, outcome=outcome
+            )
+        else:
+            self.metrics_collector.observe_kv_eviction(
+                age_seconds, lifetime_seconds, reuses, num_tokens, tier, outcome
+            )
 
     def _record_dropped_tokens(
         self,
