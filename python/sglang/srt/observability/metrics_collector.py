@@ -1678,6 +1678,19 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_time_to_first_token,
         )
 
+        self.histogram_admission_inclusive_ttft = Histogram(
+            name="sglang:admission_inclusive_time_to_first_token_seconds",
+            documentation="Engine first-token latency plus this request's SMG admission wait; excludes transport.",
+            labelnames=[*labels.keys(), "stream"],
+            buckets=bucket_time_to_first_token,
+        )
+        self.histogram_admission_inclusive_e2e = Histogram(
+            name="sglang:admission_inclusive_e2e_request_latency_seconds",
+            documentation="Engine request latency plus this request's SMG admission wait; excludes transport.",
+            labelnames=labels.keys(),
+            buckets=bucket_e2e_request_latency,
+        )
+
         self.histogram_inter_token_latency = Histogram(
             name="sglang:inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
