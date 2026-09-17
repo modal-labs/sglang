@@ -2242,6 +2242,17 @@ class Scheduler(
             req.multimodal_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _release_dropped_waiting_req_mamba_slot(self, req: Req) -> None:
+        """Return a req-owned early Mamba alloc (init_next_round_input on a
+        req that was then refused admission) when the req leaves the waiting
+        queue for good. Slot-owned state (req_pool_idx set) stays with the
+        session."""
+        if req.mamba_pool_idx is None or req.req_pool_idx is not None:
+            return
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -2705,6 +2716,7 @@ class Scheduler(
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 self._release_dropped_waiting_req_mm_inputs(candidate_req)
+                self._release_dropped_waiting_req_mamba_slot(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -2839,6 +2851,7 @@ class Scheduler(
                     req,
                 )
                 self._release_dropped_waiting_req_mm_inputs(req)
+                self._release_dropped_waiting_req_mamba_slot(req)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -3347,18 +3360,18 @@ class Scheduler(
                     else:
                         running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
+                # A slot restored from a session (req_pool_idx set) is slot-owned
+                # and freed with the session; a fresh early alloc from
+                # init_next_round_input (req_pool_idx is None) is req-owned and
+                # must be returned here. Non-session reqs always have
+                # req_pool_idx None when rejected here.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None
                     req.mamba_needs_clear = False
-                    if req.mamba_pool_idx is not None and not getattr(
-                        req, "session", None
-                    ):
+                    if req.mamba_pool_idx is not None and req.req_pool_idx is None:
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
