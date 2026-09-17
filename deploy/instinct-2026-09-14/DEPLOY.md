@@ -83,8 +83,8 @@ Image build check (in the build log): `rev-parse HEAD == fd8aff798...`, `status 
 
 Check out the previous `serve.py` commit `540bbe0021`, regenerate `engine-3ccb60f5b.bundle`
 with the same command, then deploy.
-Flags-only rollback (keep 3ccb60f5b, drop all 9 env lines — the 5 prod flags, the 2 #26 lines and the 2 #110/#113 pins) leaves
-the default-off dev levers (#26) off, but NOT #110/#113, which are default ON in the engine and can only be disabled by setting their vars to 0; at 462ade71f the 5-flags-off configuration was ==
+Flags-only rollback (keep 3ccb60f5b): drop the 7 default-off lines (the 5 prod flags + the 2 #26 lines) and set the 2 #110/#113
+lines to `"0"` — do NOT drop them, an absent var is read as ON (`EnvBool(True)`) in the engine; at 462ade71f the 5-flags-off configuration was ==
 `release/2026-09-14` behavior, greedy-identical 36/36 in every A/B arm, and on 741f05e61 the flags-off
 parity leg was 36/36 identical to prod with Δp50 +0 ms.
 
