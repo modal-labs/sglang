@@ -169,6 +169,12 @@ class TboAttnBackend(AttentionBackend):
     def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
 
+    def drain_fp8_satfinite_telemetry(self) -> list:
+        events = self.primary.drain_fp8_satfinite_telemetry()
+        for child in self.children:
+            events.extend(child.drain_fp8_satfinite_telemetry())
+        return events
+
     def __getattr__(self, name):
         # Delegate backend-specific attributes/methods not explicitly wrapped
         # above (e.g. DSV4's get_unified_swa_loc / get_swa_out_cache_loc, which

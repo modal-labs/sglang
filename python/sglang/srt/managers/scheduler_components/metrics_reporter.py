@@ -108,6 +108,7 @@ class SchedulerMetricsReporter:
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
         )
+        self._fp8_satfinite_last_warn: dict[int, float] = {}
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
         self._install_device_timer_on_runners()
 
@@ -525,6 +526,43 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def _log_fp8_satfinite_telemetry(self) -> None:
+        """Drain per-layer fp8 satfinite clamp counters on every rank (so
+        device buffers never go stale); gate metric/WARN emission as usual."""
+        try:
+            events = (
+                self.scheduler.tp_worker.model_runner.attn_backend.drain_fp8_satfinite_telemetry()
+            )
+        except AttributeError:
+            # tp_worker variants without a model_runner / attn_backend
+            return
+        if not events:
+            return
+        # Wrapped backends (TBO children, hybrid prefill/decode) may each report
+        # the same (layer, kind); aggregate so one WARN per layer covers all kinds.
+        per_layer: dict[int, tuple[dict[str, int], float]] = {}
+        for layer_id, kind, n, amax in events:
+            if self.enable_metrics:
+                self.metrics_collector.increment_fp8_satfinite_clamp_events(
+                    layer_id, kind, n
+                )
+            kinds, layer_amax = per_layer.get(layer_id, ({}, 0.0))
+            kinds[kind] = kinds.get(kind, 0) + n
+            per_layer[layer_id] = (kinds, max(layer_amax, amax))
+        if not self.is_stats_logging_rank:
+            return
+        now = time.monotonic()
+        for layer_id, (kinds, layer_amax) in per_layer.items():
+            if now - self._fp8_satfinite_last_warn.get(layer_id, 0.0) < 60.0:
+                continue
+            self._fp8_satfinite_last_warn[layer_id] = now
+            logger.warning(
+                "fp8 satfinite clamp: layer=%d rows=%s amax=%.1f",
+                layer_id,
+                " ".join(f"{k}={v}" for k, v in sorted(kinds.items())),
+                layer_amax,
+            )
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -532,6 +570,7 @@ class SchedulerMetricsReporter:
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
+        self._log_fp8_satfinite_telemetry()
         if (
             not self.is_stats_logging_rank
             and not self.current_scheduler_metrics_enabled

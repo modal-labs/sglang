@@ -609,6 +609,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
         )
+        self.fp8_satfinite_clamp_events_total = Counter(
+            name="sglang:fp8_satfinite_clamp_events_total",
+            documentation="Rows whose pre-clamp |x| exceeded the fp8 satfinite threshold (kind=gt448|gt464|nonfinite), sampled every SGLANG_FP8_SATFINITE_TELEMETRY_EVERY prefill chunks.",
+            labelnames=list(labels.keys()) + ["layer", "kind"],
+        )
         self.num_prefill_retries_total = Counter(
             name="sglang:num_prefill_retries_total",
             documentation="Total number of prefill retries.",
@@ -1215,6 +1220,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def increment_fp8_satfinite_clamp_events(
+        self, layer: int, kind: str, n: int
+    ) -> None:
+        self.fp8_satfinite_clamp_events_total.labels(
+            **self.labels, layer=str(layer), kind=kind
+        ).inc(n)
 
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:

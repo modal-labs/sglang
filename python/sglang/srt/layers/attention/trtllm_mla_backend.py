@@ -53,6 +53,9 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.fp8_satfinite_telemetry import (
+    Fp8SatfiniteTelemetry,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -243,6 +246,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.scaling = config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        self.fp8_satfinite_telemetry = None
+        if (
+            self.data_type == torch.float8_e4m3fn
+            and envs.SGLANG_FP8_SATFINITE_TELEMETRY_EVERY.get() > 0
+        ):
+            self.fp8_satfinite_telemetry = Fp8SatfiniteTelemetry(
+                num_layers=config.num_hidden_layers,
+                device=model_runner.device,
+                every=envs.SGLANG_FP8_SATFINITE_TELEMETRY_EVERY.get(),
+            )
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -933,6 +946,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
+            # Count only the final causal pass: the chunked-prefix kernel
+            # re-converts the same Q per prefix chunk.
+            if (
+                self.fp8_satfinite_telemetry is not None
+                and is_causal
+                and self.fp8_satfinite_telemetry.should_record(layer.layer_id)
+            ):
+                self.fp8_satfinite_telemetry.record(layer.layer_id, q)
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
@@ -955,6 +976,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
+
+    def drain_fp8_satfinite_telemetry(self) -> list:
+        if self.fp8_satfinite_telemetry is None:
+            return []
+        return self.fp8_satfinite_telemetry.drain()
 
     def prefix_chunk_kv_proj_dtype(self, q: torch.Tensor) -> torch.dtype:
         """Dtype to fetch cached-prefix latents in for ``kv_b_proj``; q is

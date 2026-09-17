@@ -258,3 +258,7 @@ class AttentionBackend(ABC):
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
         return None
+
+    def drain_fp8_satfinite_telemetry(self) -> list:
+        """Drain pending fp8 satfinite clamp telemetry; [] when unsupported."""
+        return []

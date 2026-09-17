@@ -38,6 +38,12 @@ class HybridAttnBackend(AttentionBackend):
             self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
         )
 
+    def drain_fp8_satfinite_telemetry(self) -> list:
+        events = self.prefill_backend.drain_fp8_satfinite_telemetry()
+        if self.decode_backend is not self.prefill_backend:
+            events.extend(self.decode_backend.drain_fp8_satfinite_telemetry())
+        return events
+
     @property
     def supports_ragged_verify_graph(self) -> bool:
         # Ragged verify is TARGET_VERIFY-only; delegate to its executor.

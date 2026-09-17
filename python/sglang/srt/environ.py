@@ -684,6 +684,7 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
+    SGLANG_FP8_SATFINITE_TELEMETRY_EVERY = EnvInt(16)
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
     # Quantization (Humming)
