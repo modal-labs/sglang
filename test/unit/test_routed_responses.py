@@ -86,6 +86,18 @@ class RoutedResponsesTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(seen[0]["stream"])
         self.assertEqual(turn.bootstrap_host, "stale")
 
+    async def test_nonstream_only_yields_final_cumulative_output(self):
+        async def handler(request):
+            return web.Response(text=(
+                'data: {"text":"a","output_ids":[1]}\n\n'
+                'data: {"text":"ab","output_ids":[1,2]}\n\n'
+                'data: [DONE]\n\n'
+            ))
+        url = await self.start(handler)
+        outputs = [x async for x in routed_turn(Turn(), url)]
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]["output_ids"], [1,2])
+
     async def test_error_and_incomplete_stream(self):
         for status, body in (
             (503, "busy"),
@@ -151,7 +163,7 @@ class RoutedResponsesTest(unittest.IsolatedAsyncioTestCase):
             return response
 
         url = await self.start(handler)
-        generator = routed_turn(Turn(), url)
+        generator = routed_turn(Turn(stream=True), url)
         await anext(generator)
         await generator.aclose()
         await asyncio.wait_for(disconnected.wait(), 2)

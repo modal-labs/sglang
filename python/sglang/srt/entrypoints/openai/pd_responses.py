@@ -204,6 +204,7 @@ async def _routed_turn_stream(request, router_url):
                         response.status,
                     )
                 pending = b""
+                last_output = None
                 async for chunk in response.content.iter_chunked(65536):
                     pending += chunk
                     while b"\n" in pending:
@@ -213,11 +214,17 @@ async def _routed_turn_stream(request, router_url):
                             continue
                         data = line[6:]
                         if data == b"[DONE]":
+                            if last_output is None:
+                                raise PDResponsesError("PD generation returned no output", 502)
+                            if not request.stream:
+                                yield last_output
                             return
                         output = json.loads(data)
                         if "error" in output:
                             raise PDResponsesError("PD generation stream failed", 502)
-                        yield output
+                        last_output = output
+                        if request.stream:
+                            yield output
                 raise PDResponsesError("PD generation stream ended without DONE", 502)
         except asyncio.CancelledError:
             raise
