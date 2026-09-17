@@ -27,8 +27,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
@@ -420,6 +421,52 @@ class TestRadixCacheEmitsKvAge(CustomTestCase):
             ),
             1,
         )
+
+    def test_split_keeps_original_creation_time_for_lifetime(self):
+        cache, allocator = self._build_cache()
+        collector = cache.metrics_collector
+
+        first_tokens = array("q", [1, 2, 3, 4])
+        first_indices = allocator.alloc(len(first_tokens))
+        cache.insert(
+            InsertParams(key=RadixKey(token_ids=first_tokens), value=first_indices)
+        )
+        node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids=first_tokens))
+        ).last_device_node
+        node.creation_time -= 100.0
+
+        second_tokens = array("q", [1, 2, 5, 6])
+        second_indices = allocator.alloc(len(second_tokens))
+        cache.insert(
+            InsertParams(key=RadixKey(token_ids=second_tokens), value=second_indices)
+        )
+
+        cache.evict(EvictParams(num_tokens=8))
+
+        lifetimes = sorted(
+            value for _, value in collector.kv_lifetime_seconds.observations
+        )
+        self.assertEqual(len(lifetimes), 3)
+        self.assertGreaterEqual(lifetimes[1], 100.0)
+        self.assertGreaterEqual(lifetimes[2], 100.0)
+
+    def test_hiradix_split_node_keeps_creation_time(self):
+        hi = HiRadixCache.__new__(HiRadixCache)
+        hi.page_size = 1
+
+        root = TreeNode()
+        child = TreeNode()
+        child.key = RadixKey(token_ids=array("q", [1, 2, 3, 4]))
+        child.value = torch.arange(4)
+        child.parent = root
+        root.children[child.key.child_key(1)] = child
+        child.creation_time -= 100.0
+
+        new_node = HiRadixCache._split_node(hi, child.key, child, 2)
+
+        self.assertEqual(new_node.creation_time, child.creation_time)
+        self.assertEqual(new_node.last_access_time, child.last_access_time)
 
 
 class TestUnifiedRadixCacheEmitsKvAge(CustomTestCase):

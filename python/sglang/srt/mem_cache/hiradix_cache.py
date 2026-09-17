@@ -1850,6 +1850,8 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.creation_time = child.creation_time
+        new_node.last_access_time = child.last_access_time
 
         # split value and host value if exists
         if child.evicted:
