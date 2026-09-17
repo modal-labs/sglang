@@ -65,6 +65,10 @@ MEM_FRACTION_STATIC = "0.915"
 PREFILL_CUDA_GRAPH_MAX_BS = "4096"
 PREFILL_CUDA_GRAPH_BS = "128 256 512 768 1024 1536 2048 3072 4096"
 DECODE_CUDA_GRAPH_MAX_BS = "48"
+K3_MIN_CONTAINERS = int(os.environ.get("K3_MIN_CONTAINERS", "63"))
+K3_MAX_CONTAINERS = (
+    int(os.environ["K3_MAX_CONTAINERS"]) if "K3_MAX_CONTAINERS" in os.environ else None
+)
 
 # HiCache: host-memory (L2) KV cache tier, sized for a 60-minute session TTL.
 # MLA host dedup keeps one copy of the (TP-replicated) target KV across the 8
@@ -80,7 +84,10 @@ SGLANG_BASE_IMAGE = "modalresearch/sglang:kimi-k3-cu13-20260806-b9e90a6d6"
 SGLANG_COMMIT = "b9e90a6d6ef1859830c3b879cef999092975a41a"   # HEAD stays here
 SGLANG_EFFECTIVE_COMMIT = "2c881e2ed528746312ec326fa89ee6e5e2169adf"  # JIT-cache salt (unchanged: same kernels/ABI)
 RELEASE_REF = "dev/instinct/2026-09-15"
-RELEASE_SHA = "fd8aff798ca487d72db3341a5057e84394196af5"  # dev head: + #58 session fixes, #67 KV-age metrics (off), #69/#72 evict_on_finish (off), #73 HiCache sizing, #74 write-stream hardening
+RELEASE_SHA = os.environ.get(
+    "K3_RELEASE_SHA",
+    "fd8aff798ca487d72db3341a5057e84394196af5",
+)  # dev head: + #58 session fixes, #67 KV-age metrics (off), #69/#72 evict_on_finish (off), #73 HiCache sizing, #74 write-stream hardening
 RELEASE_BUNDLE = Path(__file__).parent / f"engine-{RELEASE_SHA[:9]}.bundle"  # untracked; regenerate per RELEASE_SHA (see DEPLOY.md)
 RELEASE_BUNDLE_IMAGE_PATH = f"/tmp/{RELEASE_BUNDLE.name}"
 RELEASE_PIN_REF = f"refs/deploy/{RELEASE_BUNDLE.stem}"  # a bundle only advertises named refs, so pin the SHA under one
@@ -149,6 +156,16 @@ if DFLASH2_EVAL_VOLUME_NAME:
         DFLASH2_EVAL_VOLUME_NAME, environment_name=DFLASH2_EVAL_VOLUME_ENV
     ).with_mount_options(read_only=True)
 
+K3_ENV_OVERRIDES = {
+    key: os.environ[key]
+    for key in (
+        "K3_MIN_CONTAINERS",
+        "K3_MAX_CONTAINERS",
+        "K3_RELEASE_SHA",
+    )
+    if key in os.environ
+}
+
 BASE_RUNTIME_ENV = {
     "SYNC_TOKEN_IDS_ACROSS_TP": "1",
     "SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES": "4294967296",
@@ -202,6 +219,7 @@ BASE_RUNTIME_ENV = {
     "SGLANG_VLM_MEDIA_URL_FETCH_ENABLED": "false",
     "SGLANG_OPENAI_MEDIA_URL_FETCH_ENABLED": "false",
     "SGLANG_RELEASE_SHA": RELEASE_SHA,
+    **K3_ENV_OVERRIDES,
     # release/instinct/2026-09-14 (PR #22): all default-off, opted in here
     "SGLANG_TRTLLM_MLA_VERIFY_FUSED_KV_WRITE": "1",
     "SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK": "1",
@@ -478,24 +496,29 @@ def seed_prebuilt_jit(jit_cache_path: str) -> None:
     print(f"Seeded prebuilt JIT module {PREBUILT_JIT_MODULE} into {dst}")
 
 
-@app.server(
-    include_source=True,
-    image=serving_image,
-    gpu=GPU,
-    cpu=CPU,
-    memory=MEMORY_MIB,
-    volumes=server_volumes,
-    min_containers=63,
-    target_concurrency=TARGET_CONCURRENCY,
-    scaledown_window=10 * MINUTES,
-    scaleup_window=5*MINUTES,
-    startup_timeout=3 * HOURS,
-    port=PORT,
-    unauthenticated=UNAUTHENTICATED,
-    exit_grace_period=GRACEFUL_DRAIN_SECONDS + 60,
-    routing_region="us-west",
-    experimental_options={"override_eof_timeout": 1800, "kv_aware_routing": True},
-)
+SERVER_KWARGS = {
+    "include_source": True,
+    "image": serving_image,
+    "gpu": GPU,
+    "cpu": CPU,
+    "memory": MEMORY_MIB,
+    "volumes": server_volumes,
+    "min_containers": K3_MIN_CONTAINERS,
+    "target_concurrency": TARGET_CONCURRENCY,
+    "scaledown_window": 10 * MINUTES,
+    "scaleup_window": 5*MINUTES,
+    "startup_timeout": 3 * HOURS,
+    "port": PORT,
+    "unauthenticated": UNAUTHENTICATED,
+    "exit_grace_period": GRACEFUL_DRAIN_SECONDS + 60,
+    "routing_region": "us-west",
+    "experimental_options": {"override_eof_timeout": 1800, "kv_aware_routing": True},
+}
+if K3_MAX_CONTAINERS is not None:
+    SERVER_KWARGS["max_containers"] = K3_MAX_CONTAINERS
+
+
+@app.server(**SERVER_KWARGS)
 class Server:
 
     @modal.enter()

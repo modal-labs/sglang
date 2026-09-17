@@ -52,6 +52,19 @@ from any cwd.
 modal deploy serve.py          # in the directory that holds serve.py + generated bundle
 ```
 
+## Dev endpoint (1x1)
+
+Deploy a separate one-container endpoint from the repository root with the same
+`cust-instinct` environment:
+
+The bundle for `K3_RELEASE_SHA` must exist next to `serve.py`; regenerate it with
+`RELEASE_BUNDLE_CMD` as documented above.
+
+```sh
+K3_MIN_CONTAINERS=1 K3_MAX_CONTAINERS=1 K3_RELEASE_SHA=<sha> MODAL_ENVIRONMENT=cust-instinct \
+modal deploy --name kimi-k3-dev deploy/instinct-2026-09-14/serve.py
+```
+
 Image build check (in the build log): `rev-parse HEAD == fd8aff798...`, `status --porcelain` empty,
 `sglang.__file__` printed. The A/B endpoint `kimi-k3-ab-instinct` was built with the identical steps.
 
