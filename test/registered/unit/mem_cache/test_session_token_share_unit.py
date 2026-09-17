@@ -44,6 +44,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
         return_routed_experts=False,
         routed_experts_start_len=0,
         priority=None,
+        evict_on_finish=False,
         routing_key=None,
         extra_key=None,
         http_worker_ipc=None,

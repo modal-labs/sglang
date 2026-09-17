@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 import uuid
@@ -29,13 +30,27 @@ from sglang.srt.managers.io_struct import (
     SessionReapPlan,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, MultimodalInputs, Req
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
+
+
+def _inherit_mm_inputs(mm: Optional[MultimodalInputs]) -> Optional[MultimodalInputs]:
+    """Per-turn MultimodalInputs container sharing the predecessor's items
+    (features included) but not its list objects, so a turn's merge never
+    reaches the committed turn or a sibling."""
+    if mm is None:
+        return None
+    inherited = copy.copy(mm)
+    inherited.mm_items = list(mm.mm_items)
+    if mm.image_pad_len is not None:
+        inherited.image_pad_len = list(mm.image_pad_len)
+    inherited.session_turn_states = []
+    return inherited
 
 
 class SessionReqNode:
@@ -337,7 +352,9 @@ class Session:
                         new_req.session_mm_inherited = True
                         new_req.session_mm_parent = last_req
             else:
-                new_req.multimodal_inputs = last_req.multimodal_inputs
+                new_req.multimodal_inputs = _inherit_mm_inputs(
+                    last_req.multimodal_inputs
+                )
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill

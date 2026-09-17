@@ -86,6 +86,7 @@ def _session_recv(rid, parent_rid=None):
         return_routed_experts=False,
         routed_experts_start_len=0,
         priority=None,
+        evict_on_finish=False,
         routing_key=None,
         extra_key=None,
         http_worker_ipc=None,
@@ -892,7 +893,7 @@ def test_P44_session_abort_at_create_turn_gets_own_mm_object():
     assert shared.image_pad_len == [3]
 
 
-def test_P44_session_abort_at_create_turn_flag_off_shares_mm_object():
+def test_P44_session_abort_at_create_turn_flag_off_copies_mm_object():
     session = Session(32, "s", streaming=False)
     shared = MultimodalInputs(mm_items=[_item(_proxy())], image_pad_len=[3])
     parent = Req("parent", "", array("q", [1]), SamplingParams(max_new_tokens=1))
@@ -910,7 +911,9 @@ def test_P44_session_abort_at_create_turn_flag_off_shares_mm_object():
         )
 
     set_finish_with_abort.assert_called_once()
-    assert new_req.multimodal_inputs is shared
+    assert new_req.multimodal_inputs is not shared
+    assert new_req.multimodal_inputs.mm_items is not shared.mm_items
+    assert new_req.multimodal_inputs.image_pad_len is not shared.image_pad_len
     assert not new_req.session_mm_inherited
 
 
