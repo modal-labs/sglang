@@ -2949,12 +2949,17 @@ class KimiK3LinearModel(nn.Module):
                 and i in self.dspark_layers_to_capture
             ):
                 if aux_hidden_states is None:
-                    aux_hidden_states = hidden_states.new_empty(
-                        (
-                            hidden_states.shape[0],
-                            len(self.dspark_layers_to_capture) * hidden_states.shape[1],
-                        )
+                    shape = (
+                        hidden_states.shape[0],
+                        len(self.dspark_layers_to_capture) * hidden_states.shape[1],
                     )
+                    aux_hidden_states = forward_batch.aux_hidden_states_buffer
+                    if aux_hidden_states is None:
+                        aux_hidden_states = hidden_states.new_empty(shape)
+                    else:
+                        assert aux_hidden_states.shape == shape
+                        assert aux_hidden_states.dtype == hidden_states.dtype
+                        assert aux_hidden_states.device == hidden_states.device
                 hidden_size = hidden_states.shape[1]
                 aux_slot = aux_hidden_states[
                     :, aux_tap_idx * hidden_size : (aux_tap_idx + 1) * hidden_size
@@ -3122,6 +3127,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+
+    def get_cuda_graph_aux_hidden_size(self) -> int:
+        if not self.capture_aux_hidden_states:
+            return 0
+        return len(self.model.dspark_layers_to_capture) * self.config.hidden_size
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Use K3's exact post-layer stream taps for a DFlash draft.
@@ -3683,6 +3693,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def get_cuda_graph_aux_hidden_size(self) -> int:
+        if self.language_model is None:
+            return 0
+        return self.language_model.get_cuda_graph_aux_hidden_size()
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:

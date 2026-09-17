@@ -73,6 +73,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.shared_aux_hidden import SharedAuxHiddenBuffers
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -349,6 +350,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
+
+        # Outputs alias only within one runner/stream. DFlash consumes target
+        # hidden states into draft KV before the next target forward.
+        self._aux_hidden_buffers = SharedAuxHiddenBuffers()
 
         # --- buffers ---------------------------------------------------
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
@@ -956,6 +961,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
 
+        aux_width = getattr(
+            self.model_runner.model, "get_cuda_graph_aux_hidden_size", lambda: 0
+        )()
+        if (
+            aux_width
+            and self.model_runner.spec_algorithm.is_dflash_family()
+            and not self.model_runner.is_draft_worker
+        ):
+            forward_batch.aux_hidden_states_buffer = self._aux_hidden_buffers.get(
+                stream_idx,
+                rows=num_tokens,
+                max_rows=self.max_num_token,
+                width=aux_width,
+                dtype=self.model_runner.model_config.dtype,
+                device=self.device,
+            )
+
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
@@ -1307,6 +1329,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
+
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
@@ -1329,7 +1352,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
-
                 capture_mode = (
                     CaptureHiddenMode.NULL
                     if self.model_runner.spec_algorithm.is_standalone()
