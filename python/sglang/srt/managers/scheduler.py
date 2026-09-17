@@ -3283,19 +3283,22 @@ class Scheduler(
         self.metrics_reporter.record_admission_block(cause, num_blocked_reqs)
 
     def _account_admission_block(
-        self, cause: Optional[str], not_blocked: set[Req]
+        self, cause: Optional[str], admitted: List[Req], num_skipped: int
     ) -> None:
         """Close out an admission pass: count it as blocked when a gate stopped
         it while waiting requests remained, otherwise forget the last cause.
-        `not_blocked` holds the requests admitted this pass and those the loop
-        skipped for its own reasons (LoRA slots, prefetch in flight), which the
-        stopping gate did not hold back."""
-        num_blocked = (
-            0
-            if cause is None
-            else sum(1 for r in self.waiting_queue if r not in not_blocked)
-        )
-        if num_blocked == 0:
+        Requests admitted this pass and those the loop skipped for its own
+        reasons (LoRA slots, prefetch in flight) were not held back by the
+        stopping gate. O(admitted): every admitted request except the chunked
+        continuation came from the waiting queue."""
+        if cause is None:
+            self._last_admission_block_cause = None
+            return
+        if not self.metrics_reporter.current_scheduler_metrics_enabled:
+            return
+        admitted_from_queue = sum(1 for r in admitted if r is not self.chunked_req)
+        num_blocked = len(self.waiting_queue) - admitted_from_queue - num_skipped
+        if num_blocked <= 0:
             self._last_admission_block_cause = None
             return
         self._record_admission_block(cause, num_blocked)
@@ -3454,7 +3457,7 @@ class Scheduler(
         # First gate that stops this pass, for the admission-block metrics.
         block_cause: Optional[str] = None
         # Requests the loop skipped for its own reasons; not blocked by the gate.
-        skipped: set[Req] = set()
+        num_skipped = 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if adder.chunk_budget_exhausted():
@@ -3462,7 +3465,7 @@ class Scheduler(
                 break
 
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
-                skipped.add(req)
+                num_skipped += 1
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3481,15 +3484,23 @@ class Scheduler(
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
+                    # The flag may have been set on an earlier pass (chunked
+                    # prefill keeps the pass alive; preemption never clears it):
+                    # keep that pass's cause rather than losing it.
+                    block_cause = (
+                        block_cause
+                        or self._last_admission_block_cause
+                        or AdmissionBlockCause.BATCH_FULL
+                    )
                     break
-                # Preemption made room; this pass is not blocked on slots.
-                block_cause = None
+                # Preemption made room; keep the slot cause in case a later
+                # candidate cannot preempt, it is overwritten by any adder stop.
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
-                    skipped.add(req)
+                    num_skipped += 1
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
@@ -3561,7 +3572,7 @@ class Scheduler(
 
         can_run_list: List[Req] = adder.can_run_list
         can_run_set = set(can_run_list)
-        self._account_admission_block(block_cause, can_run_set | skipped)
+        self._account_admission_block(block_cause, can_run_list, num_skipped)
 
         # Update waiting queue
         if len(can_run_list) == 0:

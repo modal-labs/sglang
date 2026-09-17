@@ -163,28 +163,35 @@ def test_account_admission_block_excludes_admitted_and_skipped_requests():
             self.rid = rid
 
     a, b, c, d = (_Req(r) for r in "abcd")
+    chunked = _Req("chunked")
     sched = object.__new__(Scheduler)
     sched.waiting_queue = [a, b, c, d]
+    sched.chunked_req = chunked
     sched._last_admission_block_cause = None
-    sched.metrics_reporter = MagicMock()
+    sched.metrics_reporter = MagicMock(current_scheduler_metrics_enabled=True)
 
-    # a admitted, b skipped by the loop (LoRA / prefetch): only c and d were
-    # held back by the gate that stopped the pass.
-    sched._account_admission_block(AdmissionBlockCause.MAMBA_SLOTS, {a, b})
+    # a admitted (plus the chunked continuation, which is not in the queue),
+    # b skipped by the loop: only c and d were held back by the gate.
+    sched._account_admission_block(AdmissionBlockCause.MAMBA_SLOTS, [chunked, a], 1)
     sched.metrics_reporter.record_admission_block.assert_called_once_with(
         AdmissionBlockCause.MAMBA_SLOTS, 2
     )
     assert sched._last_admission_block_cause == AdmissionBlockCause.MAMBA_SLOTS
 
-    # Everything admitted or skipped: not a blocked pass, and the carried-over
+    # Everything admitted or skipped: not a blocked pass; the carried-over
     # cause is forgotten.
     sched.metrics_reporter.reset_mock()
-    sched._account_admission_block(AdmissionBlockCause.KV_TOKENS, {a, b, c, d})
+    sched._account_admission_block(AdmissionBlockCause.KV_TOKENS, [a, b], 2)
     sched.metrics_reporter.record_admission_block.assert_not_called()
     assert sched._last_admission_block_cause is None
 
     # No gate fired: nothing recorded.
-    sched._account_admission_block(None, set())
+    sched._account_admission_block(None, [], 0)
+    sched.metrics_reporter.record_admission_block.assert_not_called()
+
+    # Scheduler metrics off: no queue accounting at all.
+    sched.metrics_reporter = MagicMock(current_scheduler_metrics_enabled=False)
+    sched._account_admission_block(AdmissionBlockCause.KV_TOKENS, [], 0)
     sched.metrics_reporter.record_admission_block.assert_not_called()
 
 

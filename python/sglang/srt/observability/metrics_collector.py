@@ -935,8 +935,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation=(
                 "Prefill scheduling passes that ended with waiting requests "
                 "left unadmitted, by the first binding constraint (cause). "
-                "One increment per scheduler step while blocked, so rate() "
-                "is the share of steps on which that constraint capped "
+                "One increment per prefill pass while blocked (one pass per "
+                "scheduler step, or per micro-batch under pipeline "
+                "parallelism), so rate() ranks the constraints that cap "
                 "concurrency. kv_tokens / swa_tokens / mamba_slots are the "
                 "memory pools, max_running_requests / pp_micro_batch are "
                 "request slots, max_prefill_tokens / chunked_prefill_size / "
