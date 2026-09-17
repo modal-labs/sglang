@@ -305,7 +305,7 @@ class EvictOnFinishPlumbingTest(unittest.TestCase):
         )
         seen = []
         tree_cache = SimpleNamespace(
-            cache_finished_req=lambda req, is_insert, kv_len_to_handle: seen.append(
+            cache_finished_req=lambda req, is_insert, kv_len_to_handle, is_retract=False: seen.append(
                 is_insert
             ),
             supports_mamba=lambda: False,

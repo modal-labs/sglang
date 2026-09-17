@@ -2010,7 +2010,7 @@ def release_req(
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, is_insert=False)
+    release_kv_cache(req, tree_cache, is_insert=False, is_retract=True)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -2923,6 +2923,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             reqs_to_abort.append(last_req)
             self.release_req(last_idx, 0, server_args)
+            # Terminal, not a requeue: the streaming turn must not stay inflight.
+            if last_req.session is not None:
+                last_req.session.abort_req(last_req.rid)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )

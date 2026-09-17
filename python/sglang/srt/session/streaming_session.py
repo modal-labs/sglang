@@ -279,9 +279,9 @@ class StreamingSession(BasePrefixCache):
         )
 
     def try_cache_finished_req(
-        self, req: Req, is_insert: bool = True, **kwargs
+        self, req: Req, is_insert: bool = True, is_retract: bool = False, **kwargs
     ) -> bool:
-        """Handles a streaming-session finish (save slot / mid-abort nuke).
+        """Handles a streaming-session finish (save slot / mid-abort nuke / retract nuke).
         Returns True if handled; False means caller runs its raw path."""
         if not _is_streaming(req):
             return False
@@ -292,42 +292,21 @@ class StreamingSession(BasePrefixCache):
         slot = self.slots.get(session_id)
         is_first = slot is None
 
-        # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in find_active_slot) and never reach here.
-        # Nuke all KV via release_session, delete slot. Token IDs stay
-        # in req_nodes (finish_req was never called -> last successful
-        # req). Next request re-prefills from scratch.
+        # Mid-processing abort: nuke the turn's KV, drop the slot. Token IDs
+        # stay in req_nodes (last successful req); the next request
+        # re-prefills from scratch.
         if isinstance(req.finished_reason, FINISH_ABORT):
-            if slot is None:
-                # First-request mid-processing abort: create ephemeral
-                # slot from req state so release_session handles cleanup.
-                # Include last_node/cache_protected_len from the req so
-                # release_session calls dec_lock_ref on the tree lock.
-                # Also carry the mamba refs over so _free_slot_mamba can
-                # return the (possibly extra_buffer ping-pong) slots to
-                # the mamba pool; otherwise the abort orphans them.
-                slot = SessionSlot(
-                    req_pool_idx=req.req_pool_idx,
-                    kv=copy.copy(req.kv),
-                    last_node=req.last_node,
-                    cache_protected_len=req.cache_protected_len,
-                    swa_uuid_for_lock=req.swa_uuid_for_lock,
-                    skip_lock_node_ids=req.skip_lock_node_ids,
-                    mamba_pool_idx=req.mamba_pool_idx,
-                    mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
-                )
-                self.slots[session_id] = slot
-                # Slot now owns the mamba state — drop the req's refs so
-                # the abort fall-through doesn't double-free.
-                req.mamba_pool_idx = None
-                req.mamba_ping_pong_track_buffer = None
-            slot.kv.kv_allocated_len = max(
-                slot.kv.kv_allocated_len, req.kv.kv_allocated_len
-            )
-            self.release_session(session_id)
-            req.req_pool_idx = None
-            req.kv = None
+            self._release_turn_kv(slot, req, session_id)
             req.session.abort_req(req.rid)
+            return True
+
+        # Retract (release_kv_cache(is_retract=True)): same nuke, but the turn
+        # stays inflight and the checkpoint (req_nodes / slot) stays at the
+        # last finished turn; re-admission re-prefills from scratch. Explicit
+        # intent, not finished_reason: disaggregated prefill releases a
+        # finished transfer before stamping FINISH_LENGTH.
+        if is_retract:
+            self._release_turn_kv(slot, req, session_id)
             return True
 
         if is_first:
@@ -363,6 +342,33 @@ class StreamingSession(BasePrefixCache):
 
         return True
 
+    def _release_turn_kv(
+        self, slot: Optional[SessionSlot], req: Req, session_id: str
+    ) -> None:
+        if slot is None:
+            # First-turn nuke: build an ephemeral slot from the req so
+            # release_session frees the KV, the tree lock and the mamba slots.
+            slot = SessionSlot(
+                req_pool_idx=req.req_pool_idx,
+                kv=copy.copy(req.kv),
+                last_node=req.last_node,
+                cache_protected_len=req.cache_protected_len,
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+                mamba_pool_idx=req.mamba_pool_idx,
+                mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
+            )
+            self.slots[session_id] = slot
+        if slot.kv is not None and req.kv is not None:
+            slot.kv.kv_allocated_len = max(
+                slot.kv.kv_allocated_len, req.kv.kv_allocated_len
+            )
+        req.mamba_pool_idx = None
+        req.mamba_ping_pong_track_buffer = None
+        self.release_session(session_id)
+        req.req_pool_idx = None
+        req.kv = None
+
     def try_cache_unfinished_req(
         self, req: Req, chunked: bool = False, **kwargs
     ) -> bool:
@@ -391,8 +397,12 @@ class StreamingSession(BasePrefixCache):
             return result
         return self.inner.match_prefix(params)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, is_retract: bool = False, **kwargs
+    ):
+        if self.try_cache_finished_req(
+            req, is_insert=is_insert, is_retract=is_retract, **kwargs
+        ):
             return
         self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 

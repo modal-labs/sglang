@@ -801,9 +801,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return DecLockRefResult()
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        kv_len_to_handle: int,
+        is_retract: bool = False,
+        **kwargs,
     ) -> None:
-        if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+        if self.session.try_cache_finished_req(
+            req, is_insert=is_insert, is_retract=is_retract, **kwargs
+        ):
             return
 
         if self.disable:

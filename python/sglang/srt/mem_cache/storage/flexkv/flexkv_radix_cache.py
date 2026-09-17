@@ -379,7 +379,12 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def cache_finished_req(  # type: ignore[override]
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        kv_len_to_handle: int,
+        is_retract: bool = False,
     ) -> None:
         """Base cache_finished_req then fire an async FlexKV store."""
         super().cache_finished_req(

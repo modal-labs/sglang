@@ -542,7 +542,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        kv_len_to_handle: int,
+        is_retract: bool = False,
     ) -> None:
         """Cache request when it finishes."""
         if self.disable:
