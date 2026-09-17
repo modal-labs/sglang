@@ -275,6 +275,11 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    # Which limit set max_running_requests in resolve_max_num_reqs: requested,
+    # estimated, kv_capacity or mamba_pool. Exported as sglang:max_running_requests
+    # {cap_source}. A declared field: this is a slots dataclass, so an undeclared
+    # attribute assignment would raise at startup.
+    max_running_requests_cap_source: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
@@ -2371,9 +2376,7 @@ class KVCacheConfigurator:
         )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
-        config.max_running_requests_cap_source = getattr(
-            self, "max_running_requests_cap_source", None
-        )
+        config.max_running_requests_cap_source = self.max_running_requests_cap_source
         config.mem_fraction_static = get_schedule().mem_fraction_static
         return config
 
