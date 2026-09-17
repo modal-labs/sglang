@@ -25,7 +25,8 @@ on:
     # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
     # is added after the latest push. See call-gate.if for the matching guard
     # that prevents unrelated label additions from dispatching a full run.
-    types: [opened, synchronize, reopened, labeled]
+    # edited: re-dispatch when the base is retargeted to main (guarded below to base changes only).
+    types: [opened, synchronize, reopened, labeled, edited]
     # Fork: no self-hosted GPU runners, so PRs only run this on main.
     branches: [main]
   workflow_dispatch:
@@ -89,7 +90,8 @@ concurrency:
   # never cancel each other); PR runs share a per-branch group so pushes cancel
   # stale runs. (In a reusable workflow github.event_name is the originating
   # event, never workflow_call, so the guard keys off the real events.)
-  group: pr-test-amd-extra-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.head_ref || github.ref_name || inputs.ref || 'default' }}
+  # noop edits get their own group so they never cancel a real run
+  group: pr-test-amd-extra-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.head_ref || github.ref_name || inputs.ref || 'default' }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.base == null) && 'noop-edit' || 'ci' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -110,10 +112,17 @@ jobs:
   # gate is enforced at runtime inside pr-gate.yml.
   call-gate:
     if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-extra'
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      ) &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'labeled' ||
+        github.event.label.name == 'run-ci' ||
+        github.event.label.name == 'run-ci-extra'
+      )
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
@@ -227,7 +236,13 @@ jobs:
         extra-a-test-1-gpu-large-amd,
         extra-a-test-2-gpu-large-amd,
       ]
-    if: always()
+    if: |
+      always() &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

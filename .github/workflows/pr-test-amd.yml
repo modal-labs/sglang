@@ -9,6 +9,8 @@ on:
   pull_request:
     # Fork: no self-hosted GPU runners, so PRs only run this on main.
     branches: [main]
+    # edited: re-dispatch when the base is retargeted to main (guarded below to base changes only).
+    types: [opened, synchronize, reopened, edited]
     paths:
       - "python/**"
       - "scripts/ci/**"
@@ -117,17 +119,30 @@ env:
 concurrency:
   # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).
   # PR runs share a group per branch so new pushes cancel stale runs.
-  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  # noop edits get their own group so they never cancel a real run
+  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.base == null) && 'noop-edit' || 'ci' }}
   cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   call-gate:
-    if: github.event_name != 'schedule'
+    if: |
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      ) &&
+      github.event_name != 'schedule'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
   check-changes:
     needs: [call-gate]
-    if: always()
+    if: |
+      always() &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      )
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
@@ -1322,7 +1337,13 @@ jobs:
         stage-c-test-large-8-gpu-amd,
         stage-c-test-large-8-gpu-amd-mi35x,
       ]
-    if: always()
+    if: |
+      always() &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

@@ -19,7 +19,8 @@ on:
     # is added after the latest push — otherwise GHA leaves the stale
     # skipped run in place and there's no way to enable extra without
     # another push. See check-changes.if below for the matching guard.
-    types: [opened, synchronize, reopened, labeled]
+    # edited: re-dispatch when the base is retargeted to main (guarded below to base changes only).
+    types: [opened, synchronize, reopened, labeled, edited]
     # Fork: no self-hosted GPU runners, so PRs only run this on main.
     branches: [main]
   workflow_dispatch:
@@ -58,7 +59,8 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
+  # noop edits get their own group so they never cancel a real run
+  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.base == null) && 'noop-edit' || 'ci' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -92,10 +94,17 @@ jobs:
   # unrelated label addition from dispatching a full CI run.
   check-changes:
     if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-extra'
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      ) &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'labeled' ||
+        github.event.label.name == 'run-ci' ||
+        github.event.label.name == 'run-ci-extra'
+      )
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
@@ -275,7 +284,13 @@ jobs:
         extra-b-test-deepep-4-gpu-b200,
         extra-b-test-deepep-8-gpu-h200,
       ]
-    if: always()
+    if: |
+      always() &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
@@ -307,6 +322,11 @@ jobs:
     needs: [pr-test-extra-finish]
     if: |
       always() &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      ) &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest

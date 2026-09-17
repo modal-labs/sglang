@@ -6,6 +6,8 @@ on:
   pull_request:
     # Fork: no self-hosted GPU runners, so PRs only run this on main.
     branches: [main]
+    # edited: re-dispatch when the base is retargeted to main (guarded below to base changes only).
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -21,12 +23,17 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-npu-${{ inputs.ref || github.ref }}
+  # noop edits get their own group so they never cancel a real run
+  group: pr-test-npu-${{ inputs.ref || github.ref }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.base == null) && 'noop-edit' || 'ci' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.action != 'edited' ||
+      github.event.changes.base != null
     runs-on: ubuntu-latest
     outputs:
       changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true'}}
@@ -79,6 +86,10 @@ jobs:
     secrets: inherit
 
   set-image-config:
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.action != 'edited' ||
+      github.event.changes.base != null
     runs-on: ubuntu-latest
     outputs:
       CANN_image_a3: ${{ steps.set-vars.outputs.CANN_image_a3 }}
@@ -451,7 +462,13 @@ jobs:
 
         pr-single-node-tests,
       ]
-    if: always()
+    if: |
+      always() &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.action != 'edited' ||
+        github.event.changes.base != null
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

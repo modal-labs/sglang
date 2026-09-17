@@ -15,7 +15,7 @@ name: PR States
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
   workflow_run:
     workflows: ["PR Test Base", "PR Test Extra"]
     types: [requested, completed]
@@ -38,6 +38,10 @@ concurrency:
 
 jobs:
   update-pr-body:
+    if: |
+      github.event_name != 'pull_request_target' ||
+      github.event.action != 'edited' ||
+      github.event.changes.base != null
     runs-on: ubuntu-latest
     steps:
       - name: Update CI states block in PR body
@@ -114,14 +118,20 @@ jobs:
                                      && context.payload.action === 'unlabeled';
 
             async function findRunBySha(workflowFile) {
-              const { data } = await github.rest.actions.listWorkflowRuns({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: workflowFile,
-                head_sha: sha,
-                per_page: 1,
-              });
-              return data.workflow_runs[0] || null;
+              // Newest first; skipped runs (no-op edits, label-after-push) are
+              // not real runs, so page until a non-skipped one turns up.
+              for await (const { data: runs } of github.paginate.iterator(
+                github.rest.actions.listWorkflowRuns, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: workflowFile,
+                  head_sha: sha,
+                  per_page: 100,
+                })) {
+                const run = runs.find(r => r.conclusion !== 'skipped');
+                if (run) return run;
+              }
+              return null;
             }
             async function findRun(workflowFile, { preSleepMs = 0, attempts = 1, delayMs = 0 }) {
               if (preSleepMs > 0) await sleep(preSleepMs);
