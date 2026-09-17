@@ -144,6 +144,39 @@ def test_add_one_req_prefill_max_requests_gate():
     assert adder.stop_cause == AdmissionBlockCause.PREFILL_MAX_REQUESTS
 
 
+def test_account_admission_block_excludes_admitted_and_skipped_requests():
+    from sglang.srt.managers.scheduler import Scheduler
+
+    class _Req:
+        def __init__(self, rid):
+            self.rid = rid
+
+    a, b, c, d = (_Req(r) for r in "abcd")
+    sched = object.__new__(Scheduler)
+    sched.waiting_queue = [a, b, c, d]
+    sched._last_admission_block_cause = None
+    sched.metrics_reporter = MagicMock()
+
+    # a admitted, b skipped by the loop (LoRA / prefetch): only c and d were
+    # held back by the gate that stopped the pass.
+    sched._account_admission_block(AdmissionBlockCause.MAMBA_SLOTS, {a, b})
+    sched.metrics_reporter.record_admission_block.assert_called_once_with(
+        AdmissionBlockCause.MAMBA_SLOTS, 2
+    )
+    assert sched._last_admission_block_cause == AdmissionBlockCause.MAMBA_SLOTS
+
+    # Everything admitted or skipped: not a blocked pass, and the carried-over
+    # cause is forgotten.
+    sched.metrics_reporter.reset_mock()
+    sched._account_admission_block(AdmissionBlockCause.KV_TOKENS, {a, b, c, d})
+    sched.metrics_reporter.record_admission_block.assert_not_called()
+    assert sched._last_admission_block_cause is None
+
+    # No gate fired: nothing recorded.
+    sched._account_admission_block(None, set())
+    sched.metrics_reporter.record_admission_block.assert_not_called()
+
+
 def test_collector_increments_both_counters_with_cause_label():
     collector = object.__new__(SchedulerMetricsCollector)
     collector.labels = {"model_name": "test"}

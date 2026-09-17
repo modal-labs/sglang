@@ -3810,10 +3810,20 @@ class Scheduler(
 
         return res
 
-    def _req_slot_block_cause(self, running_bs: int) -> str:
+    def _req_slot_block_cause(
+        self, running_bs: int, running_batch: Optional[ScheduleBatch] = None
+    ) -> str:
+        # Same operands as get_num_allocatable_reqs: rows reserved for pending
+        # beam members are not available, or the wrong limit gets blamed.
+        active_batch = running_batch or self.running_batch
+        available = max(
+            self.req_to_token_pool.available_size()
+            - self.beam_coordinator.pending_member_rows(active_batch),
+            0,
+        )
         return req_slot_block_cause(
             pp_budget=get_parallel().pp_max_micro_batch_size - running_bs,
-            available_req_slots=self.req_to_token_pool.available_size(),
+            available_req_slots=available,
         )
 
     def _record_admission_block(self, cause: str, num_blocked_reqs: int) -> None:
@@ -3822,14 +3832,17 @@ class Scheduler(
         self.metrics_reporter.record_admission_block(cause, num_blocked_reqs)
 
     def _account_admission_block(
-        self, cause: Optional[str], admitted: set[Req]
+        self, cause: Optional[str], not_blocked: set[Req]
     ) -> None:
         """Close out an admission pass: count it as blocked when a gate stopped
-        it while waiting requests remained, otherwise forget the last cause."""
+        it while waiting requests remained, otherwise forget the last cause.
+        `not_blocked` holds the requests admitted this pass and those the loop
+        skipped for its own reasons (LoRA slots, prefetch in flight), which the
+        stopping gate did not hold back."""
         num_blocked = (
             0
             if cause is None
-            else sum(1 for r in self.waiting_queue if r not in admitted)
+            else sum(1 for r in self.waiting_queue if r not in not_blocked)
         )
         if num_blocked == 0:
             self._last_admission_block_cause = None
@@ -3917,7 +3930,8 @@ class Scheduler(
         ):
             running_batch.batch_is_full = True
             self._record_admission_block(
-                self._req_slot_block_cause(running_bs), len(self.waiting_queue)
+                self._req_slot_block_cause(running_bs, running_batch),
+                len(self.waiting_queue),
             )
             return None, running_batch
 
@@ -3992,9 +4006,12 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # First gate that stops this pass, for the admission-block metrics.
         block_cause: Optional[str] = None
+        # Requests the loop skipped for its own reasons; not blocked by the gate.
+        skipped: set[Req] = set()
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                skipped.add(req)
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4007,7 +4024,7 @@ class Scheduler(
                 running_batch=running_batch,
             ):
                 running_batch.batch_is_full = True
-                block_cause = self._req_slot_block_cause(running_bs)
+                block_cause = self._req_slot_block_cause(running_bs, running_batch)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
@@ -4029,6 +4046,7 @@ class Scheduler(
                 )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    skipped.add(req)
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4046,12 +4064,14 @@ class Scheduler(
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                skipped.add(req)
                 continue
             if (
                 self.enable_hicache_storage
                 and buffer_pipeline is not None
                 and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
+                skipped.add(req)
                 continue
             res = adder.add_one_req(
                 req,
@@ -4101,7 +4121,7 @@ class Scheduler(
 
         can_run_list: List[Req] = adder.can_run_list
         can_run_set = set(can_run_list)
-        self._account_admission_block(block_cause, can_run_set)
+        self._account_admission_block(block_cause, can_run_set | skipped)
 
         # Update waiting queue
         if len(can_run_list) == 0:
