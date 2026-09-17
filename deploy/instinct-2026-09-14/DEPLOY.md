@@ -15,7 +15,8 @@ Files in this directory:
      Plus `SGLANG_RENORM_DETERMINISTIC=1` (#110) and `SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF=1` (#113) (both default ON in the engine; pinned explicitly here).
      NOT set (stay default off): `SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET` (#29), `SGLANG_MM_CUDA_IPC_LEASE_POOL` (#33)
      and the other dev levers (#37/#38/#43).
-     Rollback of any flip = unset the var.
+     Rollback of a default-off flip (#20/#19/#26) = unset the var; #110/#113 are default ON in the engine, so a
+     flags-only rollback must set `SGLANG_RENORM_DETERMINISTIC=0` and `SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF=0`.
   3. warmup: one 1280x800 synthetic-PNG image turn after the text greeting (autoinference #516).
   4. HiCache host tier re-sized for the 60-minute session TTL (see "HiCache sizing" below):
      `--enable-mla-hicache-host-dedup --hicache-size 140 --hicache-mamba-ratio 13.5 --hicache-write-policy write_through`
