@@ -230,6 +230,10 @@ BASE_RUNTIME_ENV = {
     # dev/instinct/2026-09-15 #26: scheduler-side mm padding fast path (CONFIRMED same-box, image p50 -25..-33 ms)
     "SGLANG_K3_SCHED_MM_FASTPATH": "1",
     "SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS": "1",
+    # dev/instinct/2026-09-15 #110: bit-identical top-p/top-k renorm across TP ranks
+    "SGLANG_RENORM_DETERMINISTIC": "1",
+    # dev/instinct/2026-09-15 #113: rank-0 authority D2H write handoff lock
+    "SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF": "1",
 }
 
 PREBUILT_JIT_MODULE = "sgl_trtllm_gen_moe_fi_651799c8f7fd_4153db87ecc2"
