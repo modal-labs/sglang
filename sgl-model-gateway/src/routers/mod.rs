@@ -28,6 +28,7 @@ pub mod header_utils;
 pub mod http;
 pub mod mcp_utils;
 pub mod mesh;
+pub mod native_protocol;
 pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
@@ -45,6 +46,9 @@ pub use http::{pd_router, pd_types, router};
 /// regardless of whether it's a regular router or PD router.
 #[async_trait]
 pub trait RouterTrait: Send + Sync + Debug {
+    fn admission_metrics(&self) -> String {
+        String::new()
+    }
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
@@ -90,6 +94,19 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// Preserve native generation extension fields for HTTP PD workers.
+    async fn route_native_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        match serde_json::from_value::<GenerateRequest>(body.0.clone()) {
+            Ok(request) => self.route_generate(headers, &request, model_id).await,
+            Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        }
+    }
+
     /// Route a chat completion request
     async fn route_chat(
         &self,
@@ -112,6 +129,53 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// Forward the engine's native Anthropic Messages protocol unchanged.
+    async fn route_messages(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &native_protocol::NativeRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Native Messages endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Count native Messages tokens without creating a generation or reserving KV.
+    async fn route_messages_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &native_protocol::NativeRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Native Messages token counting not implemented",
+        )
+            .into_response()
+    }
+
+    /// HTTP engines own their native Responses schema. Other backends retain
+    /// their existing typed validation and conversion behavior.
+    async fn route_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        use validator::Validate;
+        let request = match serde_json::from_value::<ResponsesRequest>(body.0.clone()) {
+            Ok(request) => request,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        if let Err(error) = request.validate() {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+        self.route_responses(headers, &request, model_id).await
+    }
+
     /// Route a responses request
     async fn route_responses(
         &self,
@@ -124,6 +188,28 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Responses endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// Route with the original JSON body for lossless HTTP forwarding.
+    async fn route_chat_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        _original_json: Option<&serde_json::Value>,
+    ) -> Response {
+        self.route_chat(headers, body, model_id).await
+    }
+
+    /// Route with the original JSON body for lossless HTTP forwarding.
+    async fn route_completion_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        _original_json: Option<&serde_json::Value>,
+    ) -> Response {
+        self.route_completion(headers, body, model_id).await
     }
 
     /// Retrieve a stored/background response by id

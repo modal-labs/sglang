@@ -400,6 +400,13 @@ impl RouterManager {
 
 #[async_trait]
 impl RouterTrait for RouterManager {
+    fn admission_metrics(&self) -> String {
+        self.routers_snapshot
+            .load()
+            .iter()
+            .map(|r| r.admission_metrics())
+            .collect()
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -524,11 +531,55 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_native_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &super::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        // In IGW mode, resolve model_id and fail fast if not resolvable
+        // In non-IGW mode, pass through to router (router handles validation)
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let router =
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_native_generate(headers, body, effective_model_id.as_deref().or(model_id))
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+    ) -> Response {
+        self.route_chat_with_json(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_chat_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        original_json: Option<&Value>,
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
@@ -548,7 +599,12 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router
-                .route_chat(headers, body, effective_model_id.as_deref().or(model_id))
+                .route_chat_with_json(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    original_json,
+                )
                 .await
         } else {
             (
@@ -565,6 +621,17 @@ impl RouterTrait for RouterManager {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        self.route_completion_with_json(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_completion_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        original_json: Option<&Value>,
+    ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
         let effective_model_id = if self.enable_igw {
@@ -583,12 +650,98 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router
-                .route_completion(headers, body, effective_model_id.as_deref().or(model_id))
+                .route_completion_with_json(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    original_json,
+                )
                 .await
         } else {
             (
                 StatusCode::NOT_FOUND,
                 format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(response) => return *response,
+            }
+        } else {
+            None
+        };
+        let model = effective_model_id.as_deref().or(model_id);
+        if let Some(router) = self.select_router_for_request(headers, model) {
+            router.route_messages(headers, body, model).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to handle messages request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(response) => return *response,
+            }
+        } else {
+            None
+        };
+        let model = effective_model_id.as_deref().or(model_id);
+        if let Some(router) = self.select_router_for_request(headers, model) {
+            router
+                .route_messages_count_tokens(headers, body, model)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to count messages tokens",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let model = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(model) => Some(model),
+                Err(response) => return *response,
+            }
+        } else {
+            model_id.map(str::to_owned)
+        };
+        if let Some(router) = self.select_router_for_request(headers, model.as_deref()) {
+            router
+                .route_native_responses(headers, body, model.as_deref())
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to handle responses request",
             )
                 .into_response()
         }
@@ -645,12 +798,16 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
+    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        if let Some(router) = self.select_router_for_request(headers, None) {
+            router.delete_response(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to delete response",
+            )
+                .into_response()
+        }
     }
 
     async fn list_response_input_items(

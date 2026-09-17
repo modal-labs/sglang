@@ -7,7 +7,8 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    body::{Body, Bytes},
+    extract::{FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -44,10 +45,9 @@ use crate::{
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        responses::ResponsesGetParams,
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
@@ -152,9 +152,17 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
-    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
-        .await
-        .into_response()
+    let result =
+        WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
+            .await;
+    match result {
+        crate::core::worker_manager::EngineMetricsResult::Ok(mut text) => {
+            text.push('\n');
+            text.push_str(&state.router.admission_metrics());
+            crate::core::worker_manager::EngineMetricsResult::Ok(text).into_response()
+        }
+        other => other.into_response(),
+    }
 }
 
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -172,34 +180,67 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    Json(body): Json<crate::routers::native_protocol::NativeRequest>,
 ) -> Response {
-    let model_id = body.model.as_deref();
+    let model_id = body.0.get("model").and_then(Value::as_str);
     state
         .router
-        .route_generate(Some(&headers), &body, model_id)
+        .route_native_generate(Some(&headers), &body, model_id)
         .await
+}
+
+/// Preserve JSON numbers and extension fields alongside the validated routing view.
+struct ForwardedJson<T> {
+    typed: T,
+    original: Value,
+}
+
+impl<S, T> FromRequest<S> for ForwardedJson<T>
+where
+    S: Send + Sync,
+    T: FromRequest<S> + Send,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let typed = T::from_request(Request::from_parts(parts, Body::from(bytes.clone())), state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let original = serde_json::from_slice(&bytes)
+            .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()).into_response())?;
+        Ok(Self { typed, original })
+    }
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ForwardedJson {
+        typed: ValidatedJson(body),
+        original,
+    }: ForwardedJson<ValidatedJson<ChatCompletionRequest>>,
 ) -> Response {
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_with_json(Some(&headers), &body, Some(&body.model), Some(&original))
         .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    ForwardedJson {
+        typed: Json(body),
+        original,
+    }: ForwardedJson<Json<CompletionRequest>>,
 ) -> Response {
     state
         .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
+        .route_completion_with_json(Some(&headers), &body, Some(&body.model), Some(&original))
         .await
 }
 
@@ -215,14 +256,39 @@ async fn v1_rerank(
         .await
 }
 
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<crate::routers::native_protocol::NativeRequest>,
+) -> Response {
+    use crate::protocols::common::GenerationRequest;
+    state
+        .router
+        .route_messages(Some(&headers), &body, body.get_model())
+        .await
+}
+
+async fn v1_messages_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<crate::routers::native_protocol::NativeRequest>,
+) -> Response {
+    use crate::protocols::common::GenerationRequest;
+    state
+        .router
+        .route_messages_count_tokens(Some(&headers), &body, body.get_model())
+        .await
+}
+
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+    Json(body): Json<crate::routers::native_protocol::NativeRequest>,
 ) -> Response {
+    use crate::protocols::common::GenerationRequest;
     state
         .router
-        .route_responses(Some(&headers), &body, Some(&body.model))
+        .route_native_responses(Some(&headers), &body, body.get_model())
         .await
 }
 
@@ -546,6 +612,8 @@ pub fn build_app(
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/rerank", post(v1_rerank))
+        .route("/v1/messages", post(v1_messages))
+        .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
@@ -596,6 +664,7 @@ pub fn build_app(
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
+        .route("/metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/model_info", get(get_model_info))
         // TODO: Remove `/get_model_info` alias after one release-cycle deprecation window.
@@ -1147,4 +1216,59 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod forwarded_json_tests {
+    use super::*;
+    use http::header::CONTENT_TYPE;
+
+    #[tokio::test]
+    async fn preserves_original_sampling_values() {
+        for top_p in [0.95, 0.9, 1.0] {
+            let original = serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_p": top_p,
+                "custom_extension": {"value": 0.123456789012345}
+            });
+            let request = Request::builder()
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(original.to_string()))
+                .unwrap();
+            let extracted =
+                ForwardedJson::<ValidatedJson<ChatCompletionRequest>>::from_request(request, &())
+                    .await
+                    .unwrap();
+            assert_eq!(extracted.original, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_completion_sampling_values() {
+        let original = serde_json::json!({"model": "test-model", "prompt": "hello", "top_p": 0.95});
+        let request = Request::builder()
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(original.to_string()))
+            .unwrap();
+        let extracted = ForwardedJson::<Json<CompletionRequest>>::from_request(request, &())
+            .await
+            .unwrap();
+        assert_eq!(extracted.original, original);
+    }
+
+    #[tokio::test]
+    async fn preserves_json_rejections() {
+        for (content_type, body, expected) in [
+            ("text/plain", "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("application/json", "{", StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder()
+                .header(CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap();
+            let result = ForwardedJson::<Json<CompletionRequest>>::from_request(request, &()).await;
+            assert_eq!(result.err().unwrap().status(), expected);
+        }
+    }
 }

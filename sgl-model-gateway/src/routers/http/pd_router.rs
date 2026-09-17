@@ -36,6 +36,7 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
         error,
@@ -54,6 +55,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    admission: Option<Arc<super::pd_admission::Admission>>,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -81,9 +83,128 @@ struct PDRequestContext<'a> {
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
 
+fn native_messages_error(message: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        axum::Json(json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message}
+        })),
+    )
+        .into_response()
+}
+
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
+    }
+
+    /// Responses state (including previous_response_id and background jobs)
+    /// belongs to the sole decode HTTP frontend. It coordinates each prefill
+    /// turn with its configured P endpoint; duplicating the Responses request
+    /// across P and D would create divergent conversation stores.
+    async fn proxy_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        method: reqwest::Method,
+        suffix: &[&str],
+        body: Option<&Value>,
+        params: Option<&ResponsesGetParams>,
+    ) -> Response {
+        let workers = self.worker_registry.get_decode_workers();
+        let owner = std::env::var("SMG_RESPONSES_FRONTEND_URL").ok();
+        let worker = if let Some(owner) = owner {
+            match workers.iter().find(|worker| worker.url() == owner) {
+                Some(worker) => worker.clone(),
+                None => {
+                    return error::service_unavailable(
+                        "responses_state_owner",
+                        "Configured Responses frontend is unavailable",
+                    )
+                }
+            }
+        } else if workers.len() == 1 {
+            workers[0].clone()
+        } else {
+            return error::service_unavailable(
+                "responses_state_owner",
+                "Multiple decoders require an explicit Responses frontend",
+            );
+        };
+        if !worker.is_available() {
+            return error::service_unavailable(
+                "responses_decode_unavailable",
+                "Decode worker unavailable",
+            );
+        }
+        let mut url = match url::Url::parse(worker.url()) {
+            Ok(url) => url,
+            Err(_) => {
+                return error::internal_error("responses_worker_url", "Invalid decode worker URL")
+            }
+        };
+        // Push identifiers as path segments: a response ID must not become a
+        // path traversal or a different worker API route.
+        {
+            let Ok(mut segments) = url.path_segments_mut() else {
+                return error::internal_error("responses_worker_url", "Invalid decode worker URL");
+            };
+            segments.pop_if_empty().push("v1").push("responses");
+            for part in suffix {
+                segments.push(part);
+            }
+        }
+        if let Some(params) = params {
+            let mut query = url.query_pairs_mut();
+            for include in &params.include {
+                query.append_pair("include", include);
+            }
+            if let Some(value) = params.include_obfuscation {
+                query.append_pair("include_obfuscation", &value.to_string());
+            }
+            if let Some(value) = params.starting_after {
+                query.append_pair("starting_after", &value.to_string());
+            }
+            if let Some(value) = params.stream {
+                query.append_pair("stream", &value.to_string());
+            }
+        }
+        let guard = WorkerLoadGuard::new(worker.clone(), headers);
+        let mut request = self.client.request(method, url);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                if header_utils::should_forward_request_header(name.as_str()) {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        match request.send().await {
+            Ok(upstream) => {
+                let status = upstream.status();
+                let headers = header_utils::preserve_response_headers(upstream.headers());
+                let mut stream = BreakerTrackedStream::new(
+                    upstream.bytes_stream(),
+                    worker.clone(),
+                    worker.url().to_string(),
+                );
+                if status.is_server_error() {
+                    stream.mark_errored();
+                }
+                let mut response = Response::new(Body::from_stream(stream));
+                *response.status_mut() = status;
+                *response.headers_mut() = headers;
+                // Streaming directly from reqwest keeps cancellation attached to
+                // the client body; there is no detached background relay.
+                crate::core::AttachedBody::wrap_response(response, guard)
+            }
+            Err(error) => {
+                worker.record_outcome(false);
+                error::bad_gateway("responses_decode_connection", error.to_string())
+            }
+        }
     }
 
     async fn proxy_to_first_prefill_worker(
@@ -185,6 +306,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            admission: super::pd_admission::Admission::from_env()?,
         })
     }
 
@@ -362,11 +484,12 @@ impl PDRouter {
         Ok((prefill_request, decode_request))
     }
 
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
+    async fn execute_dual_dispatch<T: Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
         context: PDRequestContext<'_>,
+        original_json: Option<&Value>,
     ) -> Response {
         let start_time = Instant::now();
 
@@ -383,9 +506,55 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
+        // Preserve the forwarding payload across retries; each attempt adds its own bootstrap fields.
+        let json_request = match original_json {
+            Some(value) => value.clone(),
+            None => match serde_json::to_value(original_request) {
+                Ok(value) => value,
+                Err(e) => return Self::handle_serialization_error(e),
+            },
+        };
+        let admission_lease = if let Some(queue) = &self.admission {
+            if self.worker_registry.get_prefill_workers().len() != 1
+                || self.worker_registry.get_decode_workers().len() != 1
+            {
+                return error::service_unavailable(
+                    "admission_topology",
+                    "Experimental PD admission requires one P and one D",
+                );
+            }
+            let text = context.request_text.as_deref().unwrap_or("");
+            let key = format!("{model}\0{route}\0{text}");
+            let bytes = serde_json::to_vec(&json_request)
+                .map(|b| b.len())
+                .unwrap_or(usize::MAX)
+                .saturating_add(key.len());
+            match queue.acquire(key, bytes).await {
+                Ok(lease) => Some(lease),
+                Err(message) => {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        axum::Json(json!({"error":{"message":message,"type":"admission_error"}})),
+                    )
+                        .into_response()
+                }
+            }
+        } else {
+            None
+        };
+        // Never trust a caller-supplied timing offset. Measure this request's queue.
+        let mut timed_headers = headers.cloned().unwrap_or_default();
+        timed_headers.insert(
+            "x-smg-admission-wait-seconds",
+            admission_lease
+                .as_ref()
+                .map_or(0.0, |lease| lease.wait_seconds)
+                .to_string()
+                .parse()
+                .expect("finite admission duration"),
+        );
+        let headers = Some(&timed_headers);
+        let shared_request = Arc::new(json_request);
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
@@ -394,8 +563,8 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode) = match self
-                            .select_pd_pair(
+                        let (prefill, decode, uncached_fraction) = match self
+                            .select_pd_pair_with_cost(
                                 context.request_text.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
@@ -415,10 +584,7 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+                        let mut json_request = shared_request.as_ref().clone();
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -429,10 +595,19 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
+                        // Overwrite caller input; this estimate belongs to the selected P.
+                        let mut dispatch_headers = headers.cloned().unwrap_or_default();
+                        dispatch_headers.insert(
+                            "x-smg-prefill-uncached-fraction",
+                            uncached_fraction
+                                .to_string()
+                                .parse()
+                                .expect("finite fraction"),
+                        );
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
-                                headers,
+                                Some(&dispatch_headers),
                                 json_request,
                                 context,
                                 Arc::clone(&prefill),
@@ -516,7 +691,10 @@ impl PDRouter {
             );
         }
 
-        response
+        match admission_lease {
+            Some(lease) => super::pd_admission::hold_response(response, lease),
+            None => response,
+        }
     }
 
     async fn handle_decode_error_response(
@@ -528,6 +706,17 @@ impl PDRouter {
     ) -> Response {
         let status = res.status();
 
+        if context.route == "/v1/messages" {
+            let headers = header_utils::preserve_response_headers(res.headers());
+            return match res.bytes().await {
+                Ok(body) => {
+                    let mut response = (status, body).into_response();
+                    response.headers_mut().extend(headers);
+                    response
+                }
+                Err(_) => native_messages_error("Failed to read decode response"),
+            };
+        }
         if context.is_stream {
             // Handle streaming error response
             let response_headers = header_utils::preserve_response_headers(res.headers());
@@ -569,6 +758,8 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                None,
+                context.route,
             )
         } else {
             // Handle non-streaming error response
@@ -703,27 +894,115 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
-        tokio::pin!(decode_fut);
+        // Boxed so the streaming fast path below can hand the still-pending
+        // prefill leg to the relay task.
+        let mut prefill_fut: futures::future::BoxFuture<
+            'static,
+            Result<reqwest::Response, reqwest::Error>,
+        > = Box::pin(async move {
+            // Treat a prefill leg as pending until its body is drained, not just
+            // until headers arrive. SSE keepalives/early headers are not proof
+            // that KV transfer has completed. Decode may stream meanwhile.
+            let response = prefill_request.send().await?;
+            if !response.status().is_success() {
+                // Rejecting headers are enough to cancel the paired decoder.
+                // Error bodies may themselves be slow or streaming.
+                return Ok(response);
+            }
+            let status = response.status();
+            let version = response.version();
+            let headers = response.headers().clone();
+            let body = response.bytes().await?;
+            let mut completed = http::Response::new(body);
+            *completed.status_mut() = status;
+            *completed.version_mut() = version;
+            *completed.headers_mut() = headers;
+            Ok(reqwest::Response::from(completed))
+        });
+        let mut decode_fut = Box::pin(decode_request.send());
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
-        let prefill_result;
+        //
+        // Streaming fast path: a decode 2xx means the pair was accepted, so a
+        // streaming request that does not need prefill's body (no logprob
+        // merge) commits the client stream right away and the still-pending
+        // prefill leg is watched from the relay task. Gating the client stream
+        // on the prefill leg's HTTP response buffered every chunk (and SSE
+        // keepalive) decode produced while that response lagged and flushed
+        // them in one burst, destroying client-observed TTFT/TPOT.
+        let mut prefill_result: Option<Result<reqwest::Response, reqwest::Error>> = None;
         let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
+        let mut decode_commit: Option<reqwest::Response> = None;
         loop {
             tokio::select! {
                 biased;
                 pr = &mut prefill_fut => {
-                    prefill_result = pr;
+                    prefill_result = Some(pr);
                     break;
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                    match dr {
+                        Ok(res) if !res.status().is_success() => {
+                            // D cannot use the prefill result. Cancel P before
+                            // reading the error body, which may also be slow.
+                            drop(prefill_fut);
+                            let status = res.status();
+                            // Native Messages errors are direct passthrough;
+                            // other streaming errors have a tracked SSE body.
+                            if !context.is_stream || context.route == "/v1/messages" {
+                                decode.record_outcome(status.is_client_error());
+                            }
+                            let mut response = self
+                                .handle_decode_error_response(res, &context, prefill, decode)
+                                .await;
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return response;
+                        }
+                        Err(e) => {
+                            drop(prefill_fut);
+                            decode.record_outcome(false);
+                            let mut response = error::bad_gateway(
+                                "decode_server_error",
+                                format!("Decode server error: {}", e),
+                            );
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return response;
+                        }
+                        Ok(res) => decode_early = Some(Ok(res)),
+                    }
+                    if context.is_stream
+                        && !context.return_logprob
+                    {
+                        decode_commit = decode_early.take().and_then(Result::ok);
+                        break;
+                    }
                 }
             }
         }
+
+        if let Some(res) = decode_commit {
+            events::RequestReceivedEvent {}.emit();
+            let status = StatusCode::from_u16(res.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response = self.create_streaming_response(
+                res.bytes_stream(),
+                status,
+                None,
+                false,
+                Some(response_headers),
+                prefill,
+                decode,
+                Some(prefill_fut),
+                context.route,
+            );
+            // The relay records both workers when their actual legs finish.
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
+        }
+        let prefill_result =
+            prefill_result.expect("dispatch loop exits with prefill resolved or decode committed");
 
         // Decode can't generate without prefill's KV, so any prefill failure
         // (non-2xx / transport error) dooms the paired decode request, which would
@@ -736,6 +1015,10 @@ impl PDRouter {
         };
 
         if prefill_failed {
+            // Cancel either a pending connection or an already-received D body
+            // before awaiting the prefill error payload.
+            drop(decode_fut);
+            drop(decode_early);
             warn!(
                 "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
                 decode.url(),
@@ -752,6 +1035,25 @@ impl PDRouter {
             prefill.record_outcome(prefill_ok);
 
             // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
+            if context.route == "/v1/messages" {
+                let mut response = match prefill_result {
+                    Ok(res) => {
+                        let status = res.status();
+                        let headers = header_utils::preserve_response_headers(res.headers());
+                        match res.bytes().await {
+                            Ok(body) => {
+                                let mut response = (status, body).into_response();
+                                response.headers_mut().extend(headers);
+                                response
+                            }
+                            Err(_) => native_messages_error("Failed to read prefill response"),
+                        }
+                    }
+                    Err(_) => native_messages_error("Prefill connection failed"),
+                };
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
             let mut response = match self
                 .process_prefill_response(prefill_result, prefill.url(), false)
                 .await
@@ -811,7 +1113,7 @@ impl PDRouter {
                         Err(_) => false,
                     };
                     prefill.record_outcome(prefill_ok);
-                    if !context.is_stream {
+                    if !context.is_stream || context.route == "/v1/messages" {
                         let decode_ok = status.is_success() || status.is_client_error();
                         decode.record_outcome(decode_ok);
                     }
@@ -870,6 +1172,8 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        None,
+                        context.route,
                     )
                 } else {
                     // Non-streaming response
@@ -944,7 +1248,9 @@ impl PDRouter {
     fn policies_need_request_text(&self) -> bool {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
-        prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+        self.admission.is_some()
+            || prefill_policy.needs_request_text()
+            || decode_policy.needs_request_text()
     }
 
     /// Builds the text used for cache-aware routing of a chat request.
@@ -975,6 +1281,17 @@ impl PDRouter {
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+        self.select_pd_pair_with_cost(request_text, model_id, headers)
+            .await
+            .map(|(p, d, _)| (p, d))
+    }
+
+    async fn select_pd_pair_with_cost(
+        &self,
+        request_text: Option<&str>,
+        model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, f64), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         debug!(
@@ -1012,6 +1329,20 @@ impl PDRouter {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
+        let cost_snapshot = if std::env::var("SMG_PD_DECODE_HRRN").as_deref() == Ok("1") {
+            prefill_policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                .and_then(|policy| {
+                    prefill_workers.first().and_then(|worker| {
+                        request_text
+                            .and_then(|text| policy.prefill_cost_snapshot(worker.as_ref(), text))
+                    })
+                })
+        } else {
+            None
+        };
+
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
@@ -1047,7 +1378,15 @@ impl PDRouter {
             decode_policy.name(),
         );
 
-        Ok((prefill, decode))
+        let uncached_fraction = cost_snapshot.map_or(1.0, |m| {
+            if m.tenant.as_ref() == prefill.url() && m.input_char_count > 0 {
+                m.input_char_count.saturating_sub(m.matched_char_count) as f64
+                    / m.input_char_count as f64
+            } else {
+                1.0
+            }
+        });
+        Ok((prefill, decode, uncached_fraction))
     }
 
     async fn pick_worker_by_policy_arc(
@@ -1110,6 +1449,10 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        pending_prefill: Option<
+            futures::future::BoxFuture<'static, Result<reqwest::Response, reqwest::Error>>,
+        >,
+        route: &'static str,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1136,10 +1479,68 @@ impl PDRouter {
             tracked.mark_errored();
         }
         let decode_for_log = decode.clone();
+        // Prefill leg still in flight (streaming fast path): watch it from the
+        // relay so its breaker outcome is recorded, and terminate the client
+        // stream with an in-band SSE error if it fails. Dropping the upstream
+        // stream disconnects decode, which aborts the paired request.
+        let prefill_watch_worker = prefill.clone();
+        let mut prefill_pending = pending_prefill.is_some();
+        let mut prefill_watch: futures::future::BoxFuture<
+            'static,
+            Result<reqwest::Response, reqwest::Error>,
+        > = match pending_prefill {
+            Some(f) => f,
+            None => Box::pin(std::future::pending()),
+        };
         tokio::spawn(async move {
+            let mut cancel_prefill = false;
             loop {
                 tokio::select! {
                     biased;
+                    pr = &mut prefill_watch, if prefill_pending => {
+                        prefill_pending = false;
+                        let (prefill_ok, prefill_failed) = match &pr {
+                            Ok(r) => {
+                                let s = r.status();
+                                (s.is_success() || s.is_client_error(), !s.is_success())
+                            }
+                            Err(_) => (false, true),
+                        };
+                        prefill_watch_worker.record_outcome(prefill_ok);
+                        if prefill_failed {
+                            error!(
+                                prefill_url = %prefill_watch_worker.url(),
+                                "Prefill leg failed after the client stream was committed; \
+                                 terminating relayed decode stream"
+                            );
+                            let err = serde_json::json!({
+                                "error": {
+                                    "message": "prefill leg failed after stream start",
+                                    "type": "prefill_failed",
+                                    "code": 502
+                                }
+                            });
+                            let event = if route == "/v1/messages" {
+                                format!("event: error\ndata: {}\n\n", json!({
+                                    "type": "error",
+                                    "error": {"type": "api_error", "message": "Prefill failed after stream start"}
+                                }))
+                            } else {
+                                format!("data: {}\n\n", err)
+                            };
+                            let _ = tx.send(Ok(bytes::Bytes::from(event)));
+                            break;
+                        }
+                        if let Ok(resp) = pr {
+                            // Drain the body: dropping a reqwest::Response with an
+                            // unread body closes the connection, which the prefill
+                            // server treats as a client disconnect and aborts the
+                            // request mid KV-transfer, orphaning the decode leg.
+                            tokio::spawn(async move {
+                                let _ = resp.bytes().await;
+                            });
+                        }
+                    }
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
@@ -1163,6 +1564,7 @@ impl PDRouter {
                                 }
 
                                 if tx.send(Ok(result)).is_err() {
+                                    cancel_prefill = true;
                                     tracing::debug!(
                                         "Receiver dropped (likely client disconnect), \
                                         cancelling upstream PD stream"
@@ -1175,6 +1577,8 @@ impl PDRouter {
                                 }
                             }
                             Some(Err(e)) => {
+                                // D can no longer consume P's result.
+                                cancel_prefill = true;
                                 // BreakerTrackedStream already logged the error
                                 // and marked the terminal state as Errored so
                                 // the worker's circuit breaker will tick on drop.
@@ -1185,6 +1589,7 @@ impl PDRouter {
                         }
                     }
                     _ = tx.closed() => {
+                        cancel_prefill = true;
                         tracing::info!(
                             "Client disconnected, cancelling upstream PD stream from {}",
                             decode_for_log.url()
@@ -1192,6 +1597,25 @@ impl PDRouter {
                         break;
                     }
                 }
+            }
+            if prefill_pending && !cancel_prefill {
+                // Decode finished before the prefill leg resolved: let
+                // it finish on its own so its breaker outcome is recorded and
+                // its connection is not severed mid-request.
+                tokio::spawn(async move {
+                    let pr = prefill_watch.await;
+                    let prefill_ok = match &pr {
+                        Ok(r) => {
+                            let s = r.status();
+                            s.is_success() || s.is_client_error()
+                        }
+                        Err(_) => false,
+                    };
+                    prefill_watch_worker.record_outcome(prefill_ok);
+                    if let Ok(resp) = pr {
+                        let _ = resp.bytes().await;
+                    }
+                });
             }
         });
 
@@ -1453,6 +1877,12 @@ impl PDRouter {
 
 #[async_trait]
 impl RouterTrait for PDRouter {
+    fn admission_metrics(&self) -> String {
+        self.admission
+            .as_ref()
+            .map(|q| q.render_metrics())
+            .unwrap_or_default()
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1559,6 +1989,47 @@ impl RouterTrait for PDRouter {
             .await
     }
 
+    async fn route_native_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        if !body.0.is_object() {
+            return error::bad_request("generate_request", "Expected a JSON object");
+        }
+        let batch_size = body
+            .0
+            .get("input_ids")
+            .and_then(Value::as_array)
+            .filter(|ids| ids.first().is_some_and(Value::is_array))
+            .map(Vec::len)
+            .or_else(|| body.0.get("text").and_then(Value::as_array).map(Vec::len));
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size,
+            is_stream: body
+                .0
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            return_logprob: body
+                .0
+                .get("return_logprob")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            request_text: if self.policies_need_request_text() {
+                crate::routers::native_protocol::generation_routing_key(&body.0)
+            } else {
+                None
+            },
+            model_id,
+            headers: headers.cloned(),
+        };
+        self.execute_dual_dispatch(headers, body, context, Some(&body.0))
+            .await
+    }
+
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
@@ -1586,7 +2057,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
     }
 
     async fn route_chat(
@@ -1594,6 +2066,17 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+    ) -> Response {
+        self.route_chat_with_json(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_chat_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        original_json: Option<&Value>,
     ) -> Response {
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
@@ -1617,7 +2100,197 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, original_json)
+            .await
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        use crate::protocols::common::GenerationRequest;
+        let context = PDRequestContext {
+            route: "/v1/messages",
+            batch_size: None,
+            is_stream: body.is_stream(),
+            return_logprob: false,
+            request_text: self
+                .policies_need_request_text()
+                .then(|| body.extract_text_for_routing()),
+            model_id,
+            headers: headers.cloned(),
+        };
+        self.execute_dual_dispatch(headers, body, context, Some(&body.0))
+            .await
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let workers = if self.enable_igw {
+            model_id
+                .map(|model| self.worker_registry.get_by_model(model))
+                .unwrap_or_default()
+                .iter()
+                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.worker_registry.get_prefill_workers()
+        };
+        let Some(worker) = workers.iter().find(|worker| worker.is_available()) else {
+            return native_messages_error("No prefill worker available for token counting");
+        };
+        let url = Self::worker_endpoint_url(worker.as_ref(), "/v1/messages/count_tokens");
+        match self
+            .build_post_with_headers(&self.client, &url, &body.0, headers, false)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let headers = header_utils::preserve_response_headers(response.headers());
+                match response.bytes().await {
+                    Ok(body) => {
+                        let mut response = (status, body).into_response();
+                        response.headers_mut().extend(headers);
+                        response
+                    }
+                    Err(_) => native_messages_error("Failed to read token-count response"),
+                }
+            }
+            Err(_) => native_messages_error("Token-count connection failed"),
+        }
+    }
+
+    async fn route_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        let lease = if let Some(queue) = &self.admission {
+            if body.0.get("background").and_then(Value::as_bool) == Some(true) {
+                return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":{"message":"Background Responses is not supported by experimental PD admission","type":"admission_error"}}))).into_response();
+            }
+            use crate::protocols::common::GenerationRequest;
+            let key = format!(
+                "responses\0{}\0{}",
+                _model_id.unwrap_or(UNKNOWN_MODEL_ID),
+                body.extract_text_for_routing()
+            );
+            let bytes = serde_json::to_vec(&body.0)
+                .map(|b| b.len())
+                .unwrap_or(usize::MAX)
+                .saturating_add(key.len());
+            match queue.acquire(key, bytes).await {
+                Ok(lease) => Some(lease),
+                Err(message) => {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        axum::Json(json!({"error":{"message":message,"type":"admission_error"}})),
+                    )
+                        .into_response()
+                }
+            }
+        } else {
+            None
+        };
+        let mut timed_headers = headers.cloned().unwrap_or_default();
+        timed_headers.insert(
+            "x-smg-admission-wait-seconds",
+            lease
+                .as_ref()
+                .map_or(0.0, |lease| lease.wait_seconds)
+                .to_string()
+                .parse()
+                .expect("finite admission duration"),
+        );
+        timed_headers.insert("x-smg-prefill-uncached-fraction", "1".parse().unwrap());
+        let response = self
+            .proxy_native_responses(
+                Some(&timed_headers),
+                reqwest::Method::POST,
+                &[],
+                Some(&body.0),
+                None,
+            )
+            .await;
+        match lease {
+            Some(lease) => super::pd_admission::hold_response(response, lease),
+            None => response,
+        }
+    }
+
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        match serde_json::to_value(body) {
+            Ok(body) => {
+                self.route_native_responses(
+                    headers,
+                    &crate::routers::native_protocol::NativeRequest(body),
+                    model_id,
+                )
+                .await
+            }
+            Err(error) => Self::handle_serialization_error(error),
+        }
+    }
+
+    async fn get_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        params: &ResponsesGetParams,
+    ) -> Response {
+        self.proxy_native_responses(
+            headers,
+            reqwest::Method::GET,
+            &[response_id],
+            None,
+            Some(params),
+        )
+        .await
+    }
+
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        self.proxy_native_responses(
+            headers,
+            reqwest::Method::POST,
+            &[response_id, "cancel"],
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        self.proxy_native_responses(headers, reqwest::Method::DELETE, &[response_id], None, None)
+            .await
+    }
+
+    async fn list_response_input_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+    ) -> Response {
+        self.proxy_native_responses(
+            headers,
+            reqwest::Method::GET,
+            &[response_id, "input_items"],
+            None,
+            None,
+        )
+        .await
     }
 
     async fn route_completion(
@@ -1625,6 +2298,17 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+    ) -> Response {
+        self.route_completion_with_json(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_completion_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        original_json: Option<&Value>,
     ) -> Response {
         let is_stream = body.stream;
         let return_logprob = body.logprobs.is_some();
@@ -1651,7 +2335,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, original_json)
+            .await
     }
 
     async fn route_rerank(
@@ -1677,7 +2362,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
     }
 
     async fn route_embeddings(
@@ -1730,6 +2416,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            admission: None,
         }
     }
 
@@ -1739,6 +2426,859 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    async fn messages_test_pair(
+        prefill_app: axum::Router,
+        decode_app: axum::Router,
+    ) -> (PDRouter, Vec<tokio::task::JoinHandle<()>>) {
+        let router = create_test_pd_router();
+        let mut tasks = Vec::new();
+        for (app, role) in [
+            (
+                prefill_app,
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+            ),
+            (decode_app, WorkerType::Decode),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tasks.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            router
+                .worker_registry
+                .register(Arc::from(create_test_worker(url, role, true)));
+        }
+        (router, tasks)
+    }
+
+    #[tokio::test]
+    async fn native_generate_preserves_expanded_turn_and_overwrites_cost() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = || {
+            let seen = seen.clone();
+            axum::Router::new().route(
+                "/generate",
+                axum::routing::post(
+                    move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().unwrap().push((headers, body));
+                            axum::Json(json!({"text":"ok","meta_info":{}}))
+                        }
+                    },
+                ),
+            )
+        };
+        let (router, tasks) = messages_test_pair(app(), app()).await;
+        let request = crate::routers::native_protocol::NativeRequest(json!({
+            "input_ids":[1,2,3], "stream":false,
+            "sampling_params":{"top_p":0.95},
+            "extra_engine_field":{"must_survive":true}
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-prefill-uncached-fraction", "0".parse().unwrap());
+        let response = router
+            .route_native_generate(Some(&headers), &request, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for (headers, payload) in seen.iter() {
+            assert_eq!(payload["input_ids"], json!([1, 2, 3]));
+            assert_eq!(payload["extra_engine_field"]["must_survive"], true);
+            assert_eq!(payload["sampling_params"]["top_p"], 0.95);
+            assert_eq!(headers["x-smg-prefill-uncached-fraction"], "1");
+            assert!(payload.get("bootstrap_room").is_some());
+        }
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_blocks_both_legs_until_prior_body_drops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let p = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async { axum::Json(json!({})) }),
+        );
+        let counter = dispatched.clone();
+        let d = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Response::new(Body::from_stream(futures_util::stream::pending::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >()))
+                }
+            }),
+        );
+        let (mut router, tasks) = messages_test_pair(p, d).await;
+        router.admission = Some(super::super::pd_admission::Admission::new(
+            super::super::pd_admission::Order::Hrrn,
+            1,
+            4,
+            10000,
+            std::time::Duration::from_secs(5),
+        ));
+        let router = Arc::new(router);
+        let body = crate::routers::native_protocol::NativeRequest(
+            json!({"model":"test","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"hello"}]}),
+        );
+        let first = router.route_messages(None, &body, Some("test")).await;
+        let other = router.clone();
+        let mut second =
+            tokio::spawn(async move { other.route_messages(None, &body, Some("test")).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut second)
+                .await
+                .is_err()
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+        drop(first);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dispatched.load(Ordering::SeqCst), 2);
+        drop(response);
+        assert!(router
+            .admission_metrics()
+            .contains("smg:pd_admission_active 0"));
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_messages_preserves_payload_and_decodes_response() {
+        use std::sync::Mutex;
+        let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let mut apps = Vec::new();
+        for role in ["prefill", "decode"] {
+            let captured = captured.clone();
+            apps.push(axum::Router::new().route("/v1/messages", axum::routing::post(
+                move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push((headers, body));
+                        axum::Json(json!({
+                            "type":"message", "id":role, "content":[{"type":"text","text":"answer"}],
+                            "stop_reason":"end_turn", "usage":{"input_tokens":123,"output_tokens":7}
+                        }))
+                    }
+                }
+            )));
+        }
+        let (router, tasks) = messages_test_pair(apps.remove(0), apps.remove(0)).await;
+        let original = json!({
+            "model":"test", "max_tokens":16, "top_p":0.95, "stream":false,
+            "system":[{"type":"text","text":"instructions","cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"fixture"}},
+                {"type":"tool_result","tool_use_id":"call_1","content":"result"},
+                {"type":"text","text":"hello"}
+            ]}],
+            "thinking":{"type":"enabled","budget_tokens":1024},
+            "tools":[{"name":"tool","input_schema":{"type":"object","properties":{}}}],
+            "future_extension":{"number":0.9500000001}
+        });
+        let body = crate::routers::native_protocol::NativeRequest(original.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        let response = router
+            .route_messages(Some(&headers), &body, Some("test"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["id"], "decode");
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured[0].1["bootstrap_room"],
+            captured[1].1["bootstrap_room"]
+        );
+        for (headers, forwarded) in captured.iter() {
+            assert_eq!(headers["anthropic-version"], "2023-06-01");
+            let mut forwarded = forwarded.clone();
+            for key in ["bootstrap_host", "bootstrap_port", "bootstrap_room"] {
+                assert!(forwarded.as_object_mut().unwrap().remove(key).is_some());
+            }
+            assert_eq!(forwarded, original);
+        }
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_messages_stream_preserves_events_before_prefill_completes() {
+        use futures_util::StreamExt;
+        let prefill = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                axum::Json(json!({"type":"message","content":[]}))
+            }),
+        );
+        let expected = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reason\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let decode = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                ([(CONTENT_TYPE, "text/event-stream")], expected)
+            }),
+        );
+        let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let body = crate::routers::native_protocol::NativeRequest(json!({
+            "model":"test","max_tokens":16,"messages":[],"stream":true
+        }));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            router.route_messages(None, &body, None),
+        )
+        .await
+        .expect("decode headers must not wait for P");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk, expected.as_bytes());
+        drop(stream);
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_messages_preserves_engine_validation_errors() {
+        for failing_role in ["prefill", "decode"] {
+            for stream in [false, true] {
+                let error = json!({"type":"error","error":{"type":"invalid_request_error","message":"bad media"}});
+                let mut apps = Vec::new();
+                for role in ["prefill", "decode"] {
+                    let error = error.clone();
+                    apps.push(axum::Router::new().route(
+                        "/v1/messages",
+                        axum::routing::post(move || {
+                            let error = error.clone();
+                            async move {
+                                if role == failing_role {
+                                    (StatusCode::BAD_REQUEST, axum::Json(error))
+                                } else {
+                                    // Force the native 400 to arrive before stream commitment.
+                                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                                    (StatusCode::OK, axum::Json(json!({"type":"message"})))
+                                }
+                            }
+                        }),
+                    ));
+                }
+                let (router, tasks) = messages_test_pair(apps.remove(0), apps.remove(0)).await;
+                let body = crate::routers::native_protocol::NativeRequest(json!({
+                    "model":"test","max_tokens":16,"messages":[],"stream":stream
+                }));
+                let response = router.route_messages(None, &body, None).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let actual: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(actual, error);
+                for task in tasks {
+                    task.abort();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_messages_count_tokens_does_not_dispatch_decode_or_inject_bootstrap() {
+        let prefill = axum::Router::new().route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                assert!(body.get("bootstrap_room").is_none());
+                assert!(body["messages"][0]["content"][0]["source"]["data"].is_string());
+                axum::Json(json!({"input_tokens":42}))
+            }),
+        );
+        let decode = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let body = crate::routers::native_protocol::NativeRequest(json!({
+            "model":"test","messages":[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"fixture"}}
+            ]}]
+        }));
+        let response = router.route_messages_count_tokens(None, &body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let actual: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual, json!({"input_tokens":42}));
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_routes_state_operations_to_decode_without_dual_dispatch() {
+        use std::sync::Mutex;
+        let received = Arc::new(Mutex::new(Vec::<(String, String, Value)>::new()));
+        let captured = received.clone();
+        let decode = axum::Router::new().fallback(move |request: Request<Body>| {
+            let captured = captured.clone();
+            async move {
+                let method = request.method().to_string();
+                let uri = request.uri().to_string();
+                let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                captured.lock().unwrap().push((method, uri, body));
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    r#"{"id":"resp_owner","status":"queued"}"#,
+                )
+            }
+        });
+        let prefill = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let manager =
+            crate::routers::router_manager::RouterManager::new(router.worker_registry.clone());
+        manager.register_router(
+            crate::routers::router_manager::router_ids::HTTP_PD,
+            Arc::new(router),
+        );
+        manager.set_default_router(crate::routers::router_manager::router_ids::HTTP_PD);
+        let router = manager;
+        let original = json!({
+            "input":[{"type":"message","role":"user","content":[
+                {"type":"input_image","image_url":"data:image/png;base64,fixture","detail":"original"},
+                {"type":"input_text","text":"hello"}
+            ]}],
+            "previous_response_id":"resp_previous", "store":true, "background":true,
+            "top_p":0.95, "reasoning":{"effort":"high"},
+            "tools":[{"type":"function","name":"tool","parameters":{"type":"object"}}],
+            "future_extension":{"large_id":9007199254740993u64}
+        });
+        let request = crate::routers::native_protocol::NativeRequest(original.clone());
+        // Model is optional in the native SGLang Responses contract.
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes, r#"{"id":"resp_owner","status":"queued"}"#.as_bytes());
+        let params = ResponsesGetParams {
+            include: vec!["message.output_text.logprobs".to_string()],
+            include_obfuscation: Some(false),
+            starting_after: Some(7),
+            stream: Some(true),
+        };
+        for response in [
+            router.get_response(None, "resp_owner", &params).await,
+            router.cancel_response(None, "resp_owner").await,
+            router.delete_response(None, "resp_owner").await,
+            router.list_response_input_items(None, "resp_owner").await,
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 5);
+        assert_eq!(
+            received[0],
+            ("POST".into(), "/v1/responses".into(), original)
+        );
+        assert_eq!(received[1].0, "GET");
+        assert!(received[1].1.contains("starting_after=7"));
+        assert!(received[1].1.contains("stream=true"));
+        assert!(received[1]
+            .1
+            .contains("include=message.output_text.logprobs"));
+        assert_eq!(received[2].0, "POST");
+        assert_eq!(received[2].1, "/v1/responses/resp_owner/cancel");
+        assert_eq!(received[3].0, "DELETE");
+        assert_eq!(received[4].1, "/v1/responses/resp_owner/input_items");
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_preserves_errors_and_sse_and_drops_upstream() {
+        use futures_util::StreamExt;
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let notify = dropped.clone();
+        let decode = axum::Router::new().route("/v1/responses", axum::routing::post(
+            move |axum::Json(body): axum::Json<Value>| {
+                let notify = notify.clone();
+                async move {
+                    if body["stream"] != true {
+                        return (StatusCode::BAD_REQUEST, axum::Json(json!({
+                            "error":{"type":"invalid_request_error","message":"invalid previous_response_id"}
+                        }))).into_response();
+                    }
+                    let guard = NotifyOnDrop(notify);
+                    let event = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+                        ))
+                    });
+                    let pending = futures_util::stream::unfold(guard, |guard| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Some((Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": keepalive\n\n")), guard))
+                    });
+                    ([(CONTENT_TYPE, "text/event-stream")], Body::from_stream(event.chain(pending))).into_response()
+                }
+            }
+        ));
+        let (router, tasks) = messages_test_pair(axum::Router::new(), decode).await;
+        let request =
+            crate::routers::native_protocol::NativeRequest(json!({"input":"hello","stream":false}));
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["error"]["message"], "invalid previous_response_id");
+        let request =
+            crate::routers::native_protocol::NativeRequest(json!({"input":"hello","stream":true}));
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+        let worker = router.worker_registry.get_decode_workers()[0].clone();
+        assert_eq!(worker.load(), 1);
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("event: response.created"));
+        drop(stream);
+        assert_eq!(worker.load(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("client disconnect must close decode stream");
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_rejects_ambiguous_state_owner() {
+        let router = create_test_pd_router();
+        for url in ["http://decode-one", "http://decode-two"] {
+            router
+                .worker_registry
+                .register(Arc::from(create_test_worker(
+                    url.to_string(),
+                    WorkerType::Decode,
+                    true,
+                )));
+        }
+        let request = crate::routers::native_protocol::NativeRequest(json!({"input":"hello"}));
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn prefill_body_drain_does_not_delay_decode_and_cancels_with_client() {
+        use futures_util::StreamExt;
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = dropped.clone();
+        let prefill_started = started.clone();
+        let prefill = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let guard = NotifyOnDrop(notify.clone());
+                let started = prefill_started.clone();
+                async move {
+                    started.notify_one();
+                    // Headers and keepalive precede the actual prefill result.
+                    let stream = futures_util::stream::unfold(guard, |guard| async {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Some((
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": keepalive\n\n")),
+                            guard,
+                        ))
+                    });
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let wait_started = started.clone();
+        let decode = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let started = wait_started.clone();
+                async move {
+                    started.notified().await;
+                    // Ensure P headers arrive first, reproducing the old race.
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    let first = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+                        ))
+                    });
+                    let stream = first.chain(futures_util::stream::pending());
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let body = crate::routers::native_protocol::NativeRequest(json!({
+            "model":"test","max_tokens":16,"messages":[],"stream":true
+        }));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            router.route_messages(None, &body, None),
+        )
+        .await
+        .expect("P headers/keepalives must not prevent decode streaming");
+        let mut stream = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&chunk).contains("event: message_start"));
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("P body must be cancelled with the client, not detached");
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_stream_failure_cancels_paired_leg() {
+        use futures_util::StreamExt;
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        for prefill_fails in [false, true] {
+            let trigger = Arc::new(tokio::sync::Notify::new());
+            let peer_dropped = Arc::new(tokio::sync::Notify::new());
+            let trigger_copy = trigger.clone();
+            let failed = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let trigger = trigger_copy.clone();
+                    async move {
+                        let initial = futures_util::stream::once(async {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": initial\n\n"))
+                        });
+                        let failure = futures_util::stream::once(async move {
+                            trigger.notified().await;
+                            Err::<bytes::Bytes, _>(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "test disconnect",
+                            ))
+                        });
+                        (
+                            [(CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(initial.chain(failure)),
+                        )
+                    }
+                }),
+            );
+            let drop_copy = peer_dropped.clone();
+            let peer = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let guard = NotifyOnDrop(drop_copy.clone());
+                    async move {
+                        let stream = futures_util::stream::unfold(guard, |guard| async {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            Some((
+                                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": alive\n\n")),
+                                guard,
+                            ))
+                        });
+                        (
+                            [(CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(stream),
+                        )
+                    }
+                }),
+            );
+            let (prefill, decode) = if prefill_fails {
+                (failed, peer)
+            } else {
+                (peer, failed)
+            };
+            let (router, tasks) = messages_test_pair(prefill, decode).await;
+            let (p, d) = router.select_pd_pair(None, None, None).await.unwrap();
+            let context = PDRequestContext {
+                route: "/v1/chat/completions",
+                model_id: None,
+                is_stream: true,
+                return_logprob: false,
+                batch_size: None,
+                request_text: None,
+                headers: None,
+            };
+            let response = router
+                .execute_dual_dispatch_internal(
+                    None,
+                    json!({"model":"test","messages":[],"stream":true}),
+                    context,
+                    p,
+                    d,
+                    Instant::now(),
+                )
+                .await;
+            let mut stream = response.into_body().into_data_stream();
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            trigger.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer_dropped.notified())
+                .await
+                .expect("a transport error must close the other HTTP leg");
+            // Keep the client alive throughout the test: cancellation must come
+            // from the upstream failure, not from dropping this response body.
+            drop(stream);
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejecting_leg_cancels_peer_before_reading_error_body() {
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        // Include both directions and streaming D rejects. An error body is
+        // deliberately blocked until its peer's live HTTP body is cancelled.
+        for (prefill_rejects, stream) in [(false, false), (false, true), (true, false)] {
+            for status in [StatusCode::BAD_REQUEST, StatusCode::SERVICE_UNAVAILABLE] {
+                let peer_dropped = Arc::new(tokio::sync::Notify::new());
+                let peer_started = Arc::new(tokio::sync::Notify::new());
+                let notify = peer_dropped.clone();
+                let started = peer_started.clone();
+                let peer = axum::Router::new().route(
+                    "/v1/messages",
+                    axum::routing::post(move || {
+                        let guard = NotifyOnDrop(notify.clone());
+                        let started = started.clone();
+                        async move {
+                            started.notify_one();
+                            let stream = futures_util::stream::unfold(guard, |guard| async {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                Some((
+                                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                        b": alive\n\n",
+                                    )),
+                                    guard,
+                                ))
+                            });
+                            Body::from_stream(stream)
+                        }
+                    }),
+                );
+                let dropped = peer_dropped.clone();
+                let started = peer_started.clone();
+                let error_body = json!({
+                    "type":"error",
+                    "error":{"type":"overloaded_error","message":"test rejection"}
+                })
+                .to_string();
+                let expected = error_body.clone();
+                let rejected = axum::Router::new().route(
+                    "/v1/messages",
+                    axum::routing::post(move || {
+                        let started = started.clone();
+                        let dropped = dropped.clone();
+                        let error_body = error_body.clone();
+                        async move {
+                            started.notified().await;
+                            // Peer sends headers and multiple keepalives first.
+                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                            let body = futures_util::stream::once(async move {
+                                dropped.notified().await;
+                                Ok::<_, std::io::Error>(bytes::Bytes::from(error_body))
+                            });
+                            (
+                                status,
+                                [(CONTENT_TYPE, "application/json")],
+                                Body::from_stream(body),
+                            )
+                        }
+                    }),
+                );
+                let (prefill, decode) = if prefill_rejects {
+                    (rejected, peer)
+                } else {
+                    (peer, rejected)
+                };
+                let (router, tasks) = messages_test_pair(prefill, decode).await;
+                let (p, d) = router.select_pd_pair(None, None, None).await.unwrap();
+                let context = PDRequestContext {
+                    route: "/v1/messages",
+                    model_id: None,
+                    is_stream: stream,
+                    return_logprob: false,
+                    batch_size: None,
+                    request_text: None,
+                    headers: None,
+                };
+                let request = json!({"model":"test","max_tokens":16,"messages":[],"stream":stream});
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    router.execute_dual_dispatch_internal(
+                        None,
+                        request,
+                        context,
+                        p,
+                        d,
+                        Instant::now(),
+                    ),
+                )
+                .await
+                .expect("rejecting headers must cancel the peer before reading their body");
+                assert_eq!(response.status(), status);
+                assert!(response
+                    .extensions()
+                    .get::<BreakerOutcomesRecorded>()
+                    .is_some());
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(body, expected);
+                for task in tasks {
+                    task.abort();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_original_json_to_both_workers() {
+        use std::sync::Mutex;
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = received.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    let valid = body["top_p"].as_f64().unwrap() >= 0.95;
+                    captured.lock().unwrap().push(body);
+                    (
+                        if valid {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        },
+                        axum::Json(json!({"choices": []})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let router = create_test_pd_router();
+        for worker_type in [
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            WorkerType::Decode,
+        ] {
+            router
+                .worker_registry
+                .register(Arc::from(create_test_worker(
+                    if matches!(worker_type, WorkerType::Decode) {
+                        url.replace("127.0.0.1", "localhost")
+                    } else {
+                        url.clone()
+                    },
+                    worker_type,
+                    true,
+                )));
+        }
+        for (top_p, expected) in [(0.95, StatusCode::OK), (0.9, StatusCode::BAD_REQUEST)] {
+            let original = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_p": top_p,
+                "custom_extension": 0.123456789012345
+            });
+            let typed: ChatCompletionRequest = serde_json::from_value(original.clone()).unwrap();
+            let response = router
+                .route_chat_with_json(None, &typed, None, Some(&original))
+                .await;
+            assert_eq!(response.status(), expected);
+        }
+        let bodies = received.lock().unwrap();
+        assert!(
+            bodies.len() >= 3,
+            "both workers must receive the valid request"
+        );
+        for body in bodies.iter() {
+            assert!([0.95, 0.9].contains(&body["top_p"].as_f64().unwrap()));
+            assert_eq!(body["custom_extension"], json!(0.123456789012345));
+            assert!(body.get("bootstrap_room").is_some());
+        }
+        server.abort();
     }
 
     #[test]
@@ -1998,6 +3538,8 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
+                "/generate",
             );
 
             // Guards are now attached to response body, so load should be 1

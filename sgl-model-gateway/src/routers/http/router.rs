@@ -776,6 +776,36 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/messages", model_id)
+            .await
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/messages/count_tokens", model_id)
+            .await
+    }
+
+    async fn route_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/responses", model_id)
+            .await
+    }
+
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,

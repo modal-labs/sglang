@@ -208,11 +208,15 @@ pub fn should_forward_request_header(name: &str) -> bool {
     const REQUEST_ID_PREFIX: &str = "x-request-id-";
 
     name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("anthropic-version")
+        || name.eq_ignore_ascii_case("anthropic-beta")
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
+        || name.eq_ignore_ascii_case("x-smg-admission-wait-seconds")
+        || name.eq_ignore_ascii_case("x-smg-prefill-uncached-fraction")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
@@ -266,6 +270,8 @@ mod tests {
         assert!(should_forward_request_header("Authorization"));
         assert!(should_forward_request_header("AUTHORIZATION"));
         assert!(should_forward_request_header("x-request-id"));
+        assert!(should_forward_request_header("anthropic-version"));
+        assert!(should_forward_request_header("Anthropic-Beta"));
         assert!(should_forward_request_header("X-Request-Id"));
         assert!(should_forward_request_header("x-correlation-id"));
         assert!(should_forward_request_header("X-Correlation-ID"));
