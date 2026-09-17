@@ -3563,6 +3563,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
         if self.cache_controller is not None:
+            if not self.cache_controller.load_queue:
+                return -1
+            # The load-back H2D writes device pool state (KV pages + mamba
+            # slots) from the load stream, gated only on the schedule stream's
+            # start_event; the destination slots may have been freed by a req
+            # still being written by the in-flight forward, so fence first.
+            self.fence_state_read()
             return self.cache_controller.start_loading()
         return 0
 
