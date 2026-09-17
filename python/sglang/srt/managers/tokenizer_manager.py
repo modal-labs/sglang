@@ -1241,6 +1241,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if getattr(obj, "received_time", None) is not None
                     else time.perf_counter()
                 ),
+                prefill_uncached_fraction=getattr(obj, "prefill_uncached_fraction", 1.0),
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
@@ -3171,6 +3172,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 from sglang.srt.observability.admission_timing import parse_admission_wait
                 state.admission_wait_seconds = parse_admission_wait(
                     request.headers.get("x-smg-admission-wait-seconds")
+                )
+            if os.getenv("SGLANG_DECODE_PREALLOC_POLICY") == "hrrn" and request:
+                from sglang.srt.disaggregation.decode_hrrn import (
+                    parse_uncached_fraction,
+                )
+
+                sub_obj.prefill_uncached_fraction = parse_uncached_fraction(
+                    request.headers.get("x-smg-prefill-uncached-fraction")
                 )
             self.rid_to_state[rid] = state
             if self.enable_trace:

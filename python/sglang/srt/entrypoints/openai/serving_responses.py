@@ -669,7 +669,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             return self.create_error_response(
                 str(e),
                 status_code=status_code,
-                err_type="server_error" if status_code >= 500 else "invalid_request_error",
+                err_type="server_error"
+                if status_code >= 500
+                else "invalid_request_error",
             )
 
         status = "completed"
@@ -2925,7 +2927,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         while True:
             # Generate using SGLang's tokenizer manager
             prefill_url = self.tokenizer_manager.server_args.responses_prefill_url
-            if prefill_url:
+            generation_url = self.tokenizer_manager.server_args.responses_generation_url
+            if generation_url:
+                from sglang.srt.entrypoints.openai.pd_responses import routed_turn
+
+                generator = routed_turn(adapted_request, generation_url, raw_request)
+            elif prefill_url:
                 from sglang.srt.entrypoints.openai.pd_responses import (
                     coordinated_turn,
                     prepare_prefill_turn,
@@ -2955,7 +2962,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             try:
                 async for res in generator:
-                    if prefill_url and isinstance(res, dict):
+                    if (prefill_url or generation_url) and isinstance(res, dict):
                         finish_reason = (res.get("meta_info") or {}).get(
                             "finish_reason"
                         )

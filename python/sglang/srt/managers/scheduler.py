@@ -2293,6 +2293,7 @@ class Scheduler(
             # rank-local wait_queue_entry_time re-stamp must never feed sort
             # keys — it seeded cross-rank batch-composition divergence).
             req.arrival_stamp = getattr(recv_req, "arrival_stamp", None)
+            req.prefill_uncached_fraction = recv_req.prefill_uncached_fraction
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:

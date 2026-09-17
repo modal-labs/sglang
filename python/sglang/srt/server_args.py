@@ -798,6 +798,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    responses_generation_url: A[
+        Optional[str],
+        "Trusted PD router origin for expanded native Responses generation turns.",
+        NS("disagg"),
+    ] = None
     responses_prefill_url: A[
         Optional[str],
         "Trusted prefill worker origin for native Responses on a fixed PD decode worker.",
@@ -8806,6 +8811,26 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        if self.responses_generation_url:
+            from urllib.parse import urlsplit
+
+            origin = urlsplit(self.responses_generation_url)
+            if (
+                origin.scheme not in ("http", "https")
+                or not origin.hostname
+                or origin.username is not None
+                or origin.password is not None
+                or origin.path not in ("", "/")
+                or origin.query
+                or origin.fragment
+            ):
+                raise ValueError(
+                    "responses_generation_url must be an HTTP router origin"
+                )
+            if self.responses_prefill_url:
+                raise ValueError(
+                    "Configure Responses generation router or fixed prefill, not both"
+                )
         if self.responses_prefill_url:
             if self.disaggregation_mode != "decode":
                 raise ValueError("responses_prefill_url requires a PD decode worker")

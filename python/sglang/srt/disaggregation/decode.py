@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_backfill import DecodeBackfillBudget
+from sglang.srt.disaggregation.decode_hrrn import DecodeHrrn
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -162,9 +163,9 @@ class DecodeReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        assert (
-            len(reusing) <= 1
-        ), "only one chunked request may reuse req_pool_idx in a batch"
+        assert len(reusing) <= 1, (
+            "only one chunked request may reuse req_pool_idx in a batch"
+        )
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
@@ -344,6 +345,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if os.environ.get("SGLANG_DECODE_BOUNDED_BACKFILL") == "1"
             else None
         )
+        self._hrrn = (
+            DecodeHrrn()
+            if os.environ.get("SGLANG_DECODE_PREALLOC_POLICY") == "hrrn"
+            else None
+        )
+        if self._hrrn is not None and scheduler.enable_priority_scheduling:
+            raise ValueError(
+                "Decode HRRN cannot be combined with explicit priority scheduling"
+            )
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
         self._ensure_retry_count: Dict[str, int] = {}
@@ -467,7 +477,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Retraction resumes directly into decode, so preserve draft KV
             # together with target KV and Mamba state before releasing slots.
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                self.token_to_kv_pool._pd_dflash_draft_kv_pool = self.draft_token_to_kv_pool
+                self.token_to_kv_pool._pd_dflash_draft_kv_pool = (
+                    self.draft_token_to_kv_pool
+                )
         if self.draft_token_to_kv_pool is not None and not draft_full:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -938,6 +950,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
+        if self._hrrn is not None:
+            self._hrrn.order(self.queue)
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -978,7 +993,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Restrict the experiment to the no-prefix-cache full-KV path.
         # Radix matching acquires locks and needs separate skip-path validation.
-        backfill = self._backfill
+        backfill = self._backfill if self._hrrn is None else None
         if (
             uses_swa_tail_prealloc
             or self.scheduler.server_args.disaggregation_decode_enable_radix_cache
@@ -1117,6 +1132,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             if backfill is not None:
                 backfill.admitted(decode_req.req.rid, required_tokens_for_request)
+            if self._hrrn is not None:
+                if self.tp_rank == 0 and os.environ.get("SGLANG_K3_QUEUE_DIAGNOSTICS") == "1":
+                    arrived, cost, _ = self._hrrn.waiting[decode_req.req.rid]
+                    logger.info(
+                        "DECODE_HRRN_ADMIT rid=%s estimated_uncached=%s waited_work=%s "
+                        "reservation_tokens=%s pending=%s",
+                        decode_req.req.rid, cost, self._hrrn.admitted_work - arrived,
+                        required_tokens_for_request, len(self.queue),
+                    )
+                self._hrrn.admitted(decode_req.req.rid)
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1503,9 +1528,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert (
-            req_pool_indices is not None
-        ), "req_pool_indices is full! There is a bug in memory estimation."
+        assert req_pool_indices is not None, (
+            "req_pool_indices is full! There is a bug in memory estimation."
+        )
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv_committed_len = fill_len
@@ -1881,9 +1906,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert (
-                output_token_sampling_mask_idx is not None
-            ), "sampling mask buffer disabled on decode side"
+            assert output_token_sampling_mask_idx is not None, (
+                "sampling mask buffer disabled on decode side"
+            )
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)

@@ -822,6 +822,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # batch-composition divergence seed, 2026-08-01). Deliberately not named
     # *_time: ReqTimeStats pickling rewrites *time fields per-rank.
     arrival_stamp: Optional[float] = None
+    prefill_uncached_fraction: float = 1.0
 
     # Whether to return hidden states
     return_hidden_states: bool = False
