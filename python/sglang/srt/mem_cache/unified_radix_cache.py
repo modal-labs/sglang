@@ -114,6 +114,11 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        # Explicit eviction signal (Req.evict_on_finish): this node belongs to
+        # a finished trajectory whose prefix will not be reused. Full-component
+        # eviction heaps take marked nodes before any unmarked node (device and
+        # host); a later prefix match clears the mark.
+        self.evict_first = False
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -860,6 +865,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
+        if getattr(req, "evict_on_finish", False):
+            self._evict_finished_req_prefix(req)
+
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
@@ -1102,6 +1110,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     now_wall,
                 )
             node_update.last_access_time = cur_time
+            node_update.evict_first = False
             node_update.last_access_wall = now_wall
             cur_time -= 0.00001
             node_update = node_update.parent
@@ -1178,6 +1187,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        new_node.evict_first = child.evict_first
         new_node.creation_wall = child.creation_wall
         new_node.last_access_wall = child.last_access_wall
 
@@ -1642,6 +1652,63 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
         )
         self._update_evictable_leaf_sets(node.parent)
+
+    def eviction_key(self, node: UnifiedTreeNode) -> tuple:
+        """Heap key for Full-component eviction (device and host): nodes
+        carrying the explicit eviction mark go first, then the configured
+        ``--radix-eviction-policy`` orders the rest."""
+        return (
+            0 if node.evict_first else 1,
+            self.eviction_strategy.get_priority(node),
+        )
+
+    def _evict_finished_req_prefix(self, req: Req) -> dict[ComponentType, int]:
+        """Explicit eviction signal (``Req.evict_on_finish``): the client says
+        this request is the last turn of its trajectory and the prefix will not
+        be reused. A finished request is otherwise the most recently used entry
+        in the tree and outlives idle-but-live sessions under LRU.
+
+        Walk up from ``req.last_node`` while the node is private to this
+        trajectory: every child (if any) is itself a marked chain member. Stop
+        at the first node shared with another chain or pinned by a lock
+        (another request, an in-flight backup or load-back).
+
+        Device data is freed inline. Every rank runs this at the same point
+        for the same broadcast request over mirrored tree state, so the walk
+        is rank-symmetric like any other device eviction. Host copies are NOT
+        freed inline: at TP>1 the dedup host pool may only be mutated in
+        record order (see _drop_subtree_no_host). Nodes that stay in the tree
+        (demoted to host, or pinned) are marked ``evict_first`` so the next
+        host watermark round, or device eviction once the pin lifts, takes
+        them before any live entry.
+        """
+        tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
+        node = req.last_node
+        marked = 0
+        while node is not None and node is not self.root_node:
+            if any(not child.evict_first for child in node.children.values()):
+                break  # shared with a live chain
+            parent = node.parent
+            node.evict_first = True
+            marked += 1
+            if node in self.evictable_device_leaves:
+                # Deleted outright (no backup) or demoted to a marked host
+                # leaf (backuped); either way the parent is now a D-leaf
+                # candidate and the walk continues.
+                self._evict_device_leaf(node, tracker)
+            elif any(
+                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
+            ):
+                break  # pinned: marked, eviction takes it once the pin lifts
+            node = parent
+        if marked:
+            logger.debug(
+                "evict_on_finish rid=%s: marked %d nodes, freed device tokens %s",
+                getattr(req, "rid", None),
+                marked,
+                {ct.name: n for ct, n in tracker.items() if n},
+            )
+        return tracker
 
     def _evict_device_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]

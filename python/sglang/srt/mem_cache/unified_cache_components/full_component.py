@@ -137,7 +137,7 @@ class FullComponent(TreeComponent):
         # rank-local (memory addresses); at TP>1 eviction choices must be a
         # pure function of mirrored tree state.
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n.id, n)
+            (self.cache.eviction_key(n), n.id, n)
             for n in self.cache.evictable_device_leaves
         ]
         heapq.heapify(heap)
@@ -151,7 +151,7 @@ class FullComponent(TreeComponent):
                 heapq.heappush(
                     heap,
                     (
-                        self.cache.eviction_strategy.get_priority(x.parent),
+                        self.cache.eviction_key(x.parent),
                         x.parent.id,
                         x.parent,
                     ),
@@ -162,7 +162,7 @@ class FullComponent(TreeComponent):
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n.id, n)
+            (self.cache.eviction_key(n), n.id, n)
             for n in self.cache.evictable_host_leaves
         ]
         heapq.heapify(heap)
@@ -176,7 +176,7 @@ class FullComponent(TreeComponent):
                 heapq.heappush(
                     heap,
                     (
-                        self.cache.eviction_strategy.get_priority(x.parent),
+                        self.cache.eviction_key(x.parent),
                         x.parent.id,
                         x.parent,
                     ),

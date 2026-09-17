@@ -2316,6 +2316,7 @@ class Scheduler(
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
+                evict_on_finish=recv_req.evict_on_finish,
                 metrics_collector=(
                     self.metrics_collector
                     if self.metrics_reporter.enable_metrics

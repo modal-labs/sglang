@@ -931,6 +931,7 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
+        evict_on_finish: bool = False,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -1019,6 +1020,10 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        # Explicit eviction signal: last turn of its trajectory, prefix will
+        # not be reused. Never inserted into the radix tree; the tree cache
+        # frees the request's private chain on finish.
+        self.evict_on_finish = evict_on_finish
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None

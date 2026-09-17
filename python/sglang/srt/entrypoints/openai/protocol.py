@@ -391,6 +391,10 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Explicit eviction signal: this request is the last turn of its
+    # trajectory and its prefix will not be reused. The engine frees the
+    # request's private KV chain when it finishes instead of caching it.
+    evict_on_finish: bool = False
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -904,6 +908,10 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Explicit eviction signal: this request is the last turn of its
+    # trajectory and its prefix will not be reused. The engine frees the
+    # request's private KV chain when it finishes instead of caching it.
+    evict_on_finish: bool = False
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

@@ -146,6 +146,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
+    if getattr(req, "evict_on_finish", False):
+        # Explicit eviction signal: the client marked this request as the
+        # last turn of its trajectory; never cache its KV.
+        is_insert = False
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),

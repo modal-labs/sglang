@@ -269,6 +269,10 @@ class GenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
+    # Explicit eviction signal: this request is the last turn of its
+    # trajectory and its prefix will not be reused. The engine frees the
+    # request's private KV chain when it finishes instead of caching it.
+    evict_on_finish: bool = False
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -772,6 +776,7 @@ class GenerateReqInput:
             adjust_max_new_tokens_for_prompt=self.adjust_max_new_tokens_for_prompt,
             require_reasoning=self.require_reasoning,
             priority=self.priority,
+            evict_on_finish=self.evict_on_finish,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -863,6 +868,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Priority for the request
     priority: Optional[int] = None
+    # Explicit eviction signal: this request is the last turn of its
+    # trajectory and its prefix will not be reused. The engine frees the
+    # request's private KV chain when it finishes instead of caching it.
+    evict_on_finish: bool = False
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
