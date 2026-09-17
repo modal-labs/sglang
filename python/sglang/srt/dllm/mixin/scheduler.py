@@ -91,6 +91,10 @@ class SchedulerDllmMixin:
                     next_token_ids = result.next_token_ids[idx].tolist()
                     new_tokens = len(next_token_ids)
                     if new_tokens == 0:
+                        if req.to_finish is not None:
+                            req.update_finish_state(new_accepted_len=0)
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
                         continue
 
                     req.full_untruncated_fill_ids[
@@ -111,6 +115,11 @@ class SchedulerDllmMixin:
                 assert len(next_token_ids) == block_size
 
                 if result.accept_length_per_req_cpu[idx] == 0:
+                    if req.to_finish is not None:
+                        req.update_finish_state(new_accepted_len=0)
+                        release_kv_cache(req, self.tree_cache)
+                        req.time_stats.set_completion_time()
+                        continue
                     # Unresolved: keep partial state and KV for the next FDFO round.
                     req.dllm_incomplete_ids = array("q", next_token_ids)
                     req.dllm_algo_state = (

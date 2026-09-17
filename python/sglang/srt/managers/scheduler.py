@@ -4479,19 +4479,39 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
+            # Reqs whose forward result is still queued (overlap) must be
+            # finished by process_batch_result_dllm, which releases KV once.
+            pending_result_reqs = (
+                {r for b, _ in self.result_queue for r in b.reqs}
+                if self.enable_overlap
+                else set()
+            )
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
+                # A req that finished in the last forward stays queued until
+                # filter_finished_reqs(); its result is already committed.
+                if req.finished():
+                    continue
+                if req in pending_result_reqs:
+                    req.to_finish = FINISH_ABORT()
+                    self.dllm_manager.add_staging_reqs(req)
+                    continue
+                prepare_abort(req, "Aborted")
                 if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(rid=req.rid), req
-                )
                 if (
                     req.req_pool_idx is not None
                     or getattr(req, "mamba_pool_idx", None) is not None
                 ):
                     release_kv_cache(req, self.tree_cache, is_insert=False)
+                # After KV release so a session slot is never reusable while
+                # the turn's KV is still held; before the IPC send so a send
+                # failure cannot strand already-popped requests.
+                self._release_dropped_waiting_req_mm_inputs(req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
