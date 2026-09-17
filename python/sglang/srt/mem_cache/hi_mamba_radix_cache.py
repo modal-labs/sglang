@@ -931,18 +931,24 @@ class HiMambaRadixCache(MambaRadixCache):
                 len(node.children) > 0
                 or node.full_lock_ref > 0
                 or node.mamba_lock_ref > 0
-                or node.evicted
-                or node.backuped
-                or node.mamba_backuped
                 or node.host_ref_counter > 0
                 or node.host_mamba_ref_counter > 0
                 or node.id in self.ongoing_write_through
                 or node.id in self.ongoing_load_back
-                or node.mamba_value is None
+                or (not node.evicted and not node.backuped and node.mamba_value is None)
             ):
-                break  # shared, pinned, host-backed / backup in flight, or tombstone
+                break  # shared, pinned, in-flight, or device mamba tombstone
             parent = node.parent
-            self._evict_regular(node)
+            if not node.evicted:
+                if node.backuped:
+                    # demote to host, then free the host copy too
+                    self._evict_to_host(node)
+                else:
+                    # device-only leaf: free KV + mamba, delete from tree
+                    self._evict_regular(node)
+            if node.evicted and node.backuped:
+                # host-resident now (pre-existing or just demoted)
+                self._evict_host_leaf(node)
             # _evict_regular may have cascaded tombstone ancestors out of the
             # tree; resume at the deepest one still attached.
             while (

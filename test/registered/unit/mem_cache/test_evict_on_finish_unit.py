@@ -814,6 +814,29 @@ class _FakeHiMambaController:
         return len(value)
 
 
+class _FakeHiRadixController:
+    """Minimal HiCache controller surface used by the hiradix free paths.
+
+    ``mem_pool_device_allocator`` is the same object the real
+    ``HiCacheController`` stores (cache_controller.py), so device frees go
+    through the real allocator while host/demote frees are counted here."""
+
+    write_policy = "write_back"
+
+    def __init__(self, allocator):
+        self.mem_pool_device_allocator = allocator
+        self.device_freed = 0
+        self.host_freed = 0
+
+    def evict_device(self, value):
+        self.device_freed += len(value)
+        return len(value)
+
+    def evict_host(self, value):
+        self.host_freed += len(value)
+        return len(value)
+
+
 class EvictOnFinishHiMambaTest(CustomTestCase):
     """``HiMambaRadixCache.evict_finished_req_prefix`` must drive the
     hierarchical free path: the inherited ``MambaRadixCache`` walk unpacks the
@@ -907,15 +930,14 @@ class EvictOnFinishHiMambaTest(CustomTestCase):
         self.assertEqual(cache.mamba_pool_host.freed, [])
         cache.sanity_check()
 
-    def test_breaks_on_host_backed_locked_and_in_flight_nodes(self):
-        """The walk must stop at backuped / locked / write-in-flight nodes."""
+    def test_host_backed_private_leaf_freed_on_both_tiers(self):
+        """A private host-backed leaf is dropped on BOTH tiers: demoted off
+        device via _evict_to_host, then host copy freed via _evict_host_leaf
+        (host KV + mamba host copy), and detached from the tree."""
+        cache = self._build()
         S = list(range(1, 9))
         a1 = list(range(101, 105))
         b1 = list(range(201, 205))
-
-        # Host-backed leaf (device KV + host copy): the whole chain is
-        # protected — nothing below it may be freed either.
-        cache = self._build()
         self._insert(cache, S + b1, 10, 1000)
         self._insert(cache, S + a1, 11, 2000)
         a1_node = cache.match_prefix(
@@ -923,12 +945,51 @@ class EvictOnFinishHiMambaTest(CustomTestCase):
         ).last_device_node
         a1_node.host_value = torch.arange(len(a1), dtype=torch.int64)
         a1_node.mamba_host_value = torch.tensor([11], dtype=torch.int64)
+
         cache.evict_finished_req_prefix(
-            a1_node, matched_len=len(S + a1), kv_len=len(S + a1) + 4, rid="r"
+            a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r"
         )
-        self.assertEqual(cache.cache_controller.device_freed, 0)
-        self.assertIs(a1_node.parent.parent, cache.root_node)
+        self.assertEqual(cache.cache_controller.device_freed, len(a1))
+        self.assertEqual(cache.cache_controller.host_freed, len(a1))
+        self.assertEqual(cache.req_to_token_pool.mamba_allocator.freed, [11])
+        self.assertEqual(cache.mamba_pool_host.freed, [11])
+        # a1 detached; the shared S tombstone and S+b1 survive.
         self.assertEqual(self._hit(cache, S + b1), len(S + b1))
+        cache.sanity_check()
+
+    def test_evicted_host_only_leaf_freed_and_detached(self):
+        """An already-evicted (host-only) private leaf: host KV + mamba host
+        copy freed and node detached."""
+        cache = self._build()
+        S = list(range(1, 9))
+        a1 = list(range(101, 105))
+        b1 = list(range(201, 205))
+        self._insert(cache, S + b1, 10, 1000)
+        self._insert(cache, S + a1, 11, 2000)
+        a1_node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", S + a1), None))
+        ).last_device_node
+        # Demote through the real path: device freed, host copies remain.
+        a1_node.host_value = torch.arange(len(a1), dtype=torch.int64)
+        a1_node.mamba_host_value = torch.tensor([11], dtype=torch.int64)
+        cache._evict_to_host(a1_node)
+        device_freed_after_demote = cache.cache_controller.device_freed
+
+        cache.evict_finished_req_prefix(
+            a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r"
+        )
+        self.assertEqual(cache.cache_controller.device_freed, device_freed_after_demote)
+        self.assertEqual(cache.cache_controller.host_freed, len(a1))
+        self.assertEqual(cache.mamba_pool_host.freed, [11])
+        self.assertIsNone(a1_node.host_value)
+        self.assertIsNone(a1_node.mamba_host_value)
+        self.assertEqual(self._hit(cache, S + b1), len(S + b1))
+        cache.sanity_check()
+
+    def test_breaks_on_locked_in_flight_and_host_in_use_nodes(self):
+        """The walk must stop at locked / write-in-flight / host-in-use nodes."""
+        S = list(range(1, 9))
+        a1 = list(range(101, 105))
 
         # Locked leaf (another request shares it).
         cache = self._build()
@@ -950,11 +1011,30 @@ class EvictOnFinishHiMambaTest(CustomTestCase):
         a1_node = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", S + a1), None))
         ).last_device_node
+        a1_node.host_value = torch.arange(len(a1), dtype=torch.int64)
         cache.ongoing_write_through[a1_node.id] = a1_node
         cache.evict_finished_req_prefix(
             a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r"
         )
         self.assertEqual(cache.cache_controller.device_freed, 0)
+        self.assertEqual(cache.cache_controller.host_freed, 0)
+        self.assertIsNotNone(a1_node.host_value)
+        self.assertIn(a1_node.key.child_key(1), a1_node.parent.children)
+
+        # Host KV in use (host_ref_counter > 0).
+        cache = self._build()
+        self._insert(cache, S + a1, 11, 2000)
+        a1_node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", S + a1), None))
+        ).last_device_node
+        a1_node.host_value = torch.arange(len(a1), dtype=torch.int64)
+        a1_node.host_ref_counter = 1
+        cache.evict_finished_req_prefix(
+            a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r"
+        )
+        self.assertEqual(cache.cache_controller.device_freed, 0)
+        self.assertEqual(cache.cache_controller.host_freed, 0)
+        self.assertIsNotNone(a1_node.host_value)
         self.assertIn(a1_node.key.child_key(1), a1_node.parent.children)
 
     def test_exact_hit_frees_nothing(self):
@@ -1042,7 +1122,7 @@ def _build_hiradix_cache():
     cache.metrics_collector = None
     cache.req_to_token_pool = req_to_token_pool
     cache.token_to_kv_pool_allocator = allocator
-    cache.cache_controller = SimpleNamespace(write_policy="write_back")
+    cache.cache_controller = _FakeHiRadixController(allocator)
     cache.write_through_threshold = 1 << 30
     cache.enable_session_radix_cache = False
     cache.ongoing_write_through = {}
@@ -1071,8 +1151,10 @@ def _build_hiradix_cache():
 
 
 class EvictOnFinishHiRadixCacheTest(CustomTestCase):
-    """``HiRadixCache`` inherits the ``RadixCache`` finish-time walk; the
-    ``evicted``/``backuped`` break conditions keep host-backed nodes alive."""
+    """``HiRadixCache.evict_finished_req_prefix``: a private chain is dropped
+    on both tiers — device via ``_evict_backuped``/``_evict_regular``, host
+    via ``_evict_host_node`` — stopping only at shared, pinned, in-use, or
+    in-flight nodes."""
 
     def setUp(self):
         self.cache, self.allocator, self.req_pool = _build_hiradix_cache()
@@ -1164,22 +1246,58 @@ class EvictOnFinishHiRadixCacheTest(CustomTestCase):
         self.assertEqual(self._hit(S + b1), len(S + b1))
         self.assertEqual(KV_SIZE - self.allocator.available_size(), len(S) + len(b1))
 
-    def test_host_backed_and_locked_nodes_survive(self):
+    def test_host_backed_private_chain_freed_on_both_tiers(self):
+        """A private host-backed leaf is dropped on BOTH tiers: device via
+        ``_evict_backuped``, host via ``_evict_host_node``; the node leaves
+        the tree entirely."""
         S = list(range(1, 9))
         a1 = list(range(101, 105))
-
-        # Host-backed leaf: nothing on the chain below it may be dropped.
+        b1 = list(range(201, 205))
+        self._finish(S + b1)
         self._finish(S + a1)
         a1_node = self._leaf(S + a1)
         a1_node.host_value = torch.arange(len(a1), dtype=torch.int64)
+
         self.cache.evict_finished_req_prefix(
             a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r-host"
         )
-        self.assertEqual(self._hit(S + a1), len(S + a1))
+        # a1 freed on both tiers and detached; the shared S internal node
+        # survives via the S+b1 sibling.
+        self.assertEqual(self._hit(S + a1), len(S))
+        self.assertEqual(self._hit(S + b1), len(S + b1))
+        self.assertEqual(self.cache.cache_controller.device_freed, len(a1))
+        self.assertEqual(self.cache.cache_controller.host_freed, len(a1))
+        self.assertIsNone(a1_node.host_value)
+
+    def test_evicted_host_only_leaf_freed_and_detached(self):
+        """An already-evicted (host-only) private leaf gets its host copy
+        freed via ``_evict_host_node`` and is detached."""
+        S = list(range(1, 9))
+        a1 = list(range(101, 105))
+        b1 = list(range(201, 205))
+        self._finish(S + b1)
+        self._finish(S + a1)
+        a1_node = self._leaf(S + a1)
+        used_before = KV_SIZE - self.allocator.available_size()
+        # Simulate the demoted state: device gone, host copy remains.
+        a1_node.value = None
+        a1_node.host_value = torch.arange(len(a1), dtype=torch.int64)
+
+        self.cache.evict_finished_req_prefix(
+            a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r-host"
+        )
+        self.assertEqual(self.cache.cache_controller.device_freed, 0)
+        self.assertEqual(self.cache.cache_controller.host_freed, len(a1))
+        self.assertIsNone(a1_node.host_value)
+        self.assertEqual(self._hit(S + a1), len(S))
+        self.assertEqual(self._hit(S + b1), len(S + b1))
+        self.assertEqual(KV_SIZE - self.allocator.available_size(), used_before)
+
+    def test_locked_in_flight_and_host_in_use_nodes_survive(self):
+        S = list(range(1, 9))
+        a1 = list(range(101, 105))
 
         # Locked leaf.
-        cache2, allocator2, _ = _build_hiradix_cache()
-        self.cache, self.allocator = cache2, allocator2
         self._finish(S + a1)
         a1_node = self._leaf(S + a1)
         a1_node.lock_ref += 1
@@ -1187,6 +1305,36 @@ class EvictOnFinishHiRadixCacheTest(CustomTestCase):
             a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r-lock"
         )
         self.assertEqual(self._hit(S + a1), len(S + a1))
+
+        # In-flight write-through: untouched on both tiers.
+        cache2, allocator2, _ = _build_hiradix_cache()
+        self.cache, self.allocator = cache2, allocator2
+        self._finish(S + a1)
+        a1_node = self._leaf(S + a1)
+        a1_node.host_value = torch.arange(len(a1), dtype=torch.int64)
+        self.cache.ongoing_write_through[a1_node.id] = a1_node
+        self.cache.evict_finished_req_prefix(
+            a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r-wt"
+        )
+        self.assertEqual(self._hit(S + a1), len(S + a1))
+        self.assertEqual(self.cache.cache_controller.device_freed, 0)
+        self.assertEqual(self.cache.cache_controller.host_freed, 0)
+        self.assertIsNotNone(a1_node.host_value)
+
+        # Host KV in use (host_ref_counter > 0).
+        cache3, allocator3, _ = _build_hiradix_cache()
+        self.cache, self.allocator = cache3, allocator3
+        self._finish(S + a1)
+        a1_node = self._leaf(S + a1)
+        a1_node.host_value = torch.arange(len(a1), dtype=torch.int64)
+        a1_node.host_ref_counter = 1
+        self.cache.evict_finished_req_prefix(
+            a1_node, matched_len=len(S), kv_len=len(S + a1), rid="r-href"
+        )
+        self.assertEqual(self._hit(S + a1), len(S + a1))
+        self.assertEqual(self.cache.cache_controller.device_freed, 0)
+        self.assertEqual(self.cache.cache_controller.host_freed, 0)
+        self.assertIsNotNone(a1_node.host_value)
 
     def test_exact_hit_frees_nothing(self):
         S = list(range(1, 9))

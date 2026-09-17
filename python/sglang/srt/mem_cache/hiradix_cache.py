@@ -1259,6 +1259,33 @@ class HiRadixCache(RadixCache):
         self._delete_leaf(node)
         return num_evicted
 
+    def evict_finished_req_prefix(self, last_node, *, matched_len, kv_len, rid=None):
+        """``evict_finished_req_prefix`` extended to the hierarchical tree: a
+        private chain is dropped on both tiers — device via
+        ``_evict_backuped`` (backuped) / ``_evict_regular`` (device-only), host
+        via ``_evict_host_node``."""
+        if self.disable or kv_len <= matched_len:
+            return
+        node = last_node
+        while node is not None and node is not self.root_node:
+            if (
+                len(node.children) > 0
+                or node.lock_ref > 0
+                or node.host_ref_counter > 0
+                or node.id in self.ongoing_write_through
+                or node.id in self.ongoing_load_back
+            ):
+                break  # shared, pinned, host in use, or backup/load-back in flight
+            parent = node.parent
+            if not node.evicted:
+                if node.backuped:
+                    self._evict_backuped(node)  # demote: device freed, host stays
+                else:
+                    self._evict_regular(node)  # no host copy: delete the leaf
+            if node.evicted and node.backuped:
+                self._evict_host_node(node)  # host-resident now: free, detach
+            node = parent
+
     def _drop_subtree_no_host(self, root: TreeNode) -> int:
         nodes = []
         stack = [root]
@@ -1317,22 +1344,30 @@ class HiRadixCache(RadixCache):
             if x.host_ref_counter > 0:
                 continue
 
-            # Block deleted entirely (GPU already evicted, now CPU freed) --
-            # emit remove(CPU) so the router drops the host-tier entry.
-            self._observe_kv_eviction(x, len(x.host_value), "host", "dropped")
-            self._record_remove_event(x, medium=StorageMedium.CPU)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
-
-            key = x.key.child_key(self.page_size)
-            v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
-            if x in self.evictable_host_leaves:
-                self.evictable_host_leaves.remove(x)
-            self._update_host_leaf_status(x.parent)
+            num_evicted += self._evict_host_node(x)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+    def _evict_host_node(self, x: TreeNode) -> int:
+        """Free the host copy of a host-resident (``evicted``) leaf and detach
+        it from the tree. Returns the number of host tokens freed."""
+        # Block deleted entirely (GPU already evicted, now CPU freed) --
+        # emit remove(CPU) so the router drops the host-tier entry.
+        self._observe_kv_eviction(x, len(x.host_value), "host", "dropped")
+        self._record_remove_event(x, medium=StorageMedium.CPU)
+        num_evicted = self.cache_controller.evict_host(x.host_value)
+        x.host_value = None
+
+        self._discard_session_leaf(x)
+        key = x.key.child_key(self.page_size)
+        v = x.parent.children.pop(key, None)
+        assert v == x, f"parent does not have child key, {key}"
+        if x in self.evictable_host_leaves:
+            self.evictable_host_leaves.remove(x)
+        self._update_host_leaf_status(x.parent)
+        return num_evicted
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
