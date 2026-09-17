@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.admission_block import AdmissionBlockCause
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.runtime_context import (
@@ -241,7 +242,6 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
@@ -930,6 +930,34 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=labels.keys(),
         )
+        self.prefill_admission_blocked_passes_total = Counter(
+            name="sglang:prefill_admission_blocked_passes_total",
+            documentation=(
+                "Prefill scheduling passes that ended with waiting requests "
+                "left unadmitted, by the first binding constraint (cause). "
+                "One increment per scheduler step while blocked, so rate() "
+                "is the share of steps on which that constraint capped "
+                "concurrency. kv_tokens / swa_tokens / mamba_slots are the "
+                "memory pools, max_running_requests / pp_micro_batch are "
+                "request slots, max_prefill_tokens / chunked_prefill_size / "
+                "prefill_max_requests are per-pass compute budgets that "
+                "reset next step."
+            ),
+            labelnames=[*labels.keys(), "cause"],
+        )
+        self.prefill_admission_blocked_requests_total = Counter(
+            name="sglang:prefill_admission_blocked_requests_total",
+            documentation=(
+                "Waiting requests left unadmitted at the end of a blocked "
+                "prefill pass, summed over passes (a request that waits N "
+                "steps counts N times), by the binding constraint (cause)."
+            ),
+            labelnames=[*labels.keys(), "cause"],
+        )
+        # Pre-seed every cause at 0 so ratio panels get a complete operand set.
+        for cause in AdmissionBlockCause.ALL:
+            self.prefill_admission_blocked_passes_total.labels(**labels, cause=cause)
+            self.prefill_admission_blocked_requests_total.labels(**labels, cause=cause)
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1058,6 +1086,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:graph_memory_usage_gb",
             documentation="Memory used by captured device graphs in GB.",
             labelnames=list(labels.keys()) + ["phase"],
+            multiprocess_mode="mostrecent",
+        )
+        self.max_running_requests = Gauge(
+            name="sglang:max_running_requests",
+            documentation=(
+                "Effective per-scheduler max_running_requests, by the limit "
+                "that set it (cap_source): requested (--max-running-requests), "
+                "estimated (default heuristic), kv_capacity (KV pool / 2), "
+                "mamba_pool (max_mamba_cache_size / states per request)."
+            ),
+            labelnames=[*labels.keys(), "cap_source"],
             multiprocess_mode="mostrecent",
         )
         self.max_running_requests_under_SLO = Gauge(
@@ -1317,6 +1356,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         if num_tokens > 0:
             self.mamba_cache_miss_tokens_total.labels(**self.labels).inc(num_tokens)
 
+    def increment_admission_blocked(self, cause: str, num_blocked_reqs: int) -> None:
+        self.prefill_admission_blocked_passes_total.labels(
+            **self.labels, cause=cause
+        ).inc(1)
+        if num_blocked_reqs > 0:
+            self.prefill_admission_blocked_requests_total.labels(
+                **self.labels, cause=cause
+            ).inc(num_blocked_reqs)
+
     def increment_forward_execution_seconds(
         self,
         category: str,
@@ -1491,8 +1539,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         num_pages: int,
         context_len: int,
         startup_available_gpu_memory_gb: float,
+        max_running_requests: Optional[int] = None,
+        max_running_requests_cap_source: Optional[str] = None,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
+        if max_running_requests is not None:
+            self.max_running_requests.labels(
+                **self.labels,
+                cap_source=max_running_requests_cap_source or "unknown",
+            ).set(max_running_requests)
         if max_total_num_tokens_swa is not None:
             self._log_gauge(self.max_total_num_tokens_swa, max_total_num_tokens_swa)
         self._log_gauge(self.weight_memory_usage_gb, weight_memory_usage_gb)
