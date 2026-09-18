@@ -47,6 +47,11 @@ def resolve_chat_encoding_spec(
     return None
 
 
+def spec_supports_inline_system(spec: Optional[str]) -> bool:
+    """Native encoders verified to preserve mid-conversation system messages."""
+    return spec == "kimi_k3"
+
+
 def encode_simple_chat(
     *,
     tokenizer: Any,
