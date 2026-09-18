@@ -69,6 +69,9 @@ class MemoryPoolConfig:
 
     max_total_num_tokens: int
     max_running_requests: Optional[int] = None
+    # Which limit set max_running_requests: "requested", "estimated",
+    # "kv_capacity" or "mamba_pool" (see KVCacheConfigurator.resolve_max_num_reqs).
+    max_running_requests_cap_source: Optional[str] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
     unified_memory_pool_bytes: Optional[int] = None

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.admission_block import AdmissionBlockCause
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_CATEGORIES,
@@ -911,6 +912,51 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Pre-seed every mode at 0 so per-tier ratio charts get a complete operand set
         for mode in ("input", "device_hit", "host_hit", "storage_hit"):
             self.prefill_effective_tokens_total.labels(**labels, mode=mode)
+        self.mamba_cache_miss_requests_total = Counter(
+            name="sglang:mamba_cache_miss_requests_total",
+            documentation=(
+                "Number of prefill admissions where Full-KV cache was available "
+                "beyond the reusable Mamba checkpoint boundary."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.mamba_cache_miss_tokens_total = Counter(
+            name="sglang:mamba_cache_miss_tokens_total",
+            documentation=(
+                "Number of page-aligned Full-KV prefix tokens skipped because "
+                "the corresponding Mamba checkpoint was unavailable."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.prefill_admission_blocked_passes_total = Counter(
+            name="sglang:prefill_admission_blocked_passes_total",
+            documentation=(
+                "Prefill scheduling passes that ended with waiting requests "
+                "left unadmitted, by the first binding constraint (cause). "
+                "One increment per prefill pass while blocked (one pass per "
+                "scheduler step, or per micro-batch under pipeline "
+                "parallelism), so rate() ranks the constraints that cap "
+                "concurrency. kv_tokens / swa_tokens / mamba_slots are the "
+                "memory pools, max_running_requests / pp_micro_batch are "
+                "request slots, max_prefill_tokens / chunked_prefill_size / "
+                "prefill_max_requests are per-pass compute budgets that "
+                "reset next step."
+            ),
+            labelnames=[*labels.keys(), "cause"],
+        )
+        self.prefill_admission_blocked_requests_total = Counter(
+            name="sglang:prefill_admission_blocked_requests_total",
+            documentation=(
+                "Waiting requests left unadmitted at the end of a blocked "
+                "prefill pass, summed over passes (a request that waits N "
+                "steps counts N times), by the binding constraint (cause)."
+            ),
+            labelnames=[*labels.keys(), "cause"],
+        )
+        # Pre-seed every cause at 0 so ratio panels get a complete operand set.
+        for cause in AdmissionBlockCause.ALL:
+            self.prefill_admission_blocked_passes_total.labels(**labels, cause=cause)
+            self.prefill_admission_blocked_requests_total.labels(**labels, cause=cause)
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1064,6 +1110,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:graph_memory_usage_gb",
             documentation="Memory used by captured device graphs in GB.",
             labelnames=list(labels.keys()) + ["phase"],
+            multiprocess_mode="mostrecent",
+        )
+        self.max_running_requests = Gauge(
+            name="sglang:max_running_requests",
+            documentation=(
+                "Effective per-scheduler max_running_requests, by the limit "
+                "that set it (cap_source): requested (--max-running-requests), "
+                "estimated (default heuristic), kv_capacity (KV pool / 2), "
+                "mamba_pool (max_mamba_cache_size / states per request)."
+            ),
+            labelnames=[*labels.keys(), "cap_source"],
             multiprocess_mode="mostrecent",
         )
         self.max_running_requests_under_SLO = Gauge(
@@ -1317,6 +1374,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     **self.labels, mode=mode
                 ).inc(delta)
 
+    def increment_mamba_cache_miss(self, num_requests: int, num_tokens: int) -> None:
+        if num_requests > 0:
+            self.mamba_cache_miss_requests_total.labels(**self.labels).inc(num_requests)
+        if num_tokens > 0:
+            self.mamba_cache_miss_tokens_total.labels(**self.labels).inc(num_tokens)
+
+    def increment_admission_blocked(self, cause: str, num_blocked_reqs: int) -> None:
+        self.prefill_admission_blocked_passes_total.labels(
+            **self.labels, cause=cause
+        ).inc(1)
+        if num_blocked_reqs > 0:
+            self.prefill_admission_blocked_requests_total.labels(
+                **self.labels, cause=cause
+            ).inc(num_blocked_reqs)
+
     def increment_forward_execution_seconds(
         self,
         category: str,
@@ -1502,8 +1574,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         num_pages: int,
         context_len: int,
         startup_available_gpu_memory_gb: float,
+        max_running_requests: Optional[int] = None,
+        max_running_requests_cap_source: Optional[str] = None,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
+        if max_running_requests is not None:
+            self.max_running_requests.labels(
+                **self.labels,
+                cap_source=max_running_requests_cap_source or "unknown",
+            ).set(max_running_requests)
         if max_total_num_tokens_swa is not None:
             self._log_gauge(self.max_total_num_tokens_swa, max_total_num_tokens_swa)
         self._log_gauge(self.weight_memory_usage_gb, weight_memory_usage_gb)
@@ -2138,6 +2217,32 @@ def radix_cache_metric_labels(
     }
 
 
+KV_AGE_BUCKETS = (
+    1.0,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    1200.0,
+    1800.0,
+    3600.0,
+    7200.0,
+)
+_KV_AGE_LABELS = tuple(str(int(b)) for b in KV_AGE_BUCKETS) + ("+Inf",)
+KV_REUSE_BUCKETS = (0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+
+
+def kv_age_bucket(age_seconds: float) -> str:
+    """Upper-edge label of the KV_AGE_BUCKETS bucket that age_seconds falls in."""
+    for edge, label in zip(KV_AGE_BUCKETS, _KV_AGE_LABELS):
+        if age_seconds <= edge:
+            return label
+    return "+Inf"
+
+
 class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
@@ -2151,6 +2256,14 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
+
+        # Label children for the per-node kv_age hooks, resolved once per label
+        # combination (see _kv_age_child and friends below). Plain instance
+        # attributes, deliberately named differently from the helper methods
+        # that fill them so they cannot shadow those methods.
+        self._kv_age_child_cache = {}
+        self._kv_age_tokens_child_cache = {}
+        self._kv_eviction_child_cache = {}
 
         bucket_eviction_duration = get_histogram_conf_from_env(
             "SGLANG_BUCKET_EVICTION_DURATION"
@@ -2244,6 +2357,59 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             "(see sglang:hicache_backup_tokens_total) or destroyed (see "
             "sglang:hicache_dropped_tokens_total).",
             labelnames=labels.keys(),
+        )
+
+        self.kv_age_seconds = Histogram(
+            name="sglang:kv_age_seconds",
+            documentation="Seconds since a radix node was last matched, observed "
+            "once per node when it is matched again (event=hit) or removed from "
+            "a tier (event=evict), and once per request at its first match for "
+            "the deepest matched node (event=request_hit). tier is device or "
+            "host. outcome is hit for matches; for evictions, demoted means the "
+            "device copy was freed with the host copy kept, dropped means the "
+            "data was destroyed. hit is one sample per node on the matched path, "
+            "so shared ancestors (system prompts) dominate it: read it for "
+            "capacity, since every sample above a horizon is a hit that horizon "
+            "would lose. request_hit is one sample per request, independent of "
+            "path length: read it for the reuse gap between a session's turns. "
+            "Compare the hit and evict curves of one tier: overlap means pages "
+            "leave shortly before the traffic would have reused them.",
+            labelnames=list(labels.keys()) + ["event", "tier", "outcome"],
+            buckets=list(KV_AGE_BUCKETS),
+        )
+
+        self.kv_age_tokens = Counter(
+            name="sglang:kv_age_tokens_total",
+            documentation="Token-weighted companion of sglang:kv_age_seconds: "
+            "tokens matched or removed, by the age bucket the node fell in "
+            "(age_le is the bucket upper edge in seconds, or +Inf). Use it "
+            "when node counts would over-weight small leaves. For "
+            "event=request_hit the weight is the request's whole matched "
+            "prefix, in the bucket of the deepest matched node's idle time.",
+            labelnames=list(labels.keys()) + ["event", "tier", "outcome", "age_le"],
+        )
+
+        self.kv_lifetime_seconds = Histogram(
+            name="sglang:kv_lifetime_seconds",
+            documentation="Seconds since a radix node was created, observed once "
+            "per node when it is removed from a tier. Same tier/outcome labels "
+            'as sglang:kv_age_seconds{event="evict"}; that series is the idle '
+            "time since the last match, this one is the total residency.",
+            labelnames=list(labels.keys()) + ["tier", "outcome"],
+            buckets=list(KV_AGE_BUCKETS),
+        )
+
+        self.kv_reuses = Histogram(
+            name="sglang:kv_reuses",
+            documentation="TreeNode.hit_count at the moment a radix node is "
+            "removed from a tier: the number of non-chunked inserts that "
+            "touched the node. One request inserts twice (end of prefill and "
+            "at finish), so a node cached by one request and never reused "
+            "reads 2; each additional request that reuses it adds 2. Under "
+            "--hicache-write-policy write_back the HiCache paths do not "
+            "maintain hit_count and this reads 0.",
+            labelnames=list(labels.keys()) + ["tier", "outcome"],
+            buckets=list(KV_REUSE_BUCKETS),
         )
 
         self.load_back_duration_seconds = Histogram(
@@ -2347,6 +2513,71 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
             num_tokens
         )
+
+    # The kv_age hooks run per matched / evicted node on the scheduler thread,
+    # so the label children are resolved once per label combination (a handful
+    # of series) instead of paying prometheus_client's labels() lookup each time.
+    def _kv_age_child(self, event: str, tier: str, outcome: str):
+        cache = self._kv_age_child_cache
+        key = (event, tier, outcome)
+        child = cache.get(key)
+        if child is None:
+            child = cache[key] = self.kv_age_seconds.labels(
+                **self.labels, event=event, tier=tier, outcome=outcome
+            )
+        return child
+
+    def _kv_age_tokens_child(self, event: str, tier: str, outcome: str, age_le: str):
+        cache = self._kv_age_tokens_child_cache
+        key = (event, tier, outcome, age_le)
+        child = cache.get(key)
+        if child is None:
+            child = cache[key] = self.kv_age_tokens.labels(
+                **self.labels, event=event, tier=tier, outcome=outcome, age_le=age_le
+            )
+        return child
+
+    def _kv_eviction_children(self, tier: str, outcome: str):
+        cache = self._kv_eviction_child_cache
+        key = (tier, outcome)
+        pair = cache.get(key)
+        if pair is None:
+            pair = cache[key] = (
+                self.kv_lifetime_seconds.labels(
+                    **self.labels, tier=tier, outcome=outcome
+                ),
+                self.kv_reuses.labels(**self.labels, tier=tier, outcome=outcome),
+            )
+        return pair
+
+    def observe_kv_age(
+        self,
+        age_seconds: float,
+        num_tokens: int,
+        event: str,
+        tier: str,
+        outcome: str,
+    ) -> None:
+        self._kv_age_child(event, tier, outcome).observe(age_seconds)
+        self._kv_age_tokens_child(event, tier, outcome, kv_age_bucket(age_seconds)).inc(
+            num_tokens
+        )
+
+    def observe_kv_eviction(
+        self,
+        age_seconds: float,
+        lifetime_seconds: float,
+        reuses: int,
+        num_tokens: int,
+        tier: str,
+        outcome: str,
+    ) -> None:
+        self.observe_kv_age(
+            age_seconds, num_tokens, event="evict", tier=tier, outcome=outcome
+        )
+        lifetime, reuses_h = self._kv_eviction_children(tier, outcome)
+        lifetime.observe(lifetime_seconds)
+        reuses_h.observe(reuses)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):
