@@ -18,6 +18,7 @@ from sglang.srt.function_call.kimik3_format import (
     RESPONSE_OPEN,
     TOOLS_CLOSE,
     TOOLS_OPEN,
+    strip_partial_marker_suffix,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
@@ -67,7 +68,8 @@ def _strip_response_wrappers(text: str) -> str:
             text = text[open_idx + len(RESPONSE_OPEN) :]
     else:
         text = text.replace(RESPONSE_CLOSE, "")
-    return text.replace(MESSAGE_CLOSE, "")
+    text = text.replace(MESSAGE_CLOSE, "")
+    return strip_partial_marker_suffix(text)
 
 
 class KimiK3Detector(BaseFormatDetector):

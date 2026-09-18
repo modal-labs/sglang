@@ -8,6 +8,9 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.kimik3_detector import (
     KimiK3Detector as KimiK3FuncDetector,
 )
+from sglang.srt.function_call.kimik3_detector import (
+    _strip_response_wrappers,
+)
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
@@ -212,6 +215,60 @@ class TestKimiK3FuncDetector(unittest.TestCase):
         self.assertTrue(self.detector.supports_structural_tag())
         self.assertFalse(self.detector.parses_required_natively())
 
+    def test_non_stream_dangling_partial_marker(self):
+        for tail in ("<|close|>", "<|close|>response", "<|open|>"):
+            text = f"{RESPONSE_OPEN}Here is the answer.{tail}"
+            result = self.detector.detect_and_parse(text, self.tools)
+            self.assertEqual(result.normal_text, "Here is the answer.")
+            self.assertEqual(result.calls, [])
+
+    def test_non_stream_dangling_partial_marker_no_wrapper(self):
+        text = "Answer directly.<|close|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "Answer directly.")
+        self.assertEqual(result.calls, [])
+
+    def test_streaming_dangling_partial_marker(self):
+        full = f"{RESPONSE_OPEN}Here is the answer.<|close|>"
+        for chunks in (list(full), _stream_chunks(full, 3)):
+            self.detector = KimiK3FuncDetector()
+            text, calls = self._stream(chunks)
+            self.assertNotIn("<|", text)
+            self.assertEqual(text, "Here is the answer.")
+            self.assertEqual(calls, [])
+
+    def test_complete_text_no_marker_loss(self):
+        text = f"{RESPONSE_OPEN}hello{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "hello")
+        self.assertEqual(result.calls, [])
+        streamed, calls = self._stream(_stream_chunks(text, 3))
+        self.assertEqual(streamed, "hello")
+        self.assertEqual(calls, [])
+
+    def test_non_stream_mid_text_partial_marker_preserved_unchanged(self):
+        text = "CONTENT<|close|> more"
+        self.assertEqual(_strip_response_wrappers(text), text)
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.calls, [])
+
+    def test_non_stream_plain_text_untouched(self):
+        for text in ("plain text", "a < b", "a <", "x <|clo"):
+            result = self.detector.detect_and_parse(text, self.tools)
+            self.assertEqual(result.normal_text, text)
+            self.assertEqual(result.calls, [])
+
+    def test_non_stream_complete_markers_no_response_close_sep(self):
+        text = f"{RESPONSE_OPEN}text{RESPONSE_CLOSE}"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "text")
+        self.assertEqual(result.calls, [])
+
+    def test_non_stream_tools_open_partial_suffix_stripped(self):
+        self.assertEqual(_strip_response_wrappers("hi<|open|>tools"), "hi")
+        self.assertEqual(_strip_response_wrappers("hi<|open|>think"), "hi")
+
 
 class TestKimiK3ReasoningDetector(unittest.TestCase):
     def _stream(self, detector, chunks):
@@ -328,6 +385,78 @@ class TestKimiK3ReasoningDetector(unittest.TestCase):
         reasoning, content = self._stream(detector, _stream_chunks(full, 4))
         self.assertEqual(reasoning, "abc")
         self.assertEqual(content, "xyz")
+
+    def test_non_stream_truncated_reasoning_partial_marker(self):
+        for tail in ("<|close|>think", "<|open|>", "<|open|>think"):
+            detector = KimiK3ReasoningDetector(force_reasoning=True)
+            result = detector.detect_and_parse(f"{THINK_OPEN}still going{tail}")
+            self.assertEqual(result.reasoning_text, "still going")
+            self.assertFalse(result.normal_text)
+
+    def test_non_stream_reasoning_before_tools_preserved_unchanged(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        text = f"{THINK_OPEN}reason<|close|>{TOOLS_OPEN}call"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reason<|close|>")
+        self.assertEqual(result.normal_text, f"{TOOLS_OPEN}call")
+
+    def test_non_stream_partial_marker_after_think_close(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(
+            f"{THINK_OPEN}still going{THINK_CLOSE}"
+            f"{RESPONSE_OPEN}hi<|close|>response"
+        )
+        self.assertEqual(result.reasoning_text, "still going")
+        self.assertEqual(result.normal_text, "hi")
+
+    def test_streaming_dangling_partial_marker(self):
+        full = f"{THINK_OPEN}still going<|close|>think"
+        for chunks in (list(full), _stream_chunks(full, 3)):
+            detector = KimiK3ReasoningDetector(force_reasoning=True)
+            reasoning, content = self._stream(detector, chunks)
+            finish = detector.finish()
+            reasoning += finish.reasoning_text or ""
+            content += finish.normal_text or ""
+            self.assertNotIn("<|", reasoning)
+            self.assertNotIn("<|", content)
+            self.assertEqual(reasoning, "still going")
+
+    def test_non_stream_tools_boundary_chain(self):
+        tools_channel = (
+            f"{TOOLS_OPEN}"
+            + _call_block("get_weather", 1, {"city": ("string", "Paris")})
+            + f"{TOOLS_CLOSE}"
+        )
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(f"{THINK_CLOSE}{tools_channel}")
+        self.assertFalse(result.reasoning_text)
+        self.assertTrue(result.normal_text.startswith(TOOLS_OPEN))
+
+        func_detector = KimiK3FuncDetector()
+        tools = [_make_tool("get_weather")]
+        parsed = func_detector.detect_and_parse(result.normal_text, tools)
+        self.assertEqual(len(parsed.calls), 1)
+        self.assertEqual(parsed.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": "Paris"})
+
+    def test_streaming_tools_boundary_chain(self):
+        full = (
+            f"{THINK_CLOSE}{TOOLS_OPEN}"
+            + _call_block("get_weather", 1, {"city": ("string", "Paris")})
+            + f"{TOOLS_CLOSE}"
+        )
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        reasoning, content = self._stream(detector, _stream_chunks(full, 5))
+        self.assertFalse(reasoning)
+
+        func_detector = KimiK3FuncDetector()
+        tools = [_make_tool("get_weather")]
+        calls = []
+        for chunk in _stream_chunks(content, 5):
+            calls.extend(func_detector.parse_streaming_increment(chunk, tools).calls)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "get_weather")
+        self.assertEqual(json.loads(calls[0].parameters), {"city": "Paris"})
 
 
 if __name__ == "__main__":

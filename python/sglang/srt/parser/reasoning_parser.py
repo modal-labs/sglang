@@ -15,6 +15,7 @@ from sglang.srt.function_call.kimik3_format import (
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_OPEN,
+    strip_partial_marker_suffix,
 )
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
@@ -476,7 +477,9 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                     reasoning_text=text[start:tools_idx],
                     normal_text=text[tools_idx:],
                 )
-            return StreamingParseResult(reasoning_text=text[start:])
+            return StreamingParseResult(
+                reasoning_text=strip_partial_marker_suffix(text[start:])
+            )
 
         reasoning_text = text[start:close_idx]
         rest = text[close_idx + len(self.think_end_token) :]
