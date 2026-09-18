@@ -1895,16 +1895,24 @@ class HiRadixCache(RadixCache):
         node.last_access_time = access_time
         child_key = key.child_key(self.page_size)
         value = []
+        # Per-request sample: the deepest matched node's idle time, weighted
+        # by the whole matched prefix (device and host), see RadixCache.
+        request_idle = 0.0
+        request_tokens = 0
+        request_tier = "device"
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             prefix_len = child.key.match(key, page_size=self.page_size)
             if observe_kv_age:
+                request_idle = access_time - child.last_access_time
+                request_tokens += prefix_len
+                request_tier = "host" if child.evicted else "device"
                 self.metrics_collector.observe_kv_age(
-                    access_time - child.last_access_time,
+                    request_idle,
                     prefix_len,
                     event="hit",
-                    tier="host" if child.evicted else "device",
+                    tier=request_tier,
                     outcome="hit",
                 )
             child.last_access_time = access_time
@@ -1923,6 +1931,14 @@ class HiRadixCache(RadixCache):
                 if len(key):
                     child_key = key.child_key(self.page_size)
 
+        if observe_kv_age and request_tokens > 0:
+            self.metrics_collector.observe_kv_age(
+                request_idle,
+                request_tokens,
+                event="request_hit",
+                tier=request_tier,
+                outcome="hit",
+            )
         return value, node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):

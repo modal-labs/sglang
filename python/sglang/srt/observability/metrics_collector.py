@@ -2363,9 +2363,15 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             name="sglang:kv_age_seconds",
             documentation="Seconds since a radix node was last matched, observed "
             "once per node when it is matched again (event=hit) or removed from "
-            "a tier (event=evict). tier is device or host. outcome is hit for "
-            "matches; for evictions, demoted means the device copy was freed "
-            "with the host copy kept, dropped means the data was destroyed. "
+            "a tier (event=evict), and once per request at its first match for "
+            "the deepest matched node (event=request_hit). tier is device or "
+            "host. outcome is hit for matches; for evictions, demoted means the "
+            "device copy was freed with the host copy kept, dropped means the "
+            "data was destroyed. hit is one sample per node on the matched path, "
+            "so shared ancestors (system prompts) dominate it: read it for "
+            "capacity, since every sample above a horizon is a hit that horizon "
+            "would lose. request_hit is one sample per request, independent of "
+            "path length: read it for the reuse gap between a session's turns. "
             "Compare the hit and evict curves of one tier: overlap means pages "
             "leave shortly before the traffic would have reused them.",
             labelnames=list(labels.keys()) + ["event", "tier", "outcome"],
@@ -2377,7 +2383,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             documentation="Token-weighted companion of sglang:kv_age_seconds: "
             "tokens matched or removed, by the age bucket the node fell in "
             "(age_le is the bucket upper edge in seconds, or +Inf). Use it "
-            "when node counts would over-weight small leaves.",
+            "when node counts would over-weight small leaves. For "
+            "event=request_hit the weight is the request's whole matched "
+            "prefix, in the bucket of the deepest matched node's idle time.",
             labelnames=list(labels.keys()) + ["event", "tier", "outcome", "age_le"],
         )
 

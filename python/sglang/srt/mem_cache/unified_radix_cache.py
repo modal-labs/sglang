@@ -916,9 +916,9 @@ class UnifiedRadixCache(BasePrefixCache):
         num_tokens: int,
     ) -> None:
         """Tree-core callback: forward one node's age to the metrics collector."""
-        if event == "hit":
+        if event in ("hit", "request_hit"):
             self.metrics_collector.observe_kv_age(
-                age_seconds, num_tokens, event="hit", tier=tier, outcome=outcome
+                age_seconds, num_tokens, event=event, tier=tier, outcome=outcome
             )
         else:
             self.metrics_collector.observe_kv_eviction(

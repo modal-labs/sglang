@@ -973,6 +973,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Only a non-empty match consumes the request's one hit observation.
         if observe_kv_age and best_match_node.parent is not None:
             mark_kv_age_hit_observed(params)
+        # Per-request sample (event=request_hit): the deepest matched node's
+        # idle time, read before the walk below refreshes it, weighted by the
+        # whole matched prefix. Per-node samples over-weight hot ancestors.
+        request_idle = now_wall - best_match_node.last_access_wall
+        request_tier = "host" if best_match_node.evicted else "device"
+        request_tokens = 0
         while node_update:
             if observe_kv_age:
                 self._emit_kv_age(
@@ -982,10 +988,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     "hit",
                     now_wall,
                 )
+                if node_update.key is not None:
+                    request_tokens += len(node_update.key)
             node_update.last_access_time = cur_time
             node_update.last_access_wall = now_wall
             cur_time -= 0.00001
             node_update = node_update.parent
+        if observe_kv_age and request_tokens > 0:
+            self._emit_kv_age(
+                best_match_node,
+                "request_hit",
+                request_tier,
+                "hit",
+                now_wall,
+                num_tokens=request_tokens,
+                idle_seconds=request_idle,
+            )
 
         # last_host_node will be used as the starting node for the subsequent
         # `prefetch_from_storage` flow. We directly use best_match_node here,
@@ -1057,8 +1075,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tier: str,
         outcome: str,
         now: Optional[float] = None,
+        num_tokens: Optional[int] = None,
+        idle_seconds: Optional[float] = None,
     ) -> None:
-        """Report a node's age to the Controller's KV-age observer, if installed."""
+        """Report a node's age to the Controller's KV-age observer, if installed.
+
+        num_tokens / idle_seconds override the node's own key length and idle
+        time; the request-level hit sample uses them to report the whole
+        matched prefix and the idle time read before the walk refreshed it.
+        """
         observer = self.kv_age_observer
         if observer is None or node.parent is None or node.key is None:
             return
@@ -1068,10 +1093,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             event,
             tier,
             outcome,
-            now - node.last_access_wall,
+            now - node.last_access_wall if idle_seconds is None else idle_seconds,
             now - node.creation_wall,
             node.hit_count,
-            len(node.key),
+            len(node.key) if num_tokens is None else num_tokens,
         )
 
     def _touch_node(self, node: UnifiedTreeNode):
