@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
+import signal
 import struct
 import threading
 import time
@@ -53,12 +55,14 @@ try:
         nixlRemoteDisconnectError,
     )
 
+    _NIXL_REMOTE_DISCONNECT_ERRORS = (nixlRemoteDisconnectError,)
     _NIXL_TRANSPORT_ERRORS = (
         nixlRemoteDisconnectError,
         nixlBackendError,
         nixlCancelledError,
     )
 except ImportError:
+    _NIXL_REMOTE_DISCONNECT_ERRORS = ()
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
 
 logger = logging.getLogger(__name__)
@@ -395,6 +399,9 @@ class NixlKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._disconnect_restart_lock = threading.Lock()
+        self._disconnect_restart_signaled = False
+        self._scheduler_parent_pid = os.getppid()
         self.transfer_source_rank = (
             self.kv_args.pp_rank * self.server_args.tp_size + self.kv_args.engine_rank
         )
@@ -1335,6 +1342,32 @@ class NixlKVManager(CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
+                self._restart_on_remote_disconnect(e)
+
+    def _restart_on_remote_disconnect(self, error: Exception) -> None:
+        # TODO: safely reconnect after quiescing transfers and rebuilding peer
+        # metadata/descriptors. This is shutdown mitigation, not reconnection.
+        # NIXL invalidates the peer metadata on disconnect. Per-request failure
+        # alone leaves this manager's registration cache pointing at a lost peer.
+        # Opt-in containment for fixed PD gangs until peer recovery is supported.
+        # Do not apply this to generic transfer failures or multi-peer deployments.
+        if not (
+            envs.SGLANG_DISAGGREGATION_NIXL_EXIT_ON_REMOTE_DISCONNECT.get()
+            and isinstance(error, _NIXL_REMOTE_DISCONNECT_ERRORS)
+        ):
+            return
+        with self._disconnect_restart_lock:
+            if self._disconnect_restart_signaled:
+                return
+            logger.error(
+                "NIXL invalidated a remote peer; requesting engine shutdown "
+                "to rebuild transport state: %s",
+                error,
+            )
+            # Same parent shutdown signal as an unhandled scheduler exception.
+            # The deployment supervisor is responsible for restarting the gang.
+            os.kill(self._scheduler_parent_pid, signal.SIGQUIT)
+            self._disconnect_restart_signaled = True
 
     def register_buffer_to_engine(self):
         self.kv_descs = []

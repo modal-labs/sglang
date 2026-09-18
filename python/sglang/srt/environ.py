@@ -403,6 +403,8 @@ class Envs:
     # Diagnostic fallback for equal-TP/MLA payloads. State transfers already
     # use descriptors; heterogeneous-TP and mixed-memory paths are unchanged.
     SGLANG_NIXL_DISABLE_PREPPED = EnvBool(False)
+    # Fixed PD gangs only: require supervisor restart after peer invalidation.
+    SGLANG_DISAGGREGATION_NIXL_EXIT_ON_REMOTE_DISCONNECT = EnvBool(False)
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
