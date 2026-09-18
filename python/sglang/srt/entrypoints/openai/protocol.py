@@ -204,6 +204,7 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    request_metrics: Optional[Dict[str, Any]] = None
 
 
 class StreamOptions(BaseModel):

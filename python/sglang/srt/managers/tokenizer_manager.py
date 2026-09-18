@@ -104,10 +104,12 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
+    SchedulerReqTimeStats,
     convert_time_to_realtime,
     real_time,
     set_time_batch,
 )
+from sglang.srt.observability.request_metrics import RequestMetrics
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
@@ -225,6 +227,8 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    scheduler_time_stats: Optional[SchedulerReqTimeStats] = None
+    request_metrics_skip: bool = False
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -335,6 +339,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
         self.enable_metrics = server_args.enable_metrics
+        self.request_metrics = RequestMetrics.from_env()
         self.incremental_streaming_output = server_args.incremental_streaming_output
         self.enable_lora = server_args.enable_lora
         self.enable_trace = server_args.enable_trace
@@ -1687,6 +1692,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
+                if (
+                    self.request_metrics.enabled
+                    and isinstance(obj, GenerateReqInput)
+                    and obj.log_metrics
+                    and not state.request_metrics_skip
+                ):
+                    metrics = self.request_metrics.build(
+                        obj.rid,
+                        state.time_stats,
+                        state.scheduler_time_stats,
+                        prompt_tokens=out["meta_info"].get("prompt_tokens", 0),
+                        cached_tokens=out["meta_info"].get("cached_tokens", 0),
+                        completion_tokens=out["meta_info"].get("completion_tokens", 0),
+                        stream=is_stream,
+                        cached_tokens_details=out["meta_info"].get(
+                            "cached_tokens_details"
+                        ),
+                    )
+                    out["meta_info"]["request_metrics"] = metrics
+                    if not obj.no_logs:
+                        self.request_metrics.log(metrics)
                 self.request_logger.log_finished_request(
                     obj,
                     out,
@@ -1834,6 +1860,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
+                self.rid_to_state[tmp_obj.rid].request_metrics_skip = True
                 self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
@@ -2332,6 +2359,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_first_token_time()
 
             if state.finished:
+                if self.request_metrics.enabled and not isinstance(
+                    recv_obj, BatchEmbeddingOutput
+                ):
+                    state.scheduler_time_stats = (
+                        recv_obj.time_stats[i]
+                        if recv_obj.time_stats is not None
+                        else None
+                    )
                 if state.time_stats.trace_ctx.tracing_enable:
                     state.time_stats.trace_ctx.trace_set_root_attrs(
                         self.convert_to_span_attrs(state, recv_obj, i)

@@ -1581,6 +1581,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        request_metrics: Dict[int, Dict] = {}
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
@@ -1607,6 +1608,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                if (metrics := content["meta_info"].get("request_metrics")) is not None:
+                    request_metrics[index] = metrics
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"]
@@ -1832,6 +1835,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     image_tokens=total_image_tokens,
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
+                    request_metrics=request_metrics.get(0),
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],

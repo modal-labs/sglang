@@ -261,6 +261,9 @@ class Envs:
     # Logging Options
     # Per-node KV age/lifetime/reuse histograms (sglang:kv_age_seconds etc.); needs --enable-metrics.
     SGLANG_ENABLE_KV_AGE_METRICS = EnvBool(False)
+    # Per-request metrics: meta_info["request_metrics"] / usage.request_metrics
+    # plus one `REQUEST_METRICS {json}` log line per finished request.
+    SGLANG_ENABLE_REQUEST_METRICS = EnvBool(False)
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)

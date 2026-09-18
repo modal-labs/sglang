@@ -23,6 +23,7 @@ class UsageProcessor:
         audio_tokens: int = 0,
         video_tokens: int = 0,
     ) -> UsageInfo:
+        request_metrics = responses[0]["meta_info"].get("request_metrics")
         completion_tokens = sum(
             r["meta_info"].get("completion_tokens", 0) for r in responses
         )
@@ -52,6 +53,7 @@ class UsageProcessor:
             image_tokens=image_tokens,
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
+            request_metrics=request_metrics,
         )
 
     @staticmethod
@@ -65,6 +67,7 @@ class UsageProcessor:
         image_tokens: int = 0,
         audio_tokens: int = 0,
         video_tokens: int = 0,
+        request_metrics: Optional[Dict[str, Any]] = None,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -89,6 +92,7 @@ class UsageProcessor:
             image_tokens=image_tokens,
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
+            request_metrics=request_metrics,
         )
 
     @staticmethod
@@ -100,6 +104,7 @@ class UsageProcessor:
         image_tokens: int = 0,
         audio_tokens: int = 0,
         video_tokens: int = 0,
+        request_metrics: Optional[Dict[str, Any]] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         # `cached_tokens` is already a PromptTokensDetails (or None) carrying the
@@ -123,4 +128,5 @@ class UsageProcessor:
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=details,
             reasoning_tokens=reasoning_tokens,
+            request_metrics=request_metrics,
         )

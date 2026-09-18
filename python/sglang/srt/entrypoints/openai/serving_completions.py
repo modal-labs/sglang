@@ -233,6 +233,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         reasoning_tokens = {}
         cached_tokens = {}
+        request_metrics: Dict[int, Dict] = {}
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
@@ -248,6 +249,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                if (metrics := content["meta_info"].get("request_metrics")) is not None:
+                    request_metrics[index] = metrics
 
                 text = content["text"]
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
@@ -452,6 +455,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    request_metrics=request_metrics.get(0),
                 )
                 final_usage_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
