@@ -1,4 +1,13 @@
-# kimi-k3-fast -> dev/instinct/2026-09-15 @ fd8aff798, 4 PRs of #22 + #26 on
+# kimi-k3-fast -> release/instinct/2026-09-18 @ cc7b258e4, 4 PRs of #22 + #26 on
+
+Release branch `release/instinct/2026-09-18` = `dev/instinct/2026-09-15` @ cc7b258e48
+(= rc3 aa7df1d23 + #119 per-request metrics (default off, opted in) + #120 rank-consistent mm
+embedding-cache miss decision (default on, pinned; fixes the rank-divergent image-encode TP warmup hang)
++ #121 prefill/decode queue-depth + replica_gpu_info gauges + #124 kimik3 parser trailing-partial-marker
+fix on length-truncated output) + this pin commit. rc3 (`release/instinct/2026-09-17-rc3` @ aa7df1d23) was
+gated (GATE-30 PASS) but only ever ran as the 1x1 `kimi-k3-dev` endpoint; rc2 and the prior
+`release/instinct/2026-09-17` pin at f42865e47 were never deployed. Rollback target is the deployed prod
+`release/instinct/2026-09-14` @ 462ade71f (serve.py commit `dd2e5ed0d6`).
 
 Files in this directory:
 
@@ -12,11 +21,15 @@ Files in this directory:
      `SGLANG_KIMI_ENCODE_FAST_PATH=1` + `SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS=32000000` (#20),
      `SGLANG_K3_MM_USE_RENDERED_INPUT_IDS=1` (#19). No prefix-ack (#15 dropped).
      Plus #26 (dev, CONFIRMED same-box): `SGLANG_K3_SCHED_MM_FASTPATH=1` + `SGLANG_K3_MM_STRIP_PROCESSOR_INPUT_IDS=1`.
-     Plus `SGLANG_RENORM_DETERMINISTIC=1` (#110) and `SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF=1` (#113) (both default ON in the engine; pinned explicitly here).
+     Plus `SGLANG_RENORM_DETERMINISTIC=1` (#110), `SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF=1` (#113) and
+     `SGLANG_MM_RANK_CONSISTENT_ENCODE=1` (#120) (all three default ON in the engine; pinned explicitly here).
+     Plus `SGLANG_ENABLE_REQUEST_METRICS=1` (#119, default off; Instinct ask — per-request prefill/decode/queue
+     timings in `usage`/`meta_info`).
      NOT set (stay default off): `SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET` (#29), `SGLANG_MM_CUDA_IPC_LEASE_POOL` (#33)
-     and the other dev levers (#37/#38/#43).
-     Rollback of a default-off flip (#20/#19/#26) = unset the var; #110/#113 are default ON in the engine, so a
-     flags-only rollback must set `SGLANG_RENORM_DETERMINISTIC=0` and `SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF=0`.
+     and the other dev levers (#37/#38/#43); #123 (D2H budget / staging ring) is unmerged.
+     Rollback of a default-off flip (#20/#19/#26/#119) = unset the var; #110/#113/#120 are default ON in the engine, so a
+     flags-only rollback must set `SGLANG_RENORM_DETERMINISTIC=0`, `SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF=0`
+     and `SGLANG_MM_RANK_CONSISTENT_ENCODE=0`.
   3. warmup: one 1280x800 synthetic-PNG image turn after the text greeting (autoinference #516).
   4. HiCache host tier re-sized for the 60-minute session TTL (see "HiCache sizing" below):
      `--enable-mla-hicache-host-dedup --hicache-size 140 --hicache-mamba-ratio 13.5 --hicache-write-policy write_through`
@@ -37,8 +50,8 @@ git bundle list-heads deploy/instinct-2026-09-14/engine-<sha9>.bundle
 ```
 
 The pin ref is needed because bundles only advertise named refs; serve.py checks that the advertised
-head equals `RELEASE_SHA`. For the current pin, use `engine-fd8aff798.bundle` and
-`RELEASE_SHA=fd8aff798ca487d72db3341a5057e84394196af5`.
+head equals `RELEASE_SHA`. For the current pin, use `engine-cc7b258e4.bundle` and
+`RELEASE_SHA=cc7b258e48835d4356c742fcc6741e9664ffd9dd`.
 
 Then run `modal deploy serve.py`. `serve.py` refuses to import if the bundle is missing, fails
 `git bundle verify`, or lacks `RELEASE_SHA`; the exception message carries the exact create
@@ -54,10 +67,12 @@ from any cwd.
 modal deploy serve.py          # in the directory that holds serve.py + generated bundle
 ```
 
-## Dev endpoint (1x1)
+## Dev endpoint (1x1) / benchmark endpoint (4x4)
 
-Deploy a separate one-container endpoint from the repository root with the same
-`cust-instinct` environment:
+Deploy a separate endpoint from the repository root with the same `cust-instinct` environment.
+`--name` overrides the `kimi-k3-fast` app name; `K3_MIN_CONTAINERS`/`K3_MAX_CONTAINERS` pin the
+container count (prod is min 63 / no max). Everything else — image, flags, server args — is the
+prod recipe.
 
 The bundle for `K3_RELEASE_SHA` must exist next to `serve.py`; regenerate it with
 `RELEASE_BUNDLE_CMD` as documented above.
@@ -65,25 +80,30 @@ The bundle for `K3_RELEASE_SHA` must exist next to `serve.py`; regenerate it wit
 ```sh
 K3_MIN_CONTAINERS=1 K3_MAX_CONTAINERS=1 K3_RELEASE_SHA=<sha> MODAL_ENVIRONMENT=cust-instinct \
 modal deploy --name kimi-k3-dev deploy/instinct-2026-09-14/serve.py
+
+# 4-container benchmark endpoint (32 B300s), same recipe:
+K3_MIN_CONTAINERS=4 K3_MAX_CONTAINERS=4 K3_RELEASE_SHA=<sha> MODAL_ENVIRONMENT=cust-instinct \
+modal deploy --name kimi-k3-bench deploy/instinct-2026-09-14/serve.py
 ```
 
-Image build check (in the build log): `rev-parse HEAD == fd8aff798...`, `status --porcelain` empty,
+Image build check (in the build log): `rev-parse HEAD == cc7b258e4...`, `status --porcelain` empty,
 `sglang.__file__` printed. The A/B endpoint `kimi-k3-ab-instinct` was built with the identical steps.
 
 ## During cutover
 
 - Watch green containers schedule; if they don't, scale Instinct down a little to free GPUs.
 - Old (blue) containers are hard-terminated 4 h after deploy regardless of green progress.
-- Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release fd8aff798). ...` — the
+- Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release cc7b258e4). ...` — the
   warmup number now includes the image turn (expect +25-80 s on containers with a cold mm JIT).
-- Env check on a running container: `SGLANG_RELEASE_SHA=fd8aff798...` and the 9 flag lines above;
+- Env check on a running container: `SGLANG_RELEASE_SHA=cc7b258e4...` and the 11 flag lines above;
   `SGLANG_ENABLE_MM_CUDA_IPC_PREFIX_ACK` must be absent.
 
 ## Rollback
 
-Check out the previous `serve.py` commit `540bbe0021`, regenerate `engine-3ccb60f5b.bundle`
-with the same command, then deploy.
-Flags-only rollback (keep 3ccb60f5b): drop the 7 default-off lines (the 5 prod flags + the 2 #26 lines) and set the 2 #110/#113
+rc2, rc3 and the prior `release/instinct/2026-09-17` pin were never deployed to `kimi-k3-fast`. To return
+to the currently deployed prod 462ade71f recipe, check out `release/instinct/2026-09-14` (serve.py commit
+`dd2e5ed0d6`), regenerate `engine-462ade71f.bundle` with the same command, then deploy.
+Flags-only rollback (keep cc7b258e48): drop the 8 default-off lines (the 5 prod flags + the 2 #26 lines + #119) and set the 3 #110/#113/#120
 lines to `"0"` — do NOT drop them, an absent var is read as ON (`EnvBool(True)`) in the engine; at 462ade71f the 5-flags-off configuration was ==
 `release/2026-09-14` behavior, greedy-identical 36/36 in every A/B arm, and on 741f05e61 the flags-off
 parity leg was 36/36 identical to prod with Δp50 +0 ms.

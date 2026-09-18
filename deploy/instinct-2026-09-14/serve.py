@@ -84,11 +84,11 @@ HICACHE_WRITE_POLICY = "write_through"
 SGLANG_BASE_IMAGE = "modalresearch/sglang:kimi-k3-cu13-20260806-b9e90a6d6"
 SGLANG_COMMIT = "b9e90a6d6ef1859830c3b879cef999092975a41a"   # HEAD stays here
 SGLANG_EFFECTIVE_COMMIT = "2c881e2ed528746312ec326fa89ee6e5e2169adf"  # JIT-cache salt (unchanged: same kernels/ABI)
-RELEASE_REF = "dev/instinct/2026-09-15"
+RELEASE_REF = "release/instinct/2026-09-18"
 RELEASE_SHA = os.environ.get(
     "K3_RELEASE_SHA",
-    "fd8aff798ca487d72db3341a5057e84394196af5",
-)  # dev head: + #58 session fixes, #67 KV-age metrics (off), #69/#72 evict_on_finish (off), #73 HiCache sizing, #74 write-stream hardening
+    "cc7b258e48835d4356c742fcc6741e9664ffd9dd",
+)  # release head = dev/instinct/2026-09-15 @ cc7b258e48: rc3 aa7df1d23 + #119 per-request metrics (off) + #120 rank-consistent mm encode (on) + #121 queue-depth gauges + #124 kimik3 parser trailing-marker fix
 RELEASE_BUNDLE = Path(__file__).parent / f"engine-{RELEASE_SHA[:9]}.bundle"  # untracked; regenerate per RELEASE_SHA (see DEPLOY.md)
 RELEASE_BUNDLE_IMAGE_PATH = f"/tmp/{RELEASE_BUNDLE.name}"
 RELEASE_PIN_REF = f"refs/deploy/{RELEASE_BUNDLE.stem}"  # a bundle only advertises named refs, so pin the SHA under one
@@ -234,6 +234,10 @@ BASE_RUNTIME_ENV = {
     "SGLANG_RENORM_DETERMINISTIC": "1",
     # dev/instinct/2026-09-15 #113: rank-0 authority D2H write handoff lock
     "SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF": "1",
+    # dev/instinct/2026-09-15 #120: rank-consistent mm embedding-cache miss decision (TP warmup hang fix)
+    "SGLANG_MM_RANK_CONSISTENT_ENCODE": "1",
+    # dev/instinct/2026-09-15 #119: per-request prefill/decode/queue timings in usage/meta_info
+    "SGLANG_ENABLE_REQUEST_METRICS": "1",
 }
 
 PREBUILT_JIT_MODULE = "sgl_trtllm_gen_moe_fi_651799c8f7fd_4153db87ecc2"
