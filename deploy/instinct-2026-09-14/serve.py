@@ -545,6 +545,25 @@ def seed_prebuilt_jit(jit_cache_path: str) -> None:
     print(f"Seeded prebuilt JIT module {PREBUILT_JIT_MODULE} into {dst}")
 
 
+def export_deployment_identity() -> None:
+    """Expose the running app's id to the engine as ``MODAL_APP_ID``.
+
+    The engine's per-request metrics (SGLANG_ENABLE_REQUEST_METRICS) report
+    ``deployment_id`` from ``MODAL_APP_ID`` and ``replica_id`` from
+    ``MODAL_TASK_ID``. The container runtime only sets the latter; the app id is
+    known to the SDK once the container has initialized, so it is exported here
+    before the engine subprocess inherits the environment.
+    """
+    if os.environ.get("MODAL_APP_ID"):
+        return
+    app_id = app.app_id
+    if app_id is None:
+        print("MODAL_APP_ID not exported: app id unavailable in this container")
+        return
+    os.environ["MODAL_APP_ID"] = app_id
+    print(f"Exported MODAL_APP_ID={app_id}")
+
+
 SERVER_KWARGS = {
     "include_source": True,
     "image": serving_image,
@@ -580,6 +599,7 @@ class Server:
 
         seed_prebuilt_jit(JIT_CACHE_PATH)
         check_dflash2_checkpoint(SPECULATIVE_DRAFT_MODEL_PATH)
+        export_deployment_identity()
         started = time.monotonic()
 
         print(

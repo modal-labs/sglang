@@ -24,7 +24,9 @@ Files in this directory:
      Plus `SGLANG_RENORM_DETERMINISTIC=1` (#110), `SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF=1` (#113) and
      `SGLANG_MM_RANK_CONSISTENT_ENCODE=1` (#120) (all three default ON in the engine; pinned explicitly here).
      Plus `SGLANG_ENABLE_REQUEST_METRICS=1` (#119, default off; Instinct ask — per-request prefill/decode/queue
-     timings in `usage`/`meta_info`).
+     timings in `usage`/`meta_info`). Its `deployment_id`/`replica_id` come from `MODAL_APP_ID`/`MODAL_TASK_ID`;
+     the container runtime sets only the task id, so `startup()` exports `MODAL_APP_ID` from `app.app_id`
+     before launching the engine.
      NOT set (stay default off): `SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET` (#29), `SGLANG_MM_CUDA_IPC_LEASE_POOL` (#33)
      and the other dev levers (#37/#38/#43); #123 (D2H budget / staging ring) is unmerged.
      Rollback of a default-off flip (#20/#19/#26/#119) = unset the var; #110/#113/#120 are default ON in the engine, so a
