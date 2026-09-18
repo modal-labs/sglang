@@ -12,7 +12,7 @@ from array import array
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -586,6 +586,47 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
             item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
 
+def _mm_encode_sync_group():
+    """Attention-TP group whose ranks must agree on which items to encode.
+
+    Returns None when no cross-rank agreement is needed (flag off, no
+    distributed init, or a single attention-TP rank).
+    """
+    if not envs.SGLANG_MM_RANK_CONSISTENT_ENCODE.get():
+        return None
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    parallel = get_parallel()
+    if parallel.attn_tp_size <= 1:
+        return None
+    return parallel.attn_tp_group
+
+
+def _rank_consistent_miss_hashes(
+    ordered_hashes: List[int],
+    local_misses: Set[int],
+    tp_group,
+    device: torch.device,
+) -> Set[int]:
+    """Return the union over attention-TP ranks of the locally-missed hashes.
+
+    The embedding cache is per process, so ranks can disagree on which items
+    need the ViT. The encoder is DP-sharded across the attention-TP group and
+    ends in a collective, so a rank that skips the encode while a peer runs
+    it deadlocks the group. ``ordered_hashes`` must be built in the same
+    order on every rank (it is derived from the batch, which is identical).
+    """
+    flags = torch.tensor(
+        [1 if h in local_misses else 0 for h in ordered_hashes],
+        # float32: the custom all-reduce kernels reject integer dtypes; 0/1
+        # sums stay exact.
+        dtype=torch.float32,
+        device=device,
+    )
+    flags = tp_group.all_reduce(flags)
+    return {h for h, f in zip(ordered_hashes, flags.tolist()) if f > 0}
+
+
 def _get_chunked_embedding_full(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -692,6 +733,39 @@ def _batch_encode_per_image_misses(
             elif item.hash not in unique_misses:
                 token_count = end - start + 1
                 unique_misses[item.hash] = (item, token_count)
+
+    sync_group = _mm_encode_sync_group()
+    if sync_group is not None:
+        ordered_hashes: List[int] = []
+        hash_to_item: Dict[int, Tuple[MultimodalDataItem, int]] = {}
+        for req_info in per_image_requests:
+            for _idx, item, start, end in req_info.overlapping:
+                if item.hash not in hash_to_item:
+                    ordered_hashes.append(item.hash)
+                    hash_to_item[item.hash] = (item, end - start + 1)
+        if ordered_hashes:
+            global_misses = _rank_consistent_miss_hashes(
+                ordered_hashes, set(unique_misses), sync_group, device
+            )
+            forced = [
+                h
+                for h in ordered_hashes
+                if h in global_misses and h not in unique_misses
+            ]
+            if forced:
+                logger.warning(
+                    "mm embedding cache hit on this rank but miss on a peer for "
+                    "%d item(s); re-encoding to keep the attention-TP group in step",
+                    len(forced),
+                )
+            for h in forced:
+                hash_to_embedding.pop(h, None)
+                unique_misses[h] = hash_to_item[h]
+            # Encode order feeds the DP image->rank assignment; keep it
+            # identical on every rank rather than local-miss-then-forced.
+            unique_misses = {
+                h: unique_misses[h] for h in ordered_hashes if h in unique_misses
+            }
 
     if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
         miss_item_ids = {id(item) for item, _ in unique_misses.values()}
