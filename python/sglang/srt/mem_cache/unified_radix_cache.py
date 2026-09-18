@@ -1176,6 +1176,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             child, UnifiedLRUList.insert_mru, skip_existing=True
         )
         child.last_access_time = get_and_increase_time_counter()
+        if self.metrics_collector is not None:
+            child.last_access_wall = time.monotonic()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)

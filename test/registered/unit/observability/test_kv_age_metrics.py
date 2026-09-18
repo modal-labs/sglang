@@ -415,6 +415,41 @@ class TestUnifiedRadixCacheEmitsKvAge(unittest.TestCase):
         )
         return cache, allocator
 
+    def test_split_preserves_prefix_age_and_touches_suffix(self):
+        from unittest.mock import patch
+
+        cache, allocator = self._build_cache()
+        tokens = array("q", [1, 2, 3, 4])
+        cache.insert(
+            InsertParams(
+                key=RadixKey(token_ids=tokens), value=allocator.alloc(len(tokens))
+            )
+        )
+        (node,) = cache.root_node.children.values()
+        node.creation_wall = 10.0
+        node.last_access_wall = 20.0
+        with patch(
+            "sglang.srt.mem_cache.unified_radix_cache.time.monotonic",
+            return_value=100.0,
+        ):
+            cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=array("q", [1, 2])),
+                    req=_req("partial", [1, 2]),
+                )
+            )
+        (prefix,) = cache.root_node.children.values()
+        (suffix,) = prefix.children.values()
+        self.assertEqual(prefix.creation_wall, 10.0)
+        self.assertEqual(suffix.creation_wall, 10.0)
+        self.assertEqual(suffix.last_access_wall, 100.0)
+        hits = [
+            age
+            for labels, age in cache.metrics_collector.kv_age_seconds.observations
+            if labels["event"] == "hit"
+        ]
+        self.assertEqual(hits, [80.0])
+
     def test_match_then_evict_records_hit_and_evict_ages(self):
         cache, allocator = self._build_cache()
         collector = cache.metrics_collector
