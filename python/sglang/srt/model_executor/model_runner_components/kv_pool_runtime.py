@@ -34,6 +34,9 @@ class PostCaptureKVResize(msgspec.Struct, frozen=True, kw_only=True):
     full_max_total_num_tokens: Optional[int]
     swa_max_total_num_tokens: Optional[int]
     capped_max_running_requests: Optional[int]
+    # Which limit set capped_max_running_requests (see
+    # KVCacheConfigurator.resolve_max_num_reqs); None when the cap did not move.
+    max_running_requests_cap_source: Optional[str] = None
 
 
 def compute_post_capture_kv_resize(
@@ -87,6 +90,7 @@ def compute_post_capture_kv_resize(
     model_runner.token_to_kv_pool_allocator.resize(config)
 
     capped_max_running_requests = None
+    capped_cap_source = None
     if model_runner.max_running_requests is not None:
         # Re-calculate max_running_requests for the now smaller pool
         capped_reqs = min(
@@ -102,6 +106,13 @@ def compute_post_capture_kv_resize(
                 capped_reqs,
             )
             capped_max_running_requests = capped_reqs
+            # resolve_max_num_reqs just recorded the limit that produced the
+            # smaller value; carry it so the exported gauge stays truthful.
+            capped_cap_source = getattr(
+                model_runner.kv_cache_configurator,
+                "max_running_requests_cap_source",
+                None,
+            )
     logger.info(
         "Post-capture KV sizing: max_total_num_tokens=%d, free memory=%.2f GB",
         config.max_total_num_tokens,
@@ -112,4 +123,5 @@ def compute_post_capture_kv_resize(
         full_max_total_num_tokens=config.full_max_total_num_tokens,
         swa_max_total_num_tokens=config.swa_max_total_num_tokens,
         capped_max_running_requests=capped_max_running_requests,
+        max_running_requests_cap_source=capped_cap_source,
     )

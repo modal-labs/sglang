@@ -26,6 +26,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    kv_age_hit_pending,
+    mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
@@ -96,6 +98,7 @@ class UnifiedTreeNode:
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
+        self.creation_wall = self.last_access_wall = time.monotonic()
         self.hash_value = None
         self.hit_count = 0
         self.priority = priority
@@ -1083,8 +1086,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
+        observe_kv_age = self.metrics_collector is not None and kv_age_hit_pending(
+            params
+        )
+        now_wall = time.monotonic() if self.metrics_collector is not None else None
+        if observe_kv_age and best_match_node.parent is not None:
+            mark_kv_age_hit_observed(params)
         while node_update:
+            if observe_kv_age:
+                self._emit_kv_age(
+                    node_update,
+                    "hit",
+                    "host" if node_update.evicted else "device",
+                    "hit",
+                    now_wall,
+                )
             node_update.last_access_time = cur_time
+            if now_wall is not None:
+                node_update.last_access_wall = now_wall
             cur_time -= 0.00001
             node_update = node_update.parent
 
@@ -1129,6 +1148,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        new_node.creation_wall = child.creation_wall
+        new_node.last_access_wall = child.last_access_wall
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -1160,8 +1181,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(child)
         return new_node
 
+    def _emit_kv_age(self, node, event, tier, outcome, now=None):
+        collector = self.metrics_collector
+        if collector is None or node.parent is None or node.key is None:
+            return
+        if now is None:
+            now = time.monotonic()
+        age = now - node.last_access_wall
+        if event == "evict":
+            collector.observe_kv_eviction(
+                age,
+                now - node.creation_wall,
+                node.hit_count,
+                len(node.key),
+                tier=tier,
+                outcome=outcome,
+            )
+        else:
+            collector.observe_kv_age(
+                age, len(node.key), event=event, tier=tier, outcome=outcome
+            )
+
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
+        if self.metrics_collector is not None:
+            node.last_access_wall = time.monotonic()
         if node != self.root_node:
             for comp in self._components_tuple:
                 if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1576,6 +1620,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         """GPU→CPU demotion: release all device resources, node stays in tree."""
         assert not node.evicted and node.backuped
+        self._emit_kv_age(node, "evict", "device", "demoted")
         trigger = self.components[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
@@ -1683,6 +1728,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         """Free every component layer on the node and detach it from the LRU
         lists and evictable leaf sets."""
+        self._emit_kv_age(
+            node,
+            "evict",
+            "host" if medium == StorageMedium.CPU else "device",
+            "dropped",
+        )
         self._record_remove_event(node, medium=medium)
         for comp in self._components_tuple:
             self._evict_component_and_detach_lru(
@@ -1708,6 +1759,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
+        self._emit_kv_age(node, "evict", "host", "dropped")
 
         self._record_remove_event(node, medium=StorageMedium.CPU)
         for comp in self._components_tuple:
