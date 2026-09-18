@@ -58,18 +58,35 @@ class QueueCount:
 
     total: int = 0
     by_priority: Optional[Dict[int, int]] = None
+    # Requests retracted from decode (KV pressure) waiting to resume.
+    num_retracted: int = 0
 
     @classmethod
-    def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
+    def from_reqs(
+        cls,
+        reqs: List[Req],
+        enable_priority_scheduling: bool = False,
+        count_retracted: bool = False,
+    ):
         # NOTE: If requests have priority=None (no --default-priority-value set),
         # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
         # Set --default-priority-value when enabling priority scheduling to avoid this.
-        by_priority = (
-            dict(Counter(req.priority for req in reqs))
-            if enable_priority_scheduling
-            else None
+        if not enable_priority_scheduling and not count_retracted:
+            return cls(total=len(reqs))
+        by_priority: Optional[Counter] = (
+            Counter() if enable_priority_scheduling else None
         )
-        return cls(total=len(reqs), by_priority=by_priority)
+        num_retracted = 0
+        for req in reqs:
+            if by_priority is not None:
+                by_priority[req.priority] += 1
+            if count_retracted and req.is_retracted:
+                num_retracted += 1
+        return cls(
+            total=len(reqs),
+            by_priority=dict(by_priority) if by_priority is not None else None,
+            num_retracted=num_retracted,
+        )
 
 
 @dataclass
@@ -78,6 +95,16 @@ class SchedulerStats:
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_grammar_queue_reqs: int = 0
+    # Split of the waiting queue by what a request is waiting for.
+    # prefill_queue_depth: never-prefilled requests waiting for their first prefill.
+    # decode_queue_depth:  retracted requests (evicted mid-decode under KV pressure)
+    #                      waiting to be re-prefilled and resume decoding.
+    # Invariant (non-PD): prefill_queue_depth + decode_queue_depth == num_queue_reqs.total
+    # In PD mode these mirror the engine's own queues (bootstrap+inflight / prealloc+transfer).
+    prefill_queue_depth: int = 0
+    decode_queue_depth: int = 0
+    # 1 while a chunked prefill is in progress (scheduler.chunked_req is set), else 0.
+    num_prefill_inflight_reqs: int = 0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     decode_sum_seq_lens: int = 0
@@ -354,6 +381,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.num_grammar_queue_reqs = Gauge(
             name="sglang:num_grammar_queue_reqs",
             documentation="The number of requests in the grammar waiting queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prefill_queue_depth = Gauge(
+            name="sglang:prefill_queue_depth",
+            documentation="The number of waiting requests that have not been prefilled yet (waiting for a prefill slot).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_queue_depth = Gauge(
+            name="sglang:decode_queue_depth",
+            documentation="The number of waiting requests that were retracted from decode (KV pressure) and are waiting to resume.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_prefill_inflight_reqs = Gauge(
+            name="sglang:num_prefill_inflight_reqs",
+            documentation="The number of requests with a chunked prefill in progress (0 or 1).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1127,6 +1172,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.max_running_requests = Gauge(
+            name="sglang:max_running_requests",
+            documentation="Maximum number of concurrently running requests (--max-running-requests).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.max_queued_requests = Gauge(
+            name="sglang:max_queued_requests",
+            documentation="Maximum waiting queue length before new requests are rejected (--max-queued-requests).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.replica_gpu_info = Gauge(
+            name="sglang:replica_gpu_info",
+            documentation="Info gauge (always 1) carrying the GPU type and GPU count of this replica as labels.",
+            labelnames=[*labels.keys(), "gpu_type", "gpu_count"],
+            multiprocess_mode="mostrecent",
+        )
         self.startup_available_gpu_memory_gb = Gauge(
             name="sglang:startup_available_gpu_memory_gb",
             documentation="Available GPU memory in GB at startup.",
@@ -1379,6 +1442,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
+        self._log_gauge(self.prefill_queue_depth, stats.prefill_queue_depth)
+        self._log_gauge(self.decode_queue_depth, stats.decode_queue_depth)
+        self._log_gauge(self.num_prefill_inflight_reqs, stats.num_prefill_inflight_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
@@ -1519,8 +1585,20 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         num_pages: int,
         context_len: int,
         startup_available_gpu_memory_gb: float,
+        max_running_requests: Optional[int] = None,
+        max_queued_requests: Optional[int] = None,
+        gpu_type: Optional[str] = None,
+        gpu_count: Optional[int] = None,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
+        if max_running_requests is not None:
+            self._log_gauge(self.max_running_requests, max_running_requests)
+        if max_queued_requests is not None:
+            self._log_gauge(self.max_queued_requests, max_queued_requests)
+        if gpu_type is not None and gpu_count is not None:
+            self.replica_gpu_info.labels(
+                **self.labels, gpu_type=gpu_type, gpu_count=str(gpu_count)
+            ).set(1)
         if max_running_requests_under_SLO is not None:
             self._log_gauge(
                 self.max_running_requests_under_SLO, max_running_requests_under_SLO

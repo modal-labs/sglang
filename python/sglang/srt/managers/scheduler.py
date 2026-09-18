@@ -271,7 +271,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import get_device_name, is_npu
 from sglang.srt.utils.cudacore_pyspy_dump_utils import enable_faulthandler_signal_dump
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -1078,7 +1078,19 @@ class Scheduler(
                 num_pages=self.max_total_num_tokens // self.page_size,
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
+                max_running_requests=self.max_running_requests,
+                max_queued_requests=self.max_queued_requests,
+                gpu_type=get_device_name(self.ps.gpu_id),
+                gpu_count=self._replica_gpu_count(),
             )
+
+    def _replica_gpu_count(self) -> int:
+        # Configured allocation, not process-visible devices (which differ under
+        # per-process device isolation or over-provisioned hosts). DP-attention
+        # ranks are a subset of TP; plain DP launches independent TP groups.
+        args = self.server_args
+        dp_groups = 1 if args.enable_dp_attention else args.dp_size
+        return args.tp_size * args.pp_size * dp_groups
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
