@@ -2232,6 +2232,9 @@ KV_AGE_BUCKETS = (
     7200.0,
 )
 _KV_AGE_LABELS = tuple(str(int(b)) for b in KV_AGE_BUCKETS) + ("+Inf",)
+# Why a ghost-list entry was discarded: reinsert = popped by the hit that
+# consumed it, ttl / capacity = the list's two bounds, flush = cache reset.
+KV_GHOST_DISCARD_REASONS = ("reinsert", "ttl", "capacity", "flush")
 KV_REUSE_BUCKETS = (0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 
 
@@ -2412,6 +2415,72 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             buckets=list(KV_REUSE_BUCKETS),
         )
 
+        # KV ghost list (mem_cache/kv_ghost_list.py): pages whose last copy was
+        # destroyed are remembered; an insert that recreates one of them is a
+        # capacity miss. Single label set per cache, so the children are
+        # resolved here once, which also pre-seeds every series at zero.
+        self.kv_reinsert_after_evict_seconds = Histogram(
+            name="sglang:kv_reinsert_after_evict_seconds",
+            documentation="Seconds between a radix node's last copy being "
+            "destroyed (a dropped eviction on any tier) and an insert "
+            "recreating the same prefix, observed once per dropped fragment "
+            "that came back. This is the direct capacity-miss signal: a "
+            "sample at 90s says keeping that data 90s longer would have "
+            "turned a recompute into a hit. Bounded by the ghost list's TTL "
+            "(SGLANG_KV_GHOST_LIST_TTL_S); reinserts after that read as "
+            "cold misses.",
+            labelnames=labels.keys(),
+            buckets=list(KV_AGE_BUCKETS),
+        )
+        self.kv_recomputed_after_evict_tokens = Counter(
+            name="sglang:kv_recomputed_after_evict_tokens_total",
+            documentation="Tokens inserted as new radix nodes whose prefix the "
+            "cache had held and evicted, by the eviction-to-reinsert delay "
+            "bucket (age_le is the bucket upper edge in seconds, or +Inf). "
+            "Divide by sglang:kv_inserted_tokens_total for the share of "
+            "fresh KV that is recomputation of evicted data.",
+            labelnames=list(labels.keys()) + ["age_le"],
+        )
+        self.kv_inserted_tokens = Counter(
+            name="sglang:kv_inserted_tokens_total",
+            documentation="Tokens inserted into the radix tree as new nodes "
+            "(KV the cache did not already hold), counted at the same site "
+            "as sglang:kv_recomputed_after_evict_tokens_total so the two "
+            "are directly comparable.",
+            labelnames=labels.keys(),
+        )
+        self.kv_ghost_list_recorded_pages = Counter(
+            name="sglang:kv_ghost_list_recorded_pages_total",
+            documentation="Pages added to the KV ghost list, one per page of "
+            "each node whose last copy was destroyed.",
+            labelnames=labels.keys(),
+        )
+        self.kv_ghost_list_discarded_pages = Counter(
+            name="sglang:kv_ghost_list_discarded_pages_total",
+            documentation="Pages removed from the KV ghost list, by reason: "
+            "reinsert (consumed by a hit), ttl (older than "
+            "SGLANG_KV_GHOST_LIST_TTL_S), capacity (list full, "
+            "SGLANG_KV_GHOST_LIST_PAGES), flush (cache reset). recorded minus "
+            "discarded is the list's current size. A large capacity share "
+            "means the list is too small to see the reinsert tail.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        self._kv_reinsert_hist = self.kv_reinsert_after_evict_seconds.labels(**labels)
+        self._kv_recomputed_children = {
+            age_le: self.kv_recomputed_after_evict_tokens.labels(
+                **labels, age_le=age_le
+            )
+            for age_le in _KV_AGE_LABELS
+        }
+        self._kv_inserted_child = self.kv_inserted_tokens.labels(**labels)
+        self._kv_ghost_recorded_child = self.kv_ghost_list_recorded_pages.labels(
+            **labels
+        )
+        self._kv_ghost_discarded_children = {
+            reason: self.kv_ghost_list_discarded_pages.labels(**labels, reason=reason)
+            for reason in KV_GHOST_DISCARD_REASONS
+        }
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="GPU-stream span of a merged host-to-device load-back "
@@ -2578,6 +2647,22 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         lifetime, reuses_h = self._kv_eviction_children(tier, outcome)
         lifetime.observe(lifetime_seconds)
         reuses_h.observe(reuses)
+
+    # KV ghost list hooks (mem_cache/kv_ghost_list.py::KVGhostTracker).
+    def observe_kv_reinsert_after_evict(
+        self, delay_seconds: float, num_tokens: int
+    ) -> None:
+        self._kv_reinsert_hist.observe(delay_seconds)
+        self._kv_recomputed_children[kv_age_bucket(delay_seconds)].inc(num_tokens)
+
+    def increment_kv_inserted_tokens(self, num_tokens: int) -> None:
+        self._kv_inserted_child.inc(num_tokens)
+
+    def increment_kv_ghost_list_recorded(self, num_pages: int) -> None:
+        self._kv_ghost_recorded_child.inc(num_pages)
+
+    def increment_kv_ghost_list_discarded(self, reason: str, num_pages: int) -> None:
+        self._kv_ghost_discarded_children[reason].inc(num_pages)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):
