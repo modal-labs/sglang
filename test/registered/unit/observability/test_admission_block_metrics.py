@@ -199,8 +199,8 @@ def test_account_admission_block_excludes_admitted_and_skipped_requests():
 def test_req_slot_cause_with_a_binding_beam_cap():
     """A beam candidate needs beam_width rows: when available // beam_width is
     the smaller operand (zero or not) the row pool is binding, not PP."""
-    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.managers import scheduler as scheduler_module
+    from sglang.srt.managers.scheduler import Scheduler
 
     sched = object.__new__(Scheduler)
     sched.running_batch = object()
