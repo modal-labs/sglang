@@ -199,6 +199,16 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+        # KV age metrics: the tree core reports per-node hit / eviction ages.
+        if self.metrics_collector is not None:
+            self.tree_core.kv_age_observer = self._observe_kv_age_event
+            if not isinstance(self.tree_core, UnifiedTreeCore):
+                logger.warning(
+                    "KV age metrics (sglang:kv_age_seconds and friends) are only emitted "
+                    "by the Python tree core; %s does not call the observer, so those "
+                    "series will stay empty.",
+                    type(self.tree_core).__name__,
+                )
 
         # Session ref tracking (--enable-session-radix-cache).
         self.session_refs = UnifiedSessionRefTracker(
@@ -776,6 +786,26 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.cache_controller is not None
             and self.cache_controller.write_policy == "write_through"
         )
+
+    def _observe_kv_age_event(
+        self,
+        event: str,
+        tier: str,
+        outcome: str,
+        age_seconds: float,
+        lifetime_seconds: float,
+        reuses: int,
+        num_tokens: int,
+    ) -> None:
+        """Tree-core callback: forward one node's age to the metrics collector."""
+        if event in ("hit", "request_hit"):
+            self.metrics_collector.observe_kv_age(
+                age_seconds, num_tokens, event=event, tier=tier, outcome=outcome
+            )
+        else:
+            self.metrics_collector.observe_kv_eviction(
+                age_seconds, lifetime_seconds, reuses, num_tokens, tier, outcome
+            )
 
     def _record_dropped_tokens(self, dropped_tokens: int, reason: str) -> None:
         """Record logical KV tokens irreversibly dropped without a host backup."""

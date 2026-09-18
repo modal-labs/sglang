@@ -44,6 +44,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    kv_age_hit_pending,
+    mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
@@ -442,7 +444,16 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        observe_kv_age = self.metrics_collector is not None and kv_age_hit_pending(
+            params
+        )
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, observe_kv_age=observe_kv_age
+        )
+        # Any non-root match consumed the observation: `value` holds device
+        # indices only, so a host-only HiCache hit leaves it empty.
+        if observe_kv_age and last_node is not self.root_node:
+            mark_kv_age_hit_observed(params)
         if value:
             value = torch.cat(value)
         else:
@@ -622,10 +633,12 @@ class RadixCache(BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        now = time.monotonic()
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            self._observe_kv_eviction(x, len(x.value), "device", "dropped", now)
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
@@ -639,6 +652,28 @@ class RadixCache(BasePrefixCache):
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _observe_kv_eviction(
+        self,
+        node: TreeNode,
+        num_tokens: int,
+        tier: str,
+        outcome: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record age / lifetime / reuse metrics for a node leaving a tier."""
+        if self.metrics_collector is None:
+            return
+        if now is None:
+            now = time.monotonic()
+        self.metrics_collector.observe_kv_eviction(
+            age_seconds=now - node.last_access_time,
+            lifetime_seconds=now - node.creation_time,
+            reuses=node.hit_count,
+            num_tokens=num_tokens,
+            tier=tier,
+            outcome=outcome,
+        )
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
@@ -696,17 +731,35 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, observe_kv_age: bool = False
+    ):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
         child_key = key.child_key(self.page_size)
 
         value = []
+        # Per-request sample: the deepest matched node's idle time, weighted
+        # by the whole matched prefix (see _observe_request_hit).
+        request_idle = 0.0
+        request_tokens = 0
+        request_tier = "device"
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = access_time
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if observe_kv_age:
+                request_idle = access_time - child.last_access_time
+                request_tokens += prefix_len
+                request_tier = "host" if child.evicted else "device"
+                self.metrics_collector.observe_kv_age(
+                    request_idle,
+                    prefix_len,
+                    event="hit",
+                    tier=request_tier,
+                    outcome="hit",
+                )
+            child.last_access_time = access_time
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -720,6 +773,14 @@ class RadixCache(BasePrefixCache):
                 if len(key):
                     child_key = key.child_key(self.page_size)
 
+        if observe_kv_age and request_tokens > 0:
+            self.metrics_collector.observe_kv_age(
+                request_idle,
+                request_tokens,
+                event="request_hit",
+                tier=request_tier,
+                outcome="hit",
+            )
         return value, node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
@@ -727,6 +788,9 @@ class RadixCache(BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
         new_node.hit_count = child.hit_count
+        # A split re-shapes the tree; it does not create KV. The retained prefix
+        # keeps the residency start its lifetime metric is measured from.
+        new_node.creation_time = child.creation_time
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref

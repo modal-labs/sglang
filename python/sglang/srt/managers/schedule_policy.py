@@ -4,6 +4,7 @@ import logging
 from array import array
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.admission_block import AdmissionBlockCause
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -54,11 +55,12 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.base_prefix_cache import (
+from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: F401  re-exported; tests import it here
     BasePrefixCache,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    get_mamba_cache_miss_tokens,
     zero_match_result,
 )
 from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -194,6 +196,7 @@ def match_prefix_for_req(
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
+    req.mamba_cache_miss_tokens = get_mamba_cache_miss_tokens(match_result)
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
@@ -516,6 +519,10 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
+        # Constraint behind the last non-CONTINUE verdict (an AdmissionBlockCause
+        # value); None after CONTINUE. The scheduler labels its admission-block
+        # metrics with it.
+        self.stop_cause: Optional[str] = None
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
@@ -619,7 +626,7 @@ class PrefillAdder:
         if candidate_metric <= PREFILL_TILE_BUDGET:
             return None
 
-        return AddReqResult.OTHER
+        return self._stop(AddReqResult.OTHER, AdmissionBlockCause.PREFILL_TILE_BUDGET)
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -807,27 +814,41 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _stop(self, result: AddReqResult, cause: str) -> AddReqResult:
+        """Record which gate produced a non-CONTINUE verdict and return it."""
+        self.stop_cause = cause
+        return result
+
+    def _dllm_block_cause(self) -> str:
+        if int(self.rem_total_tokens) <= 0:
+            return AdmissionBlockCause.KV_TOKENS
+        return AdmissionBlockCause.DLLM_BUDGET
+
     def budget_state(self):
-        no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
-        if not no_token and self.is_hybrid_swa:
-            no_token = self.rem_swa_tokens <= 0
+        if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+            return self._stop(AddReqResult.NO_TOKEN, AdmissionBlockCause.KV_TOKENS)
+        if self.is_hybrid_swa and self.rem_swa_tokens <= 0:
+            return self._stop(AddReqResult.NO_TOKEN, AdmissionBlockCause.SWA_TOKENS)
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
         # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
-        if not no_token and self.rem_mamba_slots is not None:
-            no_token = self.rem_mamba_slots <= 0
-        if no_token:
-            return AddReqResult.NO_TOKEN
+        if self.rem_mamba_slots is not None and self.rem_mamba_slots <= 0:
+            return self._stop(AddReqResult.NO_TOKEN, AdmissionBlockCause.MAMBA_SLOTS)
 
         if self.rem_input_tokens <= 0:
-            return AddReqResult.OTHER
+            return self._stop(
+                AddReqResult.OTHER, AdmissionBlockCause.MAX_PREFILL_TOKENS
+            )
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._stop(AddReqResult.OTHER, AdmissionBlockCause.DLLM_BUDGET)
         else:
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._stop(
+                    AddReqResult.OTHER, AdmissionBlockCause.CHUNKED_PREFILL_SIZE
+                )
 
+        self.stop_cause = None
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
@@ -966,14 +987,14 @@ class PrefillAdder:
         _rem_tokens = self._get_dllm_remain_tokens()
 
         if _rem_tokens <= 0:
-            return AddReqResult.NO_TOKEN
+            return self._stop(AddReqResult.NO_TOKEN, self._dllm_block_cause())
 
         # Truncate input length to available tokens and update request metadata
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
         if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
-            return AddReqResult.NO_TOKEN
+            return self._stop(AddReqResult.NO_TOKEN, self._dllm_block_cause())
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -994,11 +1015,10 @@ class PrefillAdder:
         )
 
         # Return based on remaining token availability
-        return (
-            AddReqResult.NO_TOKEN
-            if self._get_dllm_remain_tokens() <= 0
-            else AddReqResult.CONTINUE
-        )
+        if self._get_dllm_remain_tokens() <= 0:
+            return self._stop(AddReqResult.NO_TOKEN, self._dllm_block_cause())
+        self.stop_cause = None
+        return AddReqResult.CONTINUE
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
@@ -1077,7 +1097,7 @@ class PrefillAdder:
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
-            return AddReqResult.NO_TOKEN
+            return self._stop(AddReqResult.NO_TOKEN, AdmissionBlockCause.KV_TOKENS)
         if self.is_hybrid_swa:
             if (
                 self._swa_budget_for_req(
@@ -1085,7 +1105,7 @@ class PrefillAdder:
                 )
                 > self.rem_swa_tokens
             ):
-                return AddReqResult.NO_TOKEN
+                return self._stop(AddReqResult.NO_TOKEN, AdmissionBlockCause.SWA_TOKENS)
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1133,7 +1153,9 @@ class PrefillAdder:
                 min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
                 # reserve tokens for corner cases
                 if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                    return AddReqResult.NO_TOKEN
+                    return self._stop(
+                        AddReqResult.NO_TOKEN, AdmissionBlockCause.KV_TOKENS
+                    )
                 tokens_freed += tokens_occupied
 
         if (self.prefill_delayer_single_pass is not None) and (
@@ -1145,11 +1167,11 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
         ):
-            return AddReqResult.OTHER
+            return self._stop(AddReqResult.OTHER, AdmissionBlockCause.PREFILL_DELAYER)
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._stop(AddReqResult.OTHER, AdmissionBlockCause.DLLM_BUDGET)
 
             if (
                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
@@ -1180,7 +1202,9 @@ class PrefillAdder:
             )
         else:
             if self.rem_chunk_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._stop(
+                    AddReqResult.OTHER, AdmissionBlockCause.CHUNKED_PREFILL_SIZE
+                )
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
@@ -1211,10 +1235,14 @@ class PrefillAdder:
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
-            return AddReqResult.OTHER
+            return self._stop(
+                AddReqResult.OTHER, AdmissionBlockCause.PREFILL_MAX_REQUESTS
+            )
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
-            return AddReqResult.OTHER
+            return self._stop(
+                AddReqResult.OTHER, AdmissionBlockCause.PREFILL_MAX_REQUESTS
+            )
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
@@ -1240,7 +1268,7 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
+            return self._stop(AddReqResult.NO_TOKEN, AdmissionBlockCause.KV_TOKENS)
 
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
@@ -1258,12 +1286,16 @@ class PrefillAdder:
                     self._swa_new_tokens(req),
                     req.swa_host_hit_length,
                 ):
-                    return AddReqResult.NO_TOKEN
+                    return self._stop(
+                        AddReqResult.NO_TOKEN, AdmissionBlockCause.SWA_TOKENS
+                    )
                 swa_cap = self._swa_chunk_cap(
                     self._swa_new_tokens(req), req.swa_host_hit_length
                 )
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
-                    return AddReqResult.NO_TOKEN
+                    return self._stop(
+                        AddReqResult.NO_TOKEN, AdmissionBlockCause.SWA_TOKENS
+                    )
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
         if (
@@ -1274,12 +1306,14 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
-            return AddReqResult.OTHER
+            return self._stop(
+                AddReqResult.OTHER, AdmissionBlockCause.MAX_PREFILL_TOKENS
+            )
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
+                return self._stop(AddReqResult.NO_TOKEN, AdmissionBlockCause.KV_TOKENS)
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
@@ -1294,12 +1328,16 @@ class PrefillAdder:
                         self._swa_new_tokens(req),
                         req.swa_host_hit_length,
                     ):
-                        return AddReqResult.NO_TOKEN
+                        return self._stop(
+                            AddReqResult.NO_TOKEN, AdmissionBlockCause.SWA_TOKENS
+                        )
                     swa_cap = self._swa_chunk_cap(
                         self._swa_new_tokens(req), req.swa_host_hit_length
                     )
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
-                        return AddReqResult.NO_TOKEN
+                        return self._stop(
+                            AddReqResult.NO_TOKEN, AdmissionBlockCause.SWA_TOKENS
+                        )
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
@@ -1314,7 +1352,9 @@ class PrefillAdder:
                     waiting_queue_len=self.waiting_queue_len,
                 )
             ):
-                return AddReqResult.OTHER
+                return self._stop(
+                    AddReqResult.OTHER, AdmissionBlockCause.PREFILL_DELAYER
+                )
 
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
@@ -1341,11 +1381,15 @@ class PrefillAdder:
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
+                return self._stop(
+                    AddReqResult.OTHER, AdmissionBlockCause.MAX_PREFILL_TOKENS
+                )
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
+                    return self._stop(
+                        AddReqResult.OTHER, AdmissionBlockCause.DLLM_BUDGET
+                    )
 
                 assert truncation_align_size is None, (
                     "truncation_align_size is not supported for dllm prefill"
@@ -1387,14 +1431,18 @@ class PrefillAdder:
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return self._stop(
+                        AddReqResult.OTHER, AdmissionBlockCause.CHUNKED_PREFILL_SIZE
+                    )
 
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
+                        return self._stop(
+                            AddReqResult.OTHER, AdmissionBlockCause.CHUNKED_PREFILL_SIZE
+                        )
                     else:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
@@ -1405,7 +1453,9 @@ class PrefillAdder:
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return self._stop(
+                        AddReqResult.OTHER, AdmissionBlockCause.CHUNKED_PREFILL_SIZE
+                    )
 
                 if (
                     tile_stop := self._check_prefill_tile_budget(trunc_len)

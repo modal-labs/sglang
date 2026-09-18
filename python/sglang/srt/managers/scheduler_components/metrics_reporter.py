@@ -99,6 +99,8 @@ class PrefillStats:
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
+    mamba_cache_miss_requests: int = 0
+    mamba_cache_miss_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -108,6 +110,17 @@ class PrefillStats:
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
     ):
+        mamba_cache_miss_requests = 0
+        mamba_cache_miss_tokens = 0
+        for req in adder.can_run_list:
+            if getattr(req, "_mamba_cache_miss_reported", False):
+                continue
+            miss_tokens = getattr(req, "mamba_cache_miss_tokens", 0)
+            if miss_tokens > 0:
+                mamba_cache_miss_requests += 1
+                mamba_cache_miss_tokens += miss_tokens
+                req._mamba_cache_miss_reported = True
+
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_replay_tokens=adder.log_replay_tokens,
@@ -123,6 +136,8 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            mamba_cache_miss_requests=mamba_cache_miss_requests,
+            mamba_cache_miss_tokens=mamba_cache_miss_tokens,
         )
 
 
@@ -596,6 +611,13 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def record_admission_block(self, cause: str, num_blocked_reqs: int) -> None:
+        """A prefill admission pass ended with `num_blocked_reqs` waiting
+        requests it could not admit; `cause` is the gate that stopped it."""
+        if not self.current_scheduler_metrics_enabled:
+            return
+        self.metrics_collector.increment_admission_blocked(cause, num_blocked_reqs)
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -691,6 +713,10 @@ class SchedulerMetricsReporter:
                 ),
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
                 dp_cooperation_info=dp_cooperation_info,
+            )
+            self.metrics_collector.increment_mamba_cache_miss(
+                num_requests=prefill_stats.mamba_cache_miss_requests,
+                num_tokens=prefill_stats.mamba_cache_miss_tokens,
             )
             if self.enable_mfu_metrics:
                 flops, read_bytes, write_bytes = self._estimate_prefill_perf(batch)

@@ -24,9 +24,10 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
+    radix_cache_metric_labels,
     resolve_collector_class,
 )
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
@@ -55,6 +56,42 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+
+
+def get_mamba_cache_miss_tokens(match_result: MatchResult) -> int:
+    """Return Full-KV tokens blocked by a missing reusable Mamba checkpoint."""
+    if match_result.mamba_branching_seqlen is None:
+        return 0
+
+    mamba_boundary_len = len(match_result.device_indices) + match_result.host_hit_length
+    if match_result.full_kv_hit_length <= mamba_boundary_len:
+        return 0
+
+    return max(
+        min(match_result.mamba_branching_seqlen, match_result.full_kv_hit_length)
+        - mamba_boundary_len,
+        0,
+    )
+
+
+def kv_age_hit_pending(params: MatchPrefixParams) -> bool:
+    """True until the request's first *non-empty* match has been observed.
+
+    Only a request's first real hit measures reuse: the scheduler re-matches
+    waiting requests every round and the cache re-matches after each insert,
+    and those would all land in the sub-second age bucket. A zero-token match
+    does not count as observed, so a request that queued against a cold cache
+    still reports the hit when a sibling fills its prefix in a later round.
+    Matches without a request (tests, probes) never observe.
+    """
+    req = params.req
+    return req is not None and not getattr(req, "kv_age_hit_observed", False)
+
+
+def mark_kv_age_hit_observed(params: MatchPrefixParams) -> None:
+    """Consume the request's one hit observation (call after a non-empty match)."""
+    if params.req is not None:
+        params.req.kv_age_hit_observed = True
 
 
 @dataclasses.dataclass
@@ -292,7 +329,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
-        labels = {"cache_type": self.__class__.__name__}
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        labels = radix_cache_metric_labels(
+            self.__class__.__name__, get_parallel(), is_dp_attention_enabled()
+        )
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
