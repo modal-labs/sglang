@@ -15,6 +15,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -30,6 +31,7 @@ PORT = 8000
 MODEL_NAME = "moonshotai/Kimi-K3"
 MODEL_REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 MODEL_PATH = MODEL_NAME
+RUNTIME_MODEL_PATH = "/tmp/kimi-k3-model"
 DFLASH_VOLUME_NAME = "dflash_spec"
 DFLASH_MOUNT_PATH = "/dflash"
 # DFlash2 draft (architectures: ["DFlash2DraftModel"]); the engine selects the
@@ -62,7 +64,7 @@ LOAD_FORMAT = "fastsafetensors"
 DRAFT_LOAD_FORMAT = "safetensors"
 
 DRAFT_KV_CACHE_DTYPE = "bf16"
-MEM_FRACTION_STATIC = "0.915"
+MEM_FRACTION_STATIC = "0.900"
 PREFILL_CUDA_GRAPH_MAX_BS = "4096"
 PREFILL_CUDA_GRAPH_BS = "128 256 512 768 1024 1536 2048 3072 4096"
 DECODE_CUDA_GRAPH_MAX_BS = "48"
@@ -129,6 +131,11 @@ MEMORY_MIB = 1024 * 1024  # 1 TiB: Modal's platform maximum
 
 TARGET_CONCURRENCY = 6
 UNAUTHENTICATED = False
+# Drain window for container stops (scale-in, host reclaim, rolling deploys).
+# One constant drives three aligned deadlines so they cannot drift:
+#   t+120  sglang abandons the drain itself (SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT)
+#   t+150  the exit hook stops waiting and falls through to the 10s kill path
+#   t+180  Modal SIGKILLs the container (exit_grace_period)
 GRACEFUL_DRAIN_SECONDS = 120
 
 HF_CACHE_PATH = "/cache/huggingface"
@@ -169,6 +176,9 @@ K3_ENV_OVERRIDES = {
 
 BASE_RUNTIME_ENV = {
     "SYNC_TOKEN_IDS_ACROSS_TP": "1",
+    # Engine-side abandon deadline for the drain started by stop(); without it
+    # the engine defaults to 0 and never drains on container stop.
+    "SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT": str(GRACEFUL_DRAIN_SECONDS),
     "SGLANG_TRTLLM_GEN_MOE_EAGER_WORKSPACE_BYTES": "4294967296",
     "SGLANG_TRTLLM_GEN_MOE_MAX_TILE_N": "256",
     "SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS": "8192",
@@ -430,6 +440,63 @@ async def _stop_current_container() -> None:
 stop_current_container = synchronize_api(_stop_current_container)
 
 
+# Container lifecycle state, guarded by the lock so the Modal exit hook and
+# the heartbeat thread cannot both start teardown: RUNNING -> STOPPING marks
+# a planned drain (exit hook); RUNNING -> HEARTBEAT_TERMINATING marks
+# heartbeat-initiated teardown. The exit hook may also move
+# HEARTBEAT_TERMINATING -> STOPPING: a planned drain takes precedence and the
+# in-flight heartbeat teardown then yields to it.
+_CONTAINER_STATE_LOCK = threading.Lock()
+_CONTAINER_STATE = "running"
+
+
+def _reset_container_state() -> None:
+    global _CONTAINER_STATE
+    with _CONTAINER_STATE_LOCK:
+        _CONTAINER_STATE = "running"
+
+
+def _container_running() -> bool:
+    with _CONTAINER_STATE_LOCK:
+        return _CONTAINER_STATE == "running"
+
+
+def _container_is_draining() -> bool:
+    with _CONTAINER_STATE_LOCK:
+        return _CONTAINER_STATE == "stopping"
+
+
+def _set_container_stopping() -> None:
+    global _CONTAINER_STATE
+    with _CONTAINER_STATE_LOCK:
+        _CONTAINER_STATE = "stopping"
+
+
+def _begin_heartbeat_termination() -> bool:
+    """Move RUNNING -> HEARTBEAT_TERMINATING exactly once."""
+    global _CONTAINER_STATE
+    with _CONTAINER_STATE_LOCK:
+        if _CONTAINER_STATE != "running":
+            return False
+        _CONTAINER_STATE = "heartbeat_terminating"
+        return True
+
+
+def _exit_unless_draining(reason: str) -> None:
+    """Force-exit the process unless a planned drain has taken over.
+
+    The lock is held across os._exit so the check and the exit are atomic:
+    the exit hook has either already moved the state to STOPPING (we yield
+    and let it finish the drain) or is still blocked in
+    _set_container_stopping() and has not started draining anything.
+    """
+    with _CONTAINER_STATE_LOCK:
+        if _CONTAINER_STATE == "stopping":
+            print(f"planned drain started; skipping forced exit ({reason})")
+            return
+        os._exit(1)
+
+
 def terminate_unhealthy_container() -> None:
     """Collect bounded forensics and stop an unhealthy production container."""
     try:
@@ -443,11 +510,134 @@ def terminate_unhealthy_container() -> None:
         )
     except (OSError, subprocess.SubprocessError) as error:
         print(f"forensics dump failed: {error!r}")
+    # The forensics dump may run for up to 60 s; a planned drain can have
+    # started meanwhile. Yield to it instead of racing ContainerStop and the
+    # forced exit against the drain.
+    if _container_is_draining():
+        print("planned drain started during forensics; skipping ContainerStop")
+        return
     try:
         stop_current_container()
-    finally:
-        time.sleep(60)
-        os._exit(1)
+    except modal.exception.ClientClosed:
+        # The worker already tore down the client: it is draining this
+        # container itself, so exit now instead of waiting for it.
+        _exit_unless_draining("ClientClosed")
+        return
+    except Exception as error:
+        print(f"ContainerStop failed: {error!r}")
+    # Give the platform's stop a minute to land, yielding as soon as the exit
+    # hook begins a planned drain.
+    for _ in range(60):
+        if _container_is_draining():
+            print("planned drain started after ContainerStop; skipping forced exit")
+            return
+        time.sleep(1)
+    _exit_unless_draining("ContainerStop timeout")
+
+
+# Kimi's pinned encoder interprets this reserved token in every string,
+# including tool output and reasoning. Only typed image parts may consume an
+# image prompt. MODEL_REVISION pins the source; the exact function match below
+# prevents a partial or stale edit. (Same rewrite as autoinference's
+# deployments/kimi_k3/prod_serve.py.)
+_KIMI_K3_VULNERABLE_APPEND_TEXT = """def _append_text(
+    segments: list[EncodeSegment],
+    text: Any,
+    image_state: _ImagePromptState,
+) -> None:
+    text = str(text)
+    if text == "":
+        return
+    if image_state.image_prompts is None or IMAGE_PLACEHOLDER not in text:
+        segments.extend(_text(text))
+        return
+
+    parts = text.split(IMAGE_PLACEHOLDER)
+    for i, part in enumerate(parts):
+        segments.extend(_text(part))
+        if i < len(parts) - 1:
+            segments.extend(_segment(image_state.next_prompt(),
+                                     allow_special=True))
+"""
+_KIMI_K3_SAFE_APPEND_TEXT = """def _append_text(
+    segments: list[EncodeSegment],
+    text: Any,
+    image_state: _ImagePromptState,
+) -> None:
+    # Text is always untrusted data. Image prompts are emitted only by the
+    # typed image/image_url branch in _render_content_segments.
+    segments.extend(_text(text))
+"""
+
+
+def _rewrite_kimi_k3_encoding(source: bytes) -> bytes:
+    text = source.decode("utf-8")
+    if text.count(_KIMI_K3_VULNERABLE_APPEND_TEXT) != 1:
+        raise RuntimeError(
+            "Kimi K3 encoder does not contain the reviewed image-placeholder block"
+        )
+    return text.replace(
+        _KIMI_K3_VULNERABLE_APPEND_TEXT,
+        _KIMI_K3_SAFE_APPEND_TEXT,
+    ).encode("utf-8")
+
+
+def prepare_model_snapshot() -> str:
+    """Materialize the pinned snapshot and patch its encoder.
+
+    The stock encoding_k3.py splits any string -- tool output, reasoning, user
+    text -- on the image placeholder and injects image prompt segments. With
+    exactly one prompt per typed image, a stray placeholder either crashes
+    encoding (prompt exhaustion) or misbinds the image. The patched copy makes
+    text always text; typed image/image_url parts emit prompts. Weights are
+    symlinked from the HF cache; only small files are copied, so the shared
+    cache is never mutated.
+    """
+    from huggingface_hub import snapshot_download
+
+    source = Path(snapshot_download(MODEL_NAME, revision=MODEL_REVISION))
+    required = [
+        source / "config.json",
+        source / "encoding_k3.py",
+        source / "kimi_k3_processor.py",
+        source / "media_utils.py",
+        source / "tokenizer_config.json",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            "Kimi K3 snapshot is incomplete or mounted from the wrong cache; "
+            f"missing: {', '.join(missing)}"
+        )
+
+    destination = Path(RUNTIME_MODEL_PATH)
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+
+    materialized_files = 0
+    for source_path in source.rglob("*"):
+        runtime_path = destination / source_path.relative_to(source)
+        if source_path.is_dir():
+            runtime_path.mkdir(exist_ok=True)
+        elif source_path.name.endswith(".safetensors"):
+            runtime_path.symlink_to(source_path)
+        else:
+            runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, runtime_path, follow_symlinks=True)
+            materialized_files += 1
+
+    custom_code = list(destination.glob("*.py"))
+    if not custom_code or any(path.is_symlink() for path in custom_code):
+        raise RuntimeError("Kimi K3 custom model code was not materialized")
+
+    encoding_path = destination / "encoding_k3.py"
+    encoding_path.write_bytes(_rewrite_kimi_k3_encoding(encoding_path.read_bytes()))
+    print(
+        f"Prepared {destination} with {materialized_files} local files; "
+        "patched encoding_k3.py for type-safe image placeholders"
+    )
+    return str(destination)
 
 app = modal.App(name="kimi-k3-fast")
 
@@ -600,6 +790,8 @@ class Server:
         seed_prebuilt_jit(JIT_CACHE_PATH)
         check_dflash2_checkpoint(SPECULATIVE_DRAFT_MODEL_PATH)
         export_deployment_identity()
+        _reset_container_state()
+        model_path = prepare_model_snapshot()
         started = time.monotonic()
 
         print(
@@ -610,7 +802,7 @@ class Server:
         )
 
         self.endpoint = SGLangEndpoint(
-            model_path=MODEL_PATH,
+            model_path=model_path,
             worker_port=PORT,
             tp=TP_SIZE,
             speculative_model_path=SPECULATIVE_DRAFT_MODEL_PATH,
@@ -638,8 +830,12 @@ class Server:
         warmup_elapsed = time.monotonic() - started
 
         start_heartbeat_thread(
-            self.endpoint.health_check,
-            on_failure=terminate_unhealthy_container,
+            lambda: self.endpoint.health_check() if _container_running() else None,
+            on_failure=lambda: (
+                terminate_unhealthy_container()
+                if _begin_heartbeat_termination()
+                else None
+            ),
             poll_interval=10.0,
             max_consecutive_failures=6,
         )
@@ -652,5 +848,27 @@ class Server:
 
     @modal.exit()
     def stop(self) -> None:
-        if hasattr(self, "endpoint"):
-            self.endpoint.stop()
+        _set_container_stopping()
+        if not hasattr(self, "endpoint"):
+            return
+        # Let the engine drain in-flight requests before endpoint.stop()'s
+        # terminate_process (SIGTERM, then SIGKILL after 10s) cuts them off.
+        # Under the fork's signal-identity dedup this SIGTERM is NOT a no-op
+        # when the platform's stop bundle already reached the engine: a
+        # repeated SIGTERM escalates the active drain to force-exit. That is
+        # the intended behavior here — this hook only runs once Modal has
+        # finished waiting (graceful path: in-flight streams already hit
+        # zero; blunt path: streams already severed platform-side), so
+        # escalation speeds teardown without cutting anything still alive.
+        # If no signal reached the engine (paths that signal only the
+        # container main process), this terminate() is what starts the
+        # drain, self-bounded via SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT, so
+        # wait() normally returns early.
+        proc = getattr(self.endpoint, "_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=GRACEFUL_DRAIN_SECONDS + 30)
+            except subprocess.TimeoutExpired:
+                pass
+        self.endpoint.stop()

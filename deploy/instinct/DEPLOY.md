@@ -46,9 +46,9 @@ fork commit since b9e90a6d6, so committing a bundle would embed the previous com
 grow without bound.
 
 ```sh
-git update-ref refs/deploy/engine-<sha9> <RELEASE_SHA> && git bundle create deploy/instinct-2026-09-14/engine-<sha9>.bundle b9e90a6d6ef1859830c3b879cef999092975a41a..refs/deploy/engine-<sha9> b9e90a6d6ef1859830c3b879cef999092975a41a..origin/release/2026-09-14
-git bundle verify deploy/instinct-2026-09-14/engine-<sha9>.bundle
-git bundle list-heads deploy/instinct-2026-09-14/engine-<sha9>.bundle
+git update-ref refs/deploy/engine-<sha9> <RELEASE_SHA> && git bundle create deploy/instinct/engine-<sha9>.bundle b9e90a6d6ef1859830c3b879cef999092975a41a..refs/deploy/engine-<sha9> b9e90a6d6ef1859830c3b879cef999092975a41a..origin/release/2026-09-14
+git bundle verify deploy/instinct/engine-<sha9>.bundle
+git bundle list-heads deploy/instinct/engine-<sha9>.bundle
 ```
 
 The pin ref is needed because bundles only advertise named refs; serve.py checks that the advertised
@@ -81,11 +81,11 @@ The bundle for `K3_RELEASE_SHA` must exist next to `serve.py`; regenerate it wit
 
 ```sh
 K3_MIN_CONTAINERS=1 K3_MAX_CONTAINERS=1 K3_RELEASE_SHA=<sha> MODAL_ENVIRONMENT=cust-instinct \
-modal deploy --name kimi-k3-dev deploy/instinct-2026-09-14/serve.py
+modal deploy --name kimi-k3-dev deploy/instinct/serve.py
 
 # 4-container benchmark endpoint (32 B300s), same recipe:
 K3_MIN_CONTAINERS=4 K3_MAX_CONTAINERS=4 K3_RELEASE_SHA=<sha> MODAL_ENVIRONMENT=cust-instinct \
-modal deploy --name kimi-k3-bench deploy/instinct-2026-09-14/serve.py
+modal deploy --name kimi-k3-bench deploy/instinct/serve.py
 ```
 
 Image build check (in the build log): `rev-parse HEAD == cc7b258e4...`, `status --porcelain` empty,

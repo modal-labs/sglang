@@ -13,8 +13,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEPLOY_FILES = [
-    REPO_ROOT / "deploy/instinct-2026-09-14/serve.py",
-    REPO_ROOT / "deploy/instinct-2026-09-14/serve_probe.py",
+    REPO_ROOT / "deploy/instinct/serve.py",
+    REPO_ROOT / "deploy/instinct/serve_probe.py",
 ]
 
 
