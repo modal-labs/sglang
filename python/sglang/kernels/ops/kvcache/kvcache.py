@@ -58,6 +58,7 @@ def store_cache(
     row_bytes: int = 0,
     num_split: int = 0,  # can be tuned for performance
     size_limit: int = 0,
+    reserved_skip_index: int = -1,
 ) -> None:
     """Store key and value tensors into KV cache at specified indices.
 
@@ -71,6 +72,8 @@ def store_cache(
             reserved padding slot); an index outside [0, size_limit) fails fast
             (device assert) instead of an illegal memory access. Defaults to the
             cache row count when 0.
+        reserved_skip_index (int): Slot that is never written (the reserved
+            padding slot); -1 disables the skip.
     """
     row_bytes = row_bytes or k.shape[-1] * k.element_size()
     module = _jit_kvcache_module(row_bytes)
@@ -91,4 +94,5 @@ def store_cache(
         indices,
         num_split,
         size_limit,
+        reserved_skip_index,
     )

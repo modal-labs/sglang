@@ -89,9 +89,11 @@ def set_mla_kv_buffer(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     num_warps: int = 0,
+    reserved_skip_index: int = -1,
 ) -> None:
     """Write packed [k_nope | k_rope] rows into ``kv_buffer`` at ``loc`` indices
     via a TMA bulk-store. SM90+ only — the caller is expected to gate.
+    Items whose ``loc`` equals ``reserved_skip_index`` (>= 0) are not written.
 
     Shapes (last dim is treated as the row payload; any leading singleton dims
     on the source tensors are flattened away):
@@ -114,4 +116,6 @@ def set_mla_kv_buffer(
         num_warps = _pick_num_warps(n_loc)
 
     module = set_mla_kv_buffer_module(nope_bytes, rope_bytes, is_arch_support_pdl())
-    module.set_mla_kv_buffer(buf, loc, src_nope, src_rope, num_warps)
+    module.set_mla_kv_buffer(
+        buf, loc, src_nope, src_rope, num_warps, reserved_skip_index
+    )

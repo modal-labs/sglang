@@ -57,6 +57,7 @@ struct SetMlaKVConcatQFp8Params {
   // (loc % world == rank) writes. world=1/rank=0 = identity (non-DCP).
   int32_t dcp_world_size;
   int32_t dcp_rank;
+  int64_t reserved_skip_index;  // physical row never written; -1 disables
   // Q quantize + concat side.
   const bf16_t* __restrict__ q_nope;
   const bf16_t* __restrict__ q_rope;
@@ -111,38 +112,40 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
       return;
     }
     const int64_t loc = vloc / params.dcp_world_size;
-    const bf16_t* nope_src = params.k_nope + item_id * params.stride_nope;
-    const bf16_t* rope_src = params.k_rope + item_id * params.stride_rope;
+    if (loc != params.reserved_skip_index) {
+      const bf16_t* nope_src = params.k_nope + item_id * params.stride_nope;
+      const bf16_t* rope_src = params.k_rope + item_id * params.stride_rope;
 
-    // nope: 512 bf16 -> 512 fp8; 16 elems/lane (2 int4 loads -> 1 int4 store).
-    {
-      const int4* src = reinterpret_cast<const int4*>(nope_src);
-      uint2 lo = bf16x8_to_fp8x8(src[lane_id * 2]);
-      uint2 hi = bf16x8_to_fp8x8(src[lane_id * 2 + 1]);
-      reinterpret_cast<int4*>(&smem[warp_in_cta][0])[lane_id] =
-          make_int4(static_cast<int>(lo.x), static_cast<int>(lo.y), static_cast<int>(hi.x), static_cast<int>(hi.y));
-    }
-    // rope: 64 bf16 -> 64 fp8; 2 elems/lane.
-    {
-      const bf16x2_t v = reinterpret_cast<const bf16x2_t*>(rope_src)[lane_id];
-      reinterpret_cast<uint16_t*>(&smem[warp_in_cta][kFp8NopeDim])[lane_id] = bf16x2_to_fp8x2(v);
-    }
+      // nope: 512 bf16 -> 512 fp8; 16 elems/lane (2 int4 loads -> 1 int4 store).
+      {
+        const int4* src = reinterpret_cast<const int4*>(nope_src);
+        uint2 lo = bf16x8_to_fp8x8(src[lane_id * 2]);
+        uint2 hi = bf16x8_to_fp8x8(src[lane_id * 2 + 1]);
+        reinterpret_cast<int4*>(&smem[warp_in_cta][0])[lane_id] =
+            make_int4(static_cast<int>(lo.x), static_cast<int>(lo.y), static_cast<int>(hi.x), static_cast<int>(hi.y));
+      }
+      // rope: 64 bf16 -> 64 fp8; 2 elems/lane.
+      {
+        const bf16x2_t v = reinterpret_cast<const bf16x2_t*>(rope_src)[lane_id];
+        reinterpret_cast<uint16_t*>(&smem[warp_in_cta][kFp8NopeDim])[lane_id] = bf16x2_to_fp8x2(v);
+      }
 
-    // TMA reads smem via the async proxy; fence so it can't observe stale sts.
-    __syncwarp();
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      // TMA reads smem via the async proxy; fence so it can't observe stale sts.
+      __syncwarp();
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
-    if (lane_id == 0) {
-      cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_global,
-          cuda::ptx::space_shared,
-          params.kv_buffer + loc * params.stride_buffer_bytes,
-          &smem[warp_in_cta][0],
-          static_cast<uint32_t>(kFp8RowBytes));
+      if (lane_id == 0) {
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_global,
+            cuda::ptx::space_shared,
+            params.kv_buffer + loc * params.stride_buffer_bytes,
+            &smem[warp_in_cta][0],
+            static_cast<uint32_t>(kFp8RowBytes));
+      }
+      // ``wait_group`` (not ``_read``): waits for gmem commit, not just smem reuse.
+      cuda::ptx::cp_async_bulk_commit_group();
+      cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
     }
-    // ``wait_group`` (not ``_read``): waits for gmem commit, not just smem reuse.
-    cuda::ptx::cp_async_bulk_commit_group();
-    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
   } else if (flat_warp - params.batch_size < params.num_q_items) {
     // --- Q role: quantize one (token, head) row into the fp8 query ---
     const uint32_t q_item = flat_warp - params.batch_size;
@@ -183,7 +186,8 @@ struct SetMlaKVConcatQFp8Kernel {
       tvm::ffi::TensorView q_out,
       int64_t num_warps_per_block,
       int64_t dcp_world_size,
-      int64_t dcp_rank) {
+      int64_t dcp_rank,
+      int64_t reserved_skip_index) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -289,6 +293,7 @@ struct SetMlaKVConcatQFp8Kernel {
         .batch_size = batch,
         .dcp_world_size = static_cast<int32_t>(dcp_world_size),
         .dcp_rank = static_cast<int32_t>(dcp_rank),
+        .reserved_skip_index = reserved_skip_index,
         .q_nope = static_cast<const bf16_t*>(q_nope.data_ptr()),
         .q_rope = static_cast<const bf16_t*>(q_rope.data_ptr()),
         .q_out = static_cast<uint8_t*>(q_out.data_ptr()),

@@ -20,7 +20,10 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
 )
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    PagedTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
@@ -306,6 +309,8 @@ class SchedulerInvariantChecker:
         """committed<=allocated for every req/slot, and no double free:
           A. no owner references a page that is in the free pool (use-after-free).
           B. the free pool has no duplicate pages (two owners freed the same page).
+          C. the allocator's page_allocated bitmap is the complement of the free
+             pool (the free() double-free guard and the free list agree).
         All heavy work runs on GPU to avoid per-token device->host sync."""
         rtt = self.req_to_token_pool.req_to_token
         row_width = rtt.shape[1]
@@ -342,13 +347,24 @@ class SchedulerInvariantChecker:
         active = [
             (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0
         ]
-        if not active:
-            return
 
-        idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
-        allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
-        mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
-        owner_pages = rtt[idx][mask] // self.page_size
+        owner_pages = None
+        if active:
+            idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
+            allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
+            mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
+            owner_pages = rtt[idx][mask] // self.page_size
+
+        # Page 0 is the reserved padded-token page: it is never in the free
+        # pool, so Check A below cannot see an owner referencing it.
+        if owner_pages is not None and (owner_pages == 0).any():
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                "count_memory_leak_warnings",
+                f"KV reserved page 0 referenced by {(owner_pages == 0).sum().item()} "
+                "owner token slots.",
+            )
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
         # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
@@ -387,6 +403,33 @@ class SchedulerInvariantChecker:
                     f"KV double free: sub-pool {i} has {free.numel() - uniq.numel()} duplicate pages.",
                 )
 
+        # Check C: page_allocated[p] == (p not in free pool) for every page.
+        for i, sub in enumerate(sub_allocs):
+            # Backend subclasses can override allocation without maintaining
+            # the plain paged allocator's bitmap.
+            if type(sub) is not PagedTokenToKVPoolAllocator:
+                continue
+            bitmap = sub.page_allocated
+            if bitmap is None:
+                continue
+            expected = torch.ones_like(bitmap)
+            expected[0] = False
+            expected[_free_pages(sub)] = False
+            mismatch = torch.nonzero(bitmap != expected).flatten()
+            if mismatch.numel() > 0:
+                raise_error_or_warn(
+                    self,
+                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                    "count_memory_leak_warnings",
+                    f"KV allocated bitmap disagrees with the free pool: sub-pool {i} "
+                    f"has {mismatch.numel()} mismatching pages, sample="
+                    f"{mismatch[:8].tolist()}, double_free_page_drops="
+                    f"{sub.double_free_page_drops_total(refresh=True)}.",
+                )
+
+        if owner_pages is None:
+            return
+
         # Check A: owner pages (full-pool indices) must not be in the full free
         # set (sub_allocs[0] is the full pool, even on hybrid-SWA).
         full_unique = torch.unique(_free_pages(sub_allocs[0]))
@@ -422,6 +465,16 @@ class SchedulerInvariantChecker:
                 "count_req_pool_leak_warnings",
                 msg,
             )
+
+    def refresh_double_free_page_drops(self):
+        """Idle-tick read of the allocators' double-free guard counters into
+        their host mirrors (the read syncs the device accumulators, so it must
+        not run per step). The first nonzero read logs once; the values are
+        exported through PoolStats as `kv_double_free_page_drops` and
+        `kv_out_of_pool_location_drops`."""
+        alloc = self.token_to_kv_pool_allocator
+        if type(alloc) is PagedTokenToKVPoolAllocator:
+            alloc.double_free_page_drops_total(refresh=True)
 
     def _report_leak(self, pool_name: str, token_msg: str):
         msg = f"{pool_name} memory leak detected! {token_msg}"

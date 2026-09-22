@@ -173,7 +173,14 @@ def set_mla_kv_concat_q(
 
     module = set_mla_kv_concat_q_module(nope_bytes, rope_bytes, is_arch_support_pdl())
     module.set_mla_kv_concat_q(
-        buf, loc, src_nope, src_rope, q_nope, q_rope, q_out, num_warps
+        buf,
+        loc,
+        src_nope,
+        src_rope,
+        q_nope,
+        q_rope,
+        q_out,
+        num_warps,
     )
     return q_out
 
@@ -270,6 +277,7 @@ def set_mla_kv_concat_q_fp8(
     num_warps: int = 0,
     dcp_world_size: int = 1,
     dcp_rank: int = 0,
+    reserved_skip_index: int = -1,
 ) -> torch.Tensor:
     """Quantize bf16 [k_nope | k_rope] rows to fp8-e4m3 and scatter them into
     ``kv_buffer`` at ``loc``, and return the fp8 concatenated query
@@ -279,7 +287,8 @@ def set_mla_kv_concat_q_fp8(
     Under DCP, ``loc`` is VIRTUAL: the physical row is ``loc //
     dcp_world_size`` and only the owner rank (``loc % dcp_world_size ==
     dcp_rank``) writes its KV row (query conversion still runs for every
-    token). world=1/rank=0 is the non-DCP identity.
+    token). world=1/rank=0 is the non-DCP identity. A physical row equal to
+    ``reserved_skip_index`` (>= 0) is never written; its query still converts.
 
     Shapes (leading singleton dims on the k sources are flattened away):
         kv_buffer:    [num_pages, 576] fp8_e4m3/uint8 (or [num_pages, 1, 576])
@@ -314,5 +323,6 @@ def set_mla_kv_concat_q_fp8(
         num_warps,
         dcp_world_size,
         dcp_rank,
+        reserved_skip_index,
     )
     return q_out

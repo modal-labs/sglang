@@ -20,7 +20,7 @@ Page-aligned memory pool.
 """
 
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -101,6 +101,14 @@ def alloc_extend_naive(
             ).view(-1)
 
 
+def _pool_zeroable(kvcache: Optional[KVCache]) -> bool:
+    # A pool is zeroed on hand-out only when its class defines zero_pages
+    # itself. The KVCache base-class generic is a shared convenience, not a
+    # correctness guarantee for exotic storage layouts, so pool classes that
+    # do not define one are skipped and keep their current behavior.
+    return kvcache is not None and "zero_pages" in type(kvcache).__dict__
+
+
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
     An allocator managing the indices to kv cache data.
@@ -119,10 +127,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        zero_pages_on_alloc: bool = False,
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        # Pools sharing this allocator's page index space whose pages are
+        # zeroed on hand-out (the owning pool, plus e.g. a draft pool that
+        # aliases the target allocator).
+        self.zero_pages_pools: List[KVCache] = (
+            [kvcache] if zero_pages_on_alloc and _pool_zeroable(kvcache) else []
+        )
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -158,8 +173,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_pages > len(self.free_pages):
             return None
 
-        out_pages = self.free_pages[:num_pages]
-        self.free_pages = self.free_pages[num_pages:]
+        out_pages = self._pop_free_pages(num_pages)
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -215,7 +229,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        self._pop_free_pages(num_new_pages)
         return out_indices
 
     def alloc_decode(
@@ -254,24 +268,55 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        self._pop_free_pages(num_new_pages)
         return out_indices
+
+    def _pop_free_pages(self, num_pages: int) -> torch.Tensor:
+        # The alloc kernels read pages from the head of free_pages; this hands
+        # those pages out: marks them allocated, zeroes them, drops them
+        # from the free list.
+        out_pages = self.free_pages[:num_pages]
+        self._mark_allocated(out_pages)
+        self._zero_handed_out_pages(out_pages)
+        self.free_pages = self.free_pages[num_pages:]
+        return out_pages
+
+    def register_zero_pages_pool(self, kvcache: KVCache):
+        if self.zero_pages_pools and _pool_zeroable(kvcache):
+            self.zero_pages_pools.append(kvcache)
+
+    def _zero_handed_out_pages(self, pages: torch.Tensor):
+        # Recycled pages are handed out whole; the request only overwrites the
+        # rows it fills, so stale bytes in the remaining rows of a page would
+        # otherwise be visible to page-granular attention kernels.
+        if self.zero_pages_pools and pages.numel() > 0:
+            for pool in self.zero_pages_pools:
+                pool.zero_pages(pages)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
+            # Page 0 is the reserved padded-token page and is never handed
+            # out, so locations below page_size must not recycle it.
+            free_index = self._drop_reserved_locations(free_index, self.page_size)
+            free_page_indices = self._free_pages_of(free_index)
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+            assert not (self.free_pages == 0).any(), "reserved page 0 in free pool"
+            assert not (self.release_pages == 0).any(), "reserved page 0 in free pool"
+            assert not self.page_allocated[self.free_pages].any(), "free page allocated"
+            assert not self.page_allocated[
+                self.release_pages
+            ].any(), "free page allocated"
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -281,6 +326,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._reset_page_allocated(self.num_pages)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

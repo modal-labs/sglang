@@ -4074,6 +4074,8 @@ class Scheduler(
             except Exception:
                 pass
 
+        self.invariant_checker.refresh_double_free_page_drops()
+
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:

@@ -136,6 +136,14 @@ class SchedulerStats:
     kv_available_tokens: int = 0
     kv_evictable_tokens: int = 0
     kv_used_tokens: int = 0
+    # Reserved-page locations that reached an allocator free() and were dropped.
+    kv_reserved_location_drops: int = 0
+    # Pages an allocator free() dropped because they were not allocated
+    # (cross-call double free), as of the scheduler's last idle tick.
+    kv_double_free_page_drops: int = 0
+    # Locations an allocator free() dropped because they lie past the end of
+    # the pool, as of the scheduler's last idle tick.
+    kv_out_of_pool_location_drops: int = 0
 
     swa_available_tokens: int = 0
     swa_evictable_tokens: int = 0
@@ -473,6 +481,35 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.kv_used_tokens = Gauge(
             name="sglang:kv_used_tokens",
             documentation="Number of actively used token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_reserved_location_drops = Gauge(
+            name="sglang:kv_reserved_location_drops",
+            documentation=(
+                "Cumulative KV locations inside the reserved padding page that "
+                "reached an allocator free() and were dropped instead of recycled."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_double_free_page_drops = Gauge(
+            name="sglang:kv_double_free_page_drops",
+            documentation=(
+                "Cumulative KV pages that reached an allocator free() while not "
+                "allocated (cross-call double free) and were dropped instead of "
+                "recycled; refreshed at the scheduler's idle tick."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_out_of_pool_location_drops = Gauge(
+            name="sglang:kv_out_of_pool_location_drops",
+            documentation=(
+                "Cumulative KV locations past the end of the pool that reached an "
+                "allocator free() and were dropped instead of recycled; refreshed "
+                "at the scheduler's idle tick."
+            ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1460,6 +1497,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
         self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
         self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
+        self._log_gauge(
+            self.kv_reserved_location_drops, stats.kv_reserved_location_drops
+        )
+        self._log_gauge(self.kv_double_free_page_drops, stats.kv_double_free_page_drops)
+        self._log_gauge(
+            self.kv_out_of_pool_location_drops, stats.kv_out_of_pool_location_drops
+        )
         self._log_gauge(self.swa_available_tokens, stats.swa_available_tokens)
         self._log_gauge(self.swa_evictable_tokens, stats.swa_evictable_tokens)
         self._log_gauge(self.swa_used_tokens, stats.swa_used_tokens)

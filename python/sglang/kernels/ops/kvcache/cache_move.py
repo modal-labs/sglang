@@ -25,6 +25,7 @@ def set_kv_buffer_prefix_valid_tiled(
     block_size,
     ROW_BYTES: tl.constexpr,
     BYTES_PER_TILE: tl.constexpr,
+    RESERVED_SKIP_INDEX: tl.constexpr = -1,
 ):
     bid = tl.program_id(0)
     row = tl.program_id(1)
@@ -34,11 +35,14 @@ def set_kv_buffer_prefix_valid_tiled(
     if row >= commit_len:
         return
 
+    loc = tl.load(loc_2d_ptr + bid * block_size + row).to(tl.int64)
+    if loc == RESERVED_SKIP_INDEX:
+        return
+
     byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
     mask_byte = byte_off < ROW_BYTES
     tl.multiple_of(byte_off, 16)
 
-    loc = tl.load(loc_2d_ptr + bid * block_size + row)
     src_row = bid * block_size + row
 
     src_k_ptr = tl.cast(src_k_ptr, tl.pointer_type(tl.uint8))

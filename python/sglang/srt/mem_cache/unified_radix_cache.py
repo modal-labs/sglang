@@ -892,7 +892,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return
 
             # Truncate if needed
-            if effective_cache_len < len(token_ids):
+            truncated = effective_cache_len < len(token_ids)
+            if truncated:
+                # This free and the unaligned-tail free after the insert are
+                # position-adjacent at effective_cache_len; were it not page
+                # aligned they would straddle one page and double-free it.
+                assert effective_cache_len % self.page_size == 0, (
+                    f"effective_cache_len={effective_cache_len} is not a multiple "
+                    f"of page_size={self.page_size}"
+                )
                 free_start = max(effective_cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
                 token_ids = token_ids[:effective_cache_len]
@@ -909,6 +917,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.insert(insert_params)
 
             # Free unaligned tail
+            assert not truncated or len(kv_indices) % self.page_size == 0, (
+                f"tail free [{page_aligned_len}:{len(kv_indices)}) shares a page "
+                f"with the truncation free at effective_cache_len={effective_cache_len}"
+            )
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])

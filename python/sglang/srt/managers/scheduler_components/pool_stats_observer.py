@@ -11,6 +11,8 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -27,6 +29,9 @@ class PoolStats:
     full_token_usage: float
     full_available_size: int
     full_evictable_size: int
+    reserved_location_drops: int = 0
+    double_free_page_drops: int = 0
+    out_of_pool_location_drops: int = 0
 
     is_hybrid_swa: bool = False
     is_hybrid_ssm: bool = False
@@ -136,6 +141,9 @@ class PoolStats:
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
+        stats.kv_reserved_location_drops = self.reserved_location_drops
+        stats.kv_double_free_page_drops = self.double_free_page_drops
+        stats.kv_out_of_pool_location_drops = self.out_of_pool_location_drops
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -201,6 +209,17 @@ class SchedulerPoolStatsObserver:
 
         if self.enable_hisparse:
             pool_stats = self._get_hisparse_token_info(pool_stats)
+
+        # Only the plain paged allocator maintains these guard counters.
+        # Composite allocators and backend subclasses retain their own paths.
+        alloc = self.token_to_kv_pool_allocator
+        if type(alloc) is PagedTokenToKVPoolAllocator:
+            pool_stats.reserved_location_drops = alloc.reserved_location_drops_total()
+            # Host mirror refreshed at idle; reading it here adds no sync.
+            pool_stats.double_free_page_drops = alloc.double_free_page_drops_total()
+            pool_stats.out_of_pool_location_drops = (
+                alloc.out_of_pool_location_drops_total()
+            )
 
         # swa + ssm can coexist: overlay mamba fields onto swa stats
         if self.is_hybrid_ssm:

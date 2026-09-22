@@ -139,6 +139,27 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
+def resolve_reserved_skip_index() -> int:
+    """Physical KV row that writers must never store to (the padded-token
+    sink, row 0), or -1 when the guard is disabled."""
+    return 0 if envs.SGLANG_ENABLE_KV_RESERVED_SLOT_WRITE_GUARD.get() else -1
+
+
+def rezero_reserved_row(buf: torch.Tensor, reserved_skip_index: int) -> None:
+    """Restore the reserved row after an index_put fallback writer that cannot
+    predicate on ``loc``. Equivalent to skipping the write (the pool is
+    zero-initialised and nothing else stores there); sync- and capture-safe."""
+    if reserved_skip_index >= 0:
+        buf[reserved_skip_index].zero_()
+
+
+def zero_rows_(buf: torch.Tensor, idx: torch.Tensor) -> None:
+    """``buf[idx] = 0`` along dim 0 through a byte view, so 1-byte float8 /
+    packed FP4 storage (no `index_fill_` kernel for float8) is handled the
+    same as bf16 and the fill is one indexed kernel per buffer."""
+    buf.view(torch.uint8).index_fill_(0, idx, 0)
+
+
 def _set_kv_buffer_impl(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -151,6 +172,7 @@ def _set_kv_buffer_impl(
     size_limit: int,
     alt_stream: Optional[torch.cuda.Stream] = None,
     same_kv_dim: bool = True,
+    reserved_skip_index: int = -1,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
     if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
@@ -162,6 +184,7 @@ def _set_kv_buffer_impl(
             indices,
             row_bytes=row_bytes,
             size_limit=size_limit,
+            reserved_skip_index=reserved_skip_index,
         )
 
     if _is_cpu and _cpu_has_amx_support:
@@ -180,12 +203,16 @@ def _set_kv_buffer_impl(
         current_stream = device_module.current_stream()
         alt_stream.wait_stream(current_stream)
         k_cache[indices] = k
+        rezero_reserved_row(k_cache, reserved_skip_index)
         with device_module.stream(alt_stream):
             v_cache[indices] = v
+            rezero_reserved_row(v_cache, reserved_skip_index)
         current_stream.wait_stream(alt_stream)
     else:  # fallback to naive implementation
         k_cache[indices] = k
         v_cache[indices] = v
+        rezero_reserved_row(k_cache, reserved_skip_index)
+        rezero_reserved_row(v_cache, reserved_skip_index)
 
 
 def _set_kv_buffer_prefix_valid_impl(
@@ -197,6 +224,7 @@ def _set_kv_buffer_prefix_valid_impl(
     commit_lens: torch.Tensor,
     row_dim: int,
     store_dtype: torch.dtype,
+    reserved_skip_index: int = -1,
 ) -> None:
     if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
         return
@@ -244,6 +272,7 @@ def _set_kv_buffer_prefix_valid_impl(
         int(loc_2d.shape[1]),
         ROW_BYTES=row_bytes,
         BYTES_PER_TILE=bytes_per_tile,
+        RESERVED_SKIP_INDEX=reserved_skip_index,
         num_warps=num_warps,
         num_stages=2,
     )
@@ -1629,6 +1658,28 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+    @cached_property
+    def reserved_skip_index(self) -> int:
+        return resolve_reserved_skip_index()
+
+    def page_rows(self, page_ids: torch.Tensor) -> torch.Tensor:
+        return (
+            page_ids[:, None] * self.page_size
+            + torch.arange(self.page_size, device=page_ids.device)
+        ).reshape(-1)
+
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        """Zero every row of the given physical pages on every layer. Called by
+        the page allocator on hand-out so a recycled page carries no stale
+        bytes into the request that receives it."""
+        rows = self.page_rows(page_ids)
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            bufs = self.get_kv_buffer(layer_id)
+            if isinstance(bufs, torch.Tensor):
+                bufs = (bufs,)
+            for buf in bufs:
+                zero_rows_(buf, rows)
+
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
@@ -2141,6 +2192,18 @@ class MHATokenToKVPool(KVCache):
             self._post_capture_owner.close()
             self._post_capture_owner = None
 
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        if self.layer_num == 0:
+            return
+        # hnd / vectorized_5d buffers are page-major (dim 0 is the page).
+        idx = (
+            page_ids
+            if self.use_hnd or self.kv_cache_layout == "vectorized_5d"
+            else self.page_rows(page_ids)
+        )
+        for buf in (*self.k_buffer, *self.v_buffer):
+            zero_rows_(buf, idx)
+
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
@@ -2392,6 +2455,7 @@ class MHATokenToKVPool(KVCache):
             size_limit=self.size + self.page_size,
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
+            reserved_skip_index=self.reserved_skip_index,
         )
 
     def _quantized_scales(self, global_layer_id: int, k_scale, v_scale):
@@ -2726,6 +2790,7 @@ class MHATokenToKVPool(KVCache):
             commit_lens,
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
+            reserved_skip_index=self.reserved_skip_index,
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -3645,6 +3710,9 @@ class HybridLinearKVPool(KVCache):
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        self.full_kv_pool.zero_pages(page_ids)
+
     def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         # Hybrid layer ids are global model-layer ids, while the backing pool
         # is dense over only full-attention layers.  Shape discovery does not
@@ -3931,6 +3999,11 @@ class MLATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.kv_buffer
 
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        rows = self.page_rows(page_ids)
+        for buf in self.kv_buffer:
+            zero_rows_(buf, rows)
+
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
@@ -3999,6 +4072,9 @@ class MLATokenToKVPool(KVCache):
             )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+        rezero_reserved_row(
+            self.kv_buffer[layer_id - self.start_layer], self.reserved_skip_index
+        )
 
     def _write_mla_kv_buffer(
         self,
@@ -4016,6 +4092,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope,
                 cache_k_rope,
                 fp8_dtype,
+                reserved_skip_index=self.reserved_skip_index,
             )
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
@@ -4033,6 +4110,7 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
+                reserved_skip_index=self.reserved_skip_index,
             )
         else:
             if cache_k_nope.dtype != self.dtype:
@@ -4051,6 +4129,7 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
+                reserved_skip_index=self.reserved_skip_index,
             )
 
     def set_mla_kv_buffer(
@@ -4265,12 +4344,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 loc,
                 cache_k_nope_fp4,
                 cache_k_rope_fp4,
+                reserved_skip_index=self.reserved_skip_index,
             )
             set_mla_kv_scale_buffer_triton(
                 self.kv_scale_buffer[layer_id - self.start_layer],
                 loc,
                 cache_k_nope_fp4_sf,
                 cache_k_rope_fp4_sf,
+                reserved_skip_index=self.reserved_skip_index,
             )
 
 

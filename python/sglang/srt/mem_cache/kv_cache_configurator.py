@@ -1541,6 +1541,12 @@ class KVCacheConfigurator:
                             device=self.device,
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
+                            # DCP allocator pages are virtual (dcp_size x
+                            # physical); zero-on-alloc needs physical pages.
+                            zero_pages_on_alloc=(
+                                envs.SGLANG_ENABLE_KV_ZERO_PAGES_ON_ALLOC.get()
+                                and self.server_args.dcp_size == 1
+                            ),
                         )
 
             if self.server_args.enable_hisparse and is_dsv4_model:
@@ -1556,6 +1562,13 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
+            if (
+                isinstance(token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
+                and not self.is_hybrid_swa
+                and token_to_kv_pool.size == token_to_kv_pool_allocator.size
+            ):
+                # The draft pool aliases the target allocator's index space.
+                token_to_kv_pool_allocator.register_zero_pages_pool(token_to_kv_pool)
             if self.is_hybrid_swa:
                 if self.draft_swa_full_capacity:
                     # Banded depth: the SWA ring is full draft capacity, so use

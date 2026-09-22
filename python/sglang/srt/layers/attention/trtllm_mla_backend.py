@@ -1105,6 +1105,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # (identity when attn_dcp_size == 1).
             dcp_world_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
+            reserved_skip_index=self.token_to_kv_pool.reserved_skip_index,
         )
 
     def forward_decode(

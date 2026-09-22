@@ -85,12 +85,14 @@ class EnvField:
         backup_value = os.environ.get(self.name)
         backup_set_to_none = self._set_to_none
         self.set(value)
-        yield
-        if backup_present:
-            os.environ[self.name] = backup_value
-        else:
-            os.environ.pop(self.name, None)
-        self._set_to_none = backup_set_to_none
+        try:
+            yield
+        finally:
+            if backup_present:
+                os.environ[self.name] = backup_value
+            else:
+                os.environ.pop(self.name, None)
+            self._set_to_none = backup_set_to_none
 
     def clear(self):
         os.environ.pop(self.name, None)
@@ -369,6 +371,12 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+
+    # Reserved KV slot/page 0 is the padded-row sink: KV writers skip stores
+    # whose destination is physical row 0.
+    SGLANG_ENABLE_KV_RESERVED_SLOT_WRITE_GUARD = EnvBool(True)
+    # Zero whole page envelopes when the paged allocator hands them out.
+    SGLANG_ENABLE_KV_ZERO_PAGES_ON_ALLOC = EnvBool(True)
 
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
