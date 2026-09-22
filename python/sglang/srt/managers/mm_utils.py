@@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import flatten_nested_list, is_hip, is_npu, print_warning_once
+from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.srt.utils.cuda_ipc_transport_utils import PRECOMPUTED_FEATURE_HASHES_KEY
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
@@ -529,6 +530,34 @@ def _flatten_embedding_result(
     return embedding
 
 
+# (item hash, placeholder token count). The compact feature hash alone is not
+# a safe cache key: two inputs can share a hash yet differ in span length.
+EmbeddingCacheKey = Tuple[Optional[int], int]
+
+
+def _embedding_token_count(embedding: torch.Tensor) -> int:
+    """Return the number of multimodal tokens represented by an embedding."""
+    # Vision encoders may return [tokens, hidden] or a higher-rank tensor.  The
+    # scheduler always consumes the flattened token dimension.
+    return embedding.reshape(-1, embedding.shape[-1]).shape[0]
+
+
+def _discard_mismatched_cached_embedding(
+    cache_key: Optional[int],
+    expected_token_count: int,
+    cached_token_count: int,
+) -> None:
+    """Log and remove a cache entry that cannot serve the current item."""
+    logger.warning(
+        "Discarding cached multimodal embedding due to a token-count mismatch: "
+        "cache_key=%s, expected_tokens=%d, cached_tokens=%d. Recomputing embedding.",
+        cache_key,
+        expected_token_count,
+        cached_token_count,
+    )
+    embedding_cache.free(cache_key, None)
+
+
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
     """Models that materialize and batch visual features inside their encoder.
 
@@ -589,11 +618,11 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
 def _mm_encode_sync_group():
     """Attention-TP group whose ranks must agree on which items to encode.
 
-    Returns None when no cross-rank agreement is needed (flag off, no
-    distributed init, or a single attention-TP rank).
+    Returns None when no cross-rank agreement is needed (no distributed
+    init, or a single attention-TP rank). The sync is unconditional whenever
+    the group has more than one rank: the failure mode without it is a hung
+    encoder collective, not a behavior choice.
     """
-    if not envs.SGLANG_MM_RANK_CONSISTENT_ENCODE.get():
-        return None
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return None
     parallel = get_parallel()
@@ -603,28 +632,28 @@ def _mm_encode_sync_group():
 
 
 def _rank_consistent_miss_hashes(
-    ordered_hashes: List[int],
-    local_misses: Set[int],
+    ordered_keys: List[EmbeddingCacheKey],
+    local_misses: Set[EmbeddingCacheKey],
     tp_group,
     device: torch.device,
-) -> Set[int]:
-    """Return the union over attention-TP ranks of the locally-missed hashes.
+) -> Set[EmbeddingCacheKey]:
+    """Return the union over attention-TP ranks of the locally-missed cache keys.
 
     The embedding cache is per process, so ranks can disagree on which items
     need the ViT. The encoder is DP-sharded across the attention-TP group and
     ends in a collective, so a rank that skips the encode while a peer runs
-    it deadlocks the group. ``ordered_hashes`` must be built in the same
+    it deadlocks the group. ``ordered_keys`` must be built in the same
     order on every rank (it is derived from the batch, which is identical).
     """
     flags = torch.tensor(
-        [1 if h in local_misses else 0 for h in ordered_hashes],
+        [1 if k in local_misses else 0 for k in ordered_keys],
         # float32: the custom all-reduce kernels reject integer dtypes; 0/1
         # sums stay exact.
         dtype=torch.float32,
         device=device,
     )
     flags = tp_group.all_reduce(flags)
-    return {h for h, f in zip(ordered_hashes, flags.tolist()) if f > 0}
+    return {k for k, f in zip(ordered_keys, flags.tolist()) if f > 0}
 
 
 def _get_chunked_embedding_full(
@@ -643,6 +672,41 @@ def _get_chunked_embedding_full(
     item_hashes = [item.hash for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
     embedding_per_req = embedding_cache.get(item_hashes)
+    expected_token_count = sum(end - start + 1 for start, end in items_offset)
+
+    # A compact feature hash can collide for inputs with different token
+    # counts.  Never feed a stale cache entry into the scheduler: the length
+    # mismatch would otherwise surface much later in _adjust_embedding_length
+    # as an unrecoverable prefill crash.
+    if embedding_per_req is not None and not isinstance(
+        embedding_per_req, EVSEmbeddingResult
+    ):
+        cached_token_count = _embedding_token_count(embedding_per_req.embedding)
+        if cached_token_count != expected_token_count:
+            _discard_mismatched_cached_embedding(
+                embedding_items_hash, expected_token_count, cached_token_count
+            )
+            embedding_per_req = None
+
+    # The cache is per process; a peer that missed this combined entry enters
+    # the same attention-TP encoder collective, so the encode decision must be
+    # the union of all ranks' local misses.
+    sync_group = _mm_encode_sync_group()
+    if sync_group is not None:
+        cache_key = (embedding_items_hash, expected_token_count)
+        global_misses = _rank_consistent_miss_hashes(
+            [cache_key],
+            {cache_key} if embedding_per_req is None else set(),
+            sync_group,
+            device,
+        )
+        if global_misses and embedding_per_req is not None:
+            logger.warning(
+                "mm embedding cache hit on this rank but miss on a peer for a "
+                "combined per-request entry; re-encoding to keep the "
+                "attention-TP group in step"
+            )
+            embedding_per_req = None
 
     if embedding_per_req is None:
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
@@ -700,16 +764,19 @@ def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
     device: torch.device,
-) -> Dict[int, torch.Tensor]:
+) -> Dict[EmbeddingCacheKey, torch.Tensor]:
     """
-    Collect cache misses across ALL per-image requests, deduplicate by hash,
-    encode in a single ViT call, and populate the cache.
+    Collect cache misses across ALL per-image requests, deduplicate by hash and
+    expected token count, encode in a single ViT call, and populate the cache.
 
     Returns:
-        hash_to_embedding: mapping from item.hash to its full embedding tensor.
+        hash_to_embedding: mapping from (item.hash, token_count) to its full
+            embedding tensor.  Including the token count prevents two
+            colliding hashes with different placeholder spans from being
+            deduplicated within the same batch.
     """
-    unique_misses: Dict[int, Tuple[MultimodalDataItem, int]] = {}
-    hash_to_embedding: Dict[int, torch.Tensor] = {}
+    unique_misses: Dict[EmbeddingCacheKey, Tuple[MultimodalDataItem, int]] = {}
+    hash_to_embedding: Dict[EmbeddingCacheKey, torch.Tensor] = {}
 
     # Phase 1a: find overlapping items per request and collect cache misses
     for req_info in per_image_requests:
@@ -725,32 +792,40 @@ def _batch_encode_per_image_misses(
         req_info.overlapping = overlapping
 
         for _idx, item, start, end in overlapping:
-            if item.hash in hash_to_embedding:
+            expected_token_count = end - start + 1
+            cache_key = (item.hash, expected_token_count)
+            if cache_key in hash_to_embedding:
                 continue
             cached = embedding_cache.get_single(item.hash)
             if cached is not None:
-                hash_to_embedding[item.hash] = cached.embedding
-            elif item.hash not in unique_misses:
-                token_count = end - start + 1
-                unique_misses[item.hash] = (item, token_count)
+                cached_embedding = cached.embedding
+                cached_token_count = _embedding_token_count(cached_embedding)
+                if cached_token_count == expected_token_count:
+                    hash_to_embedding[cache_key] = cached_embedding
+                else:
+                    _discard_mismatched_cached_embedding(
+                        item.hash, expected_token_count, cached_token_count
+                    )
+                    unique_misses[cache_key] = (item, expected_token_count)
+            elif cache_key not in unique_misses:
+                unique_misses[cache_key] = (item, expected_token_count)
 
     sync_group = _mm_encode_sync_group()
     if sync_group is not None:
-        ordered_hashes: List[int] = []
-        hash_to_item: Dict[int, Tuple[MultimodalDataItem, int]] = {}
+        ordered_keys: List[EmbeddingCacheKey] = []
+        key_to_item: Dict[EmbeddingCacheKey, Tuple[MultimodalDataItem, int]] = {}
         for req_info in per_image_requests:
             for _idx, item, start, end in req_info.overlapping:
-                if item.hash not in hash_to_item:
-                    ordered_hashes.append(item.hash)
-                    hash_to_item[item.hash] = (item, end - start + 1)
-        if ordered_hashes:
+                cache_key = (item.hash, end - start + 1)
+                if cache_key not in key_to_item:
+                    ordered_keys.append(cache_key)
+                    key_to_item[cache_key] = (item, end - start + 1)
+        if ordered_keys:
             global_misses = _rank_consistent_miss_hashes(
-                ordered_hashes, set(unique_misses), sync_group, device
+                ordered_keys, set(unique_misses), sync_group, device
             )
             forced = [
-                h
-                for h in ordered_hashes
-                if h in global_misses and h not in unique_misses
+                k for k in ordered_keys if k in global_misses and k not in unique_misses
             ]
             if forced:
                 logger.warning(
@@ -758,13 +833,13 @@ def _batch_encode_per_image_misses(
                     "%d item(s); re-encoding to keep the attention-TP group in step",
                     len(forced),
                 )
-            for h in forced:
-                hash_to_embedding.pop(h, None)
-                unique_misses[h] = hash_to_item[h]
+            for k in forced:
+                hash_to_embedding.pop(k, None)
+                unique_misses[k] = key_to_item[k]
             # Encode order feeds the DP image->rank assignment; keep it
             # identical on every rank rather than local-miss-then-forced.
             unique_misses = {
-                h: unique_misses[h] for h in ordered_hashes if h in unique_misses
+                k: unique_misses[k] for k in ordered_keys if k in unique_misses
             }
 
     if envs.SGLANG_MM_CUDA_IPC_LEASE_POOL.get():
@@ -786,22 +861,33 @@ def _batch_encode_per_image_misses(
 
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
-        ordered_hashes = list(unique_misses.keys())
-        miss_items = [unique_misses[h][0] for h in ordered_hashes]
-        token_counts = [unique_misses[h][1] for h in ordered_hashes]
+        ordered_cache_keys = list(unique_misses.keys())
+        miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
+        token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
 
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_items, device)
         all_miss_embedding = data_embedding_func(miss_items)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
-
-        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-        for h, emb in zip(ordered_hashes, split_embeddings):
-            embedding_cache.set(h, EmbeddingResult(embedding=emb))
-            # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
-            hash_to_embedding[h] = emb
+        if isinstance(all_miss_embedding, list):
+            # Per-item embeddings: no split needed, and each cache entry owns
+            # its storage (a torch.split view would pin the whole concatenated
+            # buffer for as long as any single item stays cached).
+            assert len(all_miss_embedding) == len(miss_items), (
+                f"per-item embedding count {len(all_miss_embedding)} != "
+                f"cache-miss item count {len(miss_items)}"
+            )
+            split_embeddings = [
+                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+            ]
+        else:
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
+            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+        for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
+            embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb))
+            # Keep a local ref so assembly never fails due to LRU eviction.
+            hash_to_embedding[cache_key] = emb
 
     return hash_to_embedding
 
@@ -836,13 +922,69 @@ def _get_chunked_embedding_by_item(
 
     cached_embeddings = {}
     miss_items = []
+    hit_entries: List[Tuple[EmbeddingCacheKey, MultimodalDataItem]] = []
     for idx, item, start, end in overlapping:
+        expected_token_count = end - start + 1
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
-            cached_embeddings[idx] = cached.embedding
-            _acknowledge_deferred_cuda_ipc_cache_hits([item])
+            cached_embedding = cached.embedding
+            cached_token_count = _embedding_token_count(cached_embedding)
+            if cached_token_count == expected_token_count:
+                cached_embeddings[idx] = cached_embedding
+                # The hit acknowledge is deferred until after the cross-rank
+                # miss union below: a peer miss forces a re-encode, and a
+                # re-encoded item must not release its deferred CUDA-IPC
+                # feature as a cache hit.
+                hit_entries.append(((item.hash, expected_token_count), item))
+            else:
+                _discard_mismatched_cached_embedding(
+                    item.hash, expected_token_count, cached_token_count
+                )
+                miss_items.append((idx, item, start, end))
         else:
             miss_items.append((idx, item, start, end))
+
+    sync_group = _mm_encode_sync_group()
+    if sync_group is not None:
+        ordered_keys: List[EmbeddingCacheKey] = []
+        seen_keys: Set[EmbeddingCacheKey] = set()
+        for _idx, item, start, end in overlapping:
+            cache_key = (item.hash, end - start + 1)
+            if cache_key not in seen_keys:
+                seen_keys.add(cache_key)
+                ordered_keys.append(cache_key)
+        local_misses = {
+            (item.hash, end - start + 1) for _, item, start, end in miss_items
+        }
+        global_misses = _rank_consistent_miss_hashes(
+            ordered_keys, local_misses, sync_group, device
+        )
+        forced = {
+            k for k in ordered_keys if k in global_misses and k not in local_misses
+        }
+        if forced:
+            logger.warning(
+                "mm embedding cache hit on this rank but miss on a peer for "
+                "%d item(s); re-encoding to keep the attention-TP group in step",
+                len(forced),
+            )
+            missed_idx = {idx for idx, _, _, _ in miss_items}
+            for idx, item, start, end in overlapping:
+                if (item.hash, end - start + 1) in forced and idx not in missed_idx:
+                    cached_embeddings.pop(idx, None)
+                    miss_items.append((idx, item, start, end))
+            # Encode order feeds the DP image->rank assignment; keep it in
+            # batch (overlapping) order on every rank.
+            miss_by_idx = {
+                idx: (idx, item, start, end) for idx, item, start, end in miss_items
+            }
+            miss_items = [
+                miss_by_idx[idx] for idx, *_ in overlapping if idx in miss_by_idx
+            ]
+        hit_entries = [(key, item) for key, item in hit_entries if key not in forced]
+
+    if hit_entries:
+        _acknowledge_deferred_cuda_ipc_cache_hits([item for _, item in hit_entries])
 
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
@@ -887,7 +1029,7 @@ def _get_chunked_embedding_by_item(
 
 def _assemble_per_image_chunk(
     overlapping: List[Tuple[int, MultimodalDataItem, int, int]],
-    hash_to_embedding: Dict[int, torch.Tensor],
+    hash_to_embedding: Dict[EmbeddingCacheKey, torch.Tensor],
     extend_prefix_len: int,
     extend_seq_len: int,
 ) -> Optional[torch.Tensor]:
@@ -903,7 +1045,8 @@ def _assemble_per_image_chunk(
 
     chunk_slices = []
     for _idx, item, start, end in overlapping:
-        emb = hash_to_embedding[item.hash]  # shape: (end - start + 1, hidden)
+        cache_key = (item.hash, end - start + 1)
+        emb = hash_to_embedding[cache_key]  # shape: (end - start + 1, hidden)
         overlap_start = max(start, chunk_start)
         overlap_end = min(end, chunk_end - 1)  # inclusive
         local_start = overlap_start - start
@@ -981,7 +1124,7 @@ def _get_chunked_prefill_embedding(
             full_path_requests.append(req_info)
 
     # Phase 1: batch encode all per-image cache misses in ONE ViT call
-    hash_to_embedding: Dict[int, torch.Tensor] = {}
+    hash_to_embedding: Dict[EmbeddingCacheKey, torch.Tensor] = {}
     if per_image_requests:
         hash_to_embedding = _batch_encode_per_image_misses(
             data_embedding_func, per_image_requests, device
@@ -1026,35 +1169,51 @@ def _get_multimodal_mask(
     return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 
+def _count_mm_tokens_in_extend(
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+) -> int:
+    """Count MM placeholders from host offsets without reading back the GPU mask."""
+    num_mm_tokens = 0
+    for i, (extend_start, items_offset) in enumerate(
+        zip(prefix_length, items_offset_list)
+    ):
+        extend_end = extend_start + (extend_length[i] if i < len(extend_length) else 0)
+        for item_start, item_end in items_offset:
+            overlap_start = max(item_start, extend_start)
+            overlap_end = min(item_end + 1, extend_end)
+            num_mm_tokens += max(overlap_end - overlap_start, 0)
+
+    return num_mm_tokens
+
+
 def _adjust_embedding_length(
     embedding: torch.Tensor,
-    mask: torch.Tensor,
+    num_mm_tokens_in_input_ids: int,
     logger,
 ) -> torch.Tensor:
-    num_mm_tokens_in_embedding = embedding.shape[0]
-    num_mm_tokens_in_input_ids = mask.sum().item()
+    """Check that the embedding covers exactly the placeholder tokens of this extend.
+
+    Every producer above (per-item cache validation, chunk extraction) is
+    expected to hand back exactly one row per placeholder. A mismatch means an
+    embedding was paired with the wrong span; silently keeping the last N rows
+    would scatter the wrong image rows into the prompt, so it is an error in
+    both directions.
+    """
+    num_mm_tokens_in_embedding = _embedding_token_count(embedding)
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
-        logger.warning(
-            f"Number of tokens in multimodal embedding does not match those in the input text. "
-            f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
-            f"tokens from multimodal embeddings."
-        )
-        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = get_server_args().chunked_prefill_size
-            if chunked_prefill_size != -1:
-                logger.warning(
-                    "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
-                )
-            # extract from the end: this is a compromise
-            if embedding.dim() == 2:
-                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
-            else:
-                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
-                embedding = embedding[-num_multimodal:, :]
-        else:
-            raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+        hint = ""
+        if get_server_args().chunked_prefill_size != -1:
+            hint = (
+                " Chunked prefill is enabled; if the mismatch tracks chunk "
+                "boundaries, raise `chunked_prefill_size` or disable chunked prefill."
             )
+        raise RuntimeError(
+            "Multimodal embedding length does not match the placeholder tokens in "
+            f"the input text: {num_mm_tokens_in_input_ids=} vs "
+            f"{num_mm_tokens_in_embedding=}. This is an internal error.{hint}"
+        )
     return embedding
 
 
@@ -1087,6 +1246,13 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
         - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
     """
+    original_input_ids = input_ids
+    num_mm_tokens_in_input_ids = _count_mm_tokens_in_extend(
+        prefix_length,
+        extend_length,
+        items_offset_list,
+    )
+
     # 1. Get embedding
     embedding = _get_precomputed_embedding(
         embedding_items, items_size, prefix_length, extend_length, items_offset_list
@@ -1107,8 +1273,17 @@ def get_embedding_and_mask(
     if _is_npu:
         torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
-    # 3. Adjust embedding length if needed
-    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
+    # 3. Check the embedding length against the placeholder span
+    if input_ids is not original_input_ids:
+        # EVS rewrites placeholder spans after pruning, making the original offsets stale.
+        num_mm_tokens_in_input_ids = special_multimodal_mask.sum().item()
+    else:
+        maybe_assert_sum(
+            special_multimodal_mask,
+            num_mm_tokens_in_input_ids,
+            "MM placeholder count derived from offsets does not match input_ids",
+        )
+    embedding = _adjust_embedding_length(embedding, num_mm_tokens_in_input_ids, logger)
     return embedding, special_multimodal_mask, input_ids
 
 

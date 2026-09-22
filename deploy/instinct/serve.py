@@ -244,8 +244,6 @@ BASE_RUNTIME_ENV = {
     "SGLANG_RENORM_DETERMINISTIC": "1",
     # dev/instinct/2026-09-15 #113: rank-0 authority D2H write handoff lock
     "SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF": "1",
-    # dev/instinct/2026-09-15 #120: rank-consistent mm embedding-cache miss decision (TP warmup hang fix)
-    "SGLANG_MM_RANK_CONSISTENT_ENCODE": "1",
     # dev/instinct/2026-09-15 #119: per-request prefill/decode/queue timings in usage/meta_info
     "SGLANG_ENABLE_REQUEST_METRICS": "1",
 }

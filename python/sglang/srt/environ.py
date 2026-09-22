@@ -985,10 +985,6 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-    # The mm embedding cache is per rank; all-reduce the per-item cache-miss
-    # flags over the attention-TP group so every rank runs (or skips) the
-    # DP-sharded encoder collective together.
-    SGLANG_MM_RANK_CONSISTENT_ENCODE = EnvBool(True)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
@@ -1436,6 +1432,10 @@ def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
+    # The attention-TP rank-consistent mm encode decision is unconditional; a
+    # hit/miss split wedges the DP-sharded encoder collective, so it is not a
+    # behavior choice.
+    _print_deprecated_env("SGLANG_MM_RANK_CONSISTENT_ENCODE")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
     _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
     _print_deprecated_env(
