@@ -1259,6 +1259,10 @@ class Req(ReqDllmMixin):
 
         self.spec_num_cap_tokens = 0
 
+        # Sticky: a verify step's target probs had a row without positive finite
+        # mass, so this request's KV / SSM state is not trusted for caching.
+        self.spec_target_degenerate = False
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
@@ -1713,6 +1717,15 @@ class Req(ReqDllmMixin):
                 return True
 
         return False
+
+    def mark_spec_target_degenerate(self) -> None:
+        if not self.spec_target_degenerate:
+            logger.warning(
+                "Degenerate verify target row for rid=%s; emitted the "
+                "reject-sampler sentinel and skipping cache insertion",
+                self.rid,
+            )
+        self.spec_target_degenerate = True
 
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():

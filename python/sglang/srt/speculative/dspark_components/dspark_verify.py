@@ -686,7 +686,7 @@ def accept_draft_tokens(
     ).view(bs, gamma_rows, vocab)
     expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
-        return AcceptSampling.execute(
+        correct_len, bonus, cap_trim_lens, _ = AcceptSampling.execute(
             candidates=candidates,
             target_logits=target_logits,
             draft_probs=draft_probs,
@@ -696,13 +696,14 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+        return correct_len, bonus, cap_trim_lens
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
     )
-    sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
+    sampling_len, sampling_bonus, sampling_trim, _ = AcceptSampling.execute(
         candidates=candidates,
         target_logits=target_logits,
         draft_probs=draft_probs,

@@ -16,14 +16,18 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_dflash_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
+    sanitize_dflash_verify_target_probs,
 )
 
 
 class AcceptSampling:
+    """Returns (correct_len, bonus, cap_trim_lens, target_degenerate); the last
+    is the [bs] mask of requests whose target probs had a non-sampleable row."""
+
     @classmethod
     def execute(
         cls, *args, **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
@@ -40,7 +44,7 @@ class AcceptSampling:
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling(
             candidates=candidates,
             target_logits=target_logits,
@@ -64,7 +68,7 @@ class AcceptSampling:
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling_triton(
             candidates=candidates,
             target_logits=target_logits,
@@ -87,7 +91,7 @@ def _accept_sampling_core(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
     if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
@@ -105,6 +109,7 @@ def _accept_sampling_core(
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
         )
+    target_probs, target_degenerate = sanitize_dflash_verify_target_probs(target_probs)
     (
         retrieve_index,
         retrieve_next_token,
@@ -142,7 +147,7 @@ def _accept_sampling_core(
         )
     else:
         cap_trim_lens = torch.zeros_like(correct_len)
-    return correct_len, cap_trim_lens, accept_index, predicts
+    return correct_len, cap_trim_lens, accept_index, predicts, target_degenerate
 
 
 def accept_sampling(
@@ -155,23 +160,25 @@ def accept_sampling(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
-        candidates=candidates,
-        target_logits=target_logits,
-        draft_probs=draft_probs,
-        sampling_info=sampling_info,
-        draft_input=draft_input,
-        gamma=gamma,
-        verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
+    correct_len, cap_trim_lens, accept_index, predicts, target_degenerate = (
+        _accept_sampling_core(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=draft_probs,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
-    return correct_len, bonus, cap_trim_lens
+    return correct_len, bonus, cap_trim_lens, target_degenerate
 
 
 @triton.jit
@@ -223,21 +230,23 @@ def accept_sampling_triton(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
-        candidates=candidates,
-        target_logits=target_logits,
-        draft_probs=draft_probs,
-        sampling_info=sampling_info,
-        draft_input=draft_input,
-        gamma=gamma,
-        verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    correct_len, cap_trim_lens, accept_index, predicts, target_degenerate = (
+        _accept_sampling_core(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=draft_probs,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
     )
     bonus = gather_two_level_bonus_triton(
         accept_index=accept_index, predicts=predicts, correct_len=correct_len
     )
-    return correct_len, bonus, cap_trim_lens
+    return correct_len, bonus, cap_trim_lens, target_degenerate
 
 
 try:

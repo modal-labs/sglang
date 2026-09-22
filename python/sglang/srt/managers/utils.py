@@ -81,6 +81,10 @@ class GenerationBatchResult:
 
     cap_lens: Optional[torch.Tensor] = None
 
+    # [bs] bool: requests whose verify target probs had a row without positive
+    # finite mass this step (sanitize_dflash_verify_target_probs).
+    target_degenerate: Optional[torch.Tensor] = None
+
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
 
@@ -153,6 +157,9 @@ class GenerationBatchResult:
 
         if self.cap_lens is not None:
             self.cap_lens = _async_d2h(self.cap_lens)
+
+        if self.target_degenerate is not None:
+            self.target_degenerate = _async_d2h(self.target_degenerate)
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so

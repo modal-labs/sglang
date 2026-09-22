@@ -80,6 +80,15 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+def _should_log_skipped_radix_insert() -> bool:
+    """The deploy-containment lane's environ.py hook commit defines
+    SGLANG_K3_LOG_SKIPPED_RADIX_INSERT (EnvBool, default off) to log each
+    insert skipped for a tainted request. Read it tolerantly so this branch
+    also runs before that field lands; absent means silent skips."""
+    flag = getattr(envs, "SGLANG_K3_LOG_SKIPPED_RADIX_INSERT", None)
+    return flag.get() if flag is not None else False
+
+
 T = TypeVar("T")
 
 
@@ -831,6 +840,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         result = None
         insert_params = None
 
+        if req.spec_target_degenerate:
+            is_insert = False
+            if _should_log_skipped_radix_insert():
+                logger.warning(
+                    "[radix-skip] finished rid=%s target-degenerate: skipping insert "
+                    "of %d tokens, freeing unprotected slots",
+                    req.rid,
+                    kv_len_to_handle,
+                )
+
         if is_insert:
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
@@ -848,6 +867,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
+
+            if effective_cache_len <= 0:
+                # Nothing cacheable: release KV, lock and any staged component
+                # state without inserting a key_len=0 node.
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[req.cache_protected_len :]
+                )
+                self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+                if getattr(req, "evict_on_finish", False):
+                    self.evict_finished_req_prefix(
+                        req.last_node,
+                        matched_len=req.evict_matched_len(),
+                        kv_len=self.finished_key_len(kv_len_to_handle),
+                        rid=req.rid,
+                    )
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(
+                        req,
+                        is_finished=True,
+                        insert_result=None,
+                        insert_params=insert_params,
+                    )
+                return
 
             # Truncate if needed
             if effective_cache_len < len(token_ids):
@@ -927,7 +969,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     req, effective_cache_len - 1, insert_params
                 )
 
-        if effective_cache_len <= 0:
+        if effective_cache_len <= 0 or req.spec_target_degenerate:
+            if req.spec_target_degenerate and _should_log_skipped_radix_insert():
+                logger.warning(
+                    "[radix-skip] unfinished rid=%s target-degenerate: skipping insert",
+                    req.rid,
+                )
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(

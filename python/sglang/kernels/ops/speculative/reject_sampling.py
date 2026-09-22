@@ -2,6 +2,12 @@ import triton
 import triton.language as tl
 
 
+def reject_sampling_sentinel_token(vocab_size: int) -> int:
+    """Token the final-sampling pass stores when no lane can be selected
+    (`final_token = VOCAB_SIZE - 1` below): a degenerate residual, not a draw."""
+    return vocab_size - 1
+
+
 @triton.jit
 def speculative_sampling_classic_kernel(
     # Pointers
@@ -68,7 +74,15 @@ def speculative_sampling_classic_kernel(
 
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
 
-        if coin * q < p:
+        # X was sampled from q, so q(X) has to be a positive probability.
+        # Anything else means this row is not the distribution X came from, and
+        # `coin * q < p` would then accept unconditionally -- -inf < p for an
+        # -inf q, 0 < p for a zero one, and the range guard the residual passes
+        # use lets zero through. Reject instead: the residual path resamples
+        # from the target, which is the safe direction to fail in.
+        q_is_prob = (q > 0.0) & (q <= 1.0)
+
+        if q_is_prob & (coin * q < p):
             num_accept += 1
             cur_prob_row = step
             tl.store(Predicts + last_accepted_global_idx, draft_token)
@@ -111,16 +125,17 @@ def speculative_sampling_classic_kernel(
         else:
             q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
             q_val = tl.load(q_ptr, mask=mask, other=0.0)
-            # Treat NaN q (degenerate draft rows) as 0: residual falls back to p.
-            q_val = tl.where(q_val == q_val, q_val, 0.0)
+            # Treat any non-probability q (NaN, +-inf, negative) as 0: the
+            # residual falls back to p. A comparison against NaN is false, so
+            # the range test rejects it along with the infinities.
+            q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
             diff = p_val - q_val
             val = tl.where(diff > 0.0, diff, 0.0)
 
         norm_sum += tl.sum(val)
 
-    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
-    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
+    # Pass 2: CDF. The reduction above and this scan can round differently.
+    # Only positive-mass lanes may win, including in blocks after a zero tail.
     target_u = coin_final * norm_sum
     cum_sum = 0.0
     final_token = VOCAB_SIZE - 1
@@ -139,15 +154,15 @@ def speculative_sampling_classic_kernel(
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
-                # Same NaN-q guard as pass 1.
-                q_val = tl.where(q_val == q_val, q_val, 0.0)
+                # Same guard as pass 1.
+                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
                 diff = p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
 
             block_cumsum = tl.cumsum(val, axis=0)
             total_cumsum = cum_sum + block_cumsum
 
-            candidates_mask = total_cumsum > target_u
+            candidates_mask = mask & (val > 0.0) & (total_cumsum > target_u)
             has_match = tl.max(candidates_mask, axis=0)
 
             if has_match:
@@ -156,6 +171,46 @@ def speculative_sampling_classic_kernel(
                 found = 1
 
             cum_sum += tl.sum(val)
+
+    # A finite positive distribution and u in [0, 1) must have an inverse-CDF
+    # result. If reduction/scan rounding leaves an endpoint gap, assign only
+    # that gap to the last positive token. Keep the ordinary path unchanged;
+    # this extra scan runs only when no positive-mass CDF lane was selected.
+    if (
+        (found == 0)
+        & (norm_sum > 0.0)
+        & (norm_sum < float("inf"))
+        & (coin_final >= 0.0)
+        & (coin_final < 1.0)
+    ):
+        last_positive = -1
+        valid_probs = 1
+        for block_idx in range(tl.cdiv(VOCAB_SIZE, BLOCK_V) - 1, -1, -1):
+            v_offsets = block_idx * BLOCK_V + tl.arange(0, BLOCK_V)
+            mask = v_offsets < VOCAB_SIZE
+            p_val = tl.load(tp_base_ptr + v_offsets * stride_tp_v, mask=mask, other=0.0)
+            valid = (p_val >= 0.0) & (p_val < float("inf"))
+            if all_drafts_accepted:
+                val = p_val
+            else:
+                q_val = tl.load(
+                    dp_base_ptr_safe + v_offsets * stride_dp_v, mask=mask, other=0.0
+                )
+                # Match both residual passes, including non-probability q.
+                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                diff = p_val - q_val
+                val = tl.where(diff > 0.0, diff, 0.0)
+            valid_probs = valid_probs & tl.min(
+                tl.where(mask, valid, True).to(tl.int32), axis=0
+            )
+            if last_positive < 0:
+                last_positive = tl.max(
+                    tl.where(mask & (val > 0.0), v_offsets, -1), axis=0
+                )
+        # Degenerate/nonfinite input is a separate error contract: do not hide
+        # it by manufacturing a supported token from an invalid distribution.
+        if valid_probs & (last_positive >= 0):
+            final_token = last_positive
 
     tl.store(Predicts + last_accepted_global_idx, final_token)
 

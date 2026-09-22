@@ -42,6 +42,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_draft_ring_geometry,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    greedy_target_predict,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -1479,7 +1480,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
         gamma = block - 1
@@ -1495,7 +1496,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_probs = buffer[:bs]
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
-            accept_len, bonus, _ = accept_sampling(
+            accept_len, bonus, _, target_degenerate = accept_sampling(
                 candidates=candidates,
                 target_logits=next_token_logits,
                 draft_probs=draft_probs,
@@ -1510,7 +1511,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # buffer the next draft step overwrites. In finally because the next
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
-        return accept_len.to(torch.int32), bonus.to(torch.int64)
+        return accept_len.to(torch.int32), bonus.to(torch.int64), target_degenerate
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -2144,9 +2145,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         broadcast over TP at the sites SGLANG_SPEC_TP_SYNC arms."""
         target_predict = None
         new_seq_lens = None
+        target_degenerate = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus = self._selector_sampling_accept(
+            accept_len, bonus, target_degenerate = self._selector_sampling_accept(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
                 candidate_ids=selector_candidate_ids,
@@ -2156,18 +2158,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, target_degenerate)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
-                candidates=candidates,
-                next_token_logits=next_token_logits,
-                sampling_info=sampling_info,
-                max_top_k=draft_input.max_top_k,
-                uniform_top_k_value=draft_input.uniform_top_k_value,
+            accept_len, bonus, target_degenerate = (
+                compute_dflash_sampling_correct_drafts_and_bonus(
+                    candidates=candidates,
+                    next_token_logits=next_token_logits,
+                    sampling_info=sampling_info,
+                    max_top_k=draft_input.max_top_k,
+                    uniform_top_k_value=draft_input.uniform_top_k_value,
+                )
             )
             # Sampling uses rank-local numerics and RNG. Canonicalize the whole
             # decision before it can change Mamba state, draft KV, output tokens,
@@ -2182,12 +2187,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                     tp_group=tp_group,
                     outcome_buffer=self._sampling_outcome_buf,
                 )
+                self._tp_sync.sync(
+                    SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, target_degenerate
+                )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
+            target_predict, target_degenerate = greedy_target_predict(next_token_logits)
+            target_predict = target_predict.view(bs, int(self.block_size))
+            target_degenerate = target_degenerate.view(bs, int(self.block_size)).any(
+                dim=-1
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_degenerate)
             if self._use_triton_accept_bonus:
                 try:
                     (
@@ -2227,7 +2238,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
 
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+        return (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            target_predict,
+            target_degenerate,
+        )
 
     def forward_batch_generation(
         self,
@@ -2732,6 +2751,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens,
             new_seq_lens,
             target_predict,
+            target_degenerate,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2785,6 +2805,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
+            target_degenerate=target_degenerate,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.block_size),

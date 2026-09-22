@@ -567,6 +567,11 @@ class SchedulerBatchResultProcessor:
         )
         cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
         result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
+        target_degenerate = (
+            result.target_degenerate.tolist()
+            if result.target_degenerate is not None
+            else None
+        )
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
@@ -590,6 +595,9 @@ class SchedulerBatchResultProcessor:
 
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+
+            if target_degenerate is not None and target_degenerate[i]:
+                req.mark_spec_target_degenerate()
 
             if req.is_retracted or req.finished():
                 # Nothing to settle: no worker pre-claims the bonus, so

@@ -107,6 +107,7 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+        self.spec_target_degenerate = False
 
 
 def test_preabort_detaches_session_and_preserves_slot():

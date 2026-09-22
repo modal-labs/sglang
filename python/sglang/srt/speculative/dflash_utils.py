@@ -9,6 +9,9 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.speculative.reject_sampling import (
+    reject_sampling_sentinel_token,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
@@ -22,10 +25,19 @@ from sglang.srt.sampling.penaltylib.repetition_penalty import (
     apply_scaling_penalties,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils.invariants import Bucket, Invariant, PositiveFinite, expect
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
+
+# Target verify probs feeding rejection sampling, reduced to per-row mass. A
+# NaN/Inf/zero-mass row rejects every draft and leaves the kernel's final
+# sampling with no selectable lane; the data layer collapses such rows onto
+# the kernel's own sentinel so the sampler never reads a non-finite p.
+_VERIFY_TARGET_ROW_MASS = Invariant(
+    "dspark.verify.target_row_mass", Bucket.GUARD, PositiveFinite()
+)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -966,13 +978,16 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
       - DFlash proposals are linear (topk == 1), so each verify level has at most one candidate.
       - When a candidate is rejected at a level, the final token is sampled from
         `relu(q - p)` where `p` has only the rejected candidate mass.
+
+    Also returns the per-request `target_degenerate` mask from
+    `sanitize_dflash_verify_target_probs`.
     """
     if not _DFLASH_SAMPLING_VERIFY_AVAILABLE:
         raise RuntimeError(
@@ -1051,6 +1066,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         uniform_top_k_value=uniform_top_k_value,
         use_sparse_topk=use_sparse_topk,
     )
+    target_probs, target_degenerate = sanitize_dflash_verify_target_probs(target_probs)
     draft_probs = torch.zeros_like(target_probs)
 
     (
@@ -1089,7 +1105,65 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
-    return correct_len, bonus
+    return correct_len, bonus, target_degenerate
+
+
+def sanitize_dflash_verify_target_probs(
+    target_probs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Collapse target rows without positive finite mass onto the reject
+    sampler's sentinel token, in place.
+
+    `target_probs` is `[bs, draft_token_num, vocab]`. Returns it together with a
+    `[bs]` bool mask of requests that had at least one such row; the caller
+    surfaces the mask so the request can be finished and kept out of the
+    radix tree. Branchless: no device->host sync.
+    """
+    # Both producers (SoftmaxTemp and build_dflash_verify_target_probs) produce
+    # non-negative probabilities. A finite positive sum therefore excludes
+    # NaN/Inf entries; negative-mass cancellation cannot occur on these routes.
+    row_mass = target_probs.sum(dim=-1)
+    expect(_VERIFY_TARGET_ROW_MASS, row_mass, msg="dflash verify target row")
+    degenerate_rows = ~(torch.isfinite(row_mass) & (row_mass > 0))
+    sentinel = reject_sampling_sentinel_token(int(target_probs.shape[-1]))
+    target_probs.masked_fill_(degenerate_rows.unsqueeze(-1), 0.0)
+    target_probs[..., sentinel].masked_fill_(degenerate_rows, 1.0)
+    return target_probs, degenerate_rows.any(dim=-1)
+
+
+def greedy_target_row_degenerate(logits: torch.Tensor) -> torch.Tensor:
+    """`[..., vocab]` logits -> `[...]` bool: rows with no finite selectable
+    value (all -inf / NaN) or with NaN / +inf anywhere. Legitimate -inf masks
+    (grammar, min_new_tokens, logit bias) over otherwise finite rows are valid.
+    """
+    finite = torch.isfinite(logits)
+    invalid_entry = ~finite & ~torch.isneginf(logits)
+    return ~finite.any(dim=-1) | invalid_entry.any(dim=-1)
+
+
+def greedy_target_predict(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """`[..., vocab]` logits -> (`[...]` argmax with degenerate rows collapsed
+    onto the reject sampler's sentinel token, `[...]` degenerate row mask).
+    `torch.argmax` over a NaN row returns an arbitrary index; the sentinel is
+    the greedy counterpart of `sanitize_dflash_verify_target_probs`.
+    """
+    degenerate_rows = greedy_target_row_degenerate(logits)
+    predict = torch.argmax(logits, dim=-1)
+    sentinel = reject_sampling_sentinel_token(int(logits.shape[-1]))
+    return predict.masked_fill(degenerate_rows, sentinel), degenerate_rows
+
+
+def sanitize_greedy_target_logits(
+    logits: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Copy of `[..., vocab]` logits whose degenerate rows are one-hot on the
+    reject sampler's sentinel (0 there, -inf elsewhere), so any argmax-based
+    consumer selects the sentinel. Returns it with the `[...]` row mask."""
+    degenerate_rows = greedy_target_row_degenerate(logits)
+    sentinel = reject_sampling_sentinel_token(int(logits.shape[-1]))
+    logits = logits.masked_fill(degenerate_rows.unsqueeze(-1), float("-inf"))
+    logits[..., sentinel].masked_fill_(degenerate_rows, 0.0)
+    return logits, degenerate_rows
 
 
 def build_dflash_verify_target_probs(

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -311,6 +312,50 @@ class StreamingSession(BasePrefixCache):
         # finished transfer before stamping FINISH_LENGTH.
         if is_retract:
             self._release_turn_kv(slot, req, session_id)
+            return True
+
+        # A target-degenerate turn's KV / mamba state is not trusted: drop it
+        # (and the slot) so the next turn re-prefills from the token history.
+        if req.spec_target_degenerate:
+            # The optional logging field lands in the deploy-containment lane.
+            log_skip = getattr(envs, "SGLANG_K3_LOG_SKIPPED_RADIX_INSERT", None)
+            if log_skip is not None and log_skip.get():
+                logger.warning(
+                    "[radix-skip] streaming session %s rid=%s target-degenerate: "
+                    "dropping turn KV instead of saving the session slot",
+                    session_id,
+                    req.rid,
+                )
+            evict_on_finish = getattr(req, "evict_on_finish", False)
+            if evict_on_finish:
+                # Preserve first-admission metadata before releasing the slot.
+                lock_node = slot.last_node if slot is not None else req.last_node
+                matched_len = (
+                    (
+                        slot.first_matched_len
+                        if slot.first_matched_len is not None
+                        else slot.cache_protected_len
+                    )
+                    if slot is not None
+                    else req.evict_matched_len()
+                )
+            self._release_turn_kv(slot, req, session_id)
+            if req.finished_len is not None:
+                req.output_ids = req.output_ids[: req.finished_len]
+            req.session.finish_req(req)
+            if (
+                evict_on_finish
+                and lock_node is not None
+                and not isinstance(lock_node, _VirtualNode)
+            ):
+                self.inner.evict_finished_req_prefix(
+                    lock_node,
+                    matched_len=matched_len,
+                    kv_len=self.inner.finished_key_len(
+                        len(req.origin_input_ids) + len(req.output_ids)
+                    ),
+                    rid=req.rid,
+                )
             return True
 
         if is_first:

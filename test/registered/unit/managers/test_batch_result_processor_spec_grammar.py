@@ -105,6 +105,7 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
         num_correct_drafts_per_req_cpu=None,
         block_accept_lens=None,
         cap_lens=None,
+        target_degenerate=None,
         copy_done=None,
         grammar_advanced=False,
     )

@@ -79,6 +79,15 @@ class Finite(Property):
         return torch.isfinite(value)
 
 
+class PositiveFinite(Property):
+    """Finite and > 0 -- for a mass / normalizer that must be sampleable."""
+
+    name = "positive_finite"
+
+    def ok(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.isfinite(value) & (value > 0)
+
+
 class InRange(Property):
     """Half-open [lo, hi) -- unifies oob / range / index-domain checks."""
 
