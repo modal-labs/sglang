@@ -1784,6 +1784,21 @@ def hash_feature(f):
     return data_hash(f)
 
 
+def hash_feature_with_grid(feature_hash: int, grid) -> int:
+    """Fold an image's patch grid into its feature hash.
+
+    The feature hash covers the flattened patch bytes only, so byte-identical
+    patches laid out on different grids (for example a solid-colour image at
+    transposed sizes) would otherwise share one hash, pad value and embedding
+    cache entry although the vision tower encodes them differently.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(int(feature_hash).to_bytes(16, byteorder="big", signed=False))
+    for dim in grid:
+        hasher.update(int(dim).to_bytes(8, byteorder="big", signed=True))
+    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+
+
 def extend_mrope_positions_for_retracted_request(
     mrope_positions: torch.Tensor, output_ids_len: int
 ) -> torch.Tensor:

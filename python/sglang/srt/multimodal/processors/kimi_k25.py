@@ -367,13 +367,12 @@ class MMFeatureStreamSink:
     """Per-request sink: hash and transport-wrap each image feature as it is
     produced, so the request-wide patch set never resides on the GPU at once.
 
-    The hash is computed on the freshly produced GPU tensor (same bytes and
-    same algorithm as the post-split ``set_pad_value`` path it replaces, so
-    radix-cache keys are unchanged). The tensor is then either copied into the
-    bounded CUDA-IPC pool (falling back to ``.cpu()`` when the pool is full,
-    exactly like the per-item wrap it replaces) or moved to host memory for
-    non-IPC transports. Either way the GPU copy is dropped before the next
-    image is processed.
+    The patch hash is computed on the freshly produced GPU tensor, and
+    ``hash_list`` folds in each image's grid. The tensor is then either copied
+    into the bounded CUDA-IPC pool (falling back to ``.cpu()`` when the pool
+    is full, exactly like the per-item wrap it replaces) or moved to host
+    memory for non-IPC transports. Either way the GPU copy is dropped before
+    the next image is processed.
     """
 
     def __init__(self, sglang_processor):
@@ -399,9 +398,22 @@ class MMFeatureStreamSink:
             return proxy
         return patches.cpu()
 
-    def hash_list(self, count: int) -> list:
-        # Entries are None when hashing is skipped; consumers must handle it.
-        return [self._hashes.get(index) for index in range(count)]
+    def hash_list(self, count: int, grid_thws) -> list:
+        """Per-image identity hashes: patch bytes plus the image's grid.
+
+        Entries are None when hashing is skipped; consumers must handle it.
+        """
+        from sglang.srt.managers.mm_utils import hash_feature_with_grid
+
+        hashes = []
+        for index in range(count):
+            patch_hash = self._hashes.get(index)
+            hashes.append(
+                None
+                if patch_hash is None
+                else hash_feature_with_grid(patch_hash, grid_thws[index].tolist())
+            )
+        return hashes
 
     def cancel_all(self, context: str) -> int:
         processor = self._sglang_processor
@@ -539,7 +551,9 @@ class KimiGPUProcessorWrapper:
             "image_grid_thw": grid_thws,
         }
         if feature_sink is not None:
-            ret[PRECOMPUTED_FEATURE_HASHES_KEY] = feature_sink.hash_list(len(images))
+            ret[PRECOMPUTED_FEATURE_HASHES_KEY] = feature_sink.hash_list(
+                len(images), grid_thws
+            )
         return ret
 
     def _cpu_call(self, text, images, **kwargs):

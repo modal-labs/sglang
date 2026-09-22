@@ -24,7 +24,7 @@ import pytest
 import torch
 from PIL import Image
 
-from sglang.srt.managers.mm_utils import hash_feature
+from sglang.srt.managers.mm_utils import hash_feature, hash_feature_with_grid
 from sglang.srt.multimodal.processors.kimi_k3 import (
     _fill_transparent_bg,
     _k3_to_cuda_chw,
@@ -256,10 +256,10 @@ def test_sink_receives_every_image_in_order():
     assert torch.equal(torch.cat([e.cuda() for e in entries], dim=0), reference)
 
 
-def test_stream_sink_hashes_match_legacy_split():
-    """MMFeatureStreamSink's per-image hashes must equal what the legacy
-    path computed via set_pad_value on the post-split slices, so radix-cache
-    keys are unchanged across the upgrade."""
+def test_stream_sink_hashes_are_legacy_split_hashes_with_grid():
+    """MMFeatureStreamSink's per-image hash is the hash of the legacy post-split
+    slice with that image's grid folded in: patch bytes alone do not identify
+    an image (see test_kimi_image_hash_grid.py)."""
     images = [_image(560, 420, seed=i) for i in range(3)]
     configs = _configs(images)
     scale, bias = _norm_tensors()
@@ -268,7 +268,7 @@ def test_stream_sink_hashes_match_legacy_split():
     entries, grids = _run_new(
         images, configs, scale, bias, _default_to_cuda_chw, per_image_sink=sink
     )
-    hashes = sink.hash_list(len(images))
+    hashes = sink.hash_list(len(images), grids)
     assert hashes is not None and all(not e.is_cuda for e in entries)
 
     reference, _ = _legacy_reference(images, configs, scale, bias, _default_to_cuda_chw)
@@ -276,7 +276,9 @@ def test_stream_sink_hashes_match_legacy_split():
     start = 0
     for i, count in enumerate(patches_per_image):
         legacy_slice = reference[start : start + count]
-        assert hashes[i] == hash_feature(legacy_slice)
+        assert hashes[i] == hash_feature_with_grid(
+            hash_feature(legacy_slice), grids[i].tolist()
+        )
         start += count
 
 
