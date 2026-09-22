@@ -1639,6 +1639,16 @@ class Scheduler(
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
+    def _carry_frees_into_next_launch(self):
+        # The last batch was processed before launching the current one, which
+        # was already scheduled and may still write pages that processing just
+        # freed; keep zero-on-hand-out fenced behind that launch.
+        _carry = getattr(
+            self.token_to_kv_pool_allocator, "carry_frees_into_next_launch", None
+        )
+        if _carry is not None:
+            _carry()
+
     def _apply_war_barrier(self):
         # Called right after each launch: order later schedule_stream work
         # (result processing, next iteration's writes) behind the forward's
@@ -1727,6 +1737,8 @@ class Scheduler(
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
+                if batch:
+                    self._carry_frees_into_next_launch()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -3757,6 +3769,13 @@ class Scheduler(
                         _note = getattr(self.tree_cache, "note_forward_launch", None)
                         if _note is not None:
                             _note(forward_done)
+                        # Zero-on-hand-out must not run ahead of this forward's
+                        # KV writes into slots freed while it is in flight.
+                        _alloc_note = getattr(
+                            self.token_to_kv_pool_allocator, "note_forward_launch", None
+                        )
+                        if _alloc_note is not None:
+                            _alloc_note(forward_done)
                         if self.enable_unified_memory:
                             # Only the unified pool's allocator exposes these hooks.
                             allocator = self.token_to_kv_pool_allocator

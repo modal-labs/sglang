@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     debug_mode: bool = False
+    # Overlap scheduling launches batch N+1 before processing batch N, so a
+    # request that finishes in N is still in N+1 and that forward keeps
+    # writing KV into slots free() has already returned. The scheduler
+    # hands each launched forward's completion event to the allocator;
+    # a hand-out that must zero pages after such a free waits on it (the
+    # WAR barrier only orders the forward's reads, not these writes).
+    # Class-level defaults: composite allocators (SWA, HiSparse) skip this
+    # __init__ but still receive note_forward_launch() from the scheduler.
+    _latest_forward_done_event = None
+    _freed_since_forward_launch: bool = False
+    _carry_frees_into_next_launch: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -140,6 +151,40 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def debug_print(self) -> str:
         return ""
+
+    def note_forward_launch(self, forward_done_event) -> None:
+        """Record the just-launched forward's completion event. Frees that
+        happen before the next launch may still be written by this forward.
+
+        Frees made before this launch are normally settled: every forward
+        that could write their pages was launched earlier, and the scheduler
+        processes the previous batch's result (synchronizing on its
+        completion) between this launch and its next scheduling pass. When
+        that processing ran ahead of this launch instead, the batch being
+        launched was built before those frees and may still write their
+        pages, so carry_frees_into_next_launch() keeps them fenced."""
+        self._latest_forward_done_event = forward_done_event
+        self._freed_since_forward_launch = (
+            self._carry_frees_into_next_launch and self._freed_since_forward_launch
+        )
+        self._carry_frees_into_next_launch = False
+
+    def carry_frees_into_next_launch(self) -> None:
+        """The next launched batch was scheduled before the frees made so far
+        (its predecessor's result was processed ahead of the launch), so it may
+        write their pages: keep them fenced behind that launch's event."""
+        self._carry_frees_into_next_launch = True
+
+    def _fence_frees_behind_inflight_forward(self) -> None:
+        """Order the current stream after the in-flight forward when pages
+        freed since its launch may be handed out and rewritten now."""
+        if not self._freed_since_forward_launch:
+            return
+        event = self._latest_forward_done_event
+        if event is not None:
+            # Hand-outs run on the schedule stream or the overlap plan stream,
+            # so wait on the event from whichever stream is current each time.
+            event.wait()
 
     def _drop_reserved_locations(
         self, free_index: torch.Tensor, lower_bound: int

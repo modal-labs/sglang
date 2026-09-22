@@ -290,6 +290,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # rows it fills, so stale bytes in the remaining rows of a page would
         # otherwise be visible to page-granular attention kernels.
         if self.zero_pages_pools and pages.numel() > 0:
+            # A page freed since the last launch may still receive the
+            # in-flight forward's writes for its previous owner; zeroing it
+            # first would leave those bytes in the new owner's page.
+            self._fence_frees_behind_inflight_forward()
             for pool in self.zero_pages_pools:
                 pool.zero_pages(pages)
 
@@ -302,6 +306,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # out, so locations below page_size must not recycle it.
             free_index = self._drop_reserved_locations(free_index, self.page_size)
             free_page_indices = self._free_pages_of(free_index)
+            self._freed_since_forward_launch = True
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
