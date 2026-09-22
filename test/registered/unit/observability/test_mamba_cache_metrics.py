@@ -85,6 +85,20 @@ def test_match_prefix_records_mamba_cache_miss_on_request():
     assert req.mamba_cache_miss_tokens == 6144
 
 
+class _FakeAdder(SimpleNamespace):
+    """A PrefillAdder stand-in for PrefillStats.from_adder.
+
+    Any counter the reporter reads that the test did not set reads 0, so the
+    test survives upstream adding counters to PrefillAdder / PrefillStats
+    (e.g. log_replay_tokens on trees with ReplaySSM) without being edited.
+    """
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return 0
+
+
 def test_prefill_stats_reports_each_request_once():
     miss_req = SimpleNamespace(
         mamba_cache_miss_tokens=6144,
@@ -94,15 +108,11 @@ def test_prefill_stats_reports_each_request_once():
         mamba_cache_miss_tokens=0,
         _mamba_cache_miss_reported=False,
     )
-    adder = SimpleNamespace(
+    adder = _FakeAdder(
         can_run_list=[miss_req, clean_req],
         log_input_tokens=1,
         log_hit_tokens=2,
-        reprocessed_log_input_tokens=0,
-        reprocessed_log_hit_tokens=0,
         log_device_hit_tokens=2,
-        log_host_hit_tokens=0,
-        log_storage_hit_tokens=0,
         new_token_ratio=1.0,
     )
 
