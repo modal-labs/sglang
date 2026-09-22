@@ -65,7 +65,9 @@ Files in this directory:
   3. warmup: one 1280x800 synthetic-PNG image turn after the text greeting (autoinference #516).
   4. HiCache host tier re-sized for the 60-minute session TTL (see "HiCache sizing" below):
      `--enable-mla-hicache-host-dedup --hicache-size 140 --hicache-mamba-ratio 13.5 --hicache-write-policy write_through`
-     replaces `--hicache-ratio 3 --hicache-write-policy write_through_selective`.
+     replaces `--hicache-ratio 3 --hicache-write-policy write_through_selective`. Since 2026-09-21 the
+     140 / 13.5 / 800 GiB plan is the *baseline*: `startup()` reads `/proc/meminfo` on the host the
+     container landed on and scales all three to fill it (see "Host-tier autosizing" below).
   Unchanged: app name, model/draft, other server args, volumes, B300:8, min_containers=63,
   routing/kv-aware routing, auth, heartbeat/terminate, JIT-cache salt (`SGLANG_EFFECTIVE_COMMIT`).
 
@@ -209,7 +211,91 @@ horizon is shorter than measured; the ranking is unaffected (the gap is ~50x the
 Note on `evict_on_finish` under `write_through`: release is best-effort-immediate, not guaranteed — the finished turn's private device KV is freed inline, its host copies are only marked `evict_first` (taken at the next host watermark round), and any prefix another chain already hit stays under normal LRU; the 13.5x Mamba host tier is the shock absorber for that deferred part.
 
 Check on a running container: `--enable-mla-hicache-host-dedup` in the server command line and the
-HiCache init log reporting the host KV pool at 140 GB with the Mamba host pool sized 13.5x device.
+HiCache init log reporting the host KV pool at 140 GB with the Mamba host pool sized 13.5x device
+(on a 1 TiB host; on larger hosts the autosized values from the `HiCache host tier plan:` line, below).
+
+### Host-tier autosizing (2026-09-21)
+
+The 1 TiB `memory=` request is only a scheduling floor. Modal sets the memcgroup limit to 10x the
+request when no limit is given, and inside gVisor `/proc/meminfo` reports the physical host (confirmed
+2026-09-21 on an 8xB300 AWS host: `MemTotal 4206583300 kB` inside the container, equal to the node).
+8-GPU B300 instance types admit only GPU tasks, so once the container holds all 8 GPUs nothing else can
+be placed on the host and the rest of its RAM is ours. Host RAM varies across 8xB300 SKUs, so the size
+cannot be a deploy-time constant.
+
+`plan_hicache_host_tier()` runs as the first statement of `startup()` (after placement, before the JIT
+seed, snapshot prep and engine start) and computes
+
+```
+usable_gib = min(MemTotal, MemAvailable, cgroup headroom) * K3_HICACHE_HOST_FILL_FRACTION (0.90) - K3_HICACHE_HOST_RESERVE_GIB (64)
+scale      = usable_gib / 800
+--hicache-size        = int(140 * scale)         # GB, one dedup copy
+--hicache-mamba-ratio = floor(13.5 * scale, 0.1) # per rank
+SGLANG_HICACHE_HOST_BUDGET_GIB = int(usable_gib) # engine aggregate preflight cap
+```
+
+KV, Mamba and the engine cap scale together so the validated 140/13.5 split is kept; the engine's
+aggregate preflight (`enforce_hicache_host_budget`) and per-pool `psutil` availability checks still run
+against the scaled numbers. On the 4 TB AWS host this gives `--hicache-size 620 --hicache-mamba-ratio 59.8`
+and a 3546 GiB cap (~4.4x the baseline); on a 1 TiB host it lands within ~5% of the baseline.
+
+`cgroup headroom` is the tightest of `memory.max`/`memory.high` (v2) or `memory.limit_in_bytes` (v1)
+minus current usage, read directly because `/proc/meminfo` is not bounded by the container limit (same
+approach as upstream SGLang #40135 and vLLM). With the 1 TiB request Modal's limit is 10 TiB, so it does
+not bind and the host size decides; it matters if the request is ever lowered (a 256 GiB request gives a
+2.5 TiB limit, below the 4 TB AWS host). A missing cgroupfs or an unlimited value is ignored. If a finite
+limit is visible but its usage file is unreadable, `MemTotal - MemAvailable` (the sandbox's own accounting)
+is used as the usage instead of zero, and the plan line says so.
+
+The size is not capped (`K3_HICACHE_HOST_MAX_GIB` defaults to 0). A host whose usable memory is below the
+800 GiB baseline scales the plan down instead of starting a baseline the container cannot hold. The plan
+line also logs `cloud`/`region`/`cpus` from `MODAL_CLOUD_PROVIDER`/`MODAL_REGION` so retention can be compared per
+8xB300 SKU. Expected plans from the SKU list in modal-labs/modal `instance_configs.py` (unpadded host RAM,
+assuming `MemAvailable` ≈ `MemTotal` at startup as observed):
+
+| 8xB300 SKU | host RAM | `--hicache-size` | `--hicache-mamba-ratio` | budget GiB |
+|---|---|---|---|---|
+| AWS p6-b300.48xlarge | 4012 GiB (measured) | 620 | 59.8 | 3546 |
+| and / cwv / csc | ~3020 GiB | 464 | 44.7 | 2654 |
+| Nebius 8gpu-2768gb | 2768 GiB | 424 | 40.9 | 2427 |
+| ver 8B300.240V | 2200 GiB | 335 | 32.3 | 1916 |
+| lat g4-b300-large | 1511 GiB | 226 | 21.8 | 1295 |
+
+Fallbacks to the fixed baseline (140 / 13.5 / 800), each with a `HiCache host tier:` log line saying why:
+`K3_HICACHE_AUTOSIZE=0`, unreadable `/proc/meminfo`, or `MemTotal >= 8 TiB` (no 8-GPU host has that; it
+means the sandbox reported the cgroup limit) with no cgroup limit below 8 TiB either; a bogus `MemTotal` with a
+real container limit is sized from the limit. A plan too small to express (`--hicache-size` < 1 GB or
+`--hicache-mamba-ratio` < 1.0, i.e. usable below ~59 GiB with the default baseline, e.g. a tiny
+`K3_HICACHE_HOST_MAX_GIB`) fails startup with the measured fields instead of passing zeros to the engine.
+
+Knobs (deploy-time env, forwarded into the container through `K3_ENV_OVERRIDES`): `K3_HICACHE_AUTOSIZE`,
+`K3_HICACHE_HOST_FILL_FRACTION`, `K3_HICACHE_HOST_RESERVE_GIB`, `K3_HICACHE_HOST_MAX_GIB` (hard cap on
+`usable_gib`, 0 = none).
+
+Check on a running container: the `HiCache host tier plan: MemTotal=... -> usable=... scale=...` line
+before `Kimi K3 runtime configuration:`, the same `--hicache-size` / `--hicache-mamba-ratio` in the
+printed `server_args`, and the engine's `HiCache aggregate host budget (...): total=... GiB, cap=... GiB`
+line with `cap` equal to the plan's budget. Rollback to the fixed plan without a code change:
+`K3_HICACHE_AUTOSIZE=0 modal deploy serve.py`.
+
+Measured 2026-09-21 (1x1 `kimi-k3-hicache-autosize`, cust-instinct, 8xB300 AWS host, MemTotal 4012 GiB,
+RELEASE_SHA cc7b258e48, this serve.py):
+
+- Plan line: `usable=3546 GiB, scale=4.43x baseline: --hicache-size 620 --hicache-mamba-ratio 59.8
+  SGLANG_HICACHE_HOST_BUDGET_GIB=3546`; both flags on the engine command line.
+- Engine preflight accepted it: `HiCache aggregate host budget (MLA dedup with draft L2): target_mla=577.42 GiB x1,
+  allocator_metadata=0.84 GiB x8, draft=128.32 GiB x8, mamba=210.28 GiB x8; total=3292.85 GiB, cap=3546 GiB`.
+  Note the rank-local draft L2 is sized from the target token count, so it scales with `--hicache-size` too
+  (8 x 128 GiB here); the 800 GiB baseline already included it (8 x ~29 GiB).
+- Steady state after warmup: MemAvailable 706 GiB of 4012; RSS sum 3400 GiB; rank 0 (dedup owner) 926 GiB,
+  ranks 1-7 ~348 GiB each. No OOM, no tracebacks; a chat completion from inside the container (localhost:8000)
+  returned normally with `cached_tokens` from the warmup prefix and `request_metrics` populated.
+- Cold start: `Kimi K3 TP8 DFlash is ready ... endpoint=1748.00s` (29 min from `startup()`; weights loaded in
+  ~6 min). Pinning is serial per rank at ~0.75 GiB/s (`cuda_host_register_chunks ... gib=128.32 ... threads=1
+  elapsed_s=182.6`; Mamba 210 GiB `elapsed_s=166`), and rank 0's critical path is target + draft + Mamba
+  ~915 GiB, ~4.4x the baseline's ~207 GiB, i.e. roughly +15 min of pinning per cold start versus the fixed plan.
+  `SGLANG_HICACHE_HOST_REGISTER_THREADS=0` (min(8, cores) threads over the 255 GiB chunks) is the fork's
+  lever for this and is not yet validated in prod.
 
 Fallback if rank-0 RSS is a problem: `--hicache-size 130 --hicache-mamba-ratio 16 --hicache-write-policy
 write_through_selective` (within 0.05 pt overall, -2 to -3 pt on 20-60 min wakes, ~45 GiB less pinned).
@@ -239,3 +325,7 @@ Validation (2026-09-17, L27 gate runs on fresh boxes, same tree as the measured 
 - A live trip of the #142 acceptance-collapse watchdog on a real engine (CPU unit tests and the exact-head
   heartbeat integration test only).
 - Production-scale rollout (63 containers) of this pin; the bench boot is a single container.
+- Host-tier autosizing under traffic: the 2026-09-21 container test (see "Host-tier autosizing") covered boot,
+  the engine preflight, steady-state RSS and one request; retention/hit-rate at the 4.4x tier and the rank-0
+  RSS (926 GiB) under a full replay have not been measured. Hosts other than the 4012 GiB AWS SKU have not
+  been seen.

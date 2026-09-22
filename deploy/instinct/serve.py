@@ -84,11 +84,48 @@ K3_MAX_CONTAINERS = (
 # MLA host dedup keeps one copy of the (TP-replicated) target KV across the 8
 # ranks instead of 8, so the host KV pool is an absolute size (GB, all ranks)
 # and the rank-local Mamba/KDA state is sized separately as a ratio of the
-# device Mamba pool. 140 GB KV + 13.5x Mamba => ~800 GB pinned host memory,
-# within the 1 TiB container request (Modal's maximum is 1048576 MiB = 1 TiB).
-HICACHE_KV_SIZE_GB = "140"
-HICACHE_MAMBA_RATIO = "13.5"
+# device Mamba pool. The validated baseline is 140 GB KV + 13.5x Mamba =>
+# ~800 GiB pinned host memory (SGLANG_HICACHE_HOST_BUDGET_GIB=800), which fits
+# the 1 TiB container request.
+#
+# The request is only a scheduling floor. Once the container lands, the
+# memcgroup limit is 10x the request and /proc/meminfo reports the physical
+# host (confirmed 2026-09-21 on an 8xB300 AWS host: MemTotal 4.2 TB inside
+# the container), and 8-GPU hosts admit no other tasks. plan_hicache_host_tier()
+# therefore reads the host size at startup and scales the baseline plan
+# (KV size, Mamba ratio and the engine's aggregate cap together, so the
+# validated KV/Mamba split is kept) to fill it, leaving
+# HICACHE_HOST_FILL_FRACTION headroom plus HICACHE_HOST_RESERVE_GIB for the
+# engine's own RSS, residual checkpoint page cache and the host.
+# Deploy-time env (forwarded through K3_ENV_OVERRIDES) can replace the
+# baseline split; autosizing then scales the replaced baseline. With
+# K3_HICACHE_AUTOSIZE=0 the three values are used exactly (experiment arms).
+HICACHE_KV_SIZE_GB = os.environ.get("K3_HICACHE_KV_SIZE_GB", "140")  # baseline --hicache-size (GB, one dedup copy)
+HICACHE_MAMBA_RATIO = os.environ.get("K3_HICACHE_MAMBA_RATIO", "13.5")  # baseline --hicache-mamba-ratio (per rank)
+HICACHE_HOST_BUDGET_GIB = int(os.environ.get("K3_HICACHE_HOST_BUDGET_GIB", "800"))  # baseline SGLANG_HICACHE_HOST_BUDGET_GIB
 HICACHE_WRITE_POLICY = "write_through"
+# Autosize knobs. Deploy-time env, forwarded into the container through
+# K3_ENV_OVERRIDES. K3_HICACHE_AUTOSIZE=0 pins the baseline plan.
+HICACHE_AUTOSIZE = os.environ.get("K3_HICACHE_AUTOSIZE", "1") != "0"
+HICACHE_HOST_FILL_FRACTION = float(
+    os.environ.get("K3_HICACHE_HOST_FILL_FRACTION", "0.90")
+)
+HICACHE_HOST_RESERVE_GIB = int(os.environ.get("K3_HICACHE_HOST_RESERVE_GIB", "64"))
+HICACHE_HOST_MAX_GIB = int(os.environ.get("K3_HICACHE_HOST_MAX_GIB", "0"))  # 0: no cap
+# No 8-GPU host has this much RAM; a MemTotal at or above it means the
+# sandbox reported the memcgroup limit (10x the request) instead of the
+# host, and the plan falls back to the baseline.
+HICACHE_HOST_IMPLAUSIBLE_GIB = 8 * 1024
+# Container memory cgroup files: (directory, limit files, usage file), v2 then
+# v1. /proc/meminfo is not bounded by memory.max (host-wide under runc,
+# sentry-reported under gVisor), so the plan reads the limit directly, as
+# upstream SGLang (#40135) and vLLM do.
+CGROUP_MEMORY_FILES = (
+    ("sys/fs/cgroup", ("memory.max", "memory.high"), "memory.current"),
+    ("sys/fs/cgroup/memory", ("memory.limit_in_bytes",), "memory.usage_in_bytes"),
+)
+# cgroup v1 reports "unlimited" as a sentinel near 2**63.
+CGROUP_UNLIMITED_BYTES = 1 << 62
 
 SGLANG_BASE_IMAGE = "modalresearch/sglang:kimi-k3-cu13-20260806-b9e90a6d6"
 SGLANG_COMMIT = "b9e90a6d6ef1859830c3b879cef999092975a41a"   # HEAD stays here
@@ -170,6 +207,14 @@ if DFLASH2_EVAL_VOLUME_NAME:
     server_volumes[DFLASH2_EVAL_MOUNT_PATH] = modal.Volume.from_name(
         DFLASH2_EVAL_VOLUME_NAME, environment_name=DFLASH2_EVAL_VOLUME_ENV
     ).with_mount_options(read_only=True)
+# Dev/experiment endpoints only: mount a scratch volume (driver, workload,
+# results) at /experiment. Unset in prod.
+EXPERIMENT_VOLUME_NAME = os.environ.get("K3_EXPERIMENT_VOLUME", "")
+EXPERIMENT_MOUNT_PATH = "/experiment"
+if EXPERIMENT_VOLUME_NAME:
+    server_volumes[EXPERIMENT_MOUNT_PATH] = modal.Volume.from_name(
+        EXPERIMENT_VOLUME_NAME, create_if_missing=True
+    )
 
 K3_ENV_OVERRIDES = {
     key: os.environ[key]
@@ -177,6 +222,14 @@ K3_ENV_OVERRIDES = {
         "K3_MIN_CONTAINERS",
         "K3_MAX_CONTAINERS",
         "K3_RELEASE_SHA",
+        "K3_HICACHE_AUTOSIZE",
+        "K3_HICACHE_HOST_FILL_FRACTION",
+        "K3_HICACHE_HOST_RESERVE_GIB",
+        "K3_HICACHE_HOST_MAX_GIB",
+        "K3_HICACHE_KV_SIZE_GB",
+        "K3_HICACHE_MAMBA_RATIO",
+        "K3_HICACHE_HOST_BUDGET_GIB",
+        "K3_EXPERIMENT_VOLUME",
     )
     if key in os.environ
 }
@@ -251,6 +304,9 @@ BASE_RUNTIME_ENV = {
     "SGLANG_RENORM_DETERMINISTIC": "1",
     # dev/instinct/2026-09-15 #113: rank-0 authority D2H write handoff lock
     "SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF": "1",
+    # Engine aggregate host-pool cap for the baseline plan (engine default is
+    # also 800); startup() raises it together with the pool sizes.
+    "SGLANG_HICACHE_HOST_BUDGET_GIB": str(HICACHE_HOST_BUDGET_GIB),
     # dev/instinct/2026-09-15 #119: per-request prefill/decode/queue timings in usage/meta_info
     "SGLANG_ENABLE_REQUEST_METRICS": "1",
 }
@@ -885,6 +941,174 @@ def export_deployment_identity() -> None:
     print(f"Exported MODAL_APP_ID={app_id}")
 
 
+def _read_meminfo_bytes(path: str = "/proc/meminfo") -> dict[str, int]:
+    """Parse /proc/meminfo into bytes (the kernel reports kB)."""
+    values: dict[str, int] = {}
+    with open(path) as handle:
+        for line in handle:
+            key, sep, rest = line.partition(":")
+            parts = rest.split()
+            if not sep or not parts or not parts[0].isdigit():
+                continue
+            unit = 1024 if len(parts) > 1 and parts[1] == "kB" else 1
+            values[key.strip()] = int(parts[0]) * unit
+    return values
+
+
+def _read_int_file(path: str) -> int | None:
+    try:
+        with open(path) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):  # missing file, or "max" (no limit)
+        return None
+
+
+def _read_cgroup_headroom_bytes(
+    root: str = "/", fallback_usage: int = 0
+) -> tuple[int, int, bool] | None:
+    """Bytes this container may still allocate under its memory cgroup.
+
+    None when no finite limit is visible (no cgroupfs in the sandbox, or the
+    limit is "max"). Otherwise ``(headroom, limit, usage_known)``: the tightest
+    of the limit files, and that limit minus current usage. The limit, not the
+    headroom, says whether the cgroup is a credible single-host bound. If the
+    usage file cannot be read, ``fallback_usage`` (the caller's own accounting)
+    is subtracted instead of assuming zero, which would overstate the headroom.
+    """
+    for directory, limit_names, usage_name in CGROUP_MEMORY_FILES:
+        limits = [
+            value
+            for name in limit_names
+            if (value := _read_int_file(os.path.join(root, directory, name))) is not None
+            and value < CGROUP_UNLIMITED_BYTES
+        ]
+        if limits:
+            usage = _read_int_file(os.path.join(root, directory, usage_name))
+            usage_known = usage is not None
+            if not usage_known:
+                usage = fallback_usage
+            limit = min(limits)
+            return max(0, limit - usage), limit, usage_known
+    return None
+
+
+def _host_identity() -> str:
+    """Cloud/region/CPU count, so hit rates can be compared per 8xB300 SKU."""
+    cloud = os.environ.get("MODAL_CLOUD_PROVIDER", "?").removeprefix("CLOUD_PROVIDER_").lower()
+    region = os.environ.get("MODAL_REGION", "?")
+    return f"cloud={cloud} region={region} cpus={os.cpu_count()}"
+
+
+def plan_hicache_host_tier(
+    meminfo: dict[str, int] | None = None,
+    cgroup_root: str = "/",
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Size the HiCache host tier to the physical host this container landed on.
+
+    Runs once per container, before the engine starts. Returns
+    ``(server_arg_overrides, env_overrides)``: ``--hicache-size`` and
+    ``--hicache-mamba-ratio`` scaled from the validated baseline by
+    ``usable / HICACHE_HOST_BUDGET_GIB``, and ``SGLANG_HICACHE_HOST_BUDGET_GIB``
+    set to the usable amount so the engine's aggregate preflight enforces the
+    same number. ``usable`` is
+    ``min(MemTotal, MemAvailable, cgroup headroom) * HICACHE_HOST_FILL_FRACTION
+    - HICACHE_HOST_RESERVE_GIB``, optionally capped by HICACHE_HOST_MAX_GIB.
+    A host smaller than the baseline scales the plan down rather than starting
+    a baseline the container cannot hold; a plan too small to express
+    (``--hicache-size`` < 1 GB or ``--hicache-mamba-ratio`` < 1.0) fails startup.
+    Falls back to the baseline when autosizing is off, /proc/meminfo is
+    unreadable, or neither MemTotal nor the cgroup gives a plausible
+    single-host size.
+    """
+    gib = 1024**3
+    baseline_args = {
+        "--hicache-size": HICACHE_KV_SIZE_GB,
+        "--hicache-mamba-ratio": HICACHE_MAMBA_RATIO,
+    }
+    baseline_env = {"SGLANG_HICACHE_HOST_BUDGET_GIB": str(HICACHE_HOST_BUDGET_GIB)}
+    baseline = (
+        f"--hicache-size {HICACHE_KV_SIZE_GB} --hicache-mamba-ratio "
+        f"{HICACHE_MAMBA_RATIO} SGLANG_HICACHE_HOST_BUDGET_GIB={HICACHE_HOST_BUDGET_GIB}"
+    )
+    if not HICACHE_AUTOSIZE:
+        print(f"HiCache host tier: autosize off (K3_HICACHE_AUTOSIZE=0), baseline {baseline}")
+        return baseline_args, baseline_env
+    try:
+        if meminfo is None:
+            meminfo = _read_meminfo_bytes()
+        total = meminfo["MemTotal"]
+        available = meminfo.get("MemAvailable", total)
+    except (OSError, KeyError, ValueError) as error:
+        print(f"HiCache host tier: /proc/meminfo unreadable ({error!r}), baseline {baseline}")
+        return baseline_args, baseline_env
+    total_gib = total / gib
+    available_gib = available / gib
+    identity = _host_identity()
+    # Read the cgroup before judging plausibility: a bogus MemTotal can still
+    # be sized from a real container limit. Unreadable usage falls back to the
+    # sandbox's own accounting (MemTotal - MemAvailable), never to zero.
+    cgroup = _read_cgroup_headroom_bytes(cgroup_root, fallback_usage=max(0, total - available))
+    cgroup_gib = None if cgroup is None else cgroup[0] / gib
+    cgroup_limit_gib = None if cgroup is None else cgroup[1] / gib
+    cgroup_text = "none"
+    if cgroup is not None:
+        cgroup_text = f"{cgroup_gib:.0f} GiB of {cgroup_limit_gib:.0f} GiB limit" + (
+            "" if cgroup[2] else " (usage unreadable; meminfo used)"
+        )
+    meminfo_plausible = total_gib < HICACHE_HOST_IMPLAUSIBLE_GIB
+    # Plausibility is judged on the limit: usage can pull the headroom of an
+    # implausibly large limit below the threshold without making it a host bound.
+    if not meminfo_plausible and (
+        cgroup_limit_gib is None or cgroup_limit_gib >= HICACHE_HOST_IMPLAUSIBLE_GIB
+    ):
+        print(
+            f"HiCache host tier: MemTotal={total_gib:.0f} GiB is not a single host "
+            f"(>= {HICACHE_HOST_IMPLAUSIBLE_GIB} GiB, memcgroup limit reported?) and "
+            f"cgroup_headroom={cgroup_text} gives no single-host bound, "
+            f"{identity}, baseline {baseline}"
+        )
+        return baseline_args, baseline_env
+    host_gib = min(total_gib, available_gib) if meminfo_plausible else math.inf
+    if cgroup_gib is not None:
+        host_gib = min(host_gib, cgroup_gib)
+    usable_gib = host_gib * HICACHE_HOST_FILL_FRACTION - HICACHE_HOST_RESERVE_GIB
+    if HICACHE_HOST_MAX_GIB > 0:
+        usable_gib = min(usable_gib, HICACHE_HOST_MAX_GIB)
+    memory = (
+        f"MemTotal={total_gib:.0f} GiB, MemAvailable={available_gib:.0f} GiB, "
+        f"cgroup_headroom={cgroup_text}"
+    )
+    scale = max(usable_gib, 0.0) / HICACHE_HOST_BUDGET_GIB
+    kv_size_gb = int(float(HICACHE_KV_SIZE_GB) * scale)
+    mamba_ratio = math.floor(float(HICACHE_MAMBA_RATIO) * scale * 10) / 10
+    budget_gib = int(usable_gib)
+    if kv_size_gb < 1 or mamba_ratio < 1.0:
+        # The engine rejects a zero size/ratio, and a host Mamba pool smaller
+        # than the device pool is not a useful tier.
+        min_usable_gib = HICACHE_HOST_BUDGET_GIB * max(
+            1 / float(HICACHE_KV_SIZE_GB), 1 / float(HICACHE_MAMBA_RATIO)
+        )
+        raise RuntimeError(
+            f"HiCache host tier: usable {usable_gib:.1f} GiB is below the minimum "
+            f"{min_usable_gib:.0f} GiB for this baseline (plan would be --hicache-size "
+            f"{kv_size_gb} --hicache-mamba-ratio {mamba_ratio}; {memory}, "
+            f"fill={HICACHE_HOST_FILL_FRACTION}, reserve={HICACHE_HOST_RESERVE_GIB} GiB, "
+            f"cap={HICACHE_HOST_MAX_GIB or 'none'}, {identity}); set K3_HICACHE_AUTOSIZE=0, "
+            "raise K3_HICACHE_HOST_MAX_GIB or lower the reserve."
+        )
+    print(
+        f"HiCache host tier plan: {identity}, {memory}, "
+        f"fill={HICACHE_HOST_FILL_FRACTION}, reserve={HICACHE_HOST_RESERVE_GIB} GiB, "
+        f"cap={HICACHE_HOST_MAX_GIB or 'none'} -> usable={usable_gib:.0f} GiB, "
+        f"scale={scale:.2f}x baseline: --hicache-size {kv_size_gb} "
+        f"--hicache-mamba-ratio {mamba_ratio} SGLANG_HICACHE_HOST_BUDGET_GIB={budget_gib}"
+    )
+    return (
+        {"--hicache-size": str(kv_size_gb), "--hicache-mamba-ratio": f"{mamba_ratio:g}"},
+        {"SGLANG_HICACHE_HOST_BUDGET_GIB": str(budget_gib)},
+    )
+
+
 SERVER_KWARGS = {
     "include_source": True,
     "image": serving_image,
@@ -918,6 +1142,13 @@ class Server:
             warmup_chat_completions,
         )
 
+        # First thing after placement: size the host tier to this host, before
+        # anything touches the engine. The env override is inherited by the
+        # engine subprocess started by SGLangEndpoint below.
+        hicache_args, hicache_env = plan_hicache_host_tier()
+        os.environ.update(hicache_env)
+        server_args = SERVER_ARGS | hicache_args
+
         seed_prebuilt_jit(JIT_CACHE_PATH)
         check_dflash2_checkpoint(SPECULATIVE_DRAFT_MODEL_PATH)
         export_deployment_identity()
@@ -929,7 +1160,7 @@ class Server:
             "Kimi K3 runtime configuration: "
             f"model_revision={MODEL_REVISION!r}, "
             f"draft_path={SPECULATIVE_DRAFT_MODEL_PATH!r}, "
-            f"server_args={SERVER_ARGS!r}"
+            f"server_args={server_args!r}"
         )
 
         self.endpoint = SGLangEndpoint(
@@ -937,7 +1168,7 @@ class Server:
             worker_port=PORT,
             tp=TP_SIZE,
             speculative_model_path=SPECULATIVE_DRAFT_MODEL_PATH,
-            extra_server_args=SERVER_ARGS,
+            extra_server_args=server_args,
             health_timeout=3 * HOURS,
             health_poll_interval=10.0,
             health_request_timeout=30.0,
