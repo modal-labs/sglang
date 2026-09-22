@@ -9,15 +9,22 @@ model_family: kimi_k3
 from __future__ import annotations
 
 import base64
+import http.client
 import json
+import math
 import os
+import re
 import shutil
 import struct
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import zlib
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 
 import modal
@@ -533,6 +540,132 @@ def terminate_unhealthy_container() -> None:
     _exit_unless_draining("ContainerStop timeout")
 
 
+# Sustained acceptance collapse can leave /health passing while a replica
+# generates only its bonus token at every verification step. Measure existing
+# completed-request counters over a trailing window, so idle replicas and
+# stale acceptance gauges cannot produce a verdict. Keep the calibrated
+# five-minute window and thirty ten-second failing polls before retirement.
+SPEC_ACCEPT_METRICS_URL = f"http://127.0.0.1:{PORT}/metrics"
+SPEC_ACCEPT_WINDOW_SECONDS = 5 * MINUTES
+SPEC_ACCEPT_COLLAPSE_THRESHOLD = 1.5
+SPEC_ACCEPT_MIN_VERIFY_CALLS = 200
+SPEC_ACCEPT_POLL_SECONDS = 10.0
+SPEC_ACCEPT_SUSTAINED_POLLS = 30
+# Two consecutive counter samples farther apart than this break window
+# continuity: the next successful read discards the samples before the gap,
+# so a delayed poll or a /metrics outage can extend the effective window by
+# at most this tolerance instead of by the whole outage.
+SPEC_ACCEPT_MAX_SAMPLE_GAP_SECONDS = 2 * SPEC_ACCEPT_POLL_SECONDS
+# Counters read from /metrics, in sample order. Names are pinned to the
+# TokenizerMetricsCollector definitions by the deploy watchdog unit test.
+_SPEC_ACCEPT_COUNTERS = (
+    "generation_tokens_total",
+    "spec_verify_calls_total",
+)
+_SPEC_ACCEPT_COUNTER_RE = re.compile(
+    r"^sglang:(" + "|".join(_SPEC_ACCEPT_COUNTERS) + r")(?:\{[^}]*\})?\s+(\S+)",
+    re.MULTILINE,
+)
+
+
+class SpecAcceptWatchdog:
+    """Per-poll verdict on the trailing completed-request acceptance ratio."""
+
+    def __init__(
+        self,
+        metrics_url: str = SPEC_ACCEPT_METRICS_URL,
+        *,
+        window_seconds: float = SPEC_ACCEPT_WINDOW_SECONDS,
+        collapse_threshold: float = SPEC_ACCEPT_COLLAPSE_THRESHOLD,
+        min_verify_calls: float = SPEC_ACCEPT_MIN_VERIFY_CALLS,
+        max_sample_gap: float = SPEC_ACCEPT_MAX_SAMPLE_GAP_SECONDS,
+        request_timeout: float = 5.0,
+        read_metrics: Callable[[], str] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.metrics_url = metrics_url
+        self.window_seconds = window_seconds
+        self.collapse_threshold = collapse_threshold
+        self.min_verify_calls = min_verify_calls
+        self.max_sample_gap = max_sample_gap
+        self.request_timeout = request_timeout
+        self._read_metrics = read_metrics or self._fetch_metrics
+        self._clock = clock
+        # (monotonic time, *_SPEC_ACCEPT_COUNTERS totals)
+        self._samples: deque[tuple[float, tuple[float, ...]]] = deque()
+
+    def _fetch_metrics(self) -> str:
+        with urllib.request.urlopen(
+            self.metrics_url, timeout=self.request_timeout
+        ) as response:
+            return response.read().decode("utf-8", errors="replace")
+
+    def _read_counters(self) -> tuple[float, ...]:
+        """Totals of `_SPEC_ACCEPT_COUNTERS`, summed across label sets."""
+        totals = dict.fromkeys(_SPEC_ACCEPT_COUNTERS, 0.0)
+        seen = set()
+        for name, value in _SPEC_ACCEPT_COUNTER_RE.findall(self._read_metrics()):
+            value = float(value)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"invalid {name}: {value}")
+            totals[name] += value
+            seen.add(name)
+        missing = set(_SPEC_ACCEPT_COUNTERS) - seen
+        if missing:
+            raise ValueError(f"missing acceptance counters: {sorted(missing)}")
+        return tuple(totals[name] for name in _SPEC_ACCEPT_COUNTERS)
+
+    def check(self) -> str | None:
+        """None while healthy or without a verdict; an error string on collapse."""
+        try:
+            counters = self._read_counters()
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as error:
+            # Unknown data is not a low-acceptance verdict. Invalid or absent
+            # series cannot be bridged as zero; transport gaps use the normal
+            # sample-gap tolerance on the next successful read.
+            if isinstance(error, ValueError):
+                self._samples.clear()
+            print(f"[spec-accept] metrics unavailable; no verdict: {error!r}", flush=True)
+            return None
+        now = self._clock()
+        if self._samples and now - self._samples[-1][0] > self.max_sample_gap:
+            # A poll delayed past the gap tolerance leaves the same hole an
+            # outage does; samples before the gap cannot contribute to a
+            # trailing window.
+            self._samples.clear()
+        if self._samples and any(
+            c < last for c, last in zip(counters, self._samples[-1][1])
+        ):
+            self._samples.clear()
+        self._samples.append((now, counters))
+        while len(self._samples) > 1 and (
+            self._samples[1][0] <= now - self.window_seconds
+        ):
+            self._samples.popleft()
+        first_time, first = self._samples[0]
+        elapsed = now - first_time
+        if elapsed < self.window_seconds:
+            return None
+        gen, verify_calls = (
+            c - f for c, f in zip(counters, first)
+        )
+        if verify_calls >= self.min_verify_calls:
+            accept_length = gen / verify_calls
+            if accept_length <= self.collapse_threshold:
+                return (
+                    f"spec accept collapse: {accept_length:.2f} tokens/verify over "
+                    f"{elapsed:.0f}s ({gen:.0f} tokens, "
+                    f"{verify_calls:.0f} verify calls) <= {self.collapse_threshold}"
+                )
+        return None
+
+
 # Kimi's pinned encoder interprets this reserved token in every string,
 # including tool output and reasoning. Only typed image parts may consume an
 # image prompt. MODEL_REVISION pins the source; the exact function match below
@@ -827,15 +960,22 @@ class Server:
         )
         warmup_elapsed = time.monotonic() - started
 
+        def _on_heartbeat_failure() -> None:
+            if _begin_heartbeat_termination():
+                terminate_unhealthy_container()
+
         start_heartbeat_thread(
             lambda: self.endpoint.health_check() if _container_running() else None,
-            on_failure=lambda: (
-                terminate_unhealthy_container()
-                if _begin_heartbeat_termination()
-                else None
-            ),
+            on_failure=_on_heartbeat_failure,
             poll_interval=10.0,
             max_consecutive_failures=6,
+        )
+        spec_accept_watchdog = SpecAcceptWatchdog()
+        start_heartbeat_thread(
+            lambda: spec_accept_watchdog.check() if _container_running() else None,
+            on_failure=_on_heartbeat_failure,
+            poll_interval=SPEC_ACCEPT_POLL_SECONDS,
+            max_consecutive_failures=SPEC_ACCEPT_SUSTAINED_POLLS,
         )
 
         print(
