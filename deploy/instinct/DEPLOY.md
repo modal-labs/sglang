@@ -1,4 +1,33 @@
-# kimi-k3-fast -> release/instinct/2026-09-18 @ cc7b258e4, 4 PRs of #22 + #26 on
+# kimi-k3-fast -> release/instinct/2026-09-21 @ 0cbd91d4f (RCA hotfixes), 4 PRs of #22 + #26 on
+
+Release branch `release/instinct/2026-09-21` = `dev/instinct-rca-hotfixes/2026-09-20` @ 0cbd91d4f3
+= the deployed v9 `release/instinct/2026-09-18` @ cc7b258e48 + #132 (deploy hotfix: deploy/instinct
+rename, mem-fraction 0.900, graceful drain, heartbeat teardown serialization, pinned-encoder patch)
++ the 2026-09-20 [PAD]-flood RCA hotfixes: #138 (KDA CuTe DSL MTP: each graph-padded row zeroes its own
+dense output interval), #139 (degenerate verify target-row sanitizer + sticky mark, selector chain-sampler
+CDF endpoint fallback and #37134 q guards, radix/HiCache insert skip for marked requests, zero cache-length
+early return, streaming-session degenerate-turn guard), #140 (multimodal embedding cache: owned storage,
+length-validated hits, offset-derived counts, unconditional rank-consistent encode), #143 (reserved KV
+slot-0/page-0 writer guards on the MLA/MHA path, zero-on-alloc, paged free() page-0 mask + drop gauge
+`sglang:kv_reserved_location_drops`, free-group aliasing fix, per-page allocated bitmap, page-alignment
+assert) and #142 (deploy: retire a replica after sustained speculative-acceptance collapse — trailing 300 s
+window, generation_tokens/verify_calls <= 1.5 over >= 200 verify calls for 30 consecutive 10 s polls, through
+the existing heartbeat drain path) + this pin commit. No new env flags: the engine fixes are unconditional;
+the only behavior change on the deploy side is the watchdog. Rollback target is the deployed v9
+`release/instinct/2026-09-18` @ cc7b258e48 (serve.py commit 191ad43c93): check it out, regenerate
+`engine-cc7b258e4.bundle`, deploy. Validation of this pin (2026-09-22): `kimi-k3-bench` 1x1 in
+modal-labs/cust-instinct booted 0cbd91d4f3 with `K3_RELEASE_SHA` (ready line `release 0cbd91d4f`, warmup
+734 s incl. the image turn on a cold mm JIT, /health, /get_server_info identity, chat smoke PAD-free);
+tip-minus-#142 (d7cabec178) on an isolated 8x B300: 360/360 healthy text+image requests PAD-free (logged
+acceptance mean ~3.4), the four recorded 2026-09-20 production flood bodies PAD-free 12/12 (acceptance
+~3.9), 120/120 PAD-free under HiCache write-through/load-back pressure (69.5 M tokens loaded back),
+`sglang:kv_reserved_location_drops` 0 throughout; registered CPU suites 235 passed / 33 skipped / 2
+failures that are pre-existing fixture TypeErrors reproduced on the base 003560c20d; GPU kernel suites
+(KDA 44, chain-sampler CDF 102, DFlash/DSpark accept 25 + 22 subtests, KV reserved-slot writers 11) all
+passed. The #142 watchdog has CPU + heartbeat-integration coverage only; it has not tripped on a live
+engine. Previous pin notes follow.
+
+## Previous pin: release/instinct/2026-09-18 @ cc7b258e4
 
 Release branch `release/instinct/2026-09-18` = `dev/instinct/2026-09-15` @ cc7b258e48
 (= rc3 aa7df1d23 + #119 per-request metrics (default off, opted in) + #120 rank-consistent mm
@@ -53,8 +82,9 @@ git bundle list-heads deploy/instinct/engine-<sha9>.bundle
 ```
 
 The pin ref is needed because bundles only advertise named refs; serve.py checks that the advertised
-head equals `RELEASE_SHA`. For the current pin, use `engine-cc7b258e4.bundle` and
-`RELEASE_SHA=cc7b258e48835d4356c742fcc6741e9664ffd9dd`.
+head equals `RELEASE_SHA`. For the current pin, use `engine-0cbd91d4f.bundle` and
+`RELEASE_SHA=0cbd91d4f3d0dca86315b20a60c3573d1895362d` (previous pin: `engine-cc7b258e4.bundle`,
+`cc7b258e48835d4356c742fcc6741e9664ffd9dd`).
 
 Then run `modal deploy serve.py`. `serve.py` refuses to import if the bundle is missing, fails
 `git bundle verify`, or lacks `RELEASE_SHA`; the exception message carries the exact create
@@ -89,24 +119,28 @@ K3_MIN_CONTAINERS=4 K3_MAX_CONTAINERS=4 K3_RELEASE_SHA=<sha> MODAL_ENVIRONMENT=c
 modal deploy --name kimi-k3-bench deploy/instinct/serve.py
 ```
 
-Image build check (in the build log): `rev-parse HEAD == cc7b258e4...`, `status --porcelain` empty,
+Image build check (in the build log): `rev-parse HEAD == 0cbd91d4f...`, `status --porcelain` empty,
 `sglang.__file__` printed. The A/B endpoint `kimi-k3-ab-instinct` was built with the identical steps.
 
 ## During cutover
 
 - Watch green containers schedule; if they don't, scale Instinct down a little to free GPUs.
 - Old (blue) containers are hard-terminated 4 h after deploy regardless of green progress.
-- Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release cc7b258e4). ...` — the
-  warmup number now includes the image turn (expect +25-80 s on containers with a cold mm JIT).
-- Env check on a running container: `SGLANG_RELEASE_SHA=cc7b258e4...` and the 10 flag lines above;
+- Per-container readiness line: `Kimi K3 TP8 DFlash is ready (release 0cbd91d4f). ...` — the
+  warmup number now includes the image turn (expect +25-80 s on containers with a cold mm JIT; the
+  2026-09-22 bench container reported warmup=734 s cumulative).
+- Env check on a running container: `SGLANG_RELEASE_SHA=0cbd91d4f...` and the 10 flag lines above;
   `SGLANG_ENABLE_MM_CUDA_IPC_PREFIX_ACK` and `SGLANG_MM_RANK_CONSISTENT_ENCODE` must be absent.
 
 ## Rollback
 
-rc2, rc3 and the prior `release/instinct/2026-09-17` pin were never deployed to `kimi-k3-fast`. To return
-to the currently deployed prod 462ade71f recipe, check out `release/instinct/2026-09-14` (serve.py commit
-`dd2e5ed0d6`), regenerate `engine-462ade71f.bundle` with the same command, then deploy.
-Flags-only rollback (keep cc7b258e48): drop the 8 default-off lines (the 5 prod flags + the 2 #26 lines + #119) and set the 2 #110/#113
+To return to the previously deployed v9, check out `release/instinct/2026-09-18` @ cc7b258e48 (serve.py
+commit `191ad43c93`), regenerate `engine-cc7b258e4.bundle` with the same command, then deploy. That
+reverts #132 and the five RCA hotfixes (#138/#139/#140/#143/#142) together: none of them is behind an env
+var, so there is no flags-only rollback for them. Older history: rc2, rc3 and the prior
+`release/instinct/2026-09-17` pin were never deployed to `kimi-k3-fast`; the pre-v9 prod was 462ade71f
+(`release/instinct/2026-09-14`, serve.py commit `dd2e5ed0d6`, bundle `engine-462ade71f.bundle`).
+Flags-only rollback of the older levers (keep 0cbd91d4f3): drop the 8 default-off lines (the 5 prod flags + the 2 #26 lines + #119) and set the 2 #110/#113
 lines to `"0"` — do NOT drop them, an absent var is read as ON (`EnvBool(True)`) in the engine. The #120
 rank-consistent mm miss decision has no flag (`SGLANG_MM_RANK_CONSISTENT_ENCODE` is ignored); rolling it
 back means rolling back the engine SHA; at 462ade71f the 5-flags-off configuration was ==
@@ -200,6 +234,8 @@ Validation (2026-09-17, L27 gate runs on fresh boxes, same tree as the measured 
 
 ## Not verified
 
-- A B300:8 container boot with the image warmup turn (#516 is CI-green, not container-tested).
-- `modal deploy` from this directory against Instinct's workspace (only run in modal-labs/cust-instinct
-  as `kimi-k3-ab-instinct`, 1 container, aws/us-east-1, offline HF layout).
+- `modal deploy` from this directory against Instinct's workspace (this pin has only run in
+  modal-labs/cust-instinct as the 1x1 `kimi-k3-bench`; earlier pins as `kimi-k3-ab-instinct`).
+- A live trip of the #142 acceptance-collapse watchdog on a real engine (CPU unit tests and the exact-head
+  heartbeat integration test only).
+- Production-scale rollout (63 containers) of this pin; the bench boot is a single container.

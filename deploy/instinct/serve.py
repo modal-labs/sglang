@@ -93,11 +93,11 @@ HICACHE_WRITE_POLICY = "write_through"
 SGLANG_BASE_IMAGE = "modalresearch/sglang:kimi-k3-cu13-20260806-b9e90a6d6"
 SGLANG_COMMIT = "b9e90a6d6ef1859830c3b879cef999092975a41a"   # HEAD stays here
 SGLANG_EFFECTIVE_COMMIT = "2c881e2ed528746312ec326fa89ee6e5e2169adf"  # JIT-cache salt (unchanged: same kernels/ABI)
-RELEASE_REF = "release/instinct/2026-09-18"
+RELEASE_REF = "release/instinct/2026-09-21"
 RELEASE_SHA = os.environ.get(
     "K3_RELEASE_SHA",
-    "cc7b258e48835d4356c742fcc6741e9664ffd9dd",
-)  # release head = dev/instinct/2026-09-15 @ cc7b258e48: rc3 aa7df1d23 + #119 per-request metrics (off) + #120 rank-consistent mm encode (on) + #121 queue-depth gauges + #124 kimik3 parser trailing-marker fix
+    "0cbd91d4f3d0dca86315b20a60c3573d1895362d",
+)  # release head = dev/instinct-rca-hotfixes/2026-09-20 @ 0cbd91d4f3: cc7b258e48 + #132 deploy hotfix + #138 KDA padded-row interval zeroing + #139 degenerate verify-row sanitizer/chain-sampler guards/radix-skip + #140 mm embedding-cache correctness + #143 reserved KV slot-0/page-0 guards, zero-on-alloc, allocator hygiene + #142 acceptance-collapse watchdog
 RELEASE_BUNDLE = Path(__file__).parent / f"engine-{RELEASE_SHA[:9]}.bundle"  # untracked; regenerate per RELEASE_SHA (see DEPLOY.md)
 RELEASE_BUNDLE_IMAGE_PATH = f"/tmp/{RELEASE_BUNDLE.name}"
 RELEASE_PIN_REF = f"refs/deploy/{RELEASE_BUNDLE.stem}"  # a bundle only advertises named refs, so pin the SHA under one
