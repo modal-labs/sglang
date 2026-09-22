@@ -201,7 +201,10 @@ def kda_decode_mtp_kernel(
     # CUDA-graph padding rows use slot == -1.
     if slot < 0:
         cute.arch.griddepcontrol_wait()
-        pad_bos = cu_seqlens[i_n]
+        # This wrapper requires a fixed dense verify width. Graph metadata
+        # collapses all padded sequence boundaries to the real-token endpoint,
+        # but each padded request still owns its own dense output interval.
+        pad_bos = i_n * T_LOOP
         for i_t in cutlass.range_constexpr(T_LOOP):
             if cutlass.const_expr(SPLIT_V):
                 if tidx < TILE_V:
