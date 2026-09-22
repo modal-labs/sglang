@@ -770,12 +770,17 @@ class SchedulerMetricsReporter:
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
         num_correct_drafts: int = 0,
+        num_emitting_rows: Optional[int] = None,
     ):
         batch = running_batch or self.scheduler.running_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_correct_drafts
+            # num_emitting_rows excludes rows whose (degenerate) run was dropped.
+            rows = (
+                batch.batch_size() if num_emitting_rows is None else num_emitting_rows
+            )
+            decode_tokens = rows + num_correct_drafts
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,

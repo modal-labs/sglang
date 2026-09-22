@@ -1260,7 +1260,8 @@ class Req(ReqDllmMixin):
         self.spec_num_cap_tokens = 0
 
         # Sticky: a verify step's target probs had a row without positive finite
-        # mass, so this request's KV / SSM state is not trusted for caching.
+        # mass, so this request's KV / SSM state is not trusted for caching and
+        # update_finish_state ends it with an engine-fault abort.
         self.spec_target_degenerate = False
 
         # Acceptance histogram for speculative decoding.
@@ -1721,8 +1722,8 @@ class Req(ReqDllmMixin):
     def mark_spec_target_degenerate(self) -> None:
         if not self.spec_target_degenerate:
             logger.warning(
-                "Degenerate verify target row for rid=%s; emitted the "
-                "reject-sampler sentinel and skipping cache insertion",
+                "Degenerate verify target row for rid=%s; dropping that verify's "
+                "tokens, aborting the request and skipping cache insertion",
                 self.rid,
             )
         self.spec_target_degenerate = True
@@ -1734,6 +1735,18 @@ class Req(ReqDllmMixin):
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
+            return
+
+        # Before the length / stop / EOS checks: the degenerate verify's sentinel
+        # is not a sampled token, so neither ignore_eos nor the EOS set may keep
+        # the request decoding on it.
+        if self.spec_target_degenerate:
+            self.finished_reason = FINISH_ABORT(
+                "Speculative verify produced a target distribution without "
+                "positive finite mass; generation was stopped by an engine fault.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:

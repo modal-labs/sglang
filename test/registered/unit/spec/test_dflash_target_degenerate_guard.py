@@ -1,8 +1,8 @@
 """A DFlash verify target row without positive finite mass (all-NaN, Inf, or
 zero) must not reach the reject sampler as-is; the request is marked sticky
-(one warning) and, with the reject-sampler sentinel ``vocab_size - 1`` in the
-model's EOS set (deploy-side ``--json-model-override-args``), the request stops
-at that token whether or not it was marked."""
+(one warning) and a marked request finishes with an engine-fault FINISH_ABORT
+whatever its EOS set or ignore_eos. An unmarked request that samples the
+reject-sampler sentinel ``vocab_size - 1`` still follows the normal EOS rules."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -10,6 +10,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from array import array
+from http import HTTPStatus
 from unittest import mock
 
 import torch
@@ -17,7 +18,7 @@ import torch
 from sglang.kernels.ops.speculative.reject_sampling import (
     reject_sampling_sentinel_token,
 )
-from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN, Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_MATCHED_TOKEN, Req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dflash_utils import (
@@ -136,18 +137,59 @@ class TestGreedyTargetRowDegenerate(CustomTestCase):
         self.assertTrue(torch.isneginf(out[1, :SENTINEL]).all().item())
 
 
-class TestSentinelInEosSetStopsReq(CustomTestCase):
-    def test_sentinel_after_degenerate_row_finishes_at_sentinel(self):
-        req = _make_req([11, 13, SENTINEL, 21, 22])
+class TestDegenerateReqFinishState(CustomTestCase):
+    def _assert_engine_fault(self, req):
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(
+            req.finished_reason.status_code, HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        self.assertTrue(req.spec_target_degenerate)
+
+    def test_marked_req_aborts_with_sentinel_outside_eos_set(self):
+        # The served recipe has no sentinel EOS override.
+        req = _make_req([11, 13], eos_token_ids={EOS_TOKEN_ID})
         req.mark_spec_target_degenerate()
 
-        req.update_finish_state(new_accepted_len=5)
+        req.update_finish_state(new_accepted_len=0)
 
-        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
-        self.assertEqual(req.finished_reason.matched, SENTINEL)
-        self.assertEqual(req.finished_len, 3)
-        self.assertEqual(list(req.output_ids_through_stop), [11, 13, SENTINEL])
-        self.assertTrue(req.spec_target_degenerate)
+        self._assert_engine_fault(req)
+        self.assertEqual(list(req.output_ids_through_stop), [11, 13])
+
+    def test_marked_req_aborts_under_ignore_eos(self):
+        req = _make_req([11, 13])
+        req.sampling_params.ignore_eos = True
+        req.mark_spec_target_degenerate()
+
+        req.update_finish_state(new_accepted_len=0)
+
+        self._assert_engine_fault(req)
+
+    def test_marked_req_abort_beats_same_step_eos(self):
+        req = _make_req([11, EOS_TOKEN_ID])
+        req.mark_spec_target_degenerate()
+
+        req.update_finish_state(new_accepted_len=2)
+
+        self._assert_engine_fault(req)
+
+    def test_marked_req_abort_beats_length(self):
+        req = _make_req([11, 13])
+        req.sampling_params.max_new_tokens = 2
+        req.mark_spec_target_degenerate()
+
+        req.update_finish_state(new_accepted_len=0)
+
+        self._assert_engine_fault(req)
+
+    def test_pending_to_finish_is_kept(self):
+        req = _make_req([11])
+        client_abort = FINISH_ABORT("client abort")
+        req.to_finish = client_abort
+        req.mark_spec_target_degenerate()
+
+        req.update_finish_state(new_accepted_len=0)
+
+        self.assertIs(req.finished_reason, client_abort)
 
     def test_unmarked_req_sampling_sentinel_also_stops(self):
         req = _make_req([11, 13, SENTINEL, 21])
@@ -159,32 +201,13 @@ class TestSentinelInEosSetStopsReq(CustomTestCase):
         self.assertEqual(req.finished_len, 3)
         self.assertFalse(req.spec_target_degenerate)
 
-    def test_sentinel_outside_eos_set_is_a_normal_token_even_when_marked(self):
+    def test_unmarked_sentinel_outside_eos_set_is_a_normal_token(self):
         req = _make_req([11, 13, SENTINEL, 21], eos_token_ids={EOS_TOKEN_ID})
-        req.mark_spec_target_degenerate()
 
         req.update_finish_state(new_accepted_len=4)
 
         self.assertFalse(req.finished())
-        self.assertTrue(req.spec_target_degenerate)
-
-    def test_ignore_eos_bypasses_sentinel_stop(self):
-        req = _make_req([11, 13, SENTINEL, 21])
-        req.sampling_params.ignore_eos = True
-        req.mark_spec_target_degenerate()
-
-        req.update_finish_state(new_accepted_len=4)
-
-        self.assertFalse(req.finished())
-
-    def test_degenerate_row_without_sentinel_keeps_decoding(self):
-        req = _make_req([11, 13, 21])
-        req.mark_spec_target_degenerate()
-
-        req.update_finish_state(new_accepted_len=3)
-
-        self.assertFalse(req.finished())
-        self.assertTrue(req.spec_target_degenerate)
+        self.assertFalse(req.spec_target_degenerate)
 
     def test_mark_is_sticky_and_logs_once(self):
         req = _make_req([11])
@@ -195,15 +218,6 @@ class TestSentinelInEosSetStopsReq(CustomTestCase):
             req.mark_spec_target_degenerate()
         self.assertEqual(len(cm.output), 1)
         self.assertTrue(req.spec_target_degenerate)
-
-    def test_eos_in_same_step_before_sentinel_still_wins(self):
-        req = _make_req([11, EOS_TOKEN_ID, SENTINEL])
-        req.mark_spec_target_degenerate()
-
-        req.update_finish_state(new_accepted_len=3)
-
-        self.assertEqual(req.finished_reason.matched, EOS_TOKEN_ID)
-        self.assertEqual(req.finished_len, 2)
 
 
 class TestBatchResultCarriesTargetDegenerate(CustomTestCase):

@@ -554,31 +554,58 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        target_degenerate = (
+            result.target_degenerate.tolist()
+            if result.target_degenerate is not None
+            else None
+        )
+        # A degenerate verify's run is dropped below (nothing committed or
+        # emitted), so it contributes no accepted drafts / block-accept / cap
+        # tokens to the metrics and no observation to the adaptive controller.
+        live = (
+            [not d for d in target_degenerate]
+            if target_degenerate is not None and any(target_degenerate)
+            else None
+        )
+        num_correct_drafts_per_req = [
+            x - 1 if live is None or live[i] else 0 for i, x in enumerate(accept_lens)
+        ]
+        result.num_correct_drafts = sum(num_correct_drafts_per_req)
+        result.num_correct_drafts_per_req_cpu = num_correct_drafts_per_req
 
         block_accept_lens = (
             result.block_accept_lens.tolist()
             if result.block_accept_lens is not None
             else None
         )
+        cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
+        if live is not None:
+            if block_accept_lens is not None:
+                block_accept_lens = [
+                    n if ok else 0 for n, ok in zip(block_accept_lens, live)
+                ]
+            if cap_lens is not None:
+                cap_lens = [n if ok else 0 for n, ok in zip(cap_lens, live)]
         result.num_block_accept_tokens = (
             sum(block_accept_lens) if block_accept_lens else 0
         )
-        cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
         result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
-        target_degenerate = (
-            result.target_degenerate.tolist()
-            if result.target_degenerate is not None
-            else None
-        )
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
-        )
+        if live is None:
+            self.model_worker.on_verify_complete_cpu(
+                num_correct_drafts_per_req, batch_size=len(batch.reqs)
+            )
+        else:
+            # Filtered observations, but the verify's own batch size: the
+            # controller routes the sample to the slot that ran this verify.
+            observed = [n for n, ok in zip(num_correct_drafts_per_req, live) if ok]
+            if observed:
+                self.model_worker.on_verify_complete_cpu(
+                    observed, batch_size=len(batch.reqs)
+                )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):
         # the EAGLE overlap path already did this inside verify() via the grammar
@@ -596,13 +623,19 @@ class SchedulerBatchResultProcessor:
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
-            if target_degenerate is not None and target_degenerate[i]:
+            degenerate = target_degenerate is not None and target_degenerate[i]
+            if degenerate:
                 req.mark_spec_target_degenerate()
 
             if req.is_retracted or req.finished():
                 # Nothing to settle: no worker pre-claims the bonus, so
                 # kv_committed_len already holds the committed prefix.
                 pass
+            elif degenerate:
+                # The run ends on the reject-sampler sentinel (not a sampled
+                # token): commit and emit none of it. update_finish_state then
+                # aborts the request on the sticky flag at this step.
+                accept_tokens = []
             else:
                 if req.grammar is not None:
                     # FSM already advanced + truncated by advance_grammar_fsm; reuse
@@ -704,11 +737,20 @@ class SchedulerBatchResultProcessor:
         if result.accept_lens is None:
             return
         accept_lens = result.accept_lens.tolist()
+        target_degenerate = (
+            result.target_degenerate.tolist()
+            if result.target_degenerate is not None
+            else None
+        )
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
         retained = [None] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
             if req.grammar is None or req.is_retracted or req.finished():
+                continue
+            if target_degenerate is not None and target_degenerate[i]:
+                # _resolve_spec_v2_tokens drops this run: the grammar must not
+                # consume (or reject) the sentinel it ends on.
                 continue
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
             # Stop accepting once the grammar terminates so the over-drafted suffix
@@ -756,10 +798,15 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
+        # Rows whose degenerate verify run was dropped emit no bonus token and
+        # are not a verify observation for the acceptance metrics.
+        num_emitting_rows = len(batch.reqs)
+        if not batch.spec_algorithm.is_none() and result.target_degenerate is not None:
+            num_emitting_rows -= sum(result.target_degenerate.tolist())
+        self.metrics_reporter.num_generated_tokens += num_emitting_rows
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(),
+                num_emitting_rows,
                 result.num_correct_drafts,
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
@@ -839,6 +886,7 @@ class SchedulerBatchResultProcessor:
             can_run_cuda_graph,
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
+            num_emitting_rows=num_emitting_rows,
         )
 
     def _normalize_decode_outputs(
