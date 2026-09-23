@@ -1150,9 +1150,12 @@ class SchedulerMetricsReporter:
         cache_controller = getattr(self.scheduler.tree_cache, "cache_controller", None)
         draft_pool = getattr(cache_controller, "mem_pool_host_draft", None)
         if draft_pool is not None:
-            draft_total = getattr(draft_pool, "logical_size", draft_pool.size)
-            pool_total["draft"] = draft_total
-            pool_used["draft"] = draft_total - draft_pool.available_size()
+            # The draft copy is written to and loaded from the host slots the
+            # target KV allocator hands out, and host eviction frees only that
+            # allocator; the draft pool's own allocator is never used. So the
+            # draft pool is occupied exactly where the target KV pool is.
+            pool_total["draft"] = getattr(draft_pool, "logical_size", draft_pool.size)
+            pool_used["draft"] = self.stats.hicache_host_used_tokens
 
         self.stats.hicache_host_pool_used_slots = pool_used
         self.stats.hicache_host_pool_total_slots = pool_total

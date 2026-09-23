@@ -1624,7 +1624,9 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
         kv = FakePool(100, 60)
         mamba = FakePool(8, 3)
-        draft = FakePool(100, 75)
+        # The draft host pool mirrors the target KV slots: nothing allocates
+        # from or frees its own allocator, so it always reports fully free.
+        draft = FakePool(100, 100)
         group = SimpleNamespace(
             entries=[
                 SimpleNamespace(name=PoolName.KV, host_pool=kv),
@@ -1650,7 +1652,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         )
         self.assertEqual(
             reporter.stats.hicache_host_pool_used_slots,
-            {"kv": 40, "mamba": 5, "draft": 25},
+            {"kv": 40, "mamba": 5, "draft": 40},
         )
 
     def _run_authority_worker_write(self, finish_event, ack_write_queue, pop_ack):
