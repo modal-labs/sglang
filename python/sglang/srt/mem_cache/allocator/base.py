@@ -38,9 +38,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # WAR barrier only orders the forward's reads, not these writes).
     # Class-level defaults: composite allocators (SWA, HiSparse) skip this
     # __init__ but still receive note_forward_launch() from the scheduler.
-    _latest_forward_done_event = None
+    _zero_fence_event = None
     _freed_since_forward_launch: bool = False
     _carry_frees_into_next_launch: bool = False
+    # Where composite allocators (SWA, HiSparse, unified memory) keep the
+    # child allocators that their alloc and free calls delegate to.
+    _CHILD_ALLOCATOR_ATTRS = (
+        "full_attn_allocator",
+        "swa_attn_allocator",
+        "mamba_allocator",
+        "logical_attn_allocator",
+        "hisparse_attn_allocator",
+    )
 
     @abc.abstractmethod
     def __init__(
@@ -96,6 +105,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # sizes do not create distinct Triton artifacts.
         self._triton_batch_size_upper_bound = None
 
+    def _child_allocators(self):
+        """The distinct child allocators this composite delegates to; empty
+        for a leaf allocator. PureSWA aliases full_attn_allocator to
+        swa_attn_allocator, so each child is listed once."""
+        children = []
+        for name in self._CHILD_ALLOCATOR_ATTRS:
+            child = getattr(self, name, None)
+            if child is None or child is self or any(child is c for c in children):
+                continue
+            children.append(child)
+        return children
+
     def set_triton_batch_size_upper_bound(self, max_batch_size: int) -> None:
         """Use one config-derived Triton reduction width for this allocator.
 
@@ -115,19 +136,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             new_bound,
         )
 
-        for child_name in (
-            "full_attn_allocator",
-            "swa_attn_allocator",
-            "mamba_allocator",
-            "logical_attn_allocator",
-            "hisparse_attn_allocator",
-        ):
-            child = getattr(self, child_name, None)
-            if (
-                child is not None
-                and child is not self
-                and hasattr(child, "set_triton_batch_size_upper_bound")
-            ):
+        for child in self._child_allocators():
+            if hasattr(child, "set_triton_batch_size_upper_bound"):
                 child.set_triton_batch_size_upper_bound(max_batch_size)
 
     def triton_batch_size_upper_bound(self, batch_size: int) -> int:
@@ -162,25 +172,33 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         completion) between this launch and its next scheduling pass. When
         that processing ran ahead of this launch instead, the batch being
         launched was built before those frees and may still write their
-        pages, so carry_frees_into_next_launch() keeps them fenced."""
-        self._latest_forward_done_event = forward_done_event
+        pages, so carry_frees_into_next_launch() keeps them fenced.
+
+        A composite allocator frees and hands out pages through its child
+        allocators, which keep their own fence state, so the event goes to
+        every child as well."""
+        self._zero_fence_event = forward_done_event
         self._freed_since_forward_launch = (
             self._carry_frees_into_next_launch and self._freed_since_forward_launch
         )
         self._carry_frees_into_next_launch = False
+        for child in self._child_allocators():
+            child.note_forward_launch(forward_done_event)
 
     def carry_frees_into_next_launch(self) -> None:
         """The next launched batch was scheduled before the frees made so far
         (its predecessor's result was processed ahead of the launch), so it may
         write their pages: keep them fenced behind that launch's event."""
         self._carry_frees_into_next_launch = True
+        for child in self._child_allocators():
+            child.carry_frees_into_next_launch()
 
     def _fence_frees_behind_inflight_forward(self) -> None:
         """Order the current stream after the in-flight forward when pages
         freed since its launch may be handed out and rewritten now."""
         if not self._freed_since_forward_launch:
             return
-        event = self._latest_forward_done_event
+        event = self._zero_fence_event
         if event is not None:
             # Hand-outs run on the schedule stream or the overlap plan stream,
             # so wait on the event from whichever stream is current each time.
