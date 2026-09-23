@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import msgspec
 
@@ -155,8 +155,24 @@ class UnifiedTreeCoreInterface(ABC):
     # Whether the host tier stages one node per FIFO backup intent.
     is_host_memory_buffer_only: bool
     kv_events: KVCacheEventRecorder
+    # Optional KV-age observer the Controller installs when metrics are on.
+    # Called as (event, tier, outcome, age_seconds, lifetime_seconds, reuses,
+    # num_tokens) once per node when it is matched again ("hit") or leaves a
+    # tier ("evict"). Evictions also pass trigger= and mamba_state= keywords
+    # (see KV_EVICT_TRIGGERS). Backends that do not track ages leave it uncalled.
+    kv_age_observer: Optional[Callable[..., None]] = None
+    # Optional observer called as (trigger, node) each time a Mamba state leaves
+    # the device pool; node is "leaf" or "interior".
+    mamba_evict_observer: Optional[Callable[[str, str], None]] = None
+    # What the current eviction walk is freeing space for; the Controller sets
+    # it around each walk and the eviction metrics read it.
+    evict_trigger: str = "other"
 
     # ==== Tree API ====
+
+    def _emit_mamba_state_eviction(self, node) -> None:
+        """Hook for components freeing a Mamba state; the Python core reports
+        it, other backends ignore it."""
 
     def take_events(self) -> list:
         """Hand the queued KV placement events to the Controller."""

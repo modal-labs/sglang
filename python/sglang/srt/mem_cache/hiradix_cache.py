@@ -27,6 +27,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    kv_age_hit_pending,
+    mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -1258,6 +1260,11 @@ class HiRadixCache(RadixCache):
                 return
             self.writing_check(write_back=True)
             for node, device_indices in staged:
+                # The device copy leaves here, after the backup has landed:
+                # same device-tier exit as _evict_backuped, same sample.
+                self._observe_kv_eviction(
+                    node, len(device_indices), "device", "demoted"
+                )
                 self.cache_controller.evict_device(device_indices)
                 node.release_host()
             staged.clear()
@@ -1294,6 +1301,7 @@ class HiRadixCache(RadixCache):
 
     def _evict_backuped(self, node: TreeNode):
         device_indices = node.value
+        self._observe_kv_eviction(node, len(device_indices), "device", "demoted")
         num_evicted = self._detach_backuped(node)
         self.cache_controller.evict_device(device_indices)
         return num_evicted
@@ -1302,6 +1310,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
+        self._observe_kv_eviction(node, len(node.value), "device", "dropped")
         self.kv_events.record_remove(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
@@ -1328,10 +1337,12 @@ class HiRadixCache(RadixCache):
         freed_device = 0
         for n in nodes:
             if n.host_value is not None:
+                self._observe_kv_eviction(n, len(n.host_value), "host", "dropped")
                 self.kv_events.record_remove(n, medium=StorageMedium.CPU)
                 self.cache_controller.evict_host(n.host_value)
                 n.host_value = None
             if n.value is not None:
+                self._observe_kv_eviction(n, len(n.value), "device", "dropped")
                 self.kv_events.record_remove(n, medium=StorageMedium.GPU)
                 self.cache_controller.mem_pool_device_allocator.free(n.value)
                 freed_device += len(n.value)
@@ -1374,6 +1385,7 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
+            self._observe_kv_eviction(x, len(x.host_value), "host", "dropped")
             self.kv_events.record_remove(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
@@ -1748,7 +1760,16 @@ class HiRadixCache(RadixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        observe_kv_age = self.metrics_collector is not None and kv_age_hit_pending(
+            params
+        )
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, observe_kv_age=observe_kv_age
+        )
+        # Any non-root match consumed the observation: `value` holds device
+        # indices only, so a host-only HiCache hit leaves it empty.
+        if observe_kv_age and last_node is not self.root_node:
+            mark_kv_age_hit_observed(params)
         if value:
             value = torch.cat(value)
         else:
@@ -1867,15 +1888,34 @@ class HiRadixCache(RadixCache):
 
         return matched_length
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
-        node.last_access_time = time.monotonic()
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, observe_kv_age: bool = False
+    ):
+        access_time = time.monotonic()
+        node.last_access_time = access_time
         child_key = key.child_key(self.page_size)
         value = []
+        # Per-request sample: the deepest matched node's idle time, weighted
+        # by the whole matched prefix (device and host), see RadixCache.
+        request_idle = 0.0
+        request_tokens = 0
+        request_tier = "device"
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.monotonic()
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if observe_kv_age:
+                request_idle = access_time - child.last_access_time
+                request_tokens += prefix_len
+                request_tier = "host" if child.evicted else "device"
+                self.metrics_collector.observe_kv_age(
+                    request_idle,
+                    prefix_len,
+                    event="hit",
+                    tier=request_tier,
+                    outcome="hit",
+                )
+            child.last_access_time = access_time
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
@@ -1891,6 +1931,14 @@ class HiRadixCache(RadixCache):
                 if len(key):
                     child_key = key.child_key(self.page_size)
 
+        if observe_kv_age and request_tokens > 0:
+            self.metrics_collector.observe_kv_age(
+                request_idle,
+                request_tokens,
+                event="request_hit",
+                tier=request_tier,
+                outcome="hit",
+            )
         return value, node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
@@ -1901,6 +1949,9 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        # A split re-shapes the tree; it does not create KV. The retained prefix
+        # keeps the residency start its lifetime metric is measured from.
+        new_node.creation_time = child.creation_time
 
         # split value and host value if exists
         if child.evicted:

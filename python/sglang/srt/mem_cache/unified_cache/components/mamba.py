@@ -224,6 +224,7 @@ class MambaComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert params.mamba_value is not None
+        node.mamba_state_evicted = False
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -330,6 +331,7 @@ class MambaComponent(TreeComponent):
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             cd.value = None
+            self.tree_core._emit_mamba_state_eviction(node)
 
         # Host layer
         host_lru = self.tree_core.host_lru_lists[self.component_type]

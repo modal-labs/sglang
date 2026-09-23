@@ -72,6 +72,49 @@ class MatchPrefixParams:
     req: Optional[Req] = None
 
 
+def get_mamba_cache_miss_tokens(match_result: MatchResult) -> int:
+    """Return Full-KV tokens blocked by a missing reusable Mamba checkpoint."""
+    if match_result.mamba_branching_seqlen is None:
+        return 0
+
+    mamba_boundary_len = len(match_result.device_indices) + match_result.host_hit_length
+    if match_result.full_kv_hit_length <= mamba_boundary_len:
+        return 0
+
+    return max(
+        min(match_result.mamba_branching_seqlen, match_result.full_kv_hit_length)
+        - mamba_boundary_len,
+        0,
+    )
+
+
+def get_mamba_cache_miss_cause(match_result: MatchResult) -> str:
+    """Label for a Mamba-gated miss: ``state_evicted`` when the stretch it
+    recomputes once had a Mamba state that eviction dropped, else
+    ``never_saved`` (no state was ever kept there, e.g. a mid-node branch)."""
+    return "state_evicted" if match_result.mamba_state_evicted_in_gap else "never_saved"
+
+
+def kv_age_hit_pending(params: MatchPrefixParams) -> bool:
+    """True until the request's first *non-empty* match has been observed.
+
+    Only a request's first real hit measures reuse: the scheduler re-matches
+    waiting requests every round and the cache re-matches after each insert,
+    and those would all land in the sub-second age bucket. A zero-token match
+    does not count as observed, so a request that queued against a cold cache
+    still reports the hit when a sibling fills its prefix in a later round.
+    Matches without a request (tests, probes) never observe.
+    """
+    req = params.req
+    return req is not None and not getattr(req, "kv_age_hit_observed", False)
+
+
+def mark_kv_age_hit_observed(params: MatchPrefixParams) -> None:
+    """Consume the request's one hit observation (call after a non-empty match)."""
+    if params.req is not None:
+        params.req.kv_age_hit_observed = True
+
+
 @dataclasses.dataclass
 class InsertParams:
     """Unified parameters for insert across different cache types"""
@@ -246,6 +289,9 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
+        mamba_state_evicted_in_gap: Whether a node past the reusable Mamba
+                            state, within the Full-KV hit, once held a Mamba
+                            state that eviction dropped (metrics only).
     """
 
     device_indices: torch.Tensor
@@ -259,6 +305,7 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    mamba_state_evicted_in_gap: bool = False
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 

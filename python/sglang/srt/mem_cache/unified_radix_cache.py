@@ -212,6 +212,19 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+        # KV age metrics: the tree core reports per-node hit / eviction ages.
+        if self.metrics_collector is not None:
+            self.tree_core.kv_age_observer = self._observe_kv_age_event
+            self.tree_core.mamba_evict_observer = (
+                self.metrics_collector.increment_mamba_state_evicted
+            )
+            if not isinstance(self.tree_core, UnifiedTreeCore):
+                logger.warning(
+                    "KV age metrics (sglang:kv_age_seconds and friends) are only emitted "
+                    "by the Python tree core; %s does not call the observer, so those "
+                    "series will stay empty.",
+                    type(self.tree_core).__name__,
+                )
 
         if (
             page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
@@ -851,6 +864,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # on a shared pool, released enough bytes to satisfy its allocation.
             if tracker[ct] >= request_cnt or target_reached(ct):
                 continue
+            self.tree_core.evict_trigger = self._evict_trigger_for(
+                ct, available_size_targets
+            )
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
                 while True:
@@ -886,6 +902,28 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
             finally:
                 self.tree_core.evict_device_end(ct)
+                self.tree_core.evict_trigger = "other"
+
+    @staticmethod
+    def _evict_trigger_for(
+        component_type: ComponentType,
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+    ) -> str:
+        """Metrics label for a component's eviction walk. A Full walk whose
+        target is Mamba capacity is evict_for_alloc funding a Mamba allocation
+        from the shared pool, not Full KV pressure."""
+        if component_type == ComponentType.FULL:
+            target = (available_size_targets or {}).get(ComponentType.FULL)
+            if target is not None and target[0] == ComponentType.MAMBA:
+                return "mamba_donor"
+            return "full"
+        if component_type == ComponentType.SWA:
+            return "swa"
+        if component_type == ComponentType.MAMBA:
+            return "mamba"
+        return "other"
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
@@ -894,6 +932,35 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.cache_controller is not None
             and self.cache_controller.write_policy == "write_through"
         )
+
+    def _observe_kv_age_event(
+        self,
+        event: str,
+        tier: str,
+        outcome: str,
+        age_seconds: float,
+        lifetime_seconds: float,
+        reuses: int,
+        num_tokens: int,
+        trigger: Optional[str] = None,
+        mamba_state: str = "none",
+    ) -> None:
+        """Tree-core callback: forward one node's age to the metrics collector."""
+        if event in ("hit", "request_hit"):
+            self.metrics_collector.observe_kv_age(
+                age_seconds, num_tokens, event=event, tier=tier, outcome=outcome
+            )
+        else:
+            self.metrics_collector.observe_kv_eviction(
+                age_seconds,
+                lifetime_seconds,
+                reuses,
+                num_tokens,
+                tier,
+                outcome,
+                trigger=trigger,
+                mamba_state=mamba_state,
+            )
 
     def _record_dropped_tokens(self, dropped_tokens: int, reason: str) -> None:
         """Record logical KV tokens irreversibly dropped without a host backup."""
@@ -1317,7 +1384,14 @@ class UnifiedRadixCache(BasePrefixCache):
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
-        result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        prev_trigger, self.tree_core.evict_trigger = (
+            self.tree_core.evict_trigger,
+            "host",
+        )
+        try:
+            result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        finally:
+            self.tree_core.evict_trigger = prev_trigger
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
 

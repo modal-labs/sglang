@@ -275,6 +275,11 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    # Which limit set max_running_requests in resolve_max_num_reqs: requested,
+    # estimated, kv_capacity or mamba_pool. Exported as sglang:max_running_requests
+    # {cap_source}. A declared field: this is a slots dataclass, so an undeclared
+    # attribute assignment would raise at startup.
+    max_running_requests_cap_source: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
@@ -2305,12 +2310,22 @@ class KVCacheConfigurator:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
+        # Which limit actually set the value; exported as the cap_source label
+        # of sglang:max_running_requests.
+        uncapped = (
+            requested_per_worker if requested_per_worker is not None else estimated
+        )
+        cap_source = "requested" if requested_per_worker is not None else "estimated"
+        if token_capacity // 2 < uncapped:
+            cap_source = "kv_capacity"
+
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             mamba_cap = get_schedule().max_mamba_cache_size // ratio
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
+                cap_source = "mamba_pool"
                 logger.warning(
                     "max_running_requests is capped to %d by the mamba state "
                     "cache (max_mamba_cache_size=%d, %d state slots per "
@@ -2343,6 +2358,7 @@ class KVCacheConfigurator:
                 requested_per_worker,
                 max_num_reqs,
             )
+        self.max_running_requests_cap_source = cap_source
         return max_num_reqs
 
     def _resolve_memory_pool_config(
@@ -2360,6 +2376,7 @@ class KVCacheConfigurator:
         )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
+        config.max_running_requests_cap_source = self.max_running_requests_cap_source
         config.mem_fraction_static = get_schedule().mem_fraction_static
         return config
 

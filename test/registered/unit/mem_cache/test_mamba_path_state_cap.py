@@ -61,6 +61,9 @@ class _FakeTreeCore:
     def _cascade_evict(self, node, component, tracker, device_frees, host_frees):
         self.cascaded.append(node)
 
+    def _emit_mamba_state_eviction(self, node):
+        pass
+
 
 class _FakeUnifiedCache:
     tree_components = _FakeTreeCore.tree_components
