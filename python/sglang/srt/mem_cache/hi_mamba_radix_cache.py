@@ -1335,19 +1335,27 @@ class HiMambaRadixCache(MambaRadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, best_last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, best_last_node, best_value_len)
+        value, best_last_node, best_value_len, full_kv_hit_length = (
+            self._match_prefix_helper(key)
+        )
+        return self._match_post_processor(
+            params, value, best_last_node, best_value_len, full_kv_hit_length
+        )
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode, int]:
-        """Walk tree to find best_last_node (mamba boundary)."""
+    ) -> Tuple[List[torch.Tensor], TreeNode, int, int]:
+        """Walk tree to find best_last_node (mamba boundary).
+
+        Also returns the Full-KV length of the whole matched path, device and
+        host-backed nodes alike (value holds only the device-resident part)."""
         node = self.root_node
         child_key = key.child_key(self.page_size)
 
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
+        full_kv_hit_length = 0
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
@@ -1360,6 +1368,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 best_last_node = node
 
             prefix_len = child.key.match(key, page_size=self.page_size)
+            full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
@@ -1378,7 +1387,7 @@ class HiMambaRadixCache(MambaRadixCache):
             best_value_len = len(value)
             best_last_node = node
 
-        return value, best_last_node, best_value_len
+        return value, best_last_node, best_value_len, full_kv_hit_length
 
     def _match_post_processor(
         self,
@@ -1386,6 +1395,7 @@ class HiMambaRadixCache(MambaRadixCache):
         value: List[torch.Tensor],
         best_last_node: TreeNode,
         best_value_len: int,
+        full_kv_hit_length: int = 0,
     ) -> MatchResult:
         cow_mamba = params.cow_mamba
         req = params.req
@@ -1462,6 +1472,7 @@ class HiMambaRadixCache(MambaRadixCache):
             host_hit_length=kv_host_hit_length,
             mamba_host_hit_length=mamba_host_hit,
             mamba_branching_seqlen=mamba_branching_seqlen,
+            full_kv_hit_length=full_kv_hit_length,
         )
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:

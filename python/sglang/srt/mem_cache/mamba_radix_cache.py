@@ -1181,11 +1181,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             node_update = node_update.parent
 
+        # Full KV of the whole matched path, before value is cut back to the
+        # last node with a mamba checkpoint; the gap is a mamba cache miss.
+        full_kv_hit_length = sum(len(v) for v in value)
+
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
         if len(value) > best_value_len:
             chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // self.mamba_cache_chunk_size
+                full_kv_hit_length // self.mamba_cache_chunk_size
             ) * self.mamba_cache_chunk_size
             mamba_branching_seqlen = (
                 chunk_aligned_seqlen if chunk_aligned_seqlen > 0 else None
@@ -1219,6 +1223,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_node,
             best_match_node=last_node,
             mamba_branching_seqlen=mamba_branching_seqlen,
+            full_kv_hit_length=full_kv_hit_length,
         )
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
