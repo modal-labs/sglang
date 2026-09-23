@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import msgspec
 
@@ -167,6 +167,11 @@ class UnifiedTreeCoreInterface(ABC):
     # What the current eviction walk is freeing space for; the Controller sets
     # it around each walk and the eviction metrics read it.
     evict_trigger: str = "other"
+    # Optional KV ghost-list tracker (mem_cache/kv_ghost_list.py) the
+    # Controller installs when metrics are on: on_inserted(node) once per node
+    # an insert creates, on_dropped(node) once per node whose last copy is
+    # destroyed. Backends that do not call it leave the series at zero.
+    kv_ghost: Optional[Any] = None
 
     # ==== Tree API ====
 

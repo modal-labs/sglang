@@ -1311,6 +1311,8 @@ class HiRadixCache(RadixCache):
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
         self._observe_kv_eviction(node, len(node.value), "device", "dropped")
+        if self.kv_ghost is not None:
+            self.kv_ghost.on_dropped(node)
         self.kv_events.record_remove(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
@@ -1336,6 +1338,12 @@ class HiRadixCache(RadixCache):
 
         freed_device = 0
         for n in nodes:
+            # One ghost record per node; the two tier samples below are the
+            # KV-age view of the same destruction.
+            if self.kv_ghost is not None and (
+                n.host_value is not None or n.value is not None
+            ):
+                self.kv_ghost.on_dropped(n, trigger="host")
             if n.host_value is not None:
                 self._observe_kv_eviction(n, len(n.host_value), "host", "dropped")
                 self.kv_events.record_remove(n, medium=StorageMedium.CPU)
@@ -1386,6 +1394,8 @@ class HiRadixCache(RadixCache):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._observe_kv_eviction(x, len(x.host_value), "host", "dropped")
+            if self.kv_ghost is not None:
+                self.kv_ghost.on_dropped(x, trigger="host")
             self.kv_events.record_remove(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
@@ -1968,6 +1978,9 @@ class HiRadixCache(RadixCache):
         )
         new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
+        )
+        new_node.ghost_hash, child.ghost_hash = split_node_hash_value(
+            child.ghost_hash, split_len, self.page_size
         )
         child.parent = new_node
         child.key = child.key[split_len:]

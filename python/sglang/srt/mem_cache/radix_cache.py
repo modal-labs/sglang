@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.kv_ghost_list import KVGhostTracker, build_kv_ghost_tracker
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
@@ -278,6 +279,8 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[List[str]] = None
+        # Chained per-page digests for the KV ghost list (kv_ghost_list.py).
+        self.ghost_hash: Optional[List[int]] = None
         # priority for priority-aware eviction
         self.priority = priority
 
@@ -321,6 +324,9 @@ class TreeNode:
 
 
 class RadixCache(BasePrefixCache):
+    # Capacity-miss tracking (kv_ghost_list.py); None unless metrics are on.
+    kv_ghost: Optional[KVGhostTracker] = None
+
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
@@ -336,6 +342,9 @@ class RadixCache(BasePrefixCache):
 
         if params.enable_metrics:
             self.init_metrics_collector()
+        self.kv_ghost = build_kv_ghost_tracker(
+            self.token_to_kv_pool_allocator, self.page_size, self.metrics_collector
+        )
 
         if self.token_to_kv_pool_allocator:
             dev = self.token_to_kv_pool_allocator.device
@@ -381,6 +390,9 @@ class RadixCache(BasePrefixCache):
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.root_node.hash_value = []
+        self.root_node.ghost_hash = []
+        if self.kv_ghost is not None:
+            self.kv_ghost.reset()
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
@@ -664,6 +676,8 @@ class RadixCache(BasePrefixCache):
             _priority, x = heapq.heappop(eviction_heap)
 
             self._observe_kv_eviction(x, len(x.value), "device", "dropped", now)
+            if self.kv_ghost is not None:
+                self.kv_ghost.on_dropped(x, now)
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
@@ -833,6 +847,9 @@ class RadixCache(BasePrefixCache):
         new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
         )
+        new_node.ghost_hash, child.ghost_hash = split_node_hash_value(
+            child.ghost_hash, split_len, self.page_size
+        )
 
         return new_node
 
@@ -891,6 +908,8 @@ class RadixCache(BasePrefixCache):
             new_node.value = value.clone()
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
+            if self.kv_ghost is not None:
+                self.kv_ghost.on_inserted(new_node, access_time)
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)

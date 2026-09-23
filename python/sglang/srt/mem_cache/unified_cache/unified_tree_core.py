@@ -137,6 +137,8 @@ class UnifiedTreeNode:
         self.hash_value = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
+        # Chained per-page digests for the KV ghost list (kv_ghost_list.py).
+        self.ghost_hash: Optional[list[int]] = None
         self.hit_count = 0
         # T-LRU only (0 under other policies): tokens root -> self, and the
         # branch's high-water depth, which survives tail trimming.
@@ -513,6 +515,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         self.root_node.hash_value = []
+        self.root_node.ghost_hash = []
+        if self.kv_ghost is not None:
+            self.kv_ghost.reset()
         for ct in self.component_types:
             self.root_node.component_data[ct].lock_ref = 1
 
@@ -1517,6 +1522,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
         )
+        new_node.ghost_hash, child.ghost_hash = split_node_hash_value(
+            child.ghost_hash, split_len, self.page_size
+        )
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
@@ -1574,6 +1582,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+        if self.kv_ghost is not None:
+            self.kv_ghost.on_inserted(new_node)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
@@ -1770,6 +1780,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
             assert desc.write_through_pending_id is None
             self._emit_kv_age(desc, "evict", "host", "dropped")
+            if self.kv_ghost is not None:
+                self.kv_ghost.on_dropped(desc, trigger=self.evict_trigger)
             self._release_all_component_layers(
                 desc,
                 StorageMedium.CPU,
@@ -1819,6 +1831,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         """Delete a device leaf that has no host backup, freeing all layers."""
         self._emit_kv_age(node, "evict", "device", "dropped")
+        if self.kv_ghost is not None:
+            self.kv_ghost.on_dropped(node, trigger=self.evict_trigger)
         self._release_all_component_layers(
             node, StorageMedium.GPU, tracker, device_frees, host_frees
         )
@@ -1952,6 +1966,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
         self._emit_kv_age(node, "evict", "host", "dropped")
+        if self.kv_ghost is not None:
+            self.kv_ghost.on_dropped(node, trigger=self.evict_trigger)
         self.kv_events.record_remove(node, medium=StorageMedium.CPU)
         for comp in self.components:
             _, hf = self._evict_component_and_detach_lru(
