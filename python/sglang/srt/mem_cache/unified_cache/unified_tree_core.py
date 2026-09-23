@@ -131,6 +131,9 @@ class UnifiedTreeNode:
         now = time.monotonic()
         self.last_access_wall = now
         self.creation_wall = now
+        # Set when eviction drops this node's Mamba state, cleared when a new
+        # state is committed; labels Mamba-gated misses (metrics only).
+        self.mamba_state_evicted = False
         self.hash_value = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
@@ -824,6 +827,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
+            state_evicted_in_gap,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
             params,
@@ -833,6 +837,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
+            state_evicted_in_gap,
         )
 
     def _match_prefix_helper(
@@ -844,6 +849,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         int,
         int,
         Optional[CacheAction | ComponentAction],
+        bool,
     ]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
@@ -876,12 +882,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         def _all_valid(validators, node):
             return all([v(node) for v in validators])
 
+        # Whether a node past best_match_node lost a Mamba state to eviction:
+        # its Full KV matched, but the state that would have let a request
+        # resume there is gone.
+        state_evicted_in_gap = False
+
         def _update_best_if_valid(node):
-            nonlocal best_match_node
+            nonlocal best_match_node, state_evicted_in_gap
             nonlocal best_match_device_value_len, best_match_device_node
             matched = _all_valid(validators, node)
             if matched:
                 best_match_node = node
+                state_evicted_in_gap = False
+            elif node.mamba_state_evicted:
+                state_evicted_in_gap = True
 
             if not separate_device_match:
                 if matched:
@@ -923,6 +937,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
+            state_evicted_in_gap,
         )
 
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
@@ -960,6 +975,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_value_len: int,
         full_kv_hit_length: int,
         action: Optional[CacheAction | ComponentAction],
+        state_evicted_in_gap: bool = False,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self.components:
@@ -1024,6 +1040,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=best_match_node,
             host_hit_length=0,
             full_kv_hit_length=full_kv_hit_length,
+            mamba_state_evicted_in_gap=state_evicted_in_gap,
         )
 
         for component in self.components:
@@ -1089,7 +1106,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return
         if now is None:
             now = time.monotonic()
-        observer(
+        args = (
             event,
             tier,
             outcome,
@@ -1098,6 +1115,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node.hit_count,
             len(node.key) if num_tokens is None else num_tokens,
         )
+        if event != "evict":
+            observer(*args)
+            return
+        # Read before the caller frees the node's layers.
+        mamba_state = "none"
+        if ComponentType.MAMBA in self.components_by_type:
+            cd = node.component_data[ComponentType.MAMBA]
+            held = cd.value if tier == "device" else cd.host_value
+            mamba_state = "present" if held is not None else "absent"
+        observer(*args, trigger=self.evict_trigger, mamba_state=mamba_state)
+
+    def _emit_mamba_state_eviction(self, node: UnifiedTreeNode) -> None:
+        """A node's device Mamba state was just freed: flag the node for the
+        Mamba-gated miss cause and report it. A childless node is a leaf, which
+        the caller is deleting along with its Full KV."""
+        node.mamba_state_evicted = True
+        observer = self.mamba_evict_observer
+        if observer is not None:
+            observer(self.evict_trigger, "interior" if node.children else "leaf")
 
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
@@ -1827,9 +1863,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
-            self.node_by_id(tail_node_id), device_frees, host_frees
-        )
+        prev_trigger, self.evict_trigger = self.evict_trigger, "mamba_path_cap"
+        try:
+            self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
+                self.node_by_id(tail_node_id), device_frees, host_frees
+            )
+        finally:
+            self.evict_trigger = prev_trigger
 
     def _reclaim_full_host_duplicates(
         self,

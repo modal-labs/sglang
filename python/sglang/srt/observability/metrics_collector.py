@@ -169,6 +169,10 @@ class SchedulerStats:
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
+# Why a Mamba-gated miss happened (label `cause` on sglang:mamba_cache_miss_*):
+# a node between the reusable state and the Full-KV hit end once held a state
+# that eviction dropped, or none ever did.
+MAMBA_CACHE_MISS_CAUSES = ("state_evicted", "never_saved")
 
 
 def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
@@ -916,18 +920,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:mamba_cache_miss_requests_total",
             documentation=(
                 "Number of prefill admissions where Full-KV cache was available "
-                "beyond the reusable Mamba checkpoint boundary."
+                "beyond the reusable Mamba checkpoint boundary. cause: "
+                "state_evicted = a node in that stretch once held a Mamba "
+                "state that eviction dropped; never_saved = none did (e.g. a "
+                "branch point inside a node)."
             ),
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["cause"],
         )
         self.mamba_cache_miss_tokens_total = Counter(
             name="sglang:mamba_cache_miss_tokens_total",
             documentation=(
                 "Number of page-aligned Full-KV prefix tokens skipped because "
-                "the corresponding Mamba checkpoint was unavailable."
+                "the corresponding Mamba checkpoint was unavailable, by cause "
+                "(see sglang:mamba_cache_miss_requests_total)."
             ),
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["cause"],
         )
+        for cause in MAMBA_CACHE_MISS_CAUSES:
+            self.mamba_cache_miss_requests_total.labels(**labels, cause=cause)
+            self.mamba_cache_miss_tokens_total.labels(**labels, cause=cause)
         self.prefill_admission_blocked_passes_total = Counter(
             name="sglang:prefill_admission_blocked_passes_total",
             documentation=(
@@ -1374,11 +1385,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     **self.labels, mode=mode
                 ).inc(delta)
 
-    def increment_mamba_cache_miss(self, num_requests: int, num_tokens: int) -> None:
+    def increment_mamba_cache_miss(
+        self, num_requests: int, num_tokens: int, cause: str = "never_saved"
+    ) -> None:
         if num_requests > 0:
-            self.mamba_cache_miss_requests_total.labels(**self.labels).inc(num_requests)
+            self.mamba_cache_miss_requests_total.labels(**self.labels, cause=cause).inc(
+                num_requests
+            )
         if num_tokens > 0:
-            self.mamba_cache_miss_tokens_total.labels(**self.labels).inc(num_tokens)
+            self.mamba_cache_miss_tokens_total.labels(**self.labels, cause=cause).inc(
+                num_tokens
+            )
 
     def increment_admission_blocked(self, cause: str, num_blocked_reqs: int) -> None:
         self.prefill_admission_blocked_passes_total.labels(
@@ -2233,6 +2250,23 @@ KV_AGE_BUCKETS = (
 )
 _KV_AGE_LABELS = tuple(str(int(b)) for b in KV_AGE_BUCKETS) + ("+Inf",)
 KV_REUSE_BUCKETS = (0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+# What made the cache free a node (label `trigger`): the component whose
+# device eviction walk chose it (full / swa / mamba), a Full walk run only to
+# free bytes for a Mamba allocation on a shared pool (mamba_donor), the
+# per-path Mamba state cap (mamba_path_cap), host-tier eviction (host), or any
+# path outside those walks (other).
+KV_EVICT_TRIGGERS = (
+    "full",
+    "swa",
+    "mamba",
+    "mamba_donor",
+    "mamba_path_cap",
+    "host",
+    "other",
+)
+# Whether an evicted node still held a Mamba state on the tier it left
+# (present / absent), or the cache has no Mamba component (none).
+KV_EVICT_MAMBA_STATES = ("present", "absent", "none")
 
 
 def kv_age_bucket(age_seconds: float) -> str:
@@ -2264,6 +2298,8 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self._kv_age_child_cache = {}
         self._kv_age_tokens_child_cache = {}
         self._kv_eviction_child_cache = {}
+        self._kv_evict_trigger_child_cache = {}
+        self._mamba_state_evicted_child_cache = {}
 
         bucket_eviction_duration = get_histogram_conf_from_env(
             "SGLANG_BUCKET_EVICTION_DURATION"
@@ -2387,6 +2423,29 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             "event=request_hit the weight is the request's whole matched "
             "prefix, in the bucket of the deepest matched node's idle time.",
             labelnames=list(labels.keys()) + ["event", "tier", "outcome", "age_le"],
+        )
+        self.kv_evicted_tokens_by_trigger = Counter(
+            name="sglang:kv_evicted_tokens_by_trigger_total",
+            documentation="Tokens removed from a tier, by what made the cache "
+            "free them (trigger: full / swa / mamba = that component's "
+            "eviction walk chose the node; mamba_donor = Full KV freed to fund "
+            "a Mamba allocation on a shared pool; mamba_path_cap; host; "
+            "other), whether the node still held a Mamba state (mamba_state: "
+            "present / absent / none when the cache has no Mamba component), "
+            "and its idle time band (age_le, same bands as "
+            "sglang:kv_age_tokens_total, not cumulative). Summed over trigger "
+            'and mamba_state it equals kv_age_tokens_total{event="evict"}.',
+            labelnames=list(labels.keys())
+            + ["tier", "outcome", "trigger", "mamba_state", "age_le"],
+        )
+        self.mamba_states_evicted = Counter(
+            name="sglang:mamba_states_evicted_total",
+            documentation="Mamba states freed from the device pool, by trigger "
+            "(as in sglang:kv_evicted_tokens_by_trigger_total) and node: leaf "
+            "(the node and its Full KV are deleted with it) or interior (only "
+            "the state is dropped; the Full KV stays, and a request resuming "
+            "there takes a Mamba-gated miss).",
+            labelnames=list(labels.keys()) + ["trigger", "node"],
         )
 
         self.kv_lifetime_seconds = Histogram(
@@ -2571,13 +2630,41 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         num_tokens: int,
         tier: str,
         outcome: str,
+        trigger: Optional[str] = None,
+        mamba_state: str = "none",
     ) -> None:
+        """``trigger`` defaults to the single-component radix caches' only
+        causes: ``full`` on the device tier, ``host`` on the host tier."""
         self.observe_kv_age(
             age_seconds, num_tokens, event="evict", tier=tier, outcome=outcome
         )
         lifetime, reuses_h = self._kv_eviction_children(tier, outcome)
         lifetime.observe(lifetime_seconds)
         reuses_h.observe(reuses)
+        if trigger is None:
+            trigger = "full" if tier == "device" else "host"
+        key = (tier, outcome, trigger, mamba_state, kv_age_bucket(age_seconds))
+        cache = self._kv_evict_trigger_child_cache
+        child = cache.get(key)
+        if child is None:
+            child = cache[key] = self.kv_evicted_tokens_by_trigger.labels(
+                **self.labels,
+                tier=tier,
+                outcome=outcome,
+                trigger=trigger,
+                mamba_state=mamba_state,
+                age_le=key[4],
+            )
+        child.inc(num_tokens)
+
+    def increment_mamba_state_evicted(self, trigger: str, node: str) -> None:
+        cache = self._mamba_state_evicted_child_cache
+        child = cache.get((trigger, node))
+        if child is None:
+            child = cache[(trigger, node)] = self.mamba_states_evicted.labels(
+                **self.labels, trigger=trigger, node=node
+            )
+        child.inc(1)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

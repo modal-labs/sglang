@@ -88,6 +88,13 @@ def get_mamba_cache_miss_tokens(match_result: MatchResult) -> int:
     )
 
 
+def get_mamba_cache_miss_cause(match_result: MatchResult) -> str:
+    """Label for a Mamba-gated miss: ``state_evicted`` when the stretch it
+    recomputes once had a Mamba state that eviction dropped, else
+    ``never_saved`` (no state was ever kept there, e.g. a mid-node branch)."""
+    return "state_evicted" if match_result.mamba_state_evicted_in_gap else "never_saved"
+
+
 def kv_age_hit_pending(params: MatchPrefixParams) -> bool:
     """True until the request's first *non-empty* match has been observed.
 
@@ -282,6 +289,9 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
+        mamba_state_evicted_in_gap: Whether a node past the reusable Mamba
+                            state, within the Full-KV hit, once held a Mamba
+                            state that eviction dropped (metrics only).
     """
 
     device_indices: torch.Tensor
@@ -295,6 +305,7 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    mamba_state_evicted_in_gap: bool = False
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 

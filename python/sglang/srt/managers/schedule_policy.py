@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    get_mamba_cache_miss_cause,
     zero_match_result,
 )
 from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
@@ -214,6 +215,7 @@ def match_prefix_for_req(
     )
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     req.mamba_cache_miss_tokens = get_mamba_cache_miss_tokens(match_result)
+    req.mamba_cache_miss_cause = get_mamba_cache_miss_cause(match_result)
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:

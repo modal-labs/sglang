@@ -158,10 +158,21 @@ class UnifiedTreeCoreInterface(ABC):
     # Optional KV-age observer the Controller installs when metrics are on.
     # Called as (event, tier, outcome, age_seconds, lifetime_seconds, reuses,
     # num_tokens) once per node when it is matched again ("hit") or leaves a
-    # tier ("evict"). Backends that do not track ages leave it uncalled.
+    # tier ("evict"). Evictions also pass trigger= and mamba_state= keywords
+    # (see KV_EVICT_TRIGGERS). Backends that do not track ages leave it uncalled.
     kv_age_observer: Optional[Callable[..., None]] = None
+    # Optional observer called as (trigger, node) each time a Mamba state leaves
+    # the device pool; node is "leaf" or "interior".
+    mamba_evict_observer: Optional[Callable[[str, str], None]] = None
+    # What the current eviction walk is freeing space for; the Controller sets
+    # it around each walk and the eviction metrics read it.
+    evict_trigger: str = "other"
 
     # ==== Tree API ====
+
+    def _emit_mamba_state_eviction(self, node) -> None:
+        """Hook for components freeing a Mamba state; the Python core reports
+        it, other backends ignore it."""
 
     def take_events(self) -> list:
         """Hand the queued KV placement events to the Controller."""

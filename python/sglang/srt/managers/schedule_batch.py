@@ -107,6 +107,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
     MatchPrefixParams,
+    get_mamba_cache_miss_cause,
     get_mamba_cache_miss_tokens,
     zero_match_result,
 )
@@ -1170,6 +1171,7 @@ class Req(ReqDllmMixin):
         # Full-KV tokens that could not be reused because the matching Mamba
         # checkpoint was unavailable. Reported once on the first prefill pass.
         self.mamba_cache_miss_tokens = 0
+        self.mamba_cache_miss_cause = "never_saved"
         self._mamba_cache_miss_reported = False
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
@@ -1671,6 +1673,7 @@ class Req(ReqDllmMixin):
             # prefix it could not reuse for want of a Mamba checkpoint here, not
             # only in the policy-time match (which FCFS skips on the unified cache).
             self.mamba_cache_miss_tokens = get_mamba_cache_miss_tokens(match_result)
+            self.mamba_cache_miss_cause = get_mamba_cache_miss_cause(match_result)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1976,6 +1979,7 @@ class Req(ReqDllmMixin):
         self.kv.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.mamba_cache_miss_tokens = 0
+        self.mamba_cache_miss_cause = "never_saved"
         self._mamba_cache_miss_reported = False
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
