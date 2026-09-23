@@ -1414,20 +1414,8 @@ class HiMambaRadixCache(MambaRadixCache):
             cur_time -= 0.00001
             node_update = node_update.parent
 
-        if len(value) > best_value_len:
-            from sglang.srt.runtime_context import get_server_args
-
-            mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
-            mamba_cache_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // mamba_cache_chunk_size
-            ) * mamba_cache_chunk_size
-            mamba_branching_seqlen = (
-                mamba_cache_chunk_aligned_seqlen
-                if mamba_cache_chunk_aligned_seqlen > 0
-                else None
-            )
-        else:
-            mamba_branching_seqlen = None
+        # value holds only the device-resident part of the matched path.
+        full_kv_hit_length = max(full_kv_hit_length, sum(len(v) for v in value))
 
         kv_host_hit_length = 0
         last_device_node = best_last_node
@@ -1462,6 +1450,20 @@ class HiMambaRadixCache(MambaRadixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        # The branching point is the last Mamba-chunk-aligned position within
+        # the Full-KV hit, device and host alike, beyond the reusable Mamba
+        # boundary (as in MambaComponent.finalize_match_result). Host KV past
+        # the boundary could be reused if a Mamba state existed there.
+        from sglang.srt.runtime_context import get_server_args
+
+        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        aligned_seqlen = (
+            full_kv_hit_length // mamba_cache_chunk_size
+        ) * mamba_cache_chunk_size
+        mamba_branching_seqlen = (
+            aligned_seqlen if aligned_seqlen > len(value) + kv_host_hit_length else None
+        )
 
         return MatchResult(
             device_indices=value,

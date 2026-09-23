@@ -222,8 +222,8 @@ def test_mamba_radix_cache_reports_full_kv_past_the_mamba_state():
 
 
 def test_hi_mamba_radix_cache_counts_host_nodes_in_full_kv():
-    # Device KV for 128 tokens (mamba state at 64), then 64 host-only tokens.
-    # The branching point comes from the device part, so the miss stops at 128.
+    # Device KV for 128 tokens (mamba state at 64), then 64 host-only tokens:
+    # everything past the state at 64 is blocked by the missing mamba state.
     tree, tokens = _legacy_mamba_tree(
         HiMambaRadixCache,
         [(64, True, True), (64, False, True), (64, False, False)],
@@ -233,4 +233,32 @@ def test_hi_mamba_radix_cache_counts_host_nodes_in_full_kv():
 
     assert len(result.device_indices) == 64
     assert result.full_kv_hit_length == 192
+    assert result.mamba_branching_seqlen == 192
+    assert get_mamba_cache_miss_tokens(result) == 128
+
+
+def test_hi_mamba_radix_cache_branches_past_a_host_only_tail():
+    # Only host KV follows the mamba state: the branching point still lies at
+    # the end of that host tail, so the next prefill checkpoints there.
+    tree, tokens = _legacy_mamba_tree(
+        HiMambaRadixCache, [(64, True, True), (64, False, False)]
+    )
+
+    result = _match(tree, tokens)
+
+    assert len(result.device_indices) == 64
+    assert result.host_hit_length == 0
+    assert result.mamba_branching_seqlen == 128
     assert get_mamba_cache_miss_tokens(result) == 64
+
+
+def test_hi_mamba_radix_cache_no_branch_without_kv_past_the_state():
+    tree, tokens = _legacy_mamba_tree(
+        HiMambaRadixCache, [(64, False, True), (64, True, True)]
+    )
+
+    result = _match(tree, tokens)
+
+    assert len(result.device_indices) == 128
+    assert result.mamba_branching_seqlen is None
+    assert get_mamba_cache_miss_tokens(result) == 0
