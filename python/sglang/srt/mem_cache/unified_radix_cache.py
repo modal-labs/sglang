@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.kv_ghost_list import build_kv_ghost_tracker
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -218,11 +219,18 @@ class UnifiedRadixCache(BasePrefixCache):
             self.tree_core.mamba_evict_observer = (
                 self.metrics_collector.increment_mamba_state_evicted
             )
+            self.tree_core.kv_ghost = build_kv_ghost_tracker(
+                self.token_to_kv_pool_allocator,
+                params.page_size,
+                self.metrics_collector,
+                last_access_attr="last_access_wall",
+            )
             if not isinstance(self.tree_core, UnifiedTreeCore):
                 logger.warning(
-                    "KV age metrics (sglang:kv_age_seconds and friends) are only emitted "
-                    "by the Python tree core; %s does not call the observer, so those "
-                    "series will stay empty.",
+                    "KV age metrics (sglang:kv_age_seconds and friends) and the KV "
+                    "ghost list (sglang:kv_reinsert_after_evict_seconds) are only "
+                    "emitted by the Python tree core; %s does not call the observer "
+                    "or the tracker, so those series will stay empty.",
                     type(self.tree_core).__name__,
                 )
 

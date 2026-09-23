@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     get_mamba_cache_miss_cause,
 )
+from sglang.srt.mem_cache.kv_ghost_list import KVGhostList, KVGhostTracker
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -202,6 +203,28 @@ class TestEvictTriggerOnMambaCache(unittest.TestCase):
             _state_samples(self.collector), [("mamba_path_cap", "interior")]
         )
         self.assertEqual(self.cache.tree_core.evict_trigger, "other")
+
+    def test_ghost_list_attributes_recompute_to_the_mamba_walk(self):
+        tracker = KVGhostTracker(
+            KVGhostList(capacity=64, ttl_seconds=3600.0),
+            1,
+            self.collector,
+            last_access_attr="last_access_wall",
+        )
+        self.cache.tree_core.kv_ghost = tracker
+        self._insert([1, 2, 3])
+        # The Mamba LRU deletes the leaf and its Full KV ...
+        self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+        # ... and the same prefix comes back and is recomputed.
+        self._insert([1, 2, 3])
+
+        self.assertEqual(
+            [
+                (labels["trigger"], n)
+                for labels, n in self.collector.kv_recomputed_idle_tokens.increments
+            ],
+            [("mamba", 3)],
+        )
 
     def test_gap_flag_distinguishes_evicted_from_never_saved(self):
         # root -> a[1,2,3] -> b[4,5,6] -> c[7,8,9]; drop a's and b's states.
