@@ -269,11 +269,14 @@ class TestCollectorGauges(CustomTestCase):
         self._emit(
             c,
             max_running_requests=12,
+            max_running_requests_cap_source="requested",
             max_queued_requests=16,
             gpu_type="NVIDIA B300",
             gpu_count=8,
         )
-        self.assertEqual(self._value(c.max_running_requests), 12)
+        self.assertEqual(
+            self._value(c.max_running_requests, cap_source="requested"), 12
+        )
         self.assertEqual(self._value(c.max_queued_requests), 16)
         self.assertEqual(
             self._value(c.replica_gpu_info, gpu_type="NVIDIA B300", gpu_count="8"), 1

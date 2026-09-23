@@ -2410,7 +2410,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await asyncio.sleep(0)
 
             if self.enable_metrics and state.obj.log_metrics:
-                self.collect_metrics(state, recv_obj, i)
+                self.collect_metrics(state, recv_obj, i, meta_info)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
@@ -2704,23 +2704,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.sampling_params.get("structural_tag", None)
         )
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
-        completion_tokens = (
-            recv_obj.completion_tokens[i]
-            if getattr(recv_obj, "completion_tokens", None)
-            else 0
-        )
-
-        custom_labels = getattr(state.obj, "custom_labels", None)
+    def _request_metric_labels(self, state: ReqState) -> dict:
         labels = dict(self.metrics_collector.labels)
+        custom_labels = getattr(state.obj, "custom_labels", None)
         if custom_labels:
             labels.update(custom_labels)
         if self.enable_priority_scheduling:
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
                 labels["priority"] = str(priority)
+        return labels
+
+    def collect_metrics(
+        self, state: ReqState, recv_obj: BatchStrOutput, i: int, meta_info: dict
+    ):
+        completion_tokens = (
+            recv_obj.completion_tokens[i]
+            if getattr(recv_obj, "completion_tokens", None)
+            else 0
+        )
+
+        labels = self._request_metric_labels(state)
         if (
             not state.ttft_observed
+            and completion_tokens > 0
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             state.ttft_observed = True
@@ -2730,18 +2737,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.get_first_token_latency(),
                 stream=getattr(state.obj, "stream", False),
             )
-        else:
+        elif self.disaggregation_mode != DisaggregationMode.PREFILL:
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
+            if num_new_tokens > 0:
                 self.metrics_collector.observe_inter_token_latency(
                     labels,
                     state.time_stats.get_interval(),
                     num_new_tokens,
                 )
+            if num_new_tokens != 0:
+                # A reset starts a new baseline, not a negative observation.
                 state.time_stats.set_last_time()
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
+            # Record the reciprocal of the existing per-request response field.
+            reason = recv_obj.finished_reasons[i]
+            if (
+                self.disaggregation_mode != DisaggregationMode.PREFILL
+                and completion_tokens > 1
+                and reason is not None
+                and reason.get("type") in ("stop", "length")
+            ):
+                decode_throughput = meta_info.get("decode_throughput")
+                if decode_throughput is not None and 0 < decode_throughput < float(
+                    "inf"
+                ):
+                    self.metrics_collector.observe_request_tpot(
+                        labels,
+                        1.0 / decode_throughput,
+                        stream=getattr(state.obj, "stream", False),
+                    )
             # Get detailed cache breakdown if available
             cached_tokens_details = None
             if (
@@ -2758,6 +2784,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else 0
             )
 
+            # A terminal abort without output is not an observed first token.
+            finish_reason = recv_obj.finished_reasons[i] or {}
+            reason_type = finish_reason.get("type")
+            if reason_type in ("stop", "length"):
+                outcome = "success"
+            elif reason_type == "abort":
+                outcome = "abort"
+            else:
+                outcome = "other"
+            self.metrics_collector.observe_finished_outcome(
+                labels,
+                outcome,
+                recv_obj.prompt_tokens[i],
+                recv_obj.cached_tokens[i],
+            )
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -3066,6 +3107,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         state.finished = True
         state.time_stats.set_finished_time()
+        if self.enable_metrics and getattr(state.obj, "log_metrics", True):
+            # This echo finishes requests the scheduler aborted before any
+            # finishing output batch (waiting queue, API abort), so
+            # collect_metrics never sees them. Prompt/cached token counts are
+            # not reported on this path.
+            self.metrics_collector.observe_finished_outcome(
+                self._request_metric_labels(state), "abort", 0, 0
+            )
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {

@@ -63,7 +63,7 @@ class RadixCacheCpp(BasePrefixCache):
         self.tp_group = params.tp_cache_group
 
         if params.enable_metrics:
-            self.init_metrics_collector()
+            self.init_metrics_collector(params.dp_rank)
 
         if not server_args.enable_hierarchical_cache:
             self.tree = RadixTreeCpp(

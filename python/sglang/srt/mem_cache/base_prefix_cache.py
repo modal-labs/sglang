@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
+    radix_cache_metric_labels,
     resolve_collector_class,
 )
 
@@ -57,19 +58,40 @@ class MatchPrefixParams:
     repoint_only: bool = False
 
 
-def take_kv_age_hit_observation(params: MatchPrefixParams) -> bool:
-    """Return True for the first match_prefix a request performs, False after.
+def get_mamba_cache_miss_tokens(match_result: MatchResult) -> int:
+    """Return Full-KV tokens blocked by a missing reusable Mamba checkpoint."""
+    if match_result.mamba_branching_seqlen is None:
+        return 0
 
-    Only that first match measures real reuse: the scheduler re-matches waiting
-    requests every round and the cache re-matches after each insert, and those
-    would all land in the sub-second age bucket. Matches without a request
-    (tests, probes) never observe.
+    mamba_boundary_len = len(match_result.device_indices) + match_result.host_hit_length
+    if match_result.full_kv_hit_length <= mamba_boundary_len:
+        return 0
+
+    return max(
+        min(match_result.mamba_branching_seqlen, match_result.full_kv_hit_length)
+        - mamba_boundary_len,
+        0,
+    )
+
+
+def kv_age_hit_pending(params: MatchPrefixParams) -> bool:
+    """True until the request's first *non-empty* match has been observed.
+
+    Only a request's first real hit measures reuse: the scheduler re-matches
+    waiting requests every round and the cache re-matches after each insert,
+    and those would all land in the sub-second age bucket. A zero-token match
+    does not count as observed, so a request that queued against a cold cache
+    still reports the hit when a sibling fills its prefix in a later round.
+    Matches without a request (tests, probes) never observe.
     """
     req = params.req
-    if req is None or getattr(req, "kv_age_hit_observed", False):
-        return False
-    req.kv_age_hit_observed = True
-    return True
+    return req is not None and not getattr(req, "kv_age_hit_observed", False)
+
+
+def mark_kv_age_hit_observed(params: MatchPrefixParams) -> None:
+    """Consume the request's one hit observation (call after a non-empty match)."""
+    if params.req is not None:
+        params.req.kv_age_hit_observed = True
 
 
 @dataclasses.dataclass
@@ -241,11 +263,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
 
-    def init_metrics_collector(self):
-        from sglang.srt.runtime_context import get_server_args
+    def init_metrics_collector(self, dp_rank: Optional[int] = None):
+        from sglang.srt.runtime_context import get_parallel, get_server_args
 
         server_args = get_server_args()
-        labels = {"cache_type": self.__class__.__name__}
+        labels = radix_cache_metric_labels(
+            self.__class__.__name__,
+            get_parallel(),
+            server_args.enable_dp_attention,
+            dp_rank=dp_rank,
+        )
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
@@ -254,13 +281,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             RadixCacheMetricsCollector,
         )
         self.metrics_collector = radix_cache_cls(labels=labels)
-
-    def kv_age_metrics_collector(self) -> Optional[RadixCacheMetricsCollector]:
-        """The metrics collector iff the per-node KV age hooks are enabled."""
-        mc = self.metrics_collector
-        if mc is not None and mc.kv_age_enabled:
-            return mc
-        return None
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:

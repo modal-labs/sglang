@@ -42,6 +42,8 @@ class CacheInitParams:
 
     pp_rank: int = 0
     pp_size: int = 1
+    # Plain data-parallel replica index (None without DP); labels cache metrics.
+    dp_rank: Optional[int] = None
 
     attn_cp_rank: int = 0
     attn_cp_size: int = 1

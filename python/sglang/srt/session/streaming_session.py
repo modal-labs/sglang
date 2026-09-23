@@ -705,8 +705,8 @@ class StreamingSession(BasePrefixCache):
     def available_and_evictable_str(self):
         return self.inner.available_and_evictable_str()
 
-    def init_metrics_collector(self):
-        return self.inner.init_metrics_collector()
+    def init_metrics_collector(self, dp_rank=None):
+        return self.inner.init_metrics_collector(dp_rank)
 
     def sanity_check(self):
         # Skip inner sanity check when sessions hold tree locks, because

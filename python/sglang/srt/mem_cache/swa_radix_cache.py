@@ -357,7 +357,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             self.device = torch.device("cpu")
 
         if params.enable_metrics:
-            self.init_metrics_collector()
+            self.init_metrics_collector(params.dp_rank)
 
         self.sliding_window_size = params.sliding_window_size
         self.reset()

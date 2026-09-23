@@ -36,6 +36,7 @@ from typing import (
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.admission_block import AdmissionBlockCause
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
@@ -344,6 +345,8 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
+    # Label names this collector appends to some of its own metrics.
+    RESERVED_LABELS = ("cause", "cap_source")
 
     def __init__(
         self,
@@ -365,6 +368,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         Summary = self._summary_cls or _PromSummary
 
         self.labels = labels
+        check_reserved_metric_labels(
+            self.labels, self.RESERVED_LABELS, metric_group="Scheduler"
+        )
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
@@ -1067,6 +1073,51 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["mode"],
         )
+        self.mamba_cache_miss_requests_total = Counter(
+            name="sglang:mamba_cache_miss_requests_total",
+            documentation=(
+                "Number of prefill admissions where Full-KV cache was available "
+                "beyond the reusable Mamba checkpoint boundary."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.mamba_cache_miss_tokens_total = Counter(
+            name="sglang:mamba_cache_miss_tokens_total",
+            documentation=(
+                "Number of page-aligned Full-KV prefix tokens skipped because "
+                "the corresponding Mamba checkpoint was unavailable."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.prefill_admission_blocked_passes_total = Counter(
+            name="sglang:prefill_admission_blocked_passes_total",
+            documentation=(
+                "Prefill scheduling passes that ended with waiting requests "
+                "left unadmitted, by the first binding constraint (cause). "
+                "One increment per prefill pass while blocked (one pass per "
+                "scheduler step, or per micro-batch under pipeline "
+                "parallelism), so rate() ranks the constraints that cap "
+                "concurrency. kv_tokens / swa_tokens / mamba_slots are the "
+                "memory pools, max_running_requests / pp_micro_batch are "
+                "request slots, max_prefill_tokens / chunked_prefill_size / "
+                "prefill_max_requests are per-pass compute budgets that "
+                "reset next step."
+            ),
+            labelnames=[*labels.keys(), "cause"],
+        )
+        self.prefill_admission_blocked_requests_total = Counter(
+            name="sglang:prefill_admission_blocked_requests_total",
+            documentation=(
+                "Waiting requests left unadmitted at the end of a blocked "
+                "prefill pass, summed over passes (a request that waits N "
+                "steps counts N times), by the binding constraint (cause)."
+            ),
+            labelnames=[*labels.keys(), "cause"],
+        )
+        # Pre-seed every cause at 0 so ratio panels get a complete operand set.
+        for cause in AdmissionBlockCause.ALL:
+            self.prefill_admission_blocked_passes_total.labels(**labels, cause=cause)
+            self.prefill_admission_blocked_requests_total.labels(**labels, cause=cause)
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1185,6 +1236,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.max_running_requests = Gauge(
+            name="sglang:max_running_requests",
+            documentation=(
+                "Effective per-scheduler max_running_requests, by the limit "
+                "that set it (cap_source): requested (--max-running-requests), "
+                "estimated (default heuristic), kv_capacity (KV pool / 2), "
+                "mamba_pool (max_mamba_cache_size / states per request)."
+            ),
+            labelnames=[*labels.keys(), "cap_source"],
+            multiprocess_mode="mostrecent",
+        )
         self.engine_load_weights_time = Gauge(
             name="sglang:engine_load_weights_time",
             documentation="The time taken for the engine to load weights.",
@@ -1206,12 +1268,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.context_len = Gauge(
             name="sglang:context_len",
             documentation="Maximum context length.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.max_running_requests = Gauge(
-            name="sglang:max_running_requests",
-            documentation="Maximum number of concurrently running requests (--max-running-requests).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1439,6 +1495,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     **dp_cooperation_info.to_labels(),
                 ).inc(delta)
 
+    def increment_mamba_cache_miss(self, num_requests: int, num_tokens: int) -> None:
+        if num_requests > 0:
+            self.mamba_cache_miss_requests_total.labels(**self.labels).inc(num_requests)
+        if num_tokens > 0:
+            self.mamba_cache_miss_tokens_total.labels(**self.labels).inc(num_tokens)
+
+    def increment_admission_blocked(self, cause: str, num_blocked_reqs: int) -> None:
+        self.prefill_admission_blocked_passes_total.labels(
+            **self.labels, cause=cause
+        ).inc(1)
+        if num_blocked_reqs > 0:
+            self.prefill_admission_blocked_requests_total.labels(
+                **self.labels, cause=cause
+            ).inc(num_blocked_reqs)
+
     def increment_forward_execution_seconds(
         self,
         category: str,
@@ -1633,10 +1704,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         max_queued_requests: Optional[int] = None,
         gpu_type: Optional[str] = None,
         gpu_count: Optional[int] = None,
+        max_running_requests_cap_source: Optional[str] = None,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
         if max_running_requests is not None:
-            self._log_gauge(self.max_running_requests, max_running_requests)
+            self.max_running_requests.labels(
+                **self.labels,
+                cap_source=max_running_requests_cap_source or "unknown",
+            ).set(max_running_requests)
         if max_queued_requests is not None:
             self._log_gauge(self.max_queued_requests, max_queued_requests)
         if gpu_type is not None and gpu_count is not None:
@@ -1659,7 +1734,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
     # Label names this collector appends to some of its own metrics.
-    RESERVED_LABELS = ("stream", "is_streaming", "cache_source")
+    RESERVED_LABELS = ("stream", "is_streaming", "cache_source", "outcome")
 
     def __init__(
         self,
@@ -1682,6 +1757,21 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             self.labels, self.RESERVED_LABELS, metric_group="Tokenizer"
         )
 
+        self.finished_prompt_tokens_by_outcome = Counter(
+            name="sglang:finished_prompt_tokens_by_outcome_total",
+            documentation="Reported prompt tokens at completion, separated by outcome; not executed prefill work. Aborts finished by the scheduler's abort echo (waiting queue, API abort before any output) add no tokens.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.finished_cached_tokens_by_outcome = Counter(
+            name="sglang:finished_cached_tokens_by_outcome_total",
+            documentation="Reported cached prompt tokens at completion, separated by outcome.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.finished_requests_by_outcome = Counter(
+            name="sglang:finished_requests_by_outcome_total",
+            documentation="Terminal request outcomes, including aborts with no output.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
@@ -1912,6 +2002,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_inter_token_latency,
         )
 
+        self.histogram_request_tpot = Histogram(
+            name="sglang:request_time_per_output_token_seconds",
+            documentation="Per-request mean decode latency as the reciprocal of response decode_throughput; excludes aborts and N<=1.",
+            labelnames=[*labels.keys(), "stream"],
+            buckets=bucket_inter_token_latency,
+        )
+
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
@@ -1925,6 +2022,21 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["is_streaming"],
             buckets=bucket_decode_throughput,
         )
+
+    def observe_request_tpot(self, labels, value, *, stream):
+        self.histogram_request_tpot.labels(
+            **labels, stream=str(stream).lower()
+        ).observe(value)
+
+    def observe_finished_outcome(self, labels, outcome, prompt_tokens, cached_tokens):
+        outcome_labels = {**labels, "outcome": outcome}
+        self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(
+            prompt_tokens
+        )
+        self.finished_cached_tokens_by_outcome.labels(**outcome_labels).inc(
+            cached_tokens
+        )
+        self.finished_requests_by_outcome.labels(**outcome_labels).inc()
 
     def observe_one_finished_request(
         self,
@@ -2012,6 +2124,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def observe_inter_token_latency(
         self, labels: Dict[str, str], internval: float, num_new_tokens: int
     ):
+        if num_new_tokens <= 0:
+            return
         adjusted_interval = internval / num_new_tokens
 
         # A faster version of the Histogram::observe which observes multiple values at the same time.
@@ -2149,6 +2263,31 @@ class ExpertDispatchCollector(_StatLoggerDIMixin):
         )
 
 
+def radix_cache_metric_labels(
+    cache_type: str,
+    parallel: Any,
+    dp_attention_enabled: bool,
+    dp_rank: Optional[int] = None,
+) -> Dict[str, Any]:
+    # Every scheduler rank runs its own cache over its own KV shard; without
+    # rank labels the multiprocess registry sums ranks into TP x the count.
+    # Same rank keys as the storage collector (cache_controller's storage
+    # config), so one rank's L2 and L3 series line up. (Backport of the label
+    # part of sgl-project/sglang#39280.) Plain data parallelism runs one
+    # scheduler per replica with overlapping tp ranks, so the replica's
+    # dp_rank keeps those series apart.
+    if dp_attention_enabled:
+        tp_rank, dp_rank = parallel.attn_tp_rank, parallel.attn_dp_rank
+    else:
+        tp_rank, dp_rank = parallel.tp_rank, dp_rank or 0
+    return {
+        "cache_type": cache_type,
+        "tp_rank": tp_rank,
+        "pp_rank": parallel.pp_rank,
+        "dp_rank": dp_rank,
+    }
+
+
 KV_AGE_BUCKETS = (
     1.0,
     5.0,
@@ -2176,6 +2315,9 @@ def kv_age_bucket(age_seconds: float) -> str:
 
 
 class RadixCacheMetricsCollector(_StatLoggerDIMixin):
+    # Label names this collector appends to its KV age series.
+    RESERVED_LABELS = ("event", "tier", "outcome", "age_le")
+
     def __init__(
         self,
         labels: Dict[str, str],
@@ -2188,7 +2330,17 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
-        self.kv_age_enabled = envs.SGLANG_ENABLE_KV_AGE_METRICS.get()
+        check_reserved_metric_labels(
+            self.labels, self.RESERVED_LABELS, metric_group="Radix cache"
+        )
+
+        # Label children for the per-node kv_age hooks, resolved once per label
+        # combination (see _kv_age_child and friends below). Plain instance
+        # attributes, deliberately named differently from the helper methods
+        # that fill them so they cannot shadow those methods.
+        self._kv_age_child_cache = {}
+        self._kv_age_tokens_child_cache = {}
+        self._kv_eviction_child_cache = {}
 
         # Label children for the per-node kv_age hooks, resolved once per label
         # combination (see _kv_age_child and friends below). Plain instance
@@ -2259,56 +2411,58 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
-        if self.kv_age_enabled:
-            self.kv_age_seconds = Histogram(
-                name="sglang:kv_age_seconds",
-                documentation="Seconds since a radix node was last matched, observed "
-                "once per node when it is matched again (event=hit) or removed from "
-                "a tier (event=evict). tier is device or host. outcome is hit for "
-                "matches; for evictions, demoted means the device copy was freed "
-                "with the host copy kept, dropped means the data was destroyed. "
-                "Compare the hit and evict curves of one tier: overlap means pages "
-                "leave shortly before the traffic would have reused them.",
-                labelnames=list(labels.keys()) + ["event", "tier", "outcome"],
-                buckets=list(KV_AGE_BUCKETS),
-            )
+        self.kv_age_seconds = Histogram(
+            name="sglang:kv_age_seconds",
+            documentation="Seconds since a radix node was last matched, observed "
+            "once per node when it is matched again (event=hit) or removed from "
+            "a tier (event=evict), and once per request at its first match for "
+            "the deepest matched node (event=request_hit). tier is device or "
+            "host. outcome is hit for matches; for evictions, demoted means the "
+            "device copy was freed with the host copy kept, dropped means the "
+            "data was destroyed. hit is one sample per node on the matched path, "
+            "so shared ancestors (system prompts) dominate it: read it for "
+            "capacity, since every sample above a horizon is a hit that horizon "
+            "would lose. request_hit is one sample per request, independent of "
+            "path length: read it for the reuse gap between a session's turns. "
+            "Compare the hit and evict curves of one tier: overlap means pages "
+            "leave shortly before the traffic would have reused them.",
+            labelnames=list(labels.keys()) + ["event", "tier", "outcome"],
+            buckets=list(KV_AGE_BUCKETS),
+        )
 
-            self.kv_age_tokens = Counter(
-                name="sglang:kv_age_tokens_total",
-                documentation="Token-weighted companion of sglang:kv_age_seconds: "
-                "tokens matched or removed, by the age bucket the node fell in "
-                "(age_le is the bucket upper edge in seconds, or +Inf). Use it "
-                "when node counts would over-weight small leaves.",
-                labelnames=list(labels.keys()) + ["event", "tier", "outcome", "age_le"],
-            )
+        self.kv_age_tokens = Counter(
+            name="sglang:kv_age_tokens_total",
+            documentation="Token-weighted companion of sglang:kv_age_seconds: "
+            "tokens matched or removed, by the age bucket the node fell in "
+            "(age_le is the bucket upper edge in seconds, or +Inf). Use it "
+            "when node counts would over-weight small leaves. For "
+            "event=request_hit the weight is the request's whole matched "
+            "prefix, in the bucket of the deepest matched node's idle time.",
+            labelnames=list(labels.keys()) + ["event", "tier", "outcome", "age_le"],
+        )
 
-            self.kv_lifetime_seconds = Histogram(
-                name="sglang:kv_lifetime_seconds",
-                documentation="Seconds since a radix node was created, observed once "
-                "per node when it is removed from a tier. Same tier/outcome labels "
-                'as sglang:kv_age_seconds{event="evict"}; that series is the idle '
-                "time since the last match, this one is the total residency.",
-                labelnames=list(labels.keys()) + ["tier", "outcome"],
-                buckets=list(KV_AGE_BUCKETS),
-            )
+        self.kv_lifetime_seconds = Histogram(
+            name="sglang:kv_lifetime_seconds",
+            documentation="Seconds since a radix node was created, observed once "
+            "per node when it is removed from a tier. Same tier/outcome labels "
+            'as sglang:kv_age_seconds{event="evict"}; that series is the idle '
+            "time since the last match, this one is the total residency.",
+            labelnames=list(labels.keys()) + ["tier", "outcome"],
+            buckets=list(KV_AGE_BUCKETS),
+        )
 
-            self.kv_reuses = Histogram(
-                name="sglang:kv_reuses",
-                documentation="TreeNode.hit_count at the moment a radix node is "
-                "removed from a tier: the number of non-chunked inserts that "
-                "touched the node. One request inserts twice (end of prefill and "
-                "at finish), so a node cached by one request and never reused "
-                "reads 2; each additional request that reuses it adds 2. Under "
-                "--hicache-write-policy write_back the HiCache paths do not "
-                "maintain hit_count and this reads 0.",
-                labelnames=list(labels.keys()) + ["tier", "outcome"],
-                buckets=list(KV_REUSE_BUCKETS),
-            )
-        else:
-            self.kv_age_seconds = None
-            self.kv_age_tokens = None
-            self.kv_lifetime_seconds = None
-            self.kv_reuses = None
+        self.kv_reuses = Histogram(
+            name="sglang:kv_reuses",
+            documentation="TreeNode.hit_count at the moment a radix node is "
+            "removed from a tier: the number of non-chunked inserts that "
+            "touched the node. One request inserts twice (end of prefill and "
+            "at finish), so a node cached by one request and never reused "
+            "reads 2; each additional request that reuses it adds 2. Under "
+            "--hicache-write-policy write_back the HiCache paths do not "
+            "maintain hit_count and this reads 0.",
+            labelnames=list(labels.keys()) + ["tier", "outcome"],
+            buckets=list(KV_REUSE_BUCKETS),
+        )
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",

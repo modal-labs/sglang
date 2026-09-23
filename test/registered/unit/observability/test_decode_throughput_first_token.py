@@ -99,6 +99,12 @@ class _RecordingCollector:
     def observe_inter_token_latency(self, *args, **kwargs):
         pass
 
+    def observe_request_tpot(self, *args, **kwargs):
+        pass
+
+    def observe_finished_outcome(self, *args, **kwargs):
+        pass
+
     def observe_one_finished_request(self, labels, *args, **kwargs):
         self.finished.append(kwargs)
 
@@ -221,13 +227,15 @@ class _Sim:
         # Mirrors the tokenizer's receive loop for the metrics-relevant part.
         if state.time_stats.first_token_time == 0.0:
             state.time_stats.set_first_token_time()
+        meta_info = {}
         if req.finished():
             state.finished = True
             state.time_stats.set_finished_time()
             self.meta_info = state.time_stats.convert_to_output_meta_info(
                 recv_obj.time_stats[0], recv_obj.completion_tokens[0]
             )
-        self.tm.collect_metrics(state, recv_obj, 0)
+            meta_info = self.meta_info
+        self.tm.collect_metrics(state, recv_obj, 0, meta_info)
 
     def observed(self) -> Optional[float]:
         (kwargs,) = self.collector.finished
@@ -247,18 +255,18 @@ class TestDecodeThroughputFirstToken(CustomTestCase):
     def test_non_stream_below_force_interval_uses_scheduler_window(self):
         sim = _Sim(self)
         sim.run(num_tokens=10, stream=False)
-        # The API server saw exactly one batch (at finish): the old API-side
-        # window would be zero / undefined here.
-        self.assertEqual(sim.delivered_batches, 1)
+        # First output is flushed at token one, then the finish batch.
+        self.assertEqual(sim.delivered_batches, 2)
         self._assert_true_throughput(sim, 10)
 
     def test_non_stream_above_force_interval_uses_scheduler_window(self):
         sim = _Sim(self)
         state = sim.run(num_tokens=100, stream=False)
-        self.assertEqual(sim.delivered_batches, 2)  # token 50 and finish
-        # API-side window starts at token 50 -> ~2x inflation; scheduler is exact.
+        self.assertEqual(sim.delivered_batches, 3)  # token 1, token 50 and finish
+        # The first-output flush puts the API-side first batch at token one, so
+        # the API-side window no longer starts at token 50.
         api_side = state.time_stats.get_decode_throughput(100)
-        self.assertGreater(api_side, 1.8 * self.TRUE_TPS)
+        self.assertAlmostEqual(api_side, sim.observed(), delta=0.02 * self.TRUE_TPS)
         self._assert_true_throughput(sim, 100)
 
     def test_stream_interval_gt_one_uses_scheduler_window(self):
@@ -299,7 +307,7 @@ class TestDecodeThroughputFirstToken(CustomTestCase):
     def test_two_token_completion_is_observed(self):
         sim = _Sim(self)
         sim.run(num_tokens=2, stream=False)
-        self.assertEqual(sim.delivered_batches, 1)
+        self.assertEqual(sim.delivered_batches, 2)
         self._assert_true_throughput(sim, 2)
 
     def test_speculative_multi_token_steps(self):

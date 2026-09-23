@@ -79,6 +79,10 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.admission_block import (
+    AdmissionBlockCause,
+    req_slot_block_cause,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1068,6 +1072,12 @@ class Scheduler(
         if self.server_args.enable_metrics:
             self.metrics_collector.emit_constants(
                 max_total_num_tokens=self.max_total_num_tokens,
+                max_running_requests=self.max_running_requests,
+                max_running_requests_cap_source=getattr(
+                    self.tp_worker.model_runner.memory_pool_config,
+                    "max_running_requests_cap_source",
+                    None,
+                ),
                 # TODO: max_running_requests_under_SLO has no setter — dead chain.
                 max_running_requests_under_SLO=getattr(
                     self, "max_running_requests_under_SLO", None
@@ -1078,7 +1088,6 @@ class Scheduler(
                 num_pages=self.max_total_num_tokens // self.page_size,
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
-                max_running_requests=self.max_running_requests,
                 max_queued_requests=self.max_queued_requests,
                 gpu_type=get_device_name(self.ps.gpu_id),
                 gpu_count=self._replica_gpu_count(),
@@ -1107,6 +1116,9 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        # Cause of the last blocked admission pass, replayed while
+        # `running_batch.batch_is_full` carries over to later passes.
+        self._last_admission_block_cause: Optional[str] = None
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -3201,6 +3213,48 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _req_slot_block_cause(self, running_bs: int) -> str:
+        # Same operands as this tree's get_num_allocatable_reqs (no beam rows here).
+        micro_batch_cap = get_parallel().pp_max_micro_batch_size
+        return req_slot_block_cause(
+            pp_budget=micro_batch_cap - running_bs,
+            available_req_slots=self.req_to_token_pool.available_size(),
+            pp_budget_is_running_cap=micro_batch_cap >= self.max_running_requests,
+        )
+
+    def _record_admission_block(self, cause: str, num_blocked_reqs: int) -> None:
+        """One prefill pass ended with waiting requests it could not admit."""
+        self._last_admission_block_cause = cause
+        self.metrics_reporter.record_admission_block(cause, num_blocked_reqs)
+
+    def _account_admission_block(
+        self,
+        cause: Optional[str],
+        admitted: List[Req],
+        num_skipped: int,
+        continuing_req: Optional[Req] = None,
+    ) -> None:
+        """Close out an admission pass: count it as blocked when a gate stopped
+        it while waiting requests remained, otherwise forget the last cause.
+        Requests admitted this pass and those the loop skipped for its own
+        reasons (LoRA slots, prefetch in flight) were not held back by the
+        stopping gate. O(admitted): every admitted request except the chunked
+        continuation came from the waiting queue. continuing_req is the
+        chunked request as it stood at the start of the pass: admitting its
+        final chunk clears self.chunked_req, so that attribute cannot
+        identify it here."""
+        if cause is None:
+            self._last_admission_block_cause = None
+            return
+        if not self.metrics_reporter.current_scheduler_metrics_enabled:
+            return
+        admitted_from_queue = sum(1 for r in admitted if r is not continuing_req)
+        num_blocked = len(self.waiting_queue) - admitted_from_queue - num_skipped
+        if num_blocked <= 0:
+            self._last_admission_block_cause = None
+            return
+        self._record_admission_block(cause, num_blocked)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3250,6 +3304,11 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if running_batch.batch_is_full and self.waiting_queue:
+                self._record_admission_block(
+                    self._last_admission_block_cause or AdmissionBlockCause.BATCH_FULL,
+                    len(self.waiting_queue),
+                )
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -3262,6 +3321,9 @@ class Scheduler(
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
             )
         ):
+            self._record_admission_block(
+                AdmissionBlockCause.MIN_FREE_SLOTS_DELAY, len(self.waiting_queue)
+            )
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
@@ -3275,6 +3337,10 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            self._record_admission_block(
+                self._req_slot_block_cause(running_bs),
+                len(self.waiting_queue),
+            )
             return None, running_batch
 
         # Get priority queue
@@ -3313,6 +3379,10 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        # Captured before add_chunked_req, which clears self.chunked_req once
+        # the final chunk is admitted; the continuation never came from the
+        # waiting queue.
+        continuing_req = self.chunked_req
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -3333,31 +3403,48 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        block_cause: Optional[str] = None
+        num_skipped = 0
+        res = "not_attempted"
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                num_skipped += 1
                 continue
 
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 running_batch.batch_is_full = True
+                block_cause = self._req_slot_block_cause(running_bs)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     running_batch.batch_is_full = True
+                    block_cause = AdmissionBlockCause.DISAGG_PREFILL_REQ_POOL
 
             if running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
+                    # The flag may have been set on an earlier pass (chunked
+                    # prefill keeps the pass alive; preemption never clears it):
+                    # keep that pass's cause rather than losing it.
+                    block_cause = (
+                        block_cause
+                        or self._last_admission_block_cause
+                        or AdmissionBlockCause.BATCH_FULL
+                    )
                     break
+                # Preemption made room; keep the slot cause in case a later
+                # candidate cannot preempt, it is overwritten by any adder stop.
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    num_skipped += 1
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
@@ -3375,6 +3462,11 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                block_cause = adder.stop_cause or (
+                    AdmissionBlockCause.KV_TOKENS
+                    if res == AddReqResult.NO_TOKEN
+                    else AdmissionBlockCause.OTHER
+                )
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -3407,10 +3499,15 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        can_run_set = set(can_run_list)
+        self._account_admission_block(
+            block_cause, can_run_list, num_skipped, continuing_req
+        )
+
+        # Update waiting queue
         if len(can_run_list) == 0:
             return None, running_batch
 
-        can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:

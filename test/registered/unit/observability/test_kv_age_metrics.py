@@ -1,8 +1,9 @@
 """Pure-CPU unit tests for the KV age metrics on RadixCacheMetricsCollector.
 
 ``sglang:kv_age_seconds`` / ``sglang:kv_age_tokens_total`` record how long a
-radix node had gone untouched when it was matched again (``event="hit"``) or
-removed from a tier (``event="evict"``); ``sglang:kv_lifetime_seconds`` and
+radix node had gone untouched when it was matched again (``event="hit"``, one
+sample per matched node; ``event="request_hit"``, one sample per request for the
+deepest matched node) or removed from a tier (``event="evict"``); ``sglang:kv_lifetime_seconds`` and
 ``sglang:kv_reuses`` record total residency and TreeNode.hit_count at removal.
 These tests cover the collector-level contract (label routing, the
 token-weighted bucket label, one observation per call) and an end-to-end CPU
@@ -18,7 +19,6 @@ from array import array
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -40,7 +40,6 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
 
 
 def _req(rid: str, tokens) -> Req:
@@ -51,6 +50,14 @@ def _req(rid: str, tokens) -> Req:
         origin_input_ids=list(tokens),
         sampling_params=SamplingParams(),
     )
+
+
+def _child_with_tokens(node, tokens):
+    """The child of `node` whose key is exactly `tokens` (page_size 1 trees)."""
+    (child,) = [
+        c for c in node.children.values() if list(c.key.token_ids) == list(tokens)
+    ]
+    return child
 
 
 class _BoundRecordingMetric:
@@ -85,7 +92,7 @@ class _RecordingRadixCacheMetricsCollector(RadixCacheMetricsCollector):
     _histogram_cls = _RecordingMetric
 
 
-class TestKvAgeBucket(CustomTestCase):
+class TestKvAgeBucket(unittest.TestCase):
     def test_edges_map_to_their_own_label(self):
         for edge in KV_AGE_BUCKETS:
             self.assertEqual(kv_age_bucket(edge), str(int(edge)))
@@ -102,9 +109,8 @@ class TestKvAgeBucket(CustomTestCase):
         self.assertEqual(kv_age_bucket(1e9), "+Inf")
 
 
-class TestObserveKvAge(CustomTestCase):
+class TestObserveKvAge(unittest.TestCase):
     def setUp(self):
-        self.enterContext(envs.SGLANG_ENABLE_KV_AGE_METRICS.override(True))
         self.collector = _RecordingRadixCacheMetricsCollector(
             labels={"cache_type": "RadixCache"}
         )
@@ -237,64 +243,11 @@ class TestObserveKvAge(CustomTestCase):
         self.assertEqual(self.collector.kv_age_tokens.labels_calls, 2)
 
 
-class TestKvAgeMetricsDisabled(CustomTestCase):
-    def test_disabled_collector_and_cache_do_not_observe(self):
-        self.enterContext(envs.SGLANG_ENABLE_KV_AGE_METRICS.override(False))
-        collector = _RecordingRadixCacheMetricsCollector(
-            labels={"cache_type": "RadixCache"}
-        )
-        self.assertFalse(collector.kv_age_enabled)
-        self.assertIsNone(collector.kv_age_seconds)
-        self.assertIsNone(collector.kv_age_tokens)
-        self.assertIsNone(collector.kv_lifetime_seconds)
-        self.assertIsNone(collector.kv_reuses)
-
-        req_to_token_pool = ReqToTokenPool(
-            size=4, max_context_len=64, device="cpu", enable_memory_saver=False
-        )
-        kv_pool = MHATokenToKVPool(
-            size=64,
-            page_size=1,
-            dtype=torch.float16,
-            head_num=1,
-            head_dim=8,
-            layer_num=1,
-            device="cpu",
-            enable_memory_saver=False,
-        )
-        allocator = TokenToKVPoolAllocator(
-            size=64,
-            dtype=torch.float16,
-            device="cpu",
-            kvcache=kv_pool,
-            need_sort=False,
-        )
-        cache = RadixCache(
-            CacheInitParams(
-                disable=False,
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=1,
-            )
-        )
-        cache.metrics_collector = collector
-        tokens = array("q", [1, 2, 3, 4])
-        indices = allocator.alloc(len(tokens))
-        cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
-        req = _req("disabled", tokens)
-        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
-        cache.evict(EvictParams(num_tokens=len(tokens)))
-        self.assertFalse(req.kv_age_hit_observed)
-
-
-class TestRadixCacheEmitsKvAge(CustomTestCase):
+class TestRadixCacheEmitsKvAge(unittest.TestCase):
     """End-to-end on a CPU RadixCache: a re-match records a hit age for the
     matched tokens, and an eviction records an evict age for the freed tokens."""
 
     PAGE_SIZE = 1
-
-    def setUp(self):
-        self.enterContext(envs.SGLANG_ENABLE_KV_AGE_METRICS.override(True))
 
     def _build_cache(self):
         req_to_token_pool = ReqToTokenPool(
@@ -385,71 +338,92 @@ class TestRadixCacheEmitsKvAge(CustomTestCase):
         ]
         self.assertEqual(evict_tokens, [len(tokens)])
 
-    def test_cold_miss_does_not_consume_hit_observation(self):
+    def test_request_hit_samples_the_deepest_node_once_per_request(self):
+        """event=hit fires for every node on the matched path, so shared
+        ancestors dominate it. event=request_hit fires once per request with
+        the deepest matched node's idle time, weighted by the whole prefix."""
+        cache, allocator = self._build_cache()
+        collector = cache.metrics_collector
+        a = array("q", [1, 2, 3, 4])
+        b = array("q", [1, 2, 5, 6])
+        cache.insert(InsertParams(key=RadixKey(token_ids=a), value=allocator.alloc(4)))
+        cache.insert(InsertParams(key=RadixKey(token_ids=b), value=allocator.alloc(4)))
+        prefix = _child_with_tokens(cache.root_node, [1, 2])
+        tail = _child_with_tokens(prefix, [3, 4])
+        prefix.last_access_time -= 5.0  # the shared ancestor was just touched
+        tail.last_access_time -= 100.0  # the session's own tail sat for 100 s
+
+        req = _req("r1", a)
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=a), req=req))
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=a), req=req))
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=a)))
+
+        node_hits = sorted(
+            v
+            for lab, v in collector.kv_age_seconds.observations
+            if lab["event"] == "hit"
+        )
+        self.assertEqual(len(node_hits), 2)
+        self.assertLess(node_hits[0], 50.0)
+        self.assertGreaterEqual(node_hits[1], 100.0)
+        request_hits = [
+            (lab, v)
+            for lab, v in collector.kv_age_seconds.observations
+            if lab["event"] == "request_hit"
+        ]
+        self.assertEqual(len(request_hits), 1)
+        self.assertGreaterEqual(request_hits[0][1], 100.0)
+        self.assertEqual(request_hits[0][0]["tier"], "device")
+        self.assertEqual(request_hits[0][0]["outcome"], "hit")
+        self.assertEqual(
+            [
+                (lab["age_le"], v)
+                for lab, v in collector.kv_age_tokens.increments
+                if lab["event"] == "request_hit"
+            ],
+            [(kv_age_bucket(request_hits[0][1]), len(a))],
+        )
+
+    def test_cold_request_reports_its_first_real_hit(self):
+        """A zero-token match must not consume the request's one observation:
+        a request that queued against a cold cache still reports the hit when
+        a sibling fills its prefix before a later scheduling round."""
         cache, allocator = self._build_cache()
         collector = cache.metrics_collector
         tokens = array("q", [1, 2, 3, 4])
-        req = _req("waiting", tokens)
+        req = _req("cold", tokens)
 
         cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
-        self.assertFalse(req.kv_age_hit_observed)
         self.assertEqual(collector.kv_age_seconds.observations, [])
 
         indices = allocator.alloc(len(tokens))
         cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
         cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
-        self.assertTrue(req.kv_age_hit_observed)
-        self.assertEqual(
-            len(
-                [
-                    lab
-                    for lab, _ in collector.kv_age_seconds.observations
-                    if lab["event"] == "hit"
-                ]
-            ),
-            1,
-        )
-
         cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
-        self.assertEqual(
-            len(
-                [
-                    lab
-                    for lab, _ in collector.kv_age_seconds.observations
-                    if lab["event"] == "hit"
-                ]
-            ),
-            1,
-        )
+        hits = [
+            v
+            for lab, v in collector.kv_age_seconds.observations
+            if lab["event"] == "hit"
+        ]
+        self.assertEqual(len(hits), 1)
 
-    def test_split_keeps_original_creation_time_for_lifetime(self):
+    def test_split_keeps_the_prefix_creation_time(self):
+        """A partial match splits a node; the retained prefix is the same KV and
+        keeps its residency start, so its lifetime at eviction is not reset."""
         cache, allocator = self._build_cache()
-        collector = cache.metrics_collector
+        tokens = array("q", [1, 2, 3, 4])
+        indices = allocator.alloc(len(tokens))
+        cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
+        (node,) = cache.root_node.children.values()
+        created = node.creation_time
+        node.creation_time = created - 3600.0  # pretend it has lived an hour
 
-        first_tokens = array("q", [1, 2, 3, 4])
-        first_indices = allocator.alloc(len(first_tokens))
-        cache.insert(
-            InsertParams(key=RadixKey(token_ids=first_tokens), value=first_indices)
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids=array("q", [1, 2])))
         )
-        node = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids=first_tokens))
-        ).last_device_node
-        node.creation_time -= 100.0
-
-        second_tokens = array("q", [1, 2, 5, 6])
-        second_indices = allocator.alloc(len(second_tokens))
-        cache.insert(
-            InsertParams(key=RadixKey(token_ids=second_tokens), value=second_indices)
-        )
-
-        cache.evict(EvictParams(num_tokens=8))
-
-        lifetimes = sorted(
-            value for _, value in collector.kv_lifetime_seconds.observations
-        )
-        self.assertEqual(len(lifetimes), 3)
-        self.assertGreaterEqual(lifetimes[1], 100.0)
-        self.assertGreaterEqual(lifetimes[2], 100.0)
+        (prefix,) = cache.root_node.children.values()
+        self.assertEqual(len(prefix.key), 2)
+        self.assertEqual(prefix.creation_time, created - 3600.0)
 
     def test_hiradix_split_node_keeps_creation_time(self):
         hi = HiRadixCache.__new__(HiRadixCache)
@@ -469,14 +443,11 @@ class TestRadixCacheEmitsKvAge(CustomTestCase):
         self.assertEqual(new_node.last_access_time, child.last_access_time)
 
 
-class TestUnifiedRadixCacheEmitsKvAge(CustomTestCase):
+class TestUnifiedRadixCacheEmitsKvAge(unittest.TestCase):
     """Same sequence on the default UnifiedRadixCache (Python tree core): the
-    cache's direct tree hooks report ages."""
+    tree core reports ages through the observer the cache installs."""
 
     PAGE_SIZE = 1
-
-    def setUp(self):
-        self.enterContext(envs.SGLANG_ENABLE_KV_AGE_METRICS.override(True))
 
     def _build_cache(self):
         set_global_server_args_for_scheduler(
@@ -511,10 +482,134 @@ class TestUnifiedRadixCacheEmitsKvAge(CustomTestCase):
                 tree_components=(ComponentType.FULL,),
             )
         )
+        # What UnifiedRadixCache.__init__ does when metrics are enabled.
         cache.metrics_collector = _RecordingRadixCacheMetricsCollector(
             labels={"cache_type": "UnifiedRadixCache"}
         )
         return cache, allocator
+
+    def test_hit_waits_for_the_component_finalizers(self):
+        """A finalizer may still drop the match (e.g. a Mamba load-back in
+        flight); then the request recomputes, nothing is sampled, and its one
+        hit observation stays pending for the next real match, whose idle age
+        still counts from the last accepted reuse."""
+        from unittest.mock import patch
+
+        cache, allocator = self._build_cache()
+        collector = cache.metrics_collector
+        tokens = array("q", [1, 2, 3, 4])
+        cache.insert(
+            InsertParams(key=RadixKey(token_ids=tokens), value=allocator.alloc(4))
+        )
+        (node,) = cache.root_node.children.values()
+        node.last_access_wall = 20.0
+        clock = "sglang.srt.mem_cache.unified_radix_cache.time.monotonic"
+        req = _req("dropped", tokens)
+        comps = list(cache._components_tuple)
+        for comp in comps:
+            comp.finalize_match_result = lambda **kwargs: cache._empty_match_result
+        with patch(clock, return_value=100.0):
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req)
+            )
+        self.assertEqual(collector.kv_age_seconds.observations, [])
+        self.assertFalse(getattr(req, "kv_age_hit_observed", False))
+        self.assertEqual(node.last_access_wall, 20.0)
+
+        for comp in comps:
+            del comp.finalize_match_result
+        with patch(clock, return_value=101.0):
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req)
+            )
+        samples = sorted(
+            (lab["event"], age) for lab, age in collector.kv_age_seconds.observations
+        )
+        self.assertEqual(samples, [("hit", 81.0), ("request_hit", 81.0)])
+        self.assertTrue(req.kv_age_hit_observed)
+        self.assertEqual(node.last_access_wall, 101.0)
+
+    def test_rejected_partial_match_keeps_the_split_suffix_age(self):
+        """A rejected shorter lookup that splits a node must not reset the
+        split-off suffix's idle age either."""
+        from unittest.mock import patch
+
+        cache, allocator = self._build_cache()
+        collector = cache.metrics_collector
+        tokens = array("q", [1, 2, 3, 4])
+        cache.insert(
+            InsertParams(key=RadixKey(token_ids=tokens), value=allocator.alloc(4))
+        )
+        (node,) = cache.root_node.children.values()
+        node.last_access_wall = 20.0
+        clock = "sglang.srt.mem_cache.unified_radix_cache.time.monotonic"
+        comps = list(cache._components_tuple)
+        for comp in comps:
+            comp.finalize_match_result = lambda **kwargs: cache._empty_match_result
+        with patch(clock, return_value=100.0):
+            cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=array("q", [1, 2])),
+                    req=_req("short", [1, 2]),
+                )
+            )
+        (prefix,) = cache.root_node.children.values()
+        (suffix,) = prefix.children.values()
+        self.assertEqual((len(prefix.key), len(suffix.key)), (2, 2))
+        self.assertEqual(
+            (prefix.last_access_wall, suffix.last_access_wall), (20.0, 20.0)
+        )
+        self.assertEqual(collector.kv_age_seconds.observations, [])
+
+        for comp in comps:
+            del comp.finalize_match_result
+        with patch(clock, return_value=101.0):
+            cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=tokens), req=_req("long", tokens)
+                )
+            )
+        hits = sorted(
+            age
+            for lab, age in collector.kv_age_seconds.observations
+            if lab["event"] == "hit"
+        )
+        self.assertEqual(hits, [81.0, 81.0])
+
+    def test_split_preserves_prefix_age_and_touches_suffix(self):
+        from unittest.mock import patch
+
+        cache, allocator = self._build_cache()
+        tokens = array("q", [1, 2, 3, 4])
+        cache.insert(
+            InsertParams(
+                key=RadixKey(token_ids=tokens), value=allocator.alloc(len(tokens))
+            )
+        )
+        (node,) = cache.root_node.children.values()
+        node.creation_wall = 10.0
+        node.last_access_wall = 20.0
+        with patch(
+            "sglang.srt.mem_cache.unified_radix_cache.time.monotonic",
+            return_value=100.0,
+        ):
+            cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=array("q", [1, 2])),
+                    req=_req("partial", [1, 2]),
+                )
+            )
+        (prefix,) = cache.root_node.children.values()
+        (suffix,) = prefix.children.values()
+        self.assertEqual(prefix.creation_wall, 10.0)
+        self.assertEqual(suffix.creation_wall, 10.0)
+        self.assertEqual(suffix.last_access_wall, 100.0)
+        hits = [
+            age
+            for labels, age in cache.metrics_collector.kv_age_seconds.observations
+            if labels["event"] == "hit"
+        ]
+        self.assertEqual(hits, [80.0])
 
     def test_match_then_evict_records_hit_and_evict_ages(self):
         cache, allocator = self._build_cache()
@@ -574,6 +669,94 @@ class TestUnifiedRadixCacheEmitsKvAge(CustomTestCase):
             [len(tokens)],
         )
 
+    def test_request_hit_samples_the_deepest_node_once_per_request(self):
+        """Same contract through the tree-core observer: one request_hit per
+        request, idle time of the deepest node read before the walk refreshes
+        it, weighted by the whole matched prefix."""
+        cache, allocator = self._build_cache()
+        collector = cache.metrics_collector
+        a = array("q", [1, 2, 3, 4])
+        b = array("q", [1, 2, 5, 6])
+        cache.insert(InsertParams(key=RadixKey(token_ids=a), value=allocator.alloc(4)))
+        cache.insert(InsertParams(key=RadixKey(token_ids=b), value=allocator.alloc(4)))
+        prefix = _child_with_tokens(cache.root_node, [1, 2])
+        tail = _child_with_tokens(prefix, [3, 4])
+        prefix.last_access_wall -= 5.0
+        tail.last_access_wall -= 100.0
+
+        req = _req("r1", a)
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=a), req=req))
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=a), req=req))
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=a)))
+
+        node_hits = sorted(
+            v
+            for lab, v in collector.kv_age_seconds.observations
+            if lab["event"] == "hit"
+        )
+        self.assertEqual(len(node_hits), 2)
+        self.assertLess(node_hits[0], 50.0)
+        self.assertGreaterEqual(node_hits[1], 100.0)
+        request_hits = [
+            (lab, v)
+            for lab, v in collector.kv_age_seconds.observations
+            if lab["event"] == "request_hit"
+        ]
+        self.assertEqual(len(request_hits), 1)
+        self.assertGreaterEqual(request_hits[0][1], 100.0)
+        self.assertEqual(request_hits[0][0]["tier"], "device")
+        self.assertEqual(
+            [
+                v
+                for lab, v in collector.kv_age_tokens.increments
+                if lab["event"] == "request_hit"
+            ],
+            [len(a)],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRadixCacheMetricLabels(unittest.TestCase):
+    def test_labels_carry_the_rank_so_tp_ranks_are_not_summed(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.observability.metrics_collector import radix_cache_metric_labels
+
+        ps = SimpleNamespace(tp_rank=2, pp_rank=0, attn_tp_rank=1, attn_dp_rank=3)
+        self.assertEqual(
+            radix_cache_metric_labels("UnifiedRadixCache", ps, False),
+            {
+                "cache_type": "UnifiedRadixCache",
+                "tp_rank": 2,
+                "pp_rank": 0,
+                "dp_rank": 0,
+            },
+        )
+        self.assertEqual(
+            radix_cache_metric_labels("UnifiedRadixCache", ps, True),
+            {
+                "cache_type": "UnifiedRadixCache",
+                "tp_rank": 1,
+                "pp_rank": 0,
+                "dp_rank": 3,
+            },
+        )
+        # Plain DP: each replica's scheduler has overlapping tp ranks, so its
+        # own dp_rank keeps the replicas' series apart.
+        self.assertEqual(
+            radix_cache_metric_labels("UnifiedRadixCache", ps, False, dp_rank=5),
+            {
+                "cache_type": "UnifiedRadixCache",
+                "tp_rank": 2,
+                "pp_rank": 0,
+                "dp_rank": 5,
+            },
+        )
+
+    def test_collector_rejects_labels_it_appends(self):
+        for name in RadixCacheMetricsCollector.RESERVED_LABELS:
+            with self.assertRaises(ValueError):
+                RadixCacheMetricsCollector(labels={"cache_type": "x", name: "y"})

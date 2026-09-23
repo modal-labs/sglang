@@ -26,6 +26,9 @@ def _run_pass(reevaluate: bool):
     # First gate after the early return; reaching it proves the pass ran.
     s.min_free_slots_delayer = MagicMock(**{"should_delay.return_value": True})
     s.get_num_allocatable_reqs = MagicMock(return_value=1)
+    # Admission-block attribution state that Scheduler.__init__ sets.
+    s._last_admission_block_cause = None
+    s.metrics_reporter = MagicMock()
     running = SimpleNamespace(batch_is_full=True, reqs=[])
     s._get_new_batch_prefill_raw(
         prefill_delayer_single_pass=None, running_batch=running

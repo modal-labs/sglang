@@ -26,7 +26,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
-    take_kv_age_hit_observation,
+    kv_age_hit_pending,
+    mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
@@ -106,11 +107,7 @@ class UnifiedTreeNode:
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
-        # Wall-clock twins of the logical timestamps above. Only the KV age
-        # metrics read them; eviction order keeps using the logical counter.
-        now = time.monotonic()
-        self.last_access_wall = now
-        self.creation_wall = now
+        self.creation_wall = self.last_access_wall = time.monotonic()
         self.hash_value = None
         self.hit_count = 0
         self.priority = priority
@@ -364,7 +361,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.device = torch.device("cpu")
 
         if params.enable_metrics:
-            self.init_metrics_collector()
+            self.init_metrics_collector(params.dp_rank)
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
@@ -641,21 +638,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        (
-            value,
-            best_match_node,
-            best_match_device_node,
-            best_match_device_value_len,
-            full_kv_hit_length,
-        ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
-            params,
-            value,
-            best_match_node,
-            best_match_device_node,
-            best_match_device_value_len,
-            full_kv_hit_length,
-        )
+        # Suffix nodes split off during this lookup get a fresh wall-clock
+        # touch in _split_node; record their prior value so a match the
+        # finalizers reject can undo it (see _match_post_processor).
+        self._match_split_walls = [] if self.metrics_collector is not None else None
+        try:
+            (
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+                full_kv_hit_length,
+            ) = self._match_prefix_helper(key)
+            return self._match_post_processor(
+                params,
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+                full_kv_hit_length,
+            )
+        finally:
+            self._match_split_walls = None
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -1170,26 +1174,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
-        now_wall = time.monotonic()
-        kv_age = self.kv_age_metrics_collector()
-        observe_kv_age = kv_age is not None and take_kv_age_hit_observation(params)
+        observe_kv_age = self.metrics_collector is not None and kv_age_hit_pending(
+            params
+        )
+        now_wall = time.monotonic() if self.metrics_collector is not None else None
+        # KV age samples are collected during the walk (idle time is read before
+        # it refreshes last_access_wall) and emitted only after the component
+        # finalizers accept the match: a finalizer can still drop it (e.g. a
+        # Mamba load-back in flight), and then the request recomputes and its
+        # one hit observation must stay pending for the next real match.
+        # Per-request sample (event=request_hit): the deepest matched node's
+        # idle time weighted by the whole matched prefix. Per-node samples
+        # over-weight hot ancestors.
+        pending_hits: list[tuple[UnifiedTreeNode, str, float]] = []
+        # Wall-clock touches are undone if the finalizers reject the match, so
+        # a lookup that reused nothing does not reset the nodes' idle age.
+        prior_walls: list[tuple[UnifiedTreeNode, float]] = list(
+            getattr(self, "_match_split_walls", None) or ()
+        )
+        if observe_kv_age:
+            request_idle = now_wall - best_match_node.last_access_wall
+            request_tier = "host" if best_match_node.evicted else "device"
+        request_tokens = 0
         while node_update:
-            if observe_kv_age:
-                self._emit_kv_age(
-                    node_update,
-                    "hit",
-                    "host" if node_update.evicted else "device",
-                    "hit",
-                    now_wall,
+            if (
+                observe_kv_age
+                and node_update.parent is not None
+                and node_update.key is not None
+            ):
+                pending_hits.append(
+                    (
+                        node_update,
+                        "host" if node_update.evicted else "device",
+                        now_wall - node_update.last_access_wall,
+                    )
                 )
+                request_tokens += len(node_update.key)
             node_update.last_access_time = cur_time
             node_update.evict_first = False
-            node_update.last_access_wall = now_wall
+            if now_wall is not None:
+                prior_walls.append((node_update, node_update.last_access_wall))
+                node_update.last_access_wall = now_wall
             cur_time -= 0.00001
             node_update = node_update.parent
-
-        if observe_kv_age and best_match_node is self.root_node:
-            params.req.kv_age_hit_observed = False
 
         # last_host_node will be used as the starting node for the subsequent
         # `prefetch_from_storage` flow. We directly use best_match_node here,
@@ -1221,6 +1248,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 value_chunks=value,
                 best_value_len=best_match_device_value_len,
             )
+        reused = len(result.device_indices) > 0 or result.host_hit_length > 0
+        if not reused:
+            for node, wall in prior_walls:
+                node.last_access_wall = wall
+        elif pending_hits:
+            mark_kv_age_hit_observed(params)
+            for node, tier, idle in pending_hits:
+                self._emit_kv_age(node, "hit", tier, "hit", now_wall, idle_seconds=idle)
+            self._emit_kv_age(
+                best_match_node,
+                "request_hit",
+                request_tier,
+                "hit",
+                now_wall,
+                num_tokens=request_tokens,
+                idle_seconds=request_idle,
+            )
         return result
 
     def _emit_kv_age(
@@ -1230,17 +1274,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tier: str,
         outcome: str,
         now: Optional[float] = None,
+        num_tokens: Optional[int] = None,
+        idle_seconds: Optional[float] = None,
     ) -> None:
-        """Record one node's age when it is matched again or leaves a tier."""
-        mc = self.kv_age_metrics_collector()
+        """Record one node's age when it is matched again or leaves a tier.
+
+        num_tokens / idle_seconds override the node's own key length and idle
+        time; the request-level hit sample uses them to report the whole
+        matched prefix and the idle time read before the walk refreshed it.
+        """
+        mc = self.metrics_collector
         if mc is None or node.parent is None or node.key is None:
             return
         if now is None:
             now = time.monotonic()
-        age = now - node.last_access_wall
-        num_tokens = len(node.key)
-        if event == "hit":
-            mc.observe_kv_age(age, num_tokens, event="hit", tier=tier, outcome=outcome)
+        age = now - node.last_access_wall if idle_seconds is None else idle_seconds
+        if num_tokens is None:
+            num_tokens = len(node.key)
+        if event in ("hit", "request_hit"):
+            mc.observe_kv_age(age, num_tokens, event=event, tier=tier, outcome=outcome)
         else:
             mc.observe_kv_eviction(
                 age,
@@ -1289,7 +1341,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             child, UnifiedLRUList.insert_mru, skip_existing=True
         )
         child.last_access_time = get_and_increase_time_counter()
-        child.last_access_wall = time.monotonic()
+        if self.metrics_collector is not None:
+            match_splits = getattr(self, "_match_split_walls", None)
+            if match_splits is not None:
+                match_splits.append((child, child.last_access_wall))
+            child.last_access_wall = time.monotonic()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
@@ -1297,7 +1353,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
-        node.last_access_wall = time.monotonic()
+        if self.metrics_collector is not None:
+            node.last_access_wall = time.monotonic()
         if node != self.root_node:
             for comp in self._components_tuple:
                 if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1876,7 +1933,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # this node being a D-leaf, and D-leaves evict before ancestors.
             assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
             assert desc.write_through_pending_id is None
-            self._emit_kv_age(desc, "evict", "host", "dropped")
             self._release_all_component_layers(desc, StorageMedium.CPU, tracker)
             self._remove_leaf_from_parent(desc)
         self._delete_unbacked_device_leaf(node, tracker)
@@ -1890,6 +1946,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         """Free every component layer on the node and detach it from the LRU
         lists and evictable leaf sets."""
+        self._emit_kv_age(
+            node,
+            "evict",
+            "host" if medium == StorageMedium.CPU else "device",
+            "dropped",
+        )
         self._record_remove_event(node, medium=medium)
         for comp in self._components_tuple:
             self._evict_component_and_detach_lru(
@@ -1902,7 +1964,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
     ) -> None:
         """Delete a device leaf that has no host backup, freeing all layers."""
-        self._emit_kv_age(node, "evict", "device", "dropped")
         self._release_all_component_layers(node, StorageMedium.GPU, tracker)
         parent = node.parent
         self._remove_leaf_from_parent(node)

@@ -473,7 +473,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.device = torch.device("cpu")
 
         if params.enable_metrics:
-            self.init_metrics_collector()
+            self.init_metrics_collector(params.dp_rank)
 
         self.reset()
 

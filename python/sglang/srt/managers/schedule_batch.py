@@ -87,6 +87,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
     MatchPrefixParams,
+    get_mamba_cache_miss_tokens,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -1120,12 +1121,19 @@ class Req(ReqDllmMixin):
         # KV age metrics: set once the first match_prefix for this request has
         # recorded its hit ages, so per-round re-matches and the post-insert
         # re-anchor in cache_unfinished_req do not count as reuse.
+        # Consumed by the request's first non-empty prefix match (KV age metrics).
+        # Deliberately not reset on retraction: a retracted request re-matches KV
+        # it inserted moments earlier, which would flood the sub-second hit bucket.
         self.kv_age_hit_observed = False
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        # Full-KV tokens that could not be reused because the matching Mamba
+        # checkpoint was unavailable. Reported once on the first prefill pass.
+        self.mamba_cache_miss_tokens = 0
+        self._mamba_cache_miss_reported = False
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1520,6 +1528,10 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+            # This is the match that decides the prefill shape: record the Full-KV
+            # prefix it could not reuse for want of a Mamba checkpoint here, not
+            # only in the policy-time match (which FCFS skips on the unified cache).
+            self.mamba_cache_miss_tokens = get_mamba_cache_miss_tokens(match_result)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1819,6 +1831,8 @@ class Req(ReqDllmMixin):
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.mamba_cache_miss_tokens = 0
+        self._mamba_cache_miss_reported = False
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0

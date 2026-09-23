@@ -44,7 +44,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
-    take_kv_age_hit_observation,
+    kv_age_hit_pending,
+    mark_kv_age_hit_observed,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
@@ -293,7 +294,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.kv_event_queue = []
 
         if params.enable_metrics:
-            self.init_metrics_collector()
+            self.init_metrics_collector(params.dp_rank)
 
         if self.token_to_kv_pool_allocator:
             dev = self.token_to_kv_pool_allocator.device
@@ -401,13 +402,16 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        kv_age = self.kv_age_metrics_collector()
-        observe_kv_age = kv_age is not None and take_kv_age_hit_observation(params)
+        observe_kv_age = self.metrics_collector is not None and kv_age_hit_pending(
+            params
+        )
         value, last_node = self._match_prefix_helper(
             self.root_node, key, observe_kv_age=observe_kv_age
         )
-        if observe_kv_age and not value:
-            params.req.kv_age_hit_observed = False
+        # Any non-root match consumed the observation: `value` holds device
+        # indices only, so a host-only HiCache hit leaves it empty.
+        if observe_kv_age and last_node is not self.root_node:
+            mark_kv_age_hit_observed(params)
         if value:
             value = torch.cat(value)
         else:
@@ -657,12 +661,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         now: Optional[float] = None,
     ) -> None:
         """Record age / lifetime / reuse metrics for a node leaving a tier."""
-        mc = self.kv_age_metrics_collector()
-        if mc is None:
+        if self.metrics_collector is None:
             return
         if now is None:
             now = time.monotonic()
-        mc.observe_kv_eviction(
+        self.metrics_collector.observe_kv_eviction(
             age_seconds=now - node.last_access_time,
             lifetime_seconds=now - node.creation_time,
             reuses=node.hit_count,
@@ -736,15 +739,23 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         value = []
+        # Per-request sample: the deepest matched node's idle time, weighted
+        # by the whole matched prefix (see _observe_request_hit).
+        request_idle = 0.0
+        request_tokens = 0
+        request_tier = "device"
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             prefix_len = child.key.match(key, page_size=self.page_size)
             if observe_kv_age:
-                self.kv_age_metrics_collector().observe_kv_age(
-                    access_time - child.last_access_time,
+                request_idle = access_time - child.last_access_time
+                request_tokens += prefix_len
+                request_tier = "host" if child.evicted else "device"
+                self.metrics_collector.observe_kv_age(
+                    request_idle,
                     prefix_len,
                     event="hit",
-                    tier="host" if child.evicted else "device",
+                    tier=request_tier,
                     outcome="hit",
                 )
             child.last_access_time = access_time
@@ -761,6 +772,14 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 if len(key):
                     child_key = key.child_key(self.page_size)
 
+        if observe_kv_age and request_tokens > 0:
+            self.metrics_collector.observe_kv_age(
+                request_idle,
+                request_tokens,
+                event="request_hit",
+                tier=request_tier,
+                outcome="hit",
+            )
         return value, node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
@@ -768,6 +787,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
         new_node.hit_count = child.hit_count
+        # A split re-shapes the tree; it does not create KV. The retained prefix
+        # keeps the residency start its lifetime metric is measured from.
         new_node.creation_time = child.creation_time
         new_node.last_access_time = child.last_access_time
         new_node.children = {key[split_len:].child_key(self.page_size): child}
