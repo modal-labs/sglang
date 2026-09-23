@@ -2171,7 +2171,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             name="sglang:kv_lifetime_seconds",
             documentation="Seconds since a radix node was created, observed once "
             "per node when it is removed from a tier. Same tier/outcome labels "
-            'as sglang:kv_age_seconds{event="evict"}; that series is the idle '
+            "as sglang:kv_age_seconds with event=evict; that series is the idle "
             "time since the last match, this one is the total residency.",
             labelnames=list(labels.keys()) + ["tier", "outcome"],
             buckets=list(KV_AGE_BUCKETS),
