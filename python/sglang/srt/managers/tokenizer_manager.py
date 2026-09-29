@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -1839,7 +1840,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
-                state.time_stats.set_first_token_time()
+                state.time_stats.set_first_token_time(
+                    ts=self._get_scheduler_first_token_time(state, recv_obj, i)
+                )
+                state.time_stats.set_last_time()
 
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:
@@ -1904,6 +1908,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
+
+    @staticmethod
+    def _get_scheduler_first_token_time(
+        state: ReqState, recv_obj, i: int
+    ) -> Optional[float]:
+        # Non-streaming outputs are batched; use the scheduler's first-token time.
+        if getattr(state.obj, "stream", False) or recv_obj.time_stats is None:
+            return None
+        ts = recv_obj.time_stats[i].prefill_finished_time
+        if state.time_stats.created_time < ts <= time.perf_counter():
+            return ts
+        return None
 
     def add_logprob_to_meta_info(
         self,
