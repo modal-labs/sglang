@@ -825,7 +825,8 @@ class Envs:
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Online static-E4M3 replacement for selected Kimi-K3 target BF16 dense
-    # weights. "front" converts the post-merge MoE front; "wide" additionally
+    # weights. "front" converts the post-merge MoE front (shared gate_up +
+    # latent down; the router keeps bf16 weights and fp32 logits); "wide" additionally
     # converts the already-merged KDA qkvg projection. Routed experts remain
     # checkpoint MXFP4, so this stays separate from --quantization.
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")

@@ -57,7 +57,6 @@ _CHECKPOINT_COMPONENTS_BY_ROLE = {
         {
             "shared_gate",
             "shared_up",
-            "router",
             "latent_down",
         }
     ),

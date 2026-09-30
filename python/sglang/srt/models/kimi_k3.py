@@ -509,23 +509,30 @@ class KimiK3MoE(nn.Module):
 
         # Latent MoE
         self.use_latent_moe = config.routed_expert_hidden_size is not None
-        # Merged front weight ([H, gate_up + E + latent]), built after weight
-        # loading by _merge_front_weights().
+        # Merged front weight ([H, gate_up + latent], or [H, gate_up + E +
+        # latent] when _plain_front_has_router), built after weight loading by
+        # _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._front_sizes: Optional[List[int]] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
-        # a2a pair) rather than the three-way fused-front weight.
+        # a2a pair) rather than the plain-TP fused-front weight.
         self._front_is_ep_pair = False
         self._front_fp8: Optional[K3TargetFP8Linear] = None
+        # The plain-TP fused front emits bf16 (or FP8-weight) columns, which
+        # would round the router logits: bf16 logits alone move the top-16
+        # set on ~5% of tokens. On CUDA the router stays out of the merge and
+        # runs as its own bf16 x bf16 -> fp32 GEMM. HIP keeps the legacy
+        # three-way merge (MoEGate has no fp32 896-expert path there).
+        self._plain_front_has_router = _is_hip and self._target_fp8_front_group is None
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
 
         # Gate — fp32 output so routing (sigmoid, bias add, top-k) runs in
         # full precision (matches GateLinear in mke). codespell:ignore mke
+        # Never part of the target FP8 front: the router keeps its bf16
+        # checkpoint weight.
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
-        if self._target_fp8_front_group is not None:
-            self._target_fp8_front_group.stage_linear_weight(self.gate)
 
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
         # so FusedMoE's weight_loader uses the MXFP4 fast path
@@ -748,7 +755,6 @@ class KimiK3MoE(nn.Module):
             self._target_fp8_front_group,
             [
                 self.shared_experts.gate_up_proj,
-                self.gate,
                 self.routed_expert_down_proj,
             ],
             label=f"MoE front layer {self.layer_idx}",
@@ -771,12 +777,14 @@ class KimiK3MoE(nn.Module):
             )
 
     def _merge_front_weights(self) -> None:
-        """Merge shared gate_up + router gate + latent down_proj weights.
+        """Merge shared gate_up + latent down_proj weights (plus the router
+        gate on HIP, see _plain_front_has_router).
 
-        All three GEMMs consume the same hidden_states; at decode each one is a
+        These GEMMs consume the same hidden_states; at decode each one is a
         skinny memory-bound GEMV with its own splitK epilogue. One merged
-        [H, gu+E+latent] GEMM reads the input once and drops 2 GEMM launches
-        plus their splitK-reduce tails per MoE layer.
+        [H, gu+latent] GEMM reads the input once and drops a GEMM launch plus
+        its splitK-reduce tail per MoE layer. The router stays a separate fp32
+        GEMM: the merged output is bf16 (or FP8-weight), too coarse for top-k.
 
         Called once from load_weights (after all weights are loaded, before
         cuda graph capture); only plain bf16/fp16 dense weights are merged —
@@ -787,11 +795,11 @@ class KimiK3MoE(nn.Module):
         if not self.use_latent_moe:
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
-            mods = [
-                self.shared_experts.gate_up_proj,
-                self.gate,
-                self.routed_expert_down_proj,
-            ]
+            mods = [self.shared_experts.gate_up_proj]
+            if self._plain_front_has_router:
+                mods.append(self.gate)
+            mods.append(self.routed_expert_down_proj)
+            is_ep_pair = False
         elif envs.SGLANG_K3_FUSED_FRONT.get():
             # EP a2a: the shared experts are tp1-replicated and run on the side
             # stream, so they stay out of the merge -- but the router gate and the
@@ -800,6 +808,7 @@ class KimiK3MoE(nn.Module):
             # GEMM alone is only 896 rows, which is too few to use the machine
             # well; folded into the 3584-row down-proj it comes almost free.
             mods = [self.gate, self.routed_expert_down_proj]
+            is_ep_pair = True
         else:
             return
         dtypes = {m.weight.dtype for m in mods}
@@ -826,7 +835,7 @@ class KimiK3MoE(nn.Module):
                 source,
                 self._target_fp8_front_role,
                 self.layer_idx,
-                component_names=("shared_gate_up", "router", "latent_down"),
+                component_names=("shared_gate_up", "latent_down"),
                 component_rows=self._front_sizes,
             )
             # Remove every BF16 alias before the source pool is destroyed.
@@ -842,7 +851,7 @@ class KimiK3MoE(nn.Module):
             self._front_fp8 = converted
             del source
             self._target_fp8_front_group.release()
-        self._front_is_ep_pair = len(mods) == 2
+        self._front_is_ep_pair = is_ep_pair
         # NOTE: invalidate the cached properties
         for prop in (
             "_eligible_for_fused_front",
@@ -1268,11 +1277,16 @@ class KimiK3MoE(nn.Module):
                 if self._front_fp8 is not None
                 else _k3_bf16_gemm(hidden_states, self._front_w)
             )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
-        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
-            router_logits = router_logits.contiguous()
+        if self._plain_front_has_router:
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
+            if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
+                router_logits = router_logits.contiguous()
+        else:
+            gate_up, routed_input = torch.split(fused, self._front_sizes, dim=-1)
+            # bf16 weights, fp32 logits (MoEGate -> linear_bf16_fp32)
+            router_logits = self.gate(hidden_states)
         if num_tokens > 1 and self._moe_front_needs_contiguous:
             routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
@@ -3374,13 +3388,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
                     if layer_id is not None:
-                        if name.endswith(".mlp.gate.weight"):
-                            self.model.target_fp8.mark_checkpoint_component(
-                                moe_front_role(),
-                                layer_id,
-                                "router",
-                            )
-                        elif name.endswith(".mlp.routed_expert_down_proj.weight"):
+                        if name.endswith(".mlp.routed_expert_down_proj.weight"):
                             self.model.target_fp8.mark_checkpoint_component(
                                 moe_front_role(),
                                 layer_id,

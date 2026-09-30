@@ -23,7 +23,8 @@ class TestK3TargetFP8Accounting(unittest.TestCase):
         front_layers = 92
         kda_layers = 69
         k = 7168
-        front_weights = front_layers * 6016 * k
+        # shared gate_up (1536) + latent down (3584); the router stays bf16
+        front_weights = front_layers * 5120 * k
         qkvg_weights = kda_layers * 6144 * k
         weights = front_weights + qkvg_weights
         linears = front_layers + kda_layers
@@ -37,15 +38,15 @@ class TestK3TargetFP8Accounting(unittest.TestCase):
             replaced_linears=linears,
         )
 
-        self.assertEqual(front_weights * 2, 7_934_574_592)
+        self.assertEqual(front_weights * 2, 6_752_829_440)
         self.assertEqual(qkvg_weights * 2, 6_077_546_496)
         self.assertEqual(stats.final_scale_bytes, 1_288)
-        self.assertEqual(stats.saved_bytes, 7_006_059_256)
-        self.assertAlmostEqual(stats.saved_bytes / 2**30, 6.524901144206524)
+        self.assertEqual(stats.saved_bytes, 6_415_186_680)
+        self.assertAlmostEqual(stats.saved_bytes / 2**30, 5.974608175456524)
 
     def test_exact_channel_static_front_bytes(self):
         layers = 92
-        n = 6016
+        n = 5120
         k = 7168
         weights = layers * n * k
         stats = K3TargetFP8MemoryStats(
@@ -58,8 +59,8 @@ class TestK3TargetFP8Accounting(unittest.TestCase):
             replaced_linears=layers,
         )
 
-        self.assertEqual(stats.final_bytes // layers, 43_146_756)
-        self.assertEqual(stats.saved_bytes // layers, 43_098_620)
+        self.assertEqual(stats.final_bytes // layers, 36_720_644)
+        self.assertEqual(stats.saved_bytes // layers, 36_679_676)
 
     def test_component_aliases_no_longer_hold_bf16_storage(self):
         modules = [
@@ -414,7 +415,7 @@ class TestK3TargetFP8Scope(unittest.TestCase):
             configured_kda_count=1,
         )
         state.begin_checkpoint_load()
-        for component in ("shared_gate", "shared_up", "router", "latent_down"):
+        for component in ("shared_gate", "shared_up", "latent_down"):
             state.mark_checkpoint_component(
                 moe_front_role(),
                 1,
@@ -430,6 +431,13 @@ class TestK3TargetFP8Scope(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "kda_qkvg:1"):
             state.finish_checkpoint_load()
 
+    def test_router_is_not_a_front_component(self):
+        state = K3TargetFP8State("front", "tensor_static")
+        state.begin_checkpoint_load()
+
+        with self.assertRaisesRegex(ValueError, "moe_front/router"):
+            state.mark_checkpoint_component(moe_front_role(), 1, "router")
+
     def test_range_diagnostics_preserve_component_boundaries(self):
         state = K3TargetFP8State("front", "tensor_static")
         source = torch.tensor(
@@ -439,7 +447,7 @@ class TestK3TargetFP8Scope(unittest.TestCase):
         result = state._source_range_diagnostic(
             source,
             moe_front_role(),
-            component_names=("shared", "router"),
+            component_names=("shared", "latent"),
             component_rows=(2, 1),
         )
 
