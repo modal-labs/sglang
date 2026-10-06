@@ -24,6 +24,7 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    MESSAGE_CLOSE,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -594,16 +595,23 @@ def _tool_calls_tag(call_tags: List[TagFormat], parallel_tool_calls: bool) -> Ta
     return TagFormat(begin=TOOLS_OPEN, content=content, end=TOOLS_CLOSE)
 
 
-def _auto_suffix(
-    tools_tag: TagFormat, parallel_tool_calls: bool
-) -> TriggeredTagsFormat:
+# A grammar that ends at the tools close must still admit the turn's
+# MESSAGE_CLOSE: K3 emits it before EOS, which is masked until the grammar
+# completes, so without it the model can never finish the turn.
+_OPTIONAL_MESSAGE_CLOSE = OptionalFormat(content=ConstStringFormat(value=MESSAGE_CLOSE))
+
+
+def _auto_suffix(tools_tag: TagFormat, parallel_tool_calls: bool) -> Format:
     # A retriggered second tools section would evade the single-call limit.
-    return TriggeredTagsFormat(
+    triggered = TriggeredTagsFormat(
         triggers=[TOOLS_OPEN],
         tags=[tools_tag],
         excludes=[THINK_OPEN, THINK_CLOSE, CALL_OPEN],
         stop_after_first=not parallel_tool_calls,
     )
+    if parallel_tool_calls:
+        return triggered
+    return SequenceFormat(elements=[triggered, _OPTIONAL_MESSAGE_CLOSE])
 
 
 def _with_reasoning(suffix: Format, thinking_mode: bool) -> Format:
@@ -736,6 +744,7 @@ def get_kimik3_structural_tag(
                     excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
                 ),
                 tools_tag,
+                _OPTIONAL_MESSAGE_CLOSE,
             ]
         )
     else:

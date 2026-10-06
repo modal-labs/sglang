@@ -18,6 +18,7 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    MESSAGE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -276,6 +277,33 @@ def test_required_allows_response_prefix_but_requires_tools():
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
     assert not _accepts(grammar, response)
+
+
+@pytest.mark.parametrize(
+    "tool_choice, parallel_tool_calls",
+    [
+        ("required", True),
+        ("required", False),
+        (ToolChoice(type="function", function={"name": "weather"}), True),
+        ("auto", False),
+    ],
+)
+def test_grammar_ending_at_tools_close_admits_message_close(
+    tool_choice, parallel_tool_calls
+):
+    """A strict tool call under these choices never finished: the grammar
+    ended at the tools close, K3 then emits MESSAGE_CLOSE before EOS, and
+    after it every token except EOS stayed legal."""
+    grammar = _grammar(
+        [_tool()],
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+    )
+    response = "<|open|>response<|sep|><|close|>response<|sep|>"
+
+    assert _accepts(
+        grammar, response + _tools_section(_valid_weather_call()) + MESSAGE_CLOSE
+    )
 
 
 def test_auto_allows_plain_response_or_multiple_tool_calls():
