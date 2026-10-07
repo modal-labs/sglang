@@ -272,6 +272,7 @@ def _handle_output_by_index(output, i):
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
+            detokenize_duration=output.detokenize_duration,
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
             spec_num_correct_drafts=_extract_field_by_index(
                 output, "spec_num_correct_drafts", i

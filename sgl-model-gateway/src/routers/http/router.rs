@@ -21,7 +21,7 @@ use crate::{
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
-        otel_trace::inject_trace_context_http,
+        otel_trace::{inject_trace_context_http, SendDetached},
     },
     policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
@@ -101,7 +101,7 @@ impl Router {
                     }
                 }
 
-                match request_builder.send().await {
+                match request_builder.send_detached().await {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -404,7 +404,10 @@ impl Router {
                         request_builder = request_builder.header(name.clone(), value.clone());
                     }
 
-                    request_builder.send().await.map_err(convert_reqwest_error)
+                    request_builder
+                        .send_detached()
+                        .await
+                        .map_err(convert_reqwest_error)
                 }
             })
             .collect();
@@ -563,7 +566,7 @@ impl Router {
             }
         }
 
-        let res = match request_builder.send().await {
+        let res = match request_builder.send_detached().await {
             Ok(res) => res,
             Err(e) => {
                 error!(

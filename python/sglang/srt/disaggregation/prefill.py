@@ -364,7 +364,9 @@ class PrefillBootstrapQueue:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
-            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            req.time_stats.trace_ctx.abort(
+                abort_info={"reason": message, "status_code": HTTPStatus.BAD_REQUEST}
+            )
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
@@ -942,7 +944,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_message,
+                "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -986,7 +993,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_message,
+                "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         if (
             req.req_pool_idx is not None
             or req.kv is not None

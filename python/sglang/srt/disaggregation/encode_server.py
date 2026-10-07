@@ -2901,11 +2901,21 @@ async def _dp_worker_encode_and_send(
     try:
         nbytes, embedding_len, embedding_dim, error_msg, error_code = await encode_coro
     except asyncio.TimeoutError:
-        time_stats.trace_ctx.abort(abort_info={"reason": "encoder batch timed out"})
+        time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": "encoder batch timed out",
+                "status_code": HTTPStatus.GATEWAY_TIMEOUT,
+            }
+        )
         raise
 
     if error_msg:
-        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_msg,
+                "status_code": error_code or HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         # zmq backends still forward an error EmbeddingData to P so it
         # doesn't block; send failures here are swallowed.
         try:
@@ -4073,7 +4083,10 @@ async def handle_encode_request(request: dict):
                 )
             except asyncio.TimeoutError:
                 time_stats.trace_ctx.abort(
-                    abort_info={"reason": "encoder batch timed out"}
+                    abort_info={
+                        "reason": "encoder batch timed out",
+                        "status_code": HTTPStatus.GATEWAY_TIMEOUT,
+                    }
                 )
                 return ORJSONResponse(
                     status_code=HTTPStatus.GATEWAY_TIMEOUT,
@@ -4096,7 +4109,12 @@ async def handle_encode_request(request: dict):
                 )
 
         if error_msg:
-            time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+            time_stats.trace_ctx.abort(
+                abort_info={
+                    "reason": error_msg,
+                    "status_code": error_code or HTTPStatus.INTERNAL_SERVER_ERROR,
+                }
+            )
         else:
             time_stats.set_mm_encode_end_time()
 

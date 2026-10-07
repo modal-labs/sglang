@@ -32,7 +32,10 @@ use crate::{
         is_retryable_status, model_type::Endpoint, ModelCard, ProviderType, RetryExecutor,
         RuntimeType, Worker, WorkerRegistry,
     },
-    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    observability::{
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        otel_trace::SendDetached,
+    },
     protocols::{
         chat::ChatCompletionRequest,
         responses::{
@@ -207,7 +210,7 @@ impl OpenAIRouter {
             backend_req = apply_provider_headers(backend_req, &url, Some(auth));
         }
 
-        match backend_req.send().await {
+        match backend_req.send_detached().await {
             Ok(response) if response.status().is_success() => {
                 match response.json::<Value>().await {
                     Ok(json_response) => {
@@ -582,7 +585,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         req = req.header("Accept", "text/event-stream");
                     }
 
-                    let resp = match req.send().await {
+                    let resp = match req.send_detached().await {
                         Ok(r) => r,
                         Err(e) => {
                             worker.circuit_breaker().record_failure();

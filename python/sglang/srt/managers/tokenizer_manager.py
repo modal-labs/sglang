@@ -697,7 +697,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except Exception:
+        except Exception as e:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -705,7 +705,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop any that
             # are still pending; entries already removed on the normal completion
             # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            client_disconnected = (
+                request is not None and await request.is_disconnected()
+            )
+            self._discard_pending_req_states(
+                obj, e, client_disconnected=client_disconnected
+            )
             raise
 
     def _detect_input_format(
@@ -1991,6 +1996,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 continue
 
+            if (
+                isinstance(recv_obj, BatchStrOutput)
+                and recv_obj.detokenize_duration is not None
+            ):
+                state.time_stats.add_detokenize_duration(recv_obj.detokenize_duration)
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -2208,6 +2219,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if state.time_stats.trace_ctx.tracing_enable:
                     state.time_stats.trace_ctx.trace_set_root_attrs(
                         self.convert_to_span_attrs(state, recv_obj, i)
+                    )
+                    state.time_stats.trace_ctx.trace_set_root_error(
+                        recv_obj.finished_reasons[i]
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
@@ -2937,7 +2951,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
         state.finished = True
-        state.time_stats.set_finished_time()
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
@@ -2946,6 +2959,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
+        state.time_stats.trace_ctx.trace_set_root_error(finish_reason)
+        state.time_stats.set_finished_time()
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
@@ -3186,19 +3201,44 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _discard_pending_req_states(self, obj):
+    def _discard_pending_req_states(
+        self, obj, error: Exception, *, client_disconnected: bool = False
+    ):
         """Drop rid_to_state entries created by _init_req_state for *obj*.
 
         Safe to call after a partial/failed dispatch: only entries still present
         are removed, and the scheduler-response path looks up state with
         ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Each dropped request's trace ends here, recording the status the HTTP
+        layer returns for *error*. A client disconnect also surfaces as a
+        ValueError, but gets no response, so it is recorded as an abort without
+        a status rather than as a 400.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
+        if client_disconnected:
+            status_code = None
+        elif isinstance(error, fastapi.HTTPException):
+            status_code = error.status_code
+        elif isinstance(error, ValueError):
+            # The HTTP layer answers a ValueError with 400
+            # (http_server._create_error_response).
+            status_code = HTTPStatus.BAD_REQUEST
+        else:
+            # FastAPI's response to an unhandled exception.
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        finish_reason = {
+            "type": "abort",
+            "message": str(error),
+            "status_code": status_code,
+        }
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.pop(rid, None)
+            if state is not None:
+                state.time_stats.trace_ctx.trace_set_root_error(finish_reason)
+                state.time_stats.set_finished_time()
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

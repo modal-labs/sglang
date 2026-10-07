@@ -14,11 +14,14 @@ use super::{
     mcp::{execute_tool_loop, prepare_mcp_tools_as_functions},
     utils::{mask_tools_as_mcp, patch_response_with_request_metadata},
 };
-use crate::routers::{
-    header_utils::{apply_provider_headers, extract_auth_header},
-    mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
-    openai::context::{PayloadState, RequestContext},
-    persistence_utils::persist_conversation_items,
+use crate::{
+    observability::otel_trace::SendDetached,
+    routers::{
+        header_utils::{apply_provider_headers, extract_auth_header},
+        mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
+        openai::context::{PayloadState, RequestContext},
+        persistence_utils::persist_conversation_items,
+    },
 };
 
 /// Handle a non-streaming responses request
@@ -99,7 +102,7 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         let auth_header = extract_auth_header(ctx.headers(), worker.api_key());
         request_builder = apply_provider_headers(request_builder, &url, auth_header.as_ref());
 
-        let response = match request_builder.send().await {
+        let response = match request_builder.send_detached().await {
             Ok(r) => r,
             Err(e) => {
                 worker.circuit_breaker().record_failure();

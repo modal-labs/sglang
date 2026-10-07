@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from sglang.srt.observability.trace import extract_trace_headers
 from sglang.srt.utils import ImageData, VideoData
 
 
@@ -170,7 +171,7 @@ async def coordinated_turn(request, decode_generator, prefill_task, abort_decode
             prefill_task.add_done_callback(consume)
 
 
-async def _routed_turn_stream(request, router_url):
+async def _routed_turn_stream(request, router_url, headers=None):
     """Send an expanded Responses turn through the ordinary PD generation router.
 
     The frontend retains API state; the selected P/D pair owns generation.
@@ -196,7 +197,7 @@ async def _routed_turn_stream(request, router_url):
     ) as client:
         try:
             async with client.post(
-                router_url.rstrip("/") + "/generate", json=payload
+                router_url.rstrip("/") + "/generate", json=payload, headers=headers
             ) as response:
                 if response.status >= 400:
                     raise PDResponsesError(
@@ -250,7 +251,10 @@ async def routed_turn(request, router_url, raw_request=None):
         if raw_request is not None and not getattr(request, "background", False)
         else None
     )
-    stream = _routed_turn_stream(request, router_url)
+    trace_headers = (
+        extract_trace_headers(raw_request.headers) if raw_request is not None else {}
+    )
+    stream = _routed_turn_stream(request, router_url, trace_headers)
     try:
         async for output in stream:
             yield output

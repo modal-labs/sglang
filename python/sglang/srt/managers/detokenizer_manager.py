@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -435,11 +436,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
+        detokenize_start_time = time.perf_counter()
         output_strs = (
             self._decode_batch_token_id_output(recv_obj)
             if len(recv_obj.rids) > 0
             else []
         )
+        detokenize_duration = time.perf_counter() - detokenize_start_time
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
@@ -487,6 +490,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             token_steps=recv_obj.token_steps,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            detokenize_duration=detokenize_duration,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):

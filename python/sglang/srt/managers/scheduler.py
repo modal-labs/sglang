@@ -244,7 +244,11 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.observability.trace import (
+    process_tracing_init,
+    should_trace_rank,
+    trace_set_thread_info,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
@@ -2321,7 +2325,10 @@ class Scheduler(
                     )
                     logger.error(error_msg)
                     recv_req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": error_msg}
+                        abort_info={
+                            "reason": error_msg,
+                            "status_code": HTTPStatus.BAD_REQUEST,
+                        }
                     )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
@@ -2657,7 +2664,12 @@ class Scheduler(
             ),
             req_to_abort,
         )
-        req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        req_to_abort.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": message,
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+            }
+        )
         return req_to_abort.rid == recv_req.rid
 
     def _slo_admission_check(self, req: Req) -> bool:
@@ -2745,7 +2757,9 @@ class Scheduler(
             ),
             req,
         )
-        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={"reason": message, "status_code": HTTPStatus.TOO_MANY_REQUESTS}
+        )
         return True
 
     def _abort_on_waiting_timeout(self):
@@ -5048,7 +5062,9 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
 
     # Set up tracing
-    if server_args.enable_trace:
+    if server_args.enable_trace and should_trace_rank(
+        server_args, tp_rank, attn_cp_rank
+    ):
         process_tracing_init(
             server_args.otlp_traces_endpoint,
             "sglang",

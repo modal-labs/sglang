@@ -24,6 +24,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -69,8 +71,61 @@ except ImportError:
     logger.debug("opentelemetry package is not installed, tracing disabled")
 
 
-def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
-    return {h: headers[h] for h in TRACE_HEADERS if h in headers}
+def _traced_request_headers() -> tuple[str, ...]:
+    return tuple(name.lower() for name in envs.SGLANG_TRACE_REQUEST_HEADERS.get())
+
+
+def extract_trace_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+    """Return the W3C trace context and the request headers recorded on spans."""
+    names = (*TRACE_HEADERS, *_traced_request_headers())
+    return {h: headers[h] for h in names if h in headers}
+
+
+def request_header_attributes(headers: Optional[Mapping[str, str]]) -> Dict[str, str]:
+    """Root span attributes for SGLANG_TRACE_REQUEST_HEADERS.
+
+    Named `http.request.header.<name>`, per OpenTelemetry's HTTP conventions,
+    with values cut to SGLANG_TRACE_REQUEST_HEADER_MAX_LEN characters.
+    """
+    if not headers:
+        return {}
+    max_len = envs.SGLANG_TRACE_REQUEST_HEADER_MAX_LEN.get()
+    by_name = {name.lower(): value for name, value in headers.items()}
+    return {
+        f"http.request.header.{name}": str(by_name[name])[:max_len]
+        for name in _traced_request_headers()
+        if by_name.get(name)
+    }
+
+
+def should_trace_rank(server_args, tp_rank: int, attn_cp_rank: int) -> bool:
+    """Whether a scheduler rank emits spans.
+
+    Ranks in one attention tensor- or context-parallel group run the same
+    requests in lockstep, so only the group's first rank traces unless
+    SGLANG_TRACE_ALL_RANKS is set. Every attention data-parallel group and
+    pipeline stage keeps a tracing rank, since those do different work.
+    """
+    if envs.SGLANG_TRACE_ALL_RANKS.get():
+        return True
+    from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+
+    attn_tp_rank = compute_dp_attention_world_info(
+        server_args.enable_dp_attention,
+        tp_rank,
+        server_args.tp_size,
+        server_args.dp_size,
+        server_args.attn_cp_size,
+    )[0]
+    return attn_tp_rank == 0 and attn_cp_rank == 0
+
+
+def _abort_status_code(abort_info: Mapping[str, Any]) -> int:
+    """The HTTP status code an abort carries, or 0 when it has none."""
+    try:
+        return int(abort_info.get("status_code") or 0)
+    except (TypeError, ValueError):  # never let tracing fail a request
+        return 0
 
 
 def get_global_trace_level() -> int:
@@ -125,20 +180,21 @@ class TraceThreadContext:
 
 class TraceCustomIdGenerator(id_generator.IdGenerator):
     """
-    The default IdGenerator may produce duplicate trace IDs across multiple TP scheduler processes,
-    hence a custom IdGenerator is implemented.
+    Trace and span IDs drawn from the operating system's entropy pool.
     """
 
-    def __init__(self):
-        super().__init__()
-        self.local_random = random.Random()
-        self.local_random.seed(time.time())
+    _random = random.SystemRandom()
 
     def generate_trace_id(self) -> int:
-        return self.local_random.getrandbits(64)
+        return self._nonzero_bits(128)
 
     def generate_span_id(self) -> int:
-        return self.local_random.getrandbits(64)
+        return self._nonzero_bits(64)
+
+    def _nonzero_bits(self, bits: int) -> int:
+        while True:
+            if value := self._random.getrandbits(bits):
+                return value
 
 
 # global variables
@@ -278,7 +334,13 @@ class TraceReqContext:
     ):
         self.rid: str = str(rid)
         self.trace_level = get_global_trace_level()
-        self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
+        # Health checks run a one-token request every few seconds; tracing
+        # them would only add noise.
+        self.tracing_enable: bool = (
+            opentelemetry_initialized
+            and self.trace_level > 0
+            and not self.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+        )
 
         # Filter by --trace-modules only for explicitly named modules; contexts
         # created with the default empty module_name are always traced.
@@ -324,29 +386,30 @@ class TraceReqContext:
             cur_slice_stack=[],
         )
 
-        thread_name = f"{thread_info.thread_label}"
-        if thread_info.tp_rank is not None:
-            thread_name += f" [TP {thread_info.tp_rank}] "
-        if thread_info.pp_rank is not None:
-            thread_name += f" [PP {thread_info.pp_rank}] "
-        if thread_info.dp_rank is not None:
-            thread_name += f" [DP {thread_info.dp_rank}] "
-        thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
+        ranks = {
+            label: rank
+            for label, rank in (
+                ("TP", thread_info.tp_rank),
+                ("PP", thread_info.pp_rank),
+                ("DP", thread_info.dp_rank),
+            )
+            if rank is not None
+        }
+        thread_name = " ".join(
+            [
+                thread_info.thread_label,
+                *(f"[{label} {rank}]" for label, rank in ranks.items()),
+            ]
+        )
         thread_context.thread_span = tracer.start_span(
             name=thread_name,
             start_time=ts,
             context=self.root_span_context,
         )
-
-        rank_attrs = {}
-        if thread_info.tp_rank is not None:
-            rank_attrs["tp_rank"] = thread_info.tp_rank
-        if thread_info.pp_rank is not None:
-            rank_attrs["pp_rank"] = thread_info.pp_rank
-        if thread_info.dp_rank is not None:
-            rank_attrs["dp_rank"] = thread_info.dp_rank
-        if rank_attrs:
-            thread_context.thread_span.set_attributes(rank_attrs)
+        if ranks:
+            thread_context.thread_span.set_attributes(
+                {f"{label.lower()}_rank": rank for label, rank in ranks.items()}
+            )
 
         thread_context.thread_span.set_attributes(
             {
@@ -499,14 +562,13 @@ class TraceReqContext:
             self.external_trace_header or {}
         )
 
-        # Drop the worker_id added by MultiTokenizer
-        orig_rid = self.rid.split("_")[-1]
         role = "" if self.role == "unified" else self.role
-        attrs = {"rid": orig_rid, "module": f"sglang::{self.module_name}"}
+        attrs = {"rid": self.rid, "module": f"sglang::{self.module_name}"}
         if self.bootstrap_room:
             attrs["bootstrap_room"] = str(hex(self.bootstrap_room))
+        attrs.update(request_header_attributes(self.external_trace_header))
         root_span = tracer.start_span(
-            name=f"{role} Req {orig_rid[:8]}",
+            name=f"{role} Req" if role else "Req",
             start_time=ts,
             context=external_trace_context,
             attributes=attrs,
@@ -730,6 +792,26 @@ class TraceReqContext:
         if self.root_span:
             self.root_span.set_attributes(attrs)
 
+    def trace_set_root_error(self, finish_reason: Optional[Dict[str, Any]]):
+        """
+        Record why an aborted request failed, as OpenTelemetry's `error.type`.
+        The type is the abort's HTTP status code, or "abort" when it has none.
+        Only server faults (5xx) mark the root span as an error: a 4xx is the
+        caller's, and an abort without a code may be a client disconnect.
+        """
+        if not self.tracing_enable or not self.root_span:
+            return
+        if not finish_reason or finish_reason.get("type") != "abort":
+            return
+        status_code = _abort_status_code(finish_reason)
+        self.root_span.set_attribute(
+            "error.type", str(status_code) if status_code else "abort"
+        )
+        if status_code >= 500:
+            self.root_span.set_status(
+                Status(StatusCode.ERROR, finish_reason.get("message"))
+            )
+
     def trace_set_thread_attrs(self, attrs: Dict[str, Any]):
         if self.__check_fast_return():
             return
@@ -755,7 +837,8 @@ class TraceReqContext:
 
                 if isinstance(abort_info, BaseFinishReason):
                     abort_info = abort_info.to_json()
-                self.thread_context.thread_span.set_status(Status(StatusCode.ERROR))
+                if _abort_status_code(abort_info) >= 500:
+                    self.thread_context.thread_span.set_status(Status(StatusCode.ERROR))
                 self.thread_context.thread_span.set_attributes(abort_info)
 
             if self.events_cache:

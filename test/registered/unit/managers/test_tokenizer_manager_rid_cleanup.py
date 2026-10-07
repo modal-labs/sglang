@@ -459,7 +459,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = True
         obj.rid = rid
-        tm._discard_pending_req_states(obj)
+        tm._discard_pending_req_states(obj, ValueError("rejected"))
         self.assertNotIn(rid, tm.rid_to_state)
 
     def test_discard_batch_removes_all(self):
@@ -470,7 +470,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = False
         obj.rid = list(rids)
-        tm._discard_pending_req_states(obj)
+        tm._discard_pending_req_states(obj, ValueError("rejected"))
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
@@ -481,7 +481,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = False
         obj.rid = ["p1", "already_gone"]
-        tm._discard_pending_req_states(obj)  # must not raise
+        tm._discard_pending_req_states(obj, ValueError("rejected"))  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
 
 

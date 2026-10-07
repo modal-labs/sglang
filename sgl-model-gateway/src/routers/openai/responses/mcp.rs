@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::{
+    observability::otel_trace::SendDetached,
     protocols::{
         event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
         responses::{generate_id, ResponseInput, ResponsesRequest},
@@ -533,7 +534,7 @@ pub(super) async fn execute_tool_loop(
         };
 
         let response = request_builder
-            .send()
+            .send_detached()
             .await
             .map_err(|e| format!("upstream request failed: {}", e))?;
 

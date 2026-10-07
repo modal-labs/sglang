@@ -325,6 +325,43 @@ class LifecycleTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(aborted, [])
 
+    async def test_routed_turn_forwards_trace_context_to_router(self):
+        # Each turn's /generate call must carry the frontend's W3C context, or
+        # the router starts a new trace per turn.
+        received = {}
+
+        async def generate(request):
+            received.update(request.headers)
+            response = web.StreamResponse()
+            await response.prepare(request)
+            await response.write(b'data: {"text": "hi"}\n\ndata: [DONE]\n\n')
+            return response
+
+        app = web.Application()
+        app.router.add_post("/generate", generate)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        traceparent = "traceparent-value"
+
+        class RawRequest:
+            headers = {"traceparent": traceparent, "cookie": "session=x"}
+
+            async def is_disconnected(self):
+                return False
+
+        try:
+            gen = module.routed_turn(
+                Request(background=False), f"http://127.0.0.1:{port}", RawRequest()
+            )
+            self.assertEqual(await self.collect(gen), [{"text": "hi"}])
+        finally:
+            await runner.cleanup()
+        self.assertEqual(received["traceparent"], traceparent)
+        self.assertNotIn("cookie", received)
+
     async def collect(self, gen):
         return [item async for item in gen]
 

@@ -217,6 +217,7 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("x-smg-routing-key")
         || name.eq_ignore_ascii_case("x-smg-admission-wait-seconds")
         || name.eq_ignore_ascii_case("x-smg-prefill-uncached-fraction")
+        || name.eq_ignore_ascii_case("modal-flash-request-uuid")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
@@ -284,6 +285,7 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-123"));
         assert!(should_forward_request_header("x-smg-routing-key"));
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
+        assert!(should_forward_request_header("modal-flash-request-uuid"));
     }
 
     #[test]

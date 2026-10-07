@@ -25,7 +25,7 @@ use crate::{
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
-        otel_trace::inject_trace_context_http,
+        otel_trace::{inject_trace_context_http, SendDetached},
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
@@ -174,14 +174,8 @@ impl PDRouter {
         if let Some(body) = body {
             request = request.json(body);
         }
-        if let Some(headers) = headers {
-            for (name, value) in headers {
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    request = request.header(name, value);
-                }
-            }
-        }
-        match request.send().await {
+        request = request.headers(Self::responses_frontend_headers(headers));
+        match request.send_detached().await {
             Ok(upstream) => {
                 let status = upstream.status();
                 let headers = header_utils::preserve_response_headers(upstream.headers());
@@ -205,6 +199,19 @@ impl PDRouter {
                 error::bad_gateway("responses_decode_connection", error.to_string())
             }
         }
+    }
+
+    /// Forwardable client headers for the Responses frontend, with this
+    /// router's span as the W3C parent.
+    fn responses_frontend_headers(headers: Option<&HeaderMap>) -> HeaderMap {
+        let mut forwarded = HeaderMap::new();
+        for (name, value) in headers.into_iter().flatten() {
+            if header_utils::should_forward_request_header(name.as_str()) {
+                forwarded.append(name, value.clone());
+            }
+        }
+        inject_trace_context_http(&mut forwarded);
+        forwarded
     }
 
     async fn proxy_to_first_prefill_worker(
@@ -237,7 +244,7 @@ impl PDRouter {
             }
         }
 
-        match request_builder.send().await {
+        match request_builder.send_detached().await {
             Ok(res) if res.status().is_success() => {
                 let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -903,7 +910,7 @@ impl PDRouter {
             // Treat a prefill leg as pending until its body is drained, not just
             // until headers arrive. SSE keepalives/early headers are not proof
             // that KV transfer has completed. Decode may stream meanwhile.
-            let response = prefill_request.send().await?;
+            let response = prefill_request.send_detached().await?;
             if !response.status().is_success() {
                 // Rejecting headers are enough to cancel the paired decoder.
                 // Error bodies may themselves be slow or streaming.
@@ -919,7 +926,7 @@ impl PDRouter {
             *completed.headers_mut() = headers;
             Ok(reqwest::Response::from(completed))
         });
-        let mut decode_fut = Box::pin(decode_request.send());
+        let mut decode_fut = Box::pin(decode_request.send_detached());
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
@@ -1904,8 +1911,8 @@ impl RouterTrait for PDRouter {
         let prefill_url = Self::worker_endpoint_url(prefill.as_ref(), "health_generate");
         let decode_url = Self::worker_endpoint_url(decode.as_ref(), "health_generate");
         let (prefill_result, decode_result) = tokio::join!(
-            self.client.get(&prefill_url).send(),
-            self.client.get(&decode_url).send()
+            self.client.get(&prefill_url).send_detached(),
+            self.client.get(&decode_url).send_detached()
         );
 
         // Check results
@@ -2149,7 +2156,7 @@ impl RouterTrait for PDRouter {
         let url = Self::worker_endpoint_url(worker.as_ref(), "/v1/messages/count_tokens");
         match self
             .build_post_with_headers(&self.client, &url, &body.0, headers, false)
-            .send()
+            .send_detached()
             .await
         {
             Ok(response) => {

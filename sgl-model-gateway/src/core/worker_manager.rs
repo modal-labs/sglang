@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    observability::otel_trace::SendDetached,
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
@@ -55,7 +56,7 @@ async fn fan_out(
                 }
                 WorkerResponse {
                     url,
-                    result: req.send().await,
+                    result: req.send_detached().await,
                 }
             }
         })
@@ -215,7 +216,7 @@ impl WorkerManager {
             req = req.bearer_auth(key);
         }
 
-        match req.send().await {
+        match req.send_detached().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(json) => json
                     .get("aggregate")
