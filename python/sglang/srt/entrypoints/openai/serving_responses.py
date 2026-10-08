@@ -2952,6 +2952,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 from sglang.srt.entrypoints.openai.pd_responses import (
                     coordinated_turn,
                     prepare_prefill_turn,
+                    request_trace_headers,
                     run_prefill,
                 )
 
@@ -2961,7 +2962,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.tokenizer_manager.server_args.disaggregation_bootstrap_port,
                 )
                 prefill_task = asyncio.create_task(
-                    run_prefill(prefill_url, payload, timeout=1800)
+                    run_prefill(
+                        prefill_url,
+                        payload,
+                        timeout=1800,
+                        headers=request_trace_headers(raw_request),
+                    )
                 )
                 generator = coordinated_turn(
                     adapted_request,

@@ -1104,6 +1104,7 @@ class PDWorkerFailureTestCase(unittest.TestCase):
             serving.tokenizer_manager = SimpleNamespace(
                 server_args=SimpleNamespace(
                     responses_prefill_url="http://prefill:8000",
+                    responses_generation_url=None,
                     disaggregation_bootstrap_port=8998,
                 ),
                 generate_request=decode,
@@ -1119,4 +1120,40 @@ class PDWorkerFailureTestCase(unittest.TestCase):
                 self.assertEqual(error.exception.status_code, 503)
             self.assertTrue(cleaned.is_set())
             self.assertEqual(aborted, ["resp_abort"])
+        asyncio.run(run())
+
+    def test_pd_prefill_forwards_client_trace_context(self):
+        # The frontend posts to P itself in direct P/D mode; without the
+        # client's W3C context, P's spans start a trace separate from D's.
+        from types import SimpleNamespace
+
+        async def run():
+            serving = make_serving()
+            prefill_headers = []
+            prefill_sent = asyncio.Event()
+            async def prefill(*args, headers=None, **kwargs):
+                prefill_headers.append(headers)
+                prefill_sent.set()
+            async def decode(*args):
+                await prefill_sent.wait()
+                yield {"text": "hi", "meta_info": {}}
+            serving.tokenizer_manager = SimpleNamespace(
+                server_args=SimpleNamespace(
+                    responses_prefill_url="http://prefill:8000",
+                    responses_generation_url=None,
+                    disaggregation_bootstrap_port=8998,
+                ),
+                generate_request=decode,
+                abort_request=lambda rid: None,
+            )
+            raw_request = SimpleNamespace(
+                headers={"traceparent": "traceparent-value", "cookie": "session=x"}
+            )
+            request = GenerateReqInput(input_ids=[1, 2], rid="resp_trace")
+            with patch("sglang.srt.entrypoints.openai.pd_responses.run_prefill", prefill):
+                generator = serving._generate_with_builtin_tools(
+                    "resp_trace", [1, 2], request, {}, SimpleContext(), raw_request
+                )
+                [_ async for _ in generator]
+            self.assertEqual(prefill_headers, [{"traceparent": "traceparent-value"}])
         asyncio.run(run())

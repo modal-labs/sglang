@@ -72,13 +72,18 @@ def prepare_prefill_turn(request, prefill_url, bootstrap_port):
     return payload
 
 
-async def run_prefill(prefill_url, payload, timeout):
+def request_trace_headers(raw_request):
+    """W3C context of the client request, forwarded on each worker /generate."""
+    return extract_trace_headers(raw_request.headers) if raw_request is not None else {}
+
+
+async def run_prefill(prefill_url, payload, timeout, headers=None):
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=timeout)
     ) as client:
         try:
             async with client.post(
-                prefill_url.rstrip("/") + "/generate", json=payload
+                prefill_url.rstrip("/") + "/generate", json=payload, headers=headers
             ) as response:
                 if response.status >= 400:
                     # Do not log raw request bodies or model output.
@@ -251,10 +256,9 @@ async def routed_turn(request, router_url, raw_request=None):
         if raw_request is not None and not getattr(request, "background", False)
         else None
     )
-    trace_headers = (
-        extract_trace_headers(raw_request.headers) if raw_request is not None else {}
+    stream = _routed_turn_stream(
+        request, router_url, request_trace_headers(raw_request)
     )
-    stream = _routed_turn_stream(request, router_url, trace_headers)
     try:
         async for output in stream:
             yield output
