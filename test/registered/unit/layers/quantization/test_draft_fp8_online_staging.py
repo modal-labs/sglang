@@ -194,19 +194,10 @@ def test_draft_fp8_quant_config_is_online_only_and_preserves_scheme():
 
 def test_source_pool_teardown_releases_pool_without_global_empty_cache():
     class FakePool:
+        id = (0, 323)
+
         def use_count(self):
             return 1
-
-        def snapshot(self, include_traces=True):
-            assert not include_traces
-            return [
-                {
-                    "total_size": 64,
-                    "allocated_size": 0,
-                    "active_size": 0,
-                    "is_expandable": False,
-                }
-            ]
 
     config = fp8.Fp8Config(use_online_weight_staging_pool=True)
     pool = FakePool()
@@ -215,6 +206,28 @@ def test_source_pool_teardown_releases_pool_without_global_empty_cache():
         patch.object(fp8, "_is_cuda", True),
         patch.object(fp8.torch.cuda, "device", return_value=nullcontext()),
         patch.object(fp8.torch.cuda, "synchronize") as synchronize,
+        patch.object(
+            fp8.torch.cuda.memory,
+            "_snapshot",
+            return_value={
+                "segments": [
+                    {
+                        "segment_pool_id": (0, 323),
+                        "total_size": 64,
+                        "allocated_size": 0,
+                        "active_size": 0,
+                        "is_expandable": False,
+                    },
+                    {
+                        "segment_pool_id": (0, 0),
+                        "total_size": 128,
+                        "allocated_size": 128,
+                        "active_size": 128,
+                        "is_expandable": True,
+                    },
+                ]
+            },
+        ) as memory_snapshot,
         patch.object(
             fp8,
             "_cuda_memory_snapshot",
@@ -234,6 +247,7 @@ def test_source_pool_teardown_releases_pool_without_global_empty_cache():
     assert pool_ref() is None
     assert config._online_weight_staging.pool is None
     assert synchronize.call_count == 2
+    memory_snapshot.assert_called_once_with()
     empty_cache.assert_not_called()
 
 
@@ -249,9 +263,11 @@ def test_source_pool_teardown_rejects_unsafe_ownership(
     allocated_size, use_count, is_expandable
 ):
     pool = Mock()
+    pool.id = (0, 323)
     pool.use_count.return_value = use_count
-    pool.snapshot.return_value = [
+    snapshot = [
         {
+            "segment_pool_id": pool.id,
             "total_size": 64,
             "allocated_size": allocated_size,
             "active_size": allocated_size,
@@ -263,6 +279,9 @@ def test_source_pool_teardown_rejects_unsafe_ownership(
         patch.object(fp8, "_is_cuda", True),
         patch.object(fp8.torch.cuda, "device", return_value=nullcontext()),
         patch.object(fp8.torch.cuda, "synchronize"),
+        patch.object(
+            fp8.torch.cuda.memory, "_snapshot", return_value={"segments": snapshot}
+        ),
         pytest.raises(RuntimeError, match="staging pool still owns live sources"),
     ):
         config.begin_online_weight_staging()
@@ -295,9 +314,11 @@ def test_memory_diagnostics_report_pool_recovery_once():
     }
 
     pool = Mock()
+    pool.id = (0, 323)
     pool.use_count.return_value = 1
-    pool.snapshot.return_value = [
+    snapshot = [
         {
+            "segment_pool_id": pool.id,
             "total_size": 64,
             "allocated_size": 0,
             "active_size": 0,
@@ -317,6 +338,9 @@ def test_memory_diagnostics_report_pool_recovery_once():
         ),
         patch.object(fp8.torch.cuda, "device", return_value=nullcontext()),
         patch.object(fp8.torch.cuda, "synchronize"),
+        patch.object(
+            fp8.torch.cuda.memory, "_snapshot", return_value={"segments": snapshot}
+        ),
         patch.object(fp8, "log_info_on_rank0") as log_info,
     ):
         config = fp8.Fp8Config(use_online_weight_staging_pool=True)

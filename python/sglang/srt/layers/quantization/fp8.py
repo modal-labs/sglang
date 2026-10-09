@@ -258,7 +258,13 @@ class _OnlineFp8WeightStaging:
         with torch.cuda.device(self.device):
             torch.cuda.synchronize()
             live_sources = sum(ref() is not None for ref in self.source_refs)
-            snapshot = pool.snapshot(include_traces=False)
+            # PyTorch's pool-specific snapshot incorrectly decrefs pool IDs.
+            # The global snapshot passes no pool ID to the native binding.
+            snapshot = [
+                segment
+                for segment in torch.cuda.memory._snapshot()["segments"]
+                if segment["segment_pool_id"] == pool.id
+            ]
             pool_reserved, pool_allocated, pool_active = self._pool_bytes(snapshot)
             pool_use_count = pool.use_count()
             expandable_segments = sum(
