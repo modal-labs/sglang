@@ -56,7 +56,15 @@ pub struct PDRouter {
     pub api_key: Option<String>,
     pub enable_igw: bool,
     admission: Option<Arc<super::pd_admission::Admission>>,
+    /// This router's own base URL as reachable from the decode worker
+    /// (`SMG_SELF_URL`). Sent to the decode on native Responses calls so its
+    /// generation callbacks return through the SMG that forwarded the call.
+    self_url: Option<String>,
 }
+
+/// Tells the decode Responses frontend which router to call back for P/D
+/// generation. Set only by this router, never taken from the client.
+const GENERATION_URL_HEADER: &str = "x-smg-generation-url";
 
 struct PreparedWorkerRequest<'a> {
     endpoint_url: String,
@@ -176,10 +184,17 @@ impl PDRouter {
         }
         if let Some(headers) = headers {
             for (name, value) in headers {
-                if header_utils::should_forward_request_header(name.as_str()) {
+                if name.as_str() != GENERATION_URL_HEADER
+                    && header_utils::should_forward_request_header(name.as_str())
+                {
                     request = request.header(name, value);
                 }
             }
+        }
+        // A client-supplied callback URL was dropped above (SSRF); advertise
+        // our own so the decode calls back through this router.
+        if let Some(self_url) = &self.self_url {
+            request = request.header(GENERATION_URL_HEADER, self_url);
         }
         match request.send().await {
             Ok(upstream) => {
@@ -307,6 +322,10 @@ impl PDRouter {
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
             admission: super::pd_admission::Admission::from_env()?,
+            self_url: std::env::var("SMG_SELF_URL")
+                .ok()
+                .map(|url| url.trim().to_string())
+                .filter(|url| !url.is_empty()),
         })
     }
 
@@ -1793,7 +1812,9 @@ impl PDRouter {
         }
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
-                if header_utils::should_forward_request_header(name.as_str()) {
+                if name.as_str() != GENERATION_URL_HEADER
+                    && header_utils::should_forward_request_header(name.as_str())
+                {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
                     }
@@ -2417,6 +2438,7 @@ mod tests {
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
             admission: None,
+            self_url: None,
         }
     }
 
@@ -2453,6 +2475,122 @@ mod tests {
                 .register(Arc::from(create_test_worker(url, role, true)));
         }
         (router, tasks)
+    }
+
+    /// Records the `x-smg-generation-url` header values each worker receives.
+    fn generation_url_recorder(
+        seen: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>,
+    ) -> axum::Router {
+        axum::Router::new().fallback(move |request: Request<Body>| {
+            let seen = seen.clone();
+            async move {
+                let values = request
+                    .headers()
+                    .get_all(GENERATION_URL_HEADER)
+                    .iter()
+                    .map(|value| value.to_str().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                seen.lock()
+                    .unwrap()
+                    .push((request.uri().path().to_string(), values));
+                axum::Json(json!({"id":"resp_owner","text":"ok","meta_info":{}}))
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn native_responses_sets_generation_url_from_self_url() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prefill = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let (mut router, tasks) =
+            messages_test_pair(prefill, generation_url_recorder(seen.clone())).await;
+        router.self_url = Some("http://[fdaa::1]:9000".to_string());
+        let request = crate::routers::native_protocol::NativeRequest(json!({"input":"hi"}));
+
+        // Create without a client header.
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Create with a client-supplied header: it must be replaced, not appended.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GENERATION_URL_HEADER,
+            "http://evil.example".parse().unwrap(),
+        );
+        let response = router
+            .route_native_responses(Some(&headers), &request, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Retrieve is harmless and carries the same header.
+        let response = router.delete_response(Some(&headers), "resp_owner").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for (_, values) in seen.iter() {
+            assert_eq!(values, &vec!["http://[fdaa::1]:9000".to_string()]);
+        }
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_strips_client_generation_url_without_self_url() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prefill = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let (router, tasks) =
+            messages_test_pair(prefill, generation_url_recorder(seen.clone())).await;
+        assert!(router.self_url.is_none());
+        let request = crate::routers::native_protocol::NativeRequest(json!({"input":"hi"}));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GENERATION_URL_HEADER,
+            "http://evil.example".parse().unwrap(),
+        );
+        let response = router
+            .route_native_responses(Some(&headers), &request, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].1.is_empty());
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn dual_dispatch_never_forwards_generation_url() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut router, tasks) = messages_test_pair(
+            generation_url_recorder(seen.clone()),
+            generation_url_recorder(seen.clone()),
+        )
+        .await;
+        // Even with SMG_SELF_URL configured, P/D workers never see the header.
+        router.self_url = Some("http://[fdaa::1]:9000".to_string());
+        let request = crate::routers::native_protocol::NativeRequest(json!({
+            "input_ids":[1,2,3], "stream":false
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GENERATION_URL_HEADER,
+            "http://evil.example".parse().unwrap(),
+        );
+        let response = router
+            .route_native_generate(Some(&headers), &request, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both prefill and decode are dispatched");
+        for (_, values) in seen.iter() {
+            assert!(values.is_empty());
+        }
+        for task in tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]

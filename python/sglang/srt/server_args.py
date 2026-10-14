@@ -8812,18 +8812,11 @@ class ServerArgs:
             ), "chunked_prefill_size must be divisible by page_size"
 
         if self.responses_generation_url:
-            from urllib.parse import urlsplit
+            from sglang.srt.entrypoints.openai.pd_responses import (
+                is_http_router_origin,
+            )
 
-            origin = urlsplit(self.responses_generation_url)
-            if (
-                origin.scheme not in ("http", "https")
-                or not origin.hostname
-                or origin.username is not None
-                or origin.password is not None
-                or origin.path not in ("", "/")
-                or origin.query
-                or origin.fragment
-            ):
+            if not is_http_router_origin(self.responses_generation_url):
                 raise ValueError(
                     "responses_generation_url must be an HTTP router origin"
                 )
