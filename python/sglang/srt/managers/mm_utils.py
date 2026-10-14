@@ -11,7 +11,7 @@ from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -556,6 +556,34 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
         item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
 
+def _mm_encode_sync_group():
+    if not envs.SGLANG_MM_RANK_CONSISTENT_ENCODE.get():
+        return None
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    parallel = get_parallel()
+    return parallel.attn_tp_group if parallel.attn_tp_size > 1 else None
+
+
+def _rank_consistent_miss_hashes(
+    ordered_hashes: List[int],
+    local_misses: Set[int],
+    tp_group,
+    device: torch.device,
+) -> Set[int]:
+    flags = torch.tensor(
+        [item_hash in local_misses for item_hash in ordered_hashes],
+        dtype=torch.float32,
+        device=device,
+    )
+    flags = tp_group.all_reduce(flags)
+    return {
+        item_hash
+        for item_hash, flag in zip(ordered_hashes, flags.tolist())
+        if flag > 0
+    }
+
+
 def _get_chunked_embedding_full(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -662,6 +690,24 @@ def _batch_encode_per_image_misses(
             elif item.hash not in unique_misses:
                 token_count = end - start + 1
                 unique_misses[item.hash] = (item, token_count)
+
+    sync_group = _mm_encode_sync_group()
+    if sync_group is not None:
+        ordered_items = {}
+        for req_info in per_image_requests:
+            for _idx, item, start, end in req_info.overlapping:
+                ordered_items.setdefault(item.hash, (item, end - start + 1))
+        if ordered_items:
+            misses = _rank_consistent_miss_hashes(
+                list(ordered_items), set(unique_misses), sync_group, device
+            )
+            for item_hash in misses:
+                hash_to_embedding.pop(item_hash, None)
+            unique_misses = {
+                item_hash: ordered_items[item_hash]
+                for item_hash in ordered_items
+                if item_hash in misses
+            }
 
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
