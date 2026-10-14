@@ -10,7 +10,6 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use super::strip_protocol;
 use crate::{
     core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
-    observability::otel_trace::SendDetached,
     routers::grpc::client::GrpcClient,
 };
 
@@ -28,7 +27,7 @@ async fn try_http_health_check(
     client
         .get(&health_url)
         .timeout(Duration::from_secs(timeout_secs))
-        .send_detached()
+        .send()
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| format!("Health check failed: {}", e))?;

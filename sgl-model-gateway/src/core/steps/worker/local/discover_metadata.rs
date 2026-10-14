@@ -13,7 +13,6 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use super::strip_protocol;
 use crate::{
     core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
-    observability::otel_trace::SendDetached,
     routers::grpc::client::GrpcClient,
 };
 
@@ -82,7 +81,7 @@ async fn get_json_fallback(
     }
 
     let response = req
-        .send_detached()
+        .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", old_url, e))?;
 
@@ -111,7 +110,7 @@ pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerI
     }
 
     let response = req
-        .send_detached()
+        .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", server_info_url, e))?;
 
@@ -149,7 +148,7 @@ pub async fn get_model_info(url: &str, api_key: Option<&str>) -> Result<ModelInf
     }
 
     let response = req
-        .send_detached()
+        .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", model_info_url, e))?;
 
@@ -185,7 +184,7 @@ async fn get_model_name_from_v1_models(url: &str, api_key: Option<&str>) -> Resu
     }
 
     let response = req
-        .send_detached()
+        .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", models_url, e))?;
 

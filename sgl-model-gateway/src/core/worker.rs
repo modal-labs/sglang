@@ -18,10 +18,7 @@ use super::{
     CircuitBreaker, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
-    observability::{
-        metrics::{metrics_labels, Metrics},
-        otel_trace::SendDetached,
-    },
+    observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
 };
@@ -963,7 +960,7 @@ impl Worker for BasicWorker {
             req = req.bearer_auth(api_key);
         }
 
-        match req.send_detached().await {
+        match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {

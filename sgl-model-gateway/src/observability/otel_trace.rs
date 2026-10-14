@@ -1,7 +1,6 @@
 //! OpenTelemetry tracing integration.
 
 use std::{
-    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
         OnceLock,
@@ -21,7 +20,7 @@ use opentelemetry_sdk::{
 };
 use tokio::task::spawn_blocking;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
-use tracing::{instrument::WithSubscriber, Dispatch, Metadata, Subscriber};
+use tracing::{Metadata, Subscriber};
 use tracing_opentelemetry::{self, OpenTelemetrySpanExt};
 use tracing_subscriber::{
     layer::{Context, Filter},
@@ -293,94 +292,5 @@ impl smg_grpc_client::TraceInjector for OtelTraceInjector {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         inject_trace_context_grpc(metadata);
         Ok(())
-    }
-}
-
-/// Sends an upstream HTTP request with no current span.
-///
-/// Caveat: `send` runs with no subscriber, so reqwest/hyper log events emitted
-/// during it are dropped, and any library log site first reached during it is
-/// cached as disabled for the rest of the process. To debug hyper/reqwest with
-/// `RUST_LOG`, use plain `.send()`.
-pub trait SendDetached {
-    fn send_detached(self) -> impl Future<Output = reqwest::Result<reqwest::Response>> + Send;
-}
-
-impl SendDetached for reqwest::RequestBuilder {
-    #[inline]
-    fn send_detached(self) -> impl Future<Output = reqwest::Result<reqwest::Response>> + Send {
-        self.send().with_subscriber(Dispatch::none())
-    }
-}
-
-#[cfg(test)]
-mod send_detached_tests {
-    use std::sync::{Arc, Mutex};
-
-    use tracing::{span, Instrument, Subscriber};
-    use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer, Registry};
-
-    use super::SendDetached;
-
-    /// Records the names of closed spans.
-    struct ClosedSpans(Arc<Mutex<Vec<String>>>);
-
-    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ClosedSpans {
-        fn on_close(&self, id: span::Id, cx: Context<'_, S>) {
-            if let Some(span) = cx.span(&id) {
-                self.0.lock().unwrap().push(span.name().to_string());
-            }
-        }
-    }
-
-    /// Serves `GET /` over a keep-alive connection that stays open after it.
-    async fn keep_alive_server() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}/")
-    }
-
-    /// Sends one request on a fresh pooled connection under a span named
-    /// `request`, drops the span, and reports whether it has closed while the
-    /// connection is still open.
-    async fn request_span_closed(detached: bool) -> bool {
-        let url = keep_alive_server().await;
-        let closed = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = Registry::default().with(ClosedSpans(closed.clone()));
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let client = reqwest::Client::new();
-
-        async {
-            let request = client.get(&url);
-            let response = if detached {
-                request.send_detached().await
-            } else {
-                request.send().await
-            };
-            response.unwrap().bytes().await.unwrap();
-        }
-        .instrument(tracing::info_span!("request"))
-        .await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-
-        let closed = closed.lock().unwrap().iter().any(|name| name == "request");
-        drop(client); // keeps the pooled connection open until here
-        closed
-    }
-
-    #[tokio::test]
-    async fn plain_send_keeps_the_request_span_open_for_the_connection() {
-        // Control: proves the pool still captures the span in this build, so
-        // the test below can detect a regression.
-        assert!(!request_span_closed(false).await);
-    }
-
-    #[tokio::test]
-    async fn send_detached_lets_the_request_span_close_with_the_request() {
-        assert!(request_span_closed(true).await);
     }
 }

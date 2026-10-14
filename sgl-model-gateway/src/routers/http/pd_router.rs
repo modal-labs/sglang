@@ -25,7 +25,7 @@ use crate::{
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
-        otel_trace::{inject_trace_context_http, SendDetached},
+        otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
@@ -175,7 +175,7 @@ impl PDRouter {
             request = request.json(body);
         }
         request = request.headers(Self::responses_frontend_headers(headers));
-        match request.send_detached().await {
+        match request.send().await {
             Ok(upstream) => {
                 let status = upstream.status();
                 let headers = header_utils::preserve_response_headers(upstream.headers());
@@ -244,7 +244,7 @@ impl PDRouter {
             }
         }
 
-        match request_builder.send_detached().await {
+        match request_builder.send().await {
             Ok(res) if res.status().is_success() => {
                 let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -910,7 +910,7 @@ impl PDRouter {
             // Treat a prefill leg as pending until its body is drained, not just
             // until headers arrive. SSE keepalives/early headers are not proof
             // that KV transfer has completed. Decode may stream meanwhile.
-            let response = prefill_request.send_detached().await?;
+            let response = prefill_request.send().await?;
             if !response.status().is_success() {
                 // Rejecting headers are enough to cancel the paired decoder.
                 // Error bodies may themselves be slow or streaming.
@@ -926,7 +926,7 @@ impl PDRouter {
             *completed.headers_mut() = headers;
             Ok(reqwest::Response::from(completed))
         });
-        let mut decode_fut = Box::pin(decode_request.send_detached());
+        let mut decode_fut = Box::pin(decode_request.send());
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
@@ -1911,8 +1911,8 @@ impl RouterTrait for PDRouter {
         let prefill_url = Self::worker_endpoint_url(prefill.as_ref(), "health_generate");
         let decode_url = Self::worker_endpoint_url(decode.as_ref(), "health_generate");
         let (prefill_result, decode_result) = tokio::join!(
-            self.client.get(&prefill_url).send_detached(),
-            self.client.get(&decode_url).send_detached()
+            self.client.get(&prefill_url).send(),
+            self.client.get(&decode_url).send()
         );
 
         // Check results
@@ -2156,7 +2156,7 @@ impl RouterTrait for PDRouter {
         let url = Self::worker_endpoint_url(worker.as_ref(), "/v1/messages/count_tokens");
         match self
             .build_post_with_headers(&self.client, &url, &body.0, headers, false)
-            .send_detached()
+            .send()
             .await
         {
             Ok(response) => {

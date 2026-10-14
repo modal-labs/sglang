@@ -10,13 +10,10 @@ use serde::Deserialize;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    core::{
-        model_card::{ModelCard, ProviderType},
-        model_type::ModelType,
-        steps::workflow_data::ExternalWorkerWorkflowData,
-    },
-    observability::otel_trace::SendDetached,
+use crate::core::{
+    model_card::{ModelCard, ProviderType},
+    model_type::ModelType,
+    steps::workflow_data::ExternalWorkerWorkflowData,
 };
 
 // HTTP client for API calls
@@ -189,7 +186,7 @@ async fn fetch_models(url: &str, api_key: Option<&str>) -> Result<Vec<ModelCard>
     }
 
     let response = req
-        .send_detached()
+        .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", models_url, e))?;
 

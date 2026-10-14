@@ -32,7 +32,6 @@ use super::{
     utils::{mask_tools_as_mcp, patch_response_with_request_metadata, rewrite_streaming_block},
 };
 use crate::{
-    observability::otel_trace::SendDetached,
     protocols::{
         event_types::{
             is_function_call_type, is_response_event, FunctionCallEvent, ItemType, McpEvent,
@@ -510,7 +509,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     request_builder = request_builder.header("Accept", "text/event-stream");
 
-    let response = match request_builder.send_detached().await {
+    let response = match request_builder.send().await {
         Ok(resp) => resp,
         Err(err) => {
             worker.circuit_breaker().record_failure();
@@ -837,7 +836,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
             // cancels this in-flight HTTP request (not just mid-stream).
             let response = tokio::select! {
                 biased;
-                res = request_builder.send_detached() => res,
+                res = request_builder.send() => res,
                 _ = tx.closed() => {
                     tracing::info!(
                         "Client disconnected before /responses tool-interception \
