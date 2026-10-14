@@ -259,6 +259,8 @@ class Envs:
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    # Request headers written to request logs. SMG also forwards them to
+    # workers, so name only request-identifier headers (e.g. "x-request-id").
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
@@ -337,7 +339,8 @@ class Envs:
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     # Request headers recorded on each request's root span, so a request can
-    # be found by an ID set upstream (e.g. "x-request-id").
+    # be found by an ID set upstream (e.g. "x-request-id"). SMG also records
+    # them and forwards them to workers, so name only request-identifier headers.
     SGLANG_TRACE_REQUEST_HEADERS = EnvTuple(tuple())
     # Longest value recorded per traced header; longer ones are cut
     SGLANG_TRACE_REQUEST_HEADER_MAX_LEN = EnvInt(256)

@@ -292,7 +292,17 @@ fn traced_header_max_len() -> usize {
 
 /// Custom span maker that includes request ID
 #[derive(Clone, Debug)]
-pub struct RequestSpan;
+pub struct RequestSpan {
+    traced_headers: &'static [otel_trace::TracedRequestHeader],
+}
+
+impl Default for RequestSpan {
+    fn default() -> Self {
+        Self {
+            traced_headers: otel_trace::traced_request_headers(),
+        }
+    }
+}
 
 impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
@@ -315,20 +325,15 @@ impl<B> MakeSpan<B> for RequestSpan {
         if parent.span().span_context().is_valid() {
             span.set_parent(parent);
         }
-        // Temporary, until PD routing moves into FPRS+: record both request IDs,
-        // so a request is findable even when SMG rejects it before any engine.
-        const TRACED_HEADERS: [(&str, &str); 2] = [
-            ("x-request-id", "http.request.header.x-request-id"),
-            (
-                "modal-flash-request-uuid",
-                "http.request.header.modal-flash-request-uuid",
-            ),
-        ];
-        for (header, attribute) in TRACED_HEADERS {
-            if let Some(value) = request.headers().get(header).and_then(|v| v.to_str().ok()) {
+        for header in self.traced_headers {
+            if let Some(value) = request
+                .headers()
+                .get(header.name.as_str())
+                .and_then(|v| v.to_str().ok())
+            {
                 // `to_str` only accepts visible ASCII, so any byte index is a char boundary.
                 let value = &value[..value.len().min(traced_header_max_len())];
-                span.set_attribute(attribute, value.to_owned());
+                span.set_attribute(header.attribute.as_str(), value.to_owned());
             }
         }
         span
@@ -436,7 +441,7 @@ pub fn create_logging_layer() -> TraceLayer<
     ResponseLogger,
 > {
     TraceLayer::new_for_http()
-        .make_span_with(RequestSpan)
+        .make_span_with(RequestSpan::default())
         .on_request(RequestLogger)
         .on_response(ResponseLogger::default())
 }
@@ -1181,7 +1186,17 @@ mod tests {
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
-            let span = RequestSpan.make_span(&request.body(()).unwrap());
+            // Parsed like the engine parses SGLANG_TRACE_REQUEST_HEADERS: names
+            // are trimmed and lowercased, and empty entries are dropped.
+            let mut make_span = RequestSpan {
+                traced_headers: Box::leak(
+                    otel_trace::parse_traced_request_headers(
+                        " x-request-id, ,X-Upstream-Request-Id,",
+                    )
+                    .into_boxed_slice(),
+                ),
+            };
+            let span = make_span.make_span(&request.body(()).unwrap());
             if let Some(status) = status {
                 let response = Response::builder().status(status).body(()).unwrap();
                 ResponseLogger::default().on_response(&response, Duration::from_millis(1), &span);
@@ -1210,7 +1225,8 @@ mod tests {
     fn test_request_span_records_request_ids() {
         let span = export_request_span(&[
             ("x-request-id", "req-1"),
-            ("modal-flash-request-uuid", "0f1e2d3c"),
+            ("x-upstream-request-id", "0f1e2d3c"),
+            ("x-untraced-id", "not-recorded"),
         ]);
         let attribute = |key: &str| {
             span.attributes
@@ -1223,9 +1239,10 @@ mod tests {
             Some("req-1")
         );
         assert_eq!(
-            attribute("http.request.header.modal-flash-request-uuid").as_deref(),
+            attribute("http.request.header.x-upstream-request-id").as_deref(),
             Some("0f1e2d3c")
         );
+        assert_eq!(attribute("http.request.header.x-untraced-id"), None);
     }
 
     #[test]

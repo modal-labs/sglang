@@ -201,8 +201,6 @@ impl PDRouter {
         }
     }
 
-    /// Forwardable client headers for the Responses frontend, with this
-    /// router's span as the W3C parent.
     fn responses_frontend_headers(headers: Option<&HeaderMap>) -> HeaderMap {
         let mut forwarded = HeaderMap::new();
         for (name, value) in headers.into_iter().flatten() {

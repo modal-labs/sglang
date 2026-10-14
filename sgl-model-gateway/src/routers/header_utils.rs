@@ -1,9 +1,13 @@
+use std::sync::OnceLock;
+
 use axum::{
     body::Body,
     extract::Request,
     http::{HeaderMap, HeaderValue},
 };
 use http::header::HeaderName;
+
+use crate::observability::otel_trace;
 
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
@@ -217,10 +221,25 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("x-smg-routing-key")
         || name.eq_ignore_ascii_case("x-smg-admission-wait-seconds")
         || name.eq_ignore_ascii_case("x-smg-prefill-uncached-fraction")
-        || name.eq_ignore_ascii_case("modal-flash-request-uuid")
+        || engine_recorded_headers()
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
+}
+
+fn engine_recorded_headers() -> &'static [String] {
+    static HEADERS: OnceLock<Vec<String>> = OnceLock::new();
+    HEADERS.get_or_init(|| {
+        let logged = std::env::var("SGLANG_LOG_REQUEST_HEADERS").unwrap_or_default();
+        otel_trace::traced_request_headers()
+            .iter()
+            .cloned()
+            .chain(otel_trace::parse_traced_request_headers(&logged))
+            .map(|header| header.name)
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -285,7 +304,6 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-123"));
         assert!(should_forward_request_header("x-smg-routing-key"));
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
-        assert!(should_forward_request_header("modal-flash-request-uuid"));
     }
 
     #[test]

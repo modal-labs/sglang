@@ -36,7 +36,7 @@ try:
 except ImportError:
     _has_otel = False
 
-TRACED = "x-request-id,modal-flash-request-uuid"
+TRACED = "x-request-id,x-upstream-request-id"
 TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
 
 
@@ -69,7 +69,7 @@ class TestRequestHeaders(CustomTestCase):
         gateway also reads: a hardcoded cap would ignore the setting and let the
         engine and gateway record the same header differently. Empty values are
         left out."""
-        headers = {"X-Request-Id": "a" * 1000, "modal-flash-request-uuid": ""}
+        headers = {"X-Request-Id": "a" * 1000, "x-upstream-request-id": ""}
         with (
             envs.SGLANG_TRACE_REQUEST_HEADERS.override(TRACED),
             envs.SGLANG_TRACE_REQUEST_HEADER_MAX_LEN.override(8),

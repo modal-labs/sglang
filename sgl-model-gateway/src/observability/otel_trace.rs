@@ -234,6 +234,33 @@ pub fn inject_trace_context_http(headers: &mut HeaderMap) {
     });
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TracedRequestHeader {
+    pub name: String,
+    pub attribute: String,
+}
+
+pub fn parse_traced_request_headers(value: &str) -> Vec<TracedRequestHeader> {
+    value
+        .split(',')
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .map(|name| TracedRequestHeader {
+            attribute: format!("http.request.header.{name}"),
+            name,
+        })
+        .collect()
+}
+
+pub fn traced_request_headers() -> &'static [TracedRequestHeader] {
+    static HEADERS: OnceLock<Vec<TracedRequestHeader>> = OnceLock::new();
+    HEADERS.get_or_init(|| {
+        parse_traced_request_headers(
+            &std::env::var("SGLANG_TRACE_REQUEST_HEADERS").unwrap_or_default(),
+        )
+    })
+}
+
 /// Extract W3C trace context from incoming HTTP request headers.
 pub fn extract_trace_context_http(headers: &HeaderMap) -> opentelemetry::Context {
     struct HeaderExtractor<'a>(&'a HeaderMap);
