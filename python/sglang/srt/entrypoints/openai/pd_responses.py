@@ -73,7 +73,6 @@ def prepare_prefill_turn(request, prefill_url, bootstrap_port):
 
 
 def request_trace_headers(raw_request):
-    """W3C context of the client request, forwarded on each worker /generate."""
     return extract_trace_headers(raw_request.headers) if raw_request is not None else {}
 
 

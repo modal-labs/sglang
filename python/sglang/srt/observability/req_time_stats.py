@@ -372,7 +372,6 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     api_server_dispatch_time: float = 0.0
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
-    # Detokenizer batches that carried this request, for the root span
     detokenize_total_duration: float = 0.0
     detokenize_batches: int = 0
 

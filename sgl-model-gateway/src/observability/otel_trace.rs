@@ -261,7 +261,6 @@ pub fn traced_request_headers() -> &'static [TracedRequestHeader] {
     })
 }
 
-/// Extract W3C trace context from incoming HTTP request headers.
 pub fn extract_trace_context_http(headers: &HeaderMap) -> opentelemetry::Context {
     struct HeaderExtractor<'a>(&'a HeaderMap);
 

@@ -3223,11 +3223,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         elif isinstance(error, fastapi.HTTPException):
             status_code = error.status_code
         elif isinstance(error, ValueError):
-            # The HTTP layer answers a ValueError with 400
-            # (http_server._create_error_response).
             status_code = HTTPStatus.BAD_REQUEST
         else:
-            # FastAPI's response to an unhandled exception.
             status_code = HTTPStatus.INTERNAL_SERVER_ERROR
         finish_reason = {
             "type": "abort",

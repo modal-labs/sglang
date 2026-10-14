@@ -76,17 +76,11 @@ def _traced_request_headers() -> tuple[str, ...]:
 
 
 def extract_trace_headers(headers: Mapping[str, str]) -> Dict[str, str]:
-    """Return the W3C trace context and the request headers recorded on spans."""
     names = (*TRACE_HEADERS, *_traced_request_headers())
     return {h: headers[h] for h in names if h in headers}
 
 
 def request_header_attributes(headers: Optional[Mapping[str, str]]) -> Dict[str, str]:
-    """Root span attributes for SGLANG_TRACE_REQUEST_HEADERS.
-
-    Named `http.request.header.<name>`, per OpenTelemetry's HTTP conventions,
-    with values cut to SGLANG_TRACE_REQUEST_HEADER_MAX_LEN characters.
-    """
     if not headers:
         return {}
     max_len = envs.SGLANG_TRACE_REQUEST_HEADER_MAX_LEN.get()
@@ -99,13 +93,6 @@ def request_header_attributes(headers: Optional[Mapping[str, str]]) -> Dict[str,
 
 
 def should_trace_rank(server_args, tp_rank: int, attn_cp_rank: int) -> bool:
-    """Whether a scheduler rank emits spans.
-
-    Ranks in one attention tensor- or context-parallel group run the same
-    requests in lockstep, so only the group's first rank traces unless
-    SGLANG_TRACE_ALL_RANKS is set. Every attention data-parallel group and
-    pipeline stage keeps a tracing rank, since those do different work.
-    """
     if envs.SGLANG_TRACE_ALL_RANKS.get():
         return True
     from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -121,7 +108,6 @@ def should_trace_rank(server_args, tp_rank: int, attn_cp_rank: int) -> bool:
 
 
 def _abort_status_code(abort_info: Mapping[str, Any]) -> int:
-    """The HTTP status code an abort carries, or 0 when it has none."""
     try:
         return int(abort_info.get("status_code") or 0)
     except (TypeError, ValueError):  # never let tracing fail a request
@@ -334,8 +320,7 @@ class TraceReqContext:
     ):
         self.rid: str = str(rid)
         self.trace_level = get_global_trace_level()
-        # Health checks run a one-token request every few seconds; tracing
-        # them would only add noise.
+
         self.tracing_enable: bool = (
             opentelemetry_initialized
             and self.trace_level > 0
@@ -793,12 +778,6 @@ class TraceReqContext:
             self.root_span.set_attributes(attrs)
 
     def trace_set_root_error(self, finish_reason: Optional[Dict[str, Any]]):
-        """
-        Record why an aborted request failed, as OpenTelemetry's `error.type`.
-        The type is the abort's HTTP status code, or "abort" when it has none.
-        Only server faults (5xx) mark the root span as an error: a 4xx is the
-        caller's, and an abort without a code may be a client disconnect.
-        """
         if not self.tracing_enable or not self.root_span:
             return
         if not finish_reason or finish_reason.get("type") != "abort":

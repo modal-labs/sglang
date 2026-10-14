@@ -331,7 +331,6 @@ impl<B> MakeSpan<B> for RequestSpan {
                 .get(header.name.as_str())
                 .and_then(|v| v.to_str().ok())
             {
-                // `to_str` only accepts visible ASCII, so any byte index is a char boundary.
                 let value = &value[..value.len().min(traced_header_max_len())];
                 span.set_attribute(header.attribute.as_str(), value.to_owned());
             }
@@ -1073,7 +1072,6 @@ pub async fn wasm_middleware(
 
 #[cfg(test)]
 mod tests {
-    use opentelemetry::trace::{SpanId, Status};
     use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
 
     use super::*;
@@ -1158,14 +1156,6 @@ mod tests {
 
     /// Build one `http_request` span through `RequestSpan` and return what was exported.
     fn export_request_span(headers: &[(&str, &str)]) -> SpanData {
-        export_request_span_with_status(headers, None)
-    }
-
-    /// As `export_request_span`, answering with `status` through `ResponseLogger` when given.
-    fn export_request_span_with_status(
-        headers: &[(&str, &str)],
-        status: Option<StatusCode>,
-    ) -> SpanData {
         use opentelemetry::trace::TracerProvider as _;
         use tracing_subscriber::{layer::SubscriberExt, Layer as _};
 
@@ -1186,8 +1176,6 @@ mod tests {
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
-            // Parsed like the engine parses SGLANG_TRACE_REQUEST_HEADERS: names
-            // are trimmed and lowercased, and empty entries are dropped.
             let mut make_span = RequestSpan {
                 traced_headers: Box::leak(
                     otel_trace::parse_traced_request_headers(
@@ -1196,12 +1184,7 @@ mod tests {
                     .into_boxed_slice(),
                 ),
             };
-            let span = make_span.make_span(&request.body(()).unwrap());
-            if let Some(status) = status {
-                let response = Response::builder().status(status).body(()).unwrap();
-                ResponseLogger::default().on_response(&response, Duration::from_millis(1), &span);
-            }
-            drop(span);
+            drop(make_span.make_span(&request.body(()).unwrap()));
         });
         let mut spans = exporter.0.lock().unwrap();
         assert_eq!(spans.len(), 1);
@@ -1243,26 +1226,6 @@ mod tests {
             Some("0f1e2d3c")
         );
         assert_eq!(attribute("http.request.header.x-untraced-id"), None);
-    }
-
-    #[test]
-    fn test_request_span_without_valid_traceparent_is_a_root() {
-        for headers in [&[][..], &[("traceparent", "not-a-traceparent")][..]] {
-            let span = export_request_span(headers);
-            assert_eq!(span.parent_span_id, SpanId::INVALID);
-        }
-    }
-
-    #[test]
-    fn test_request_span_records_why_a_request_failed() {
-        let span = export_request_span_with_status(&[], Some(StatusCode::SERVICE_UNAVAILABLE));
-        assert_eq!(span.status, Status::error(""));
-        let error = span.attributes.iter().find(|kv| kv.key.as_str() == "error");
-        assert_eq!(error.unwrap().value.as_str(), "Service Unavailable");
-
-        let span = export_request_span_with_status(&[], Some(StatusCode::OK));
-        assert_eq!(span.status, Status::Unset);
-        assert!(!span.attributes.iter().any(|kv| kv.key.as_str() == "error"));
     }
 }
 

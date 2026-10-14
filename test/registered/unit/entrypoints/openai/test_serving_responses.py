@@ -1123,8 +1123,6 @@ class PDWorkerFailureTestCase(unittest.TestCase):
         asyncio.run(run())
 
     def test_pd_prefill_forwards_client_trace_context(self):
-        # The frontend posts to P itself in direct P/D mode; without the
-        # client's W3C context, P's spans start a trace separate from D's.
         from types import SimpleNamespace
 
         async def run():

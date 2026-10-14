@@ -338,14 +338,11 @@ class Envs:
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
-    # Request headers recorded on each request's root span, so a request can
-    # be found by an ID set upstream (e.g. "x-request-id"). SMG also records
+    # Request headers recorded on each request's root span. SMG also records
     # them and forwards them to workers, so name only request-identifier headers.
     SGLANG_TRACE_REQUEST_HEADERS = EnvTuple(tuple())
-    # Longest value recorded per traced header; longer ones are cut
     SGLANG_TRACE_REQUEST_HEADER_MAX_LEN = EnvInt(256)
-    # Trace every TP and context-parallel rank. By default only the first rank
-    # of each attention TP/CP group traces
+    # By default only the first rank of each attention TP/CP group traces
     SGLANG_TRACE_ALL_RANKS = EnvBool(False)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     # Disable lazy compaction in the unified memory pool allocator and
