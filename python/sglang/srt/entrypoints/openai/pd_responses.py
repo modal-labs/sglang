@@ -8,6 +8,7 @@ import asyncio
 import copy
 import dataclasses
 import json
+import logging
 import secrets
 import uuid
 from urllib.parse import urlsplit
@@ -16,6 +17,12 @@ import aiohttp
 
 from sglang.srt.utils import ImageData, VideoData
 
+logger = logging.getLogger(__name__)
+
+# Set by the SMG that forwarded a Responses call; names the router origin the
+# decode frontend should call back for P/D generation.
+GENERATION_URL_HEADER = "x-smg-generation-url"
+
 
 class PDResponsesError(ValueError):
     """Keep a worker failure distinct from invalid client input."""
@@ -23,6 +30,47 @@ class PDResponsesError(ValueError):
     def __init__(self, message, status_code):
         super().__init__(message)
         self.status_code = status_code
+
+
+def is_http_router_origin(url):
+    """Whether url is a bare http(s) origin: no credentials, path, query or fragment."""
+    origin = urlsplit(url)
+    return not (
+        origin.scheme not in ("http", "https")
+        or not origin.hostname
+        or origin.username is not None
+        or origin.password is not None
+        or origin.path not in ("", "/")
+        or origin.query
+        or origin.fragment
+    )
+
+
+def select_generation_url(configured_url, raw_request=None):
+    """Pick the router to call back for this Responses request.
+
+    The header is honored only when a generation router is configured (this node
+    is a PD Responses frontend). An invalid header falls back to the configured
+    URL.
+    """
+    if not configured_url:
+        return configured_url
+    headers = getattr(raw_request, "headers", None)
+    value = headers.get(GENERATION_URL_HEADER) if headers is not None else None
+    if not value:
+        return configured_url
+    value = value.strip()
+    try:
+        valid = is_http_router_origin(value)
+    except ValueError:
+        valid = False
+    if not valid:
+        logger.warning(
+            "Ignoring invalid %s header; using configured responses_generation_url",
+            GENERATION_URL_HEADER,
+        )
+        return configured_url
+    return value
 
 
 def _media_reference_json(value):

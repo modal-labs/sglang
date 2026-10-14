@@ -2940,10 +2940,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         """Generate with builtin tool support for harmony-based models."""
         orig_priority = priority or 0
 
+        # Resolved once so every tool-loop turn of this request calls back
+        # through the same router.
+        generation_url = self.tokenizer_manager.server_args.responses_generation_url
+        if generation_url:
+            from sglang.srt.entrypoints.openai.pd_responses import (
+                select_generation_url,
+            )
+
+            generation_url = select_generation_url(generation_url, raw_request)
+
         while True:
             # Generate using SGLang's tokenizer manager
             prefill_url = self.tokenizer_manager.server_args.responses_prefill_url
-            generation_url = self.tokenizer_manager.server_args.responses_generation_url
             if generation_url:
                 from sglang.srt.entrypoints.openai.pd_responses import routed_turn
 
