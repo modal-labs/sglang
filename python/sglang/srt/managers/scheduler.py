@@ -217,6 +217,11 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
+from sglang.srt.managers.scheduler_components.rank_digest_check import (
+    AttnDecisionConfig,
+    RankDigestChecker,
+    gloo_all_gather,
+)
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
@@ -262,9 +267,9 @@ from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
     get_available_gpu_memory,
-    ignore_external_stop_signals,
     get_bool_env_var,
     get_int_env_var,
+    ignore_external_stop_signals,
     is_cuda,
     is_hip,
     is_mps,
@@ -611,6 +616,8 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+
+        self.maybe_init_rank_digest_check()
 
         self.init_kv_events_publisher()
 
@@ -1967,6 +1974,34 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
         )
 
+    def maybe_init_rank_digest_check(self) -> None:
+        # SGLANG_K3_RANK_DIGEST_CHECK: per-extend-forward TP digest exchange
+        # that fail-stops on per-rank batch divergence (see the module doc).
+        self.rank_digest_checker: Optional[RankDigestChecker] = None
+        if not envs.SGLANG_K3_RANK_DIGEST_CHECK.get() or self.tp_group.world_size < 2:
+            return
+        prefill_backend, _ = self.server_args.get_attention_backends()
+        self.rank_digest_checker = RankDigestChecker(
+            rank=self.tp_group.rank_in_group,
+            world_size=self.tp_group.world_size,
+            max_batch=self.max_running_requests,
+            cfg=AttnDecisionConfig(
+                prefill_backend=prefill_backend,
+                disable_chunked_prefix_cache=self.server_args.disable_chunked_prefix_cache,
+                chunked_prefix_cache_threshold=envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get(),
+                flashinfer_mla_disable_ragged=self.server_args.flashinfer_mla_disable_ragged,
+                enable_deterministic_inference=self.server_args.enable_deterministic_inference,
+                mla_prefill_cp=self.server_args.enable_prefill_context_parallel
+                and self.server_args.use_mla_backend(),
+                chunk_capacity=envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get(),
+            ),
+            all_gather=gloo_all_gather(
+                self.tp_cpu_group,
+                world_size=self.tp_group.world_size,
+                timeout_s=envs.SGLANG_K3_RANK_DIGEST_TIMEOUT_S.get(),
+            ),
+        )
+
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
             kv_events_config=self.server_args.kv_events_config,
@@ -3252,7 +3287,9 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             if self.server_args.short_prefill_token_threshold > 0:
-                from sglang.srt.managers.short_prefill import add_chunk_with_short_prefill_budget
+                from sglang.srt.managers.short_prefill import (
+                    add_chunk_with_short_prefill_budget,
+                )
 
                 self.chunked_req = add_chunk_with_short_prefill_budget(
                     adder,
@@ -3376,7 +3413,9 @@ class Scheduler(
             mamba_allocator.alloc_group_end()
 
         if queue_diagnostics.enabled(self):
-            queue_diagnostics.record_prefill(self, adder.can_run_list, res if self.waiting_queue else "no_waiting")
+            queue_diagnostics.record_prefill(
+                self, adder.can_run_list, res if self.waiting_queue else "no_waiting"
+            )
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -3707,6 +3746,18 @@ class Scheduler(
             # SGLANG_ENABLE_HICACHE_ATOMIC_WRITE_HANDOFF: exclude worker D2H commits
             # across wait_stream -> launch -> forward_done.record (no-op when off).
             forward_launch_section = hicache_authority.forward_launch_section()
+
+        # SGLANG_K3_RANK_DIGEST_CHECK: fail-stop here, on the CPU, if the TP
+        # ranks disagree on what this extend batch is.
+        if self.rank_digest_checker is not None and batch.forward_mode.is_extend():
+            self.rank_digest_checker.check(
+                forward_mode=batch.forward_mode.value,
+                is_extend_without_speculative=batch.forward_mode.is_extend_without_speculative(),
+                rids=[req.rid for req in batch.reqs],
+                extend_lens=batch.extend_lens,
+                extend_prefix_lens=batch.prefix_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+            )
 
         # Run forward
         if self.is_generation:

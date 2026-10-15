@@ -847,6 +847,16 @@ class Envs:
     # until a serving lane opts in after real-weight/mixed-batch soak; setting
     # 0 remains the same-build standalone static-quant fallback.
     SGLANG_K3_ATTN_RES_FP8_FUSION = EnvBool(False)
+    # Diagnostic: before every extend forward, all-gather a fixed-size digest
+    # of the ScheduleBatch (rids, extend/prefix/seq lens, attention method,
+    # chunked-prefix plan, forward counter) over the TP gloo group and
+    # fail-stop on any per-rank mismatch, so a HiCache V3 / DCP divergence
+    # dies with a diagnosis instead of wedging in NCCL. One small CPU
+    # collective per extend batch. See managers/scheduler_components/rank_digest_check.py.
+    SGLANG_K3_RANK_DIGEST_CHECK = EnvBool(False)
+    # Bounded wait on that gather: a peer that never arrives (different batch
+    # or already wedged) fail-stops after this many seconds.
+    SGLANG_K3_RANK_DIGEST_TIMEOUT_S = EnvFloat(60.0)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
