@@ -229,6 +229,17 @@ pub fn should_forward_request_header(name: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
 }
 
+/// Configured headers SMG never forwards: they carry credentials or route and
+/// frame the request SMG builds for the worker.
+const NEVER_FORWARD: [&str; 6] = [
+    "host",
+    "cookie",
+    "proxy-authorization",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+];
+
 fn engine_recorded_headers() -> &'static [String] {
     static HEADERS: OnceLock<Vec<String>> = OnceLock::new();
     HEADERS.get_or_init(|| {
@@ -238,6 +249,13 @@ fn engine_recorded_headers() -> &'static [String] {
             .cloned()
             .chain(otel_trace::parse_traced_request_headers(&logged))
             .map(|header| header.name)
+            .filter(|name| {
+                let forward = !NEVER_FORWARD.contains(&name.as_str());
+                if !forward {
+                    tracing::warn!("Not forwarding configured request header {name:?} to workers");
+                }
+                forward
+            })
             .collect()
     })
 }
