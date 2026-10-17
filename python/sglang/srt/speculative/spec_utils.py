@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
@@ -520,6 +521,51 @@ def generate_simulated_accept_index(
     return sim_accept_index
 
 
+def _log_traverse_reject(
+    grammar: BaseGrammarObject,
+    row_buffer: torch.Tensor,
+    parent_pos: int,
+    curr: int,
+    draft_tokens: torch.Tensor,
+    vocab_size: Optional[int],
+) -> None:
+    """Record why the bitmask allowed a draft token that accept_token rejected.
+
+    Runs before any rollback, so the grammar is still in the parent's state: a
+    freshly filled row is what the stored row should have been.
+    """
+    try:
+        token = int(draft_tokens[curr])
+        width = row_buffer.shape[1]
+        stored = row_buffer[parent_pos]
+        fresh = grammar.allocate_vocab_mask(
+            vocab_size=width * 32, batch_size=1, device="cpu"
+        )
+        grammar.fill_vocab_mask(fresh, 0)
+        word, bit = token // 32, token % 32
+
+        def allowed(row):
+            return (int(row[word]) >> bit) & 1
+
+        inner = getattr(grammar, "grammar", grammar)
+        logger.error(
+            "Grammar traverse reject diagnostics: "
+            f"token={token} node={curr} parent_pos={parent_pos} "
+            f"stored_bit={allowed(stored)} fresh_bit={allowed(fresh[0])} "
+            f"rows_equal={bool(torch.equal(stored, fresh[0]))} "
+            f"draft_dtype={draft_tokens.dtype} vocab_size={vocab_size} "
+            f"mask_width_words={width} thread={threading.current_thread().name} "
+            f"chain={[int(t) for t in draft_tokens.tolist()]} "
+            f"wrapper_state={getattr(grammar, 'tokens_in_think', None)}/"
+            f"{getattr(grammar, 'tokens_after_end', None)}/"
+            f"{getattr(grammar, '_matched_think_end_tokens', None)} "
+            f"inner_tail={getattr(inner, 'accepted_tokens', [])[-8:]} "
+            f"terminated={grammar.is_terminated()}"
+        )
+    except Exception as e:  # diagnostics must never mask the original error
+        logger.error(f"Grammar traverse reject diagnostics failed: {e!r}")
+
+
 def traverse_tree(
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
@@ -563,7 +609,18 @@ def traverse_tree(
         if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(int(draft_tokens[curr]))
+                try:
+                    grammar.accept_token(int(draft_tokens[curr]))
+                except ValueError:
+                    _log_traverse_reject(
+                        grammar,
+                        allocate_token_bitmask,
+                        parent_pos,
+                        curr,
+                        draft_tokens,
+                        vocab_size,
+                    )
+                    raise
                 depth += 1
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
