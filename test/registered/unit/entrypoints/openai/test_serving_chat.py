@@ -3041,6 +3041,36 @@ class ServingChatTestCase(CustomTestCase):
                     kwargs["response_format"]["type"], response_format["type"]
                 )
 
+    def test_history_tool_call_without_function_name_is_rejected(self):
+        """A history tool call without function.name reached the chat encoder,
+        which raised KeyError('name'), so the request failed with a 500."""
+        for function in ({"arguments": "{}"}, {"name": "", "arguments": "{}"}):
+            with self.subTest(function=function):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Read it."},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "read:0",
+                                    "type": "function",
+                                    "function": {"name": "read", "arguments": "{}"},
+                                },
+                                {"id": ":1", "type": "function", "function": function},
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": "read:0", "content": "ok"},
+                        {"role": "tool", "tool_call_id": ":1", "content": "ok"},
+                    ],
+                )
+                self.assertEqual(
+                    self.chat._validate_request(request),
+                    "messages[1].tool_calls[1].function.name is required.",
+                )
+
     def test_history_tool_call_arguments_must_be_a_json_object(self):
         """History tool call arguments must parse to a JSON object, for Jinja
         templates and the DeepSeek encoders alike; an object-shaped OpenAI JSON

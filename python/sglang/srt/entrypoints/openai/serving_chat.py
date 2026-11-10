@@ -1227,6 +1227,15 @@ class OpenAIServingChat(OpenAIServingBase):
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
 
+        # Chat encoders render each history call under its function name; a call
+        # without one is malformed input, not a server error.
+        for i, message in enumerate(request.messages):
+            if not isinstance(message, ChatCompletionMessageGenericParam):
+                continue
+            for j, tool_call in enumerate(message.tool_calls or []):
+                if not tool_call.function.name:
+                    return f"messages[{i}].tool_calls[{j}].function.name is required."
+
         if has_message_tools:
             names = [tool.function.name for tool in effective_tools]
             if len(names) != len(set(names)):
