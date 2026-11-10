@@ -54,6 +54,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -1448,7 +1449,15 @@ class AnthropicServing:
             request_obj=adapted_request,
             max_req_input_len=tokenizer_manager.max_req_input_len,
         )
-        if mm_inputs is None or mm_inputs.input_ids is None:
+        if mm_inputs is None:
+            return len(input_ids)
+        # Never dispatched, so no scheduler acknowledges the CUDA IPC slices
+        # the processor published
+        for item in mm_inputs.mm_items:
+            for tensor in (item.feature, item.precomputed_embeddings):
+                if isinstance(tensor, CudaIpcTensorTransportProxy):
+                    mm_processor.cudaipc_mmfeature_pool.cancel_proxy(tensor)
+        if mm_inputs.input_ids is None:
             return len(input_ids)
         return len(mm_inputs.input_ids)
 

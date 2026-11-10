@@ -1065,7 +1065,7 @@ class TestAnthropicServing(unittest.TestCase):
 
                     async def process_mm_data_async(self, **kwargs):
                         processed.append(kwargs)
-                        return SimpleNamespace(input_ids=list(range(2425)))
+                        return SimpleNamespace(input_ids=list(range(2425)), mm_items=[])
 
                 self.tokenizer_manager.mm_processor = _Processor()
                 self.tokenizer_manager.max_req_input_len = 1 << 20
@@ -1096,6 +1096,60 @@ class TestAnthropicServing(unittest.TestCase):
         (call,) = processed
         self.assertEqual(call["input_text"], [7] * 6)
         self.assertEqual(call["image_data"], ["data:image/png;base64,AAAA"])
+
+    def test_count_tokens_returns_cuda_ipc_feature_slices(self):
+        """count_tokens never dispatches, so the CUDA IPC slices the processor
+        published must go back to the pool or it fills up for good."""
+        from sglang.srt.multimodal.transport.cuda_ipc import (
+            CudaIpcTensorTransportProxy,
+        )
+
+        proxy = object.__new__(CudaIpcTensorTransportProxy)
+        cancelled = []
+
+        class _IpcCounting(_FakeOpenAIServingChat):
+            def __init__(self):
+                super().__init__()
+
+                class _Processor:
+                    prefer_tokenized_input = True
+                    cudaipc_mmfeature_pool = SimpleNamespace(
+                        cancel_proxy=cancelled.append
+                    )
+
+                    async def process_mm_data_async(self, **kwargs):
+                        item = SimpleNamespace(
+                            feature=proxy, precomputed_embeddings=None
+                        )
+                        return SimpleNamespace(input_ids=[0] * 9, mm_items=[item])
+
+                self.tokenizer_manager.mm_processor = _Processor()
+                self.tokenizer_manager.max_req_input_len = 1 << 20
+                self.tokenizer_manager._normalize_mm_content_hashes = lambda obj: None
+
+            def _validate_request(self, chat_request):
+                return None
+
+            def _convert_to_internal_request(self, chat_request, raw_request):
+                adapted = GenerateReqInput(
+                    input_ids=[7] * 6,
+                    image_data=["data:image/png;base64,AAAA"],
+                    modalities=["image"],
+                )
+                return adapted, chat_request
+
+        response = asyncio.run(
+            AnthropicServing(_IpcCounting()).handle_count_tokens(
+                AnthropicCountTokensRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                ),
+                object(),
+            )
+        )
+
+        self.assertEqual(json.loads(response.body)["input_tokens"], 9)
+        self.assertEqual(cancelled, [proxy])
 
     def test_request_output_config_task_budget_is_logged_not_enforced(self):
         """``task_budget`` is a soft hint; ``max_tokens`` is the hard cap."""
