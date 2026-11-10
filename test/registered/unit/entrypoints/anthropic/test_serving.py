@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -37,7 +38,7 @@ class _FakeOpenAIServingChat:
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
         self.tokenizer_manager = SimpleNamespace(
-            tokenizer=SimpleNamespace(chat_template=chat_template)
+            tokenizer=SimpleNamespace(chat_template=chat_template), mm_processor=None
         )
         self.supports_inline_system = detect_inline_system_support(chat_template)
 
@@ -1018,16 +1019,19 @@ class TestAnthropicServing(unittest.TestCase):
                     is_multimodal=False
                 )
 
-            def _process_messages(self, chat_request, is_multimodal):
+            def _validate_request(self, chat_request):
+                return None
+
+            def _convert_to_internal_request(self, chat_request, raw_request):
                 rendered.append(chat_request)
-                return SimpleNamespace(prompt_ids=[1])
+                return GenerateReqInput(input_ids=[1]), chat_request
 
         output_config = {
             "effort": "high",
             "format": {"type": "json_schema", "schema": {"type": "object"}},
         }
         serving = AnthropicServing(_CountingOpenAI())
-        asyncio.run(
+        response = asyncio.run(
             serving.handle_count_tokens(
                 AnthropicCountTokensRequest(
                     model="test-model",
@@ -1037,6 +1041,7 @@ class TestAnthropicServing(unittest.TestCase):
                 object(),
             )
         )
+        self.assertEqual(json.loads(response.body), {"input_tokens": 1})
         messages = serving._convert_to_chat_completion_request(
             self._anthropic_request(output_config=output_config)
         )
@@ -1045,6 +1050,52 @@ class TestAnthropicServing(unittest.TestCase):
             (rendered[0].response_format, rendered[0].reasoning_effort),
             (messages.response_format, messages.reasoning_effort),
         )
+
+    def test_count_tokens_counts_image_tokens_like_a_request(self):
+        """The multimodal processor expands each image placeholder into the
+        image's tokens; tokenizing the rendered prompt alone left them out."""
+        processed = []
+
+        class _MultimodalCounting(_FakeOpenAIServingChat):
+            def __init__(self):
+                super().__init__()
+
+                class _Processor:
+                    prefer_tokenized_input = True
+
+                    async def process_mm_data_async(self, **kwargs):
+                        processed.append(kwargs)
+                        return SimpleNamespace(input_ids=list(range(2425)))
+
+                self.tokenizer_manager.mm_processor = _Processor()
+                self.tokenizer_manager.max_req_input_len = 1 << 20
+                self.tokenizer_manager._normalize_mm_content_hashes = lambda obj: None
+
+            def _validate_request(self, chat_request):
+                return None
+
+            def _convert_to_internal_request(self, chat_request, raw_request):
+                adapted = GenerateReqInput(
+                    input_ids=[7] * 6,
+                    image_data=["data:image/png;base64,AAAA"],
+                    modalities=["image"],
+                )
+                return adapted, chat_request
+
+        response = asyncio.run(
+            AnthropicServing(_MultimodalCounting()).handle_count_tokens(
+                AnthropicCountTokensRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                ),
+                object(),
+            )
+        )
+
+        self.assertEqual(json.loads(response.body)["input_tokens"], 2425)
+        (call,) = processed
+        self.assertEqual(call["input_text"], [7] * 6)
+        self.assertEqual(call["image_data"], ["data:image/png;base64,AAAA"])
 
     def test_request_output_config_task_budget_is_logged_not_enforced(self):
         """``task_budget`` is a soft hint; ``max_tokens`` is the hard cap."""

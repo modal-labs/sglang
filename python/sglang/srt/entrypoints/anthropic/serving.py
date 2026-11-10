@@ -53,6 +53,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -1424,6 +1425,33 @@ class AnthropicServing:
             content=error_resp.model_dump(),
         )
 
+    async def _count_prompt_tokens(self, adapted_request: GenerateReqInput) -> int:
+        """Prompt tokens of the engine request /v1/messages would send, with each
+        multimodal placeholder expanded as TokenizerManager._tokenize_one_request does."""
+        tokenizer_manager = self.openai_serving_chat.tokenizer_manager
+        input_ids = adapted_request.input_ids
+        if input_ids is None:
+            input_ids = tokenizer_manager.tokenizer.encode(adapted_request.text)
+        mm_processor = tokenizer_manager.mm_processor
+        if mm_processor is None or not adapted_request.contains_mm_input():
+            return len(input_ids)
+        adapted_request.normalize_batch_and_arguments()
+        tokenizer_manager._normalize_mm_content_hashes(adapted_request)
+        mm_inputs = await mm_processor.process_mm_data_async(
+            image_data=adapted_request.image_data,
+            audio_data=adapted_request.audio_data,
+            input_text=(
+                input_ids
+                if mm_processor.prefer_tokenized_input or not adapted_request.text
+                else adapted_request.text
+            ),
+            request_obj=adapted_request,
+            max_req_input_len=tokenizer_manager.max_req_input_len,
+        )
+        if mm_inputs is None or mm_inputs.input_ids is None:
+            return len(input_ids)
+        return len(mm_inputs.input_ids)
+
     async def handle_count_tokens(
         self,
         request: AnthropicCountTokensRequest,
@@ -1457,20 +1485,19 @@ class AnthropicServing:
                 message=str(e),
             )
 
+        error_msg = self.openai_serving_chat._validate_request(chat_request)
+        if error_msg:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=error_msg,
+            )
         try:
-            is_multimodal = (
-                self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
+            # Render as /v1/messages does, so the count is of the same prompt.
+            adapted_request, _ = self.openai_serving_chat._convert_to_internal_request(
+                chat_request, raw_request
             )
-            processed = self.openai_serving_chat._process_messages(
-                chat_request, is_multimodal
-            )
-
-            if isinstance(processed.prompt_ids, list):
-                input_tokens = len(processed.prompt_ids)
-            else:
-                # prompt_ids is a string (multimodal case) — tokenize it
-                tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
-                input_tokens = len(tokenizer.encode(processed.prompt_ids))
+            input_tokens = await self._count_prompt_tokens(adapted_request)
 
             return JSONResponse(
                 content=AnthropicCountTokensResponse(
