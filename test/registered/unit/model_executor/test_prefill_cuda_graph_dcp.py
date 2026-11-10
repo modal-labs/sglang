@@ -18,6 +18,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
+    _fill_capture_slots,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
@@ -89,6 +90,20 @@ class TestDcpAdmission(unittest.TestCase):
         runner = _runner(dcp_active=True)
         self.assertTrue(runner.can_run_graph(fresh))
         self.assertFalse(runner.can_run_graph(prefix_hit))
+
+
+class TestDcpCaptureSlots(unittest.TestCase):
+    def test_every_rank_owns_its_share_of_each_capture_request(self):
+        """Capture requests all mapped to slot 0, so one DCP rank owned every
+        KV row, the others owned none, and the capture-time gather failed."""
+        dcp_size = 8
+        seq_lens = [16, 5]
+        req_to_token = torch.zeros((4, 32), dtype=torch.int32)
+        _fill_capture_slots(req_to_token, seq_lens)
+        for req, seq_len in enumerate(seq_lens):
+            owners = req_to_token[req, :seq_len] % dcp_size
+            counts = torch.bincount(owners.long(), minlength=dcp_size)
+            self.assertLessEqual(int(counts.max() - counts.min()), 1)
 
 
 class TestDcpReplayMetadata(unittest.TestCase):

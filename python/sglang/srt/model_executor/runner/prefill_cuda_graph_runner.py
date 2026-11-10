@@ -320,6 +320,15 @@ _PREFILL_STATIC_FIELDS = (
 )
 
 
+def _fill_capture_slots(req_to_token: torch.Tensor, capture_seq_lens) -> None:
+    # DCP reads each request's KV rows on the rank that owns the slot
+    # (slot % dcp_size), so dummy requests need position-ordered slots.
+    for i, seq_len in enumerate(capture_seq_lens):
+        req_to_token[i, :seq_len] = torch.arange(
+            seq_len, dtype=req_to_token.dtype, device=req_to_token.device
+        )
+
+
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
@@ -1685,6 +1694,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             s["orig_seq_lens"][:bs].copy_(shape_inputs["orig_seq_lens"])
             for name in _PREFILL_STATIC_FIELDS:
                 shape_inputs[name] = s[name][:bs]
+        if get_parallel().attn_dcp_size > 1:
+            _fill_capture_slots(
+                self.model_runner.req_to_token_pool.req_to_token, capture_seq_lens
+            )
 
         registry = self.buffer_registry
 
