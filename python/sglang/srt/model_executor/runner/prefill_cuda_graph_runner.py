@@ -320,6 +320,18 @@ _PREFILL_STATIC_FIELDS = (
 )
 
 
+def _mla_reads_dcp_gather_buffer(modules) -> bool:
+    # forward_mla skips the gather buffer for DSA layers; the DSA backend gathers
+    # the batch's KV into a per-batch buffer inside its attention break.
+    from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+    return any(
+        not module.use_dsa
+        for module in modules
+        if isinstance(module, DeepseekV2AttentionMLA)
+    )
+
+
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
@@ -336,6 +348,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
+    _dcp_extend_gathers_prefix = False
     dllm_attention = None
 
     @property
@@ -739,6 +752,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
         self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
+        self._dcp_extend_gathers_prefix = (
+            self._dcp_extend_active
+            and _mla_reads_dcp_gather_buffer(model_runner.model.modules())
+        )
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -1504,9 +1521,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
             return False
-        # Under DCP only fresh prefills replay; a prefix hit needs the cross-rank
-        # prefix KV all-gather with per-batch shapes, which stays eager.
-        if self._dcp_extend_active and prefix_lens is not None and any(prefix_lens):
+        # Under DCP only fresh prefills replay when MLA layers read the gather
+        # buffer: a prefix hit needs the cross-rank prefix KV all-gather with
+        # per-batch shapes, which stays eager.
+        if (
+            self._dcp_extend_gathers_prefix
+            and prefix_lens is not None
+            and any(prefix_lens)
+        ):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:

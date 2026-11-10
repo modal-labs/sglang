@@ -3,7 +3,8 @@
 Replay re-runs the break functions with their capture-time arguments, so the
 DCP extend gather must take the live batch from the forward context, and the
 runner must hand every replayed batch the bucket-sized gather buffer it
-captured. Prefix hits need the cross-rank all-gather and stay eager.
+captured. Prefix hits need the cross-rank all-gather and stay eager, unless
+no MLA layer reads that buffer.
 
     python -m pytest test/registered/unit/model_executor/test_prefill_cuda_graph_dcp.py -v
 """
@@ -18,10 +19,12 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
+    _mla_reads_dcp_gather_buffer,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -61,7 +64,7 @@ def _batch(num_tokens, prefix_lens):
     )
 
 
-def _runner(dcp_active):
+def _runner(dcp_active, gathers_prefix=None):
     runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
     runner._capture_req_slots = 4
     runner.enable_lora = False
@@ -77,6 +80,9 @@ def _runner(dcp_active):
     runner._capture_chunked_prefix = False
     runner.use_captured_attn_metadata = False
     runner._dcp_extend_active = dcp_active
+    runner._dcp_extend_gathers_prefix = (
+        dcp_active if gathers_prefix is None else gathers_prefix
+    )
     runner._dcp_kv_buffers = {}
     return runner
 
@@ -89,6 +95,24 @@ class TestDcpAdmission(unittest.TestCase):
         runner = _runner(dcp_active=True)
         self.assertTrue(runner.can_run_graph(fresh))
         self.assertFalse(runner.can_run_graph(prefix_hit))
+
+    def test_prefix_hits_replay_when_no_layer_reads_the_gather_buffer(self):
+        """A prefix hit ran eagerly under DCP even when every MLA layer was DSA,
+        which gathers its prefix KV in its own break and never reads the
+        capture-sized gather buffer."""
+        runner = _runner(dcp_active=True, gathers_prefix=False)
+        self.assertTrue(runner.can_run_graph(_batch(8, [4])))
+
+    def test_only_non_dsa_mla_layers_read_the_gather_buffer(self):
+        def mla(use_dsa):
+            layer = DeepseekV2AttentionMLA.__new__(DeepseekV2AttentionMLA)
+            layer.__dict__["use_dsa"] = use_dsa
+            return layer
+
+        other = torch.nn.Linear(1, 1)
+        self.assertFalse(_mla_reads_dcp_gather_buffer([other, mla(True), mla(True)]))
+        self.assertTrue(_mla_reads_dcp_gather_buffer([mla(True), mla(False)]))
+        self.assertFalse(_mla_reads_dcp_gather_buffer([other]))
 
 
 class TestDcpReplayMetadata(unittest.TestCase):
