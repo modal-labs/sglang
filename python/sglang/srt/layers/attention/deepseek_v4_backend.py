@@ -4337,6 +4337,7 @@ class DeepseekV4AttnBackend(
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -4416,6 +4417,7 @@ class DeepseekV4AttnBackend(
                     swa_page_indices=swa_page_indices,
                     extra_indices=extra_indices,
                     extra_topk_lengths=extra_topk_lengths,
+                    out=out,
                 )
 
             if q.ndim == 3:

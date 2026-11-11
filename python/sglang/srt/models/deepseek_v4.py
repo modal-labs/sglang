@@ -832,6 +832,7 @@ def deepseek_v4_attention_with_output(
             compress_ratio=compress_ratio,
             attn_sink=attn_sink,
             save_kv_cache=save_kv_cache,
+            out=output[:real_num_tokens],
         )
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
@@ -840,7 +841,13 @@ def deepseek_v4_attention_with_output(
         f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
     )
 
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    output_view = output[:real_num_tokens].view(ret.shape)
+    if (
+        ret.data_ptr() != output_view.data_ptr()
+        or ret.dtype != output_view.dtype
+        or ret.stride() != output_view.stride()
+    ):
+        output_view.copy_(ret)
     output[real_num_tokens:].zero_()
     return
 

@@ -1,5 +1,6 @@
 """Regression tests for multimodal IDs and Engram masking during graph replay."""
 
+import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -122,6 +123,140 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                     model, torch.arange(3), hidden, batch, ids, ids, False, []
                 )
             torch.testing.assert_close(actual, expected)
+
+
+class TestDeepseekV4BCGAttentionOutput(CustomTestCase):
+    def run_attention(self, output, real_rows, forward):
+        cache_loc = torch.arange(output.shape[0])
+        batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=real_rows, out_cache_loc=cache_loc
+        )
+        context = SimpleNamespace(forward_batch=batch, attention_layers=[object()])
+        with (
+            patch.object(
+                dsv4, "get_tc_piecewise_forward_context", return_value=context
+            ),
+            patch.object(
+                dsv4, "get_attn_backend", return_value=SimpleNamespace(forward=forward)
+            ),
+        ):
+            try:
+                inspect.unwrap(dsv4.deepseek_v4_attention_with_output)(
+                    torch.ones_like(output),
+                    torch.ones_like(output),
+                    output,
+                    0,
+                    0,
+                    torch.zeros(output.shape[1]),
+                    False,
+                )
+            finally:
+                self.assertIs(batch.out_cache_loc, cache_loc)
+
+    def test_backend_output_reuse_avoids_copy_and_clears_padding(self):
+        """BCG must not copy an already-written attention result into itself."""
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                output = torch.full((4, 2, 512), float("nan"), dtype=torch.bfloat16)
+
+                def forward(q, out=None, **kwargs):
+                    result = out if reuse and out is not None else torch.empty_like(q)
+                    return result.fill_(7)
+
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU]
+                ) as profile:
+                    self.run_attention(output, 2, forward)
+                torch.testing.assert_close(output[:2], torch.full_like(output[:2], 7))
+                torch.testing.assert_close(output[2:], torch.zeros_like(output[2:]))
+                copies = sum(
+                    event.count
+                    for event in profile.key_averages()
+                    if event.key == "aten::copy_"
+                )
+                self.assertEqual(copies, 0 if reuse else 1)
+
+    def test_empty_and_failed_attention_preserve_cache_locations(self):
+        def fail(**kwargs):
+            raise RuntimeError("backend failed")
+
+        output = torch.full((4, 2, 512), float("nan"))
+        self.run_attention(output, 0, fail)
+        torch.testing.assert_close(output, torch.zeros_like(output))
+        with self.assertRaisesRegex(RuntimeError, "backend failed"):
+            self.run_attention(output, 2, fail)
+
+    def test_trtllm_prefill_only_reuses_compatible_unpadded_output(self):
+        """An incompatible or padded destination must not reach the VarSeq kernel."""
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        backend = trtllm.DeepseekV4TrtllmAttnBackend.__new__(
+            trtllm.DeepseekV4TrtllmAttnBackend
+        )
+        backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
+        backend.trtllm_workspace_buffer = torch.empty(1)
+        backend.softmax_scale = 1.0
+        core = SimpleNamespace(
+            trtllm_prefill_qmeta=(torch.tensor([0, 2]), 2, 2, torch.tensor([2])),
+            trtllm_prefill_swa_lens=torch.ones(2, dtype=torch.int32),
+        )
+        backend.forward_metadata = SimpleNamespace(core_attn_metadata=core)
+        good = torch.empty(2, 2, 512, dtype=torch.bfloat16)
+        for destination, rows, reuse in (
+            (good, 2, True),
+            (None, 2, False),
+            (good.float(), 2, False),
+            (good.view(2, 1, 1024), 2, False),
+            (torch.empty(2, 512, 2, dtype=torch.bfloat16).transpose(1, 2), 2, False),
+            (good, 3, False),
+        ):
+            with self.subTest(
+                shape=None if destination is None else destination.shape,
+                rows=rows,
+                reuse=reuse,
+            ):
+
+                def launch(query, out, **kwargs):
+                    result = (
+                        out
+                        if out is not None
+                        else torch.empty(query.shape, dtype=torch.bfloat16)
+                    )
+                    return result.fill_(7)
+
+                with (
+                    patch.object(
+                        backend, "_trtllm_kv_cache_views", return_value=(None, None)
+                    ),
+                    patch.object(trtllm, "_check_trtllm_query_rows"),
+                    patch.object(
+                        trtllm, "_get_trtllm_kv_counter_buffer", return_value=None
+                    ),
+                    patch.object(
+                        trtllm,
+                        "trtllm_batch_decode_sparse_mla_dsv4",
+                        side_effect=launch,
+                        create=True,
+                    ),
+                ):
+                    result = backend._forward_trtllm_prefill(
+                        q=torch.ones(rows, 2, 512),
+                        layer=SimpleNamespace(layer_id=0, k_scale_float=None),
+                        compress_ratio=0,
+                        forward_batch=None,
+                        attn_sink=torch.zeros(2),
+                        swa_page_indices=torch.zeros(
+                            rows, trtllm.SWA_WINDOW, dtype=torch.int32
+                        ),
+                        extra_indices=None,
+                        extra_topk_lengths=None,
+                        out=destination,
+                    )
+                torch.testing.assert_close(result[:2], torch.full_like(good, 7))
+                if destination is not None:
+                    self.assertEqual(result.data_ptr() == destination.data_ptr(), reuse)
+                if rows == 3:
+                    torch.testing.assert_close(result[2:], torch.zeros_like(result[2:]))
 
 
 if __name__ == "__main__":

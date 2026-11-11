@@ -2232,6 +2232,7 @@ class DeepseekV4AscendAttnBackend(
         compress_ratio: int = 0,
         attn_sink: Optional[torch.Tensor] = None,
         save_kv_cache: bool = True,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if compress_ratio not in (0, 4, 128):
             raise ValueError(

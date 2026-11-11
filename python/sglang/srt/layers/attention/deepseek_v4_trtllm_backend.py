@@ -186,6 +186,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         swa_page_indices: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert attn_sink is not None
         if self.is_dsv41:
@@ -223,6 +224,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             swa_page_indices=swa_page_indices,
             extra_indices=extra_indices,
             extra_topk_lengths=extra_topk_lengths,
+            out=out,
         )
 
     def _get_trtllm_bmm_scales(self, layer: RadixAttention) -> Tuple[float, float]:
@@ -387,6 +389,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         swa_page_indices: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run varlen prefill eagerly, including at BCG breaks."""
 
@@ -492,7 +495,16 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         out_padded = None
         out_arg = None
-        if num_qo_padded != sum_q:
+        if (
+            out is not None
+            and num_qo_padded == sum_q
+            and out.shape == (sum_q, num_heads, 512)
+            and out.dtype == torch.bfloat16
+            and out.device == q.device
+            and out.is_contiguous()
+        ):
+            out_arg = out
+        elif num_qo_padded != sum_q:
             # Run only real tokens and keep discarded padding rows finite.
             out_padded = torch.zeros(
                 (num_qo_padded, num_heads, 512),
